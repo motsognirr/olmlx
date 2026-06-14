@@ -254,7 +254,7 @@ class Settings(BaseSettings):
     # the draft model's pre-trained ``block_size`` for DFlash and EAGLE.
     speculative: bool = False
     speculative_strategy: Literal[
-        "classic", "dflash", "eagle", "pld", "self_speculative"
+        "classic", "dflash", "eagle", "pld", "self_speculative", "proxy_tuning"
     ] = "classic"
     speculative_draft_model: Annotated[str, Field(min_length=1)] | None = None
     speculative_tokens: Annotated[int, Field(gt=0)] | None = None
@@ -274,6 +274,16 @@ class Settings(BaseSettings):
     #: Self-speculative knob — number of layers skipped during the draft
     #: pass. ``None`` defaults to L//4 at load time.
     speculative_layers_skip: Annotated[int, Field(ge=1)] | None = None
+    #: Proxy-tuning (engine/proxy_tuning.py) model paths + steering strength.
+    #: Only read when ``speculative_strategy == "proxy_tuning"``. The expert
+    #: (``M+``, tuned) and anti-expert (``M-``, untuned) are small models that
+    #: must share the base model's exact tokenizer/vocabulary. ``alpha`` scales
+    #: the tuning delta ``(expert - antiexpert)``; 1.0 is the paper's default.
+    speculative_proxy_expert_model: Annotated[str, Field(min_length=1)] | None = None
+    speculative_proxy_antiexpert_model: (
+        Annotated[str, Field(min_length=1)] | None
+    ) = None
+    speculative_proxy_alpha: float = 1.0
 
     #: Cross-request KV-cache reuse for speculative decoding (issue #421).
     #: Max persisted speculative cache lineages held on the per-model
@@ -463,6 +473,41 @@ class Settings(BaseSettings):
                 "OLMLX_TREE_SPECULATIVE=true is only supported with "
                 "OLMLX_SPECULATIVE_STRATEGY=classic "
                 f"(got {self.speculative_strategy!r})"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def validate_proxy_tuning(self) -> "Settings":
+        if self.speculative_strategy != "proxy_tuning":
+            return self
+        if not self.speculative:
+            # Scope the requirement to an actually-enabled proxy-tuning config,
+            # mirroring how PLD/tree validators avoid rejecting inert settings.
+            return self
+        missing = [
+            name
+            for name, val in (
+                ("speculative_proxy_expert_model", self.speculative_proxy_expert_model),
+                (
+                    "speculative_proxy_antiexpert_model",
+                    self.speculative_proxy_antiexpert_model,
+                ),
+            )
+            if not val
+        ]
+        if missing:
+            raise ValueError(
+                "speculative_strategy='proxy_tuning' requires "
+                + " and ".join(missing)
+                + " to be set (OLMLX_SPECULATIVE_PROXY_EXPERT_MODEL / "
+                "OLMLX_SPECULATIVE_PROXY_ANTIEXPERT_MODEL)."
+            )
+        import math
+
+        if not math.isfinite(self.speculative_proxy_alpha):
+            raise ValueError(
+                "speculative_proxy_alpha must be a finite number, got "
+                f"{self.speculative_proxy_alpha!r}"
             )
         return self
 
