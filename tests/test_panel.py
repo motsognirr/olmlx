@@ -396,3 +396,10 @@ class TestPanelGenerateChatStream:
         full = "".join(c.get("text", "") for c in chunks)
         assert full == "Final synthesized answer."
         assert chunks[-1].get("done") is True
+
+
+class TestRouterDispatch:
+    def test_openai_router_imports_panel_dispatch(self):
+        from olmlx.routers import openai as openai_router
+
+        assert hasattr(openai_router, "panel_generate_chat")

@@ -17,6 +17,7 @@ from olmlx.engine.inference import (
     generate_completion,
     generate_embeddings,
 )
+from olmlx.engine.panel import panel_generate_chat
 from olmlx.engine.tool_parser import (
     fill_missing_required_args,
     parse_model_output,
@@ -372,9 +373,11 @@ async def openai_chat(req: OpenAIChatRequest, request: Request):
     enable_thinking = resolve_openai_think(
         req.reasoning_effort, req.chat_template_kwargs
     )
+    registry = request.app.state.registry
+    dispatch = panel_generate_chat if registry.is_panel(req.model) else generate_chat
 
     if req.stream:
-        result = await generate_chat(
+        result = await dispatch(
             manager,
             req.model,
             messages,
@@ -417,7 +420,7 @@ async def openai_chat(req: OpenAIChatRequest, request: Request):
             media_type="text/event-stream",
         )
     else:
-        result = await generate_chat(
+        result = await dispatch(
             manager,
             req.model,
             messages,
