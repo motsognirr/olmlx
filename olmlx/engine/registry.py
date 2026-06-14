@@ -1259,6 +1259,7 @@ class ModelRegistry:
 
     def __init__(self):
         self._mappings: dict[str, ModelConfig] = {}
+        self._panels: dict[str, PanelConfig] = {}
         self._raw_unrecognized: dict[str, Any] = {}
         self._dirty_keys: set[str] = set()
         self._removed_keys: set[str] = set()
@@ -1295,15 +1296,25 @@ class ModelRegistry:
                     f"file is not overwritten."
                 )
             self._mappings = {}
+            self._panels = {}
             self._raw_unrecognized = {}
             self._dirty_keys = set()
             self._removed_keys = set()
             for k, v in raw.items():
+                normalized = self.normalize_name(k)
+                if isinstance(v, dict) and v.get("type") == "panel":
+                    try:
+                        self._panels[normalized] = PanelConfig.from_entry(normalized, v)
+                    except (ValueError, TypeError) as exc:
+                        logger.warning("Skipping invalid panel entry %r: %s", k, exc)
+                        self._raw_unrecognized[k] = v
+                    continue
                 try:
                     self._mappings[k] = ModelConfig.from_entry(v)
                 except (ValueError, TypeError) as exc:
                     logger.warning("Skipping invalid models.json entry %r: %s", k, exc)
                     self._raw_unrecognized[k] = v
+            self._validate_panels()
         if self._aliases_path.exists():
             try:
                 with open(self._aliases_path) as f:
@@ -1354,6 +1365,39 @@ class ModelRegistry:
         if name in self._mappings:
             return self._mappings[name]
         return None
+
+    def is_panel(self, name: str) -> bool:
+        """True if *name* resolves to a ``type: "panel"`` entry."""
+        return self.normalize_name(name) in self._panels
+
+    def resolve_panel(self, name: str) -> "PanelConfig | None":
+        """Resolve *name* to a PanelConfig, or None if it is not a panel."""
+        return self._panels.get(self.normalize_name(name))
+
+    def _validate_panels(self) -> None:
+        """Drop panels referencing unknown models; warn on judge-in-panel.
+
+        Cross-reference validation runs after all entries are loaded so a
+        panel may reference members declared anywhere in the file.
+        """
+        for name, panel in list(self._panels.items()):
+            refs = {panel.classifier, panel.judge} | panel.all_member_names()
+            missing = sorted(r for r in refs if self.resolve(r) is None)
+            if missing:
+                logger.warning(
+                    "Dropping panel %r: references unknown models %s",
+                    name,
+                    missing,
+                )
+                del self._panels[name]
+                continue
+            if panel.judge in panel.all_member_names():
+                logger.warning(
+                    "Panel %r: judge %r is also a panelist; this invites "
+                    "self-preference bias.",
+                    name,
+                    panel.judge,
+                )
 
     def list_models(self) -> dict[str, ModelConfig]:
         """Return all known model name → ModelConfig mappings.

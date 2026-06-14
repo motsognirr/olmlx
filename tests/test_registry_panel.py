@@ -1,8 +1,10 @@
 """Tests for panel-type entries in olmlx.engine.registry."""
 
+import json
+
 import pytest
 
-from olmlx.engine.registry import PanelConfig
+from olmlx.engine.registry import ModelRegistry, PanelConfig
 
 
 class TestPanelConfig:
@@ -68,3 +70,55 @@ class TestPanelConfig:
             },
         )
         assert pc.all_member_names() == {"a", "b", "c2"}
+
+
+def _load_registry(tmp_path, monkeypatch, config: dict) -> ModelRegistry:
+    path = tmp_path / "models.json"
+    path.write_text(json.dumps(config))
+    monkeypatch.setattr("olmlx.engine.registry.settings.models_config", path)
+    reg = ModelRegistry()
+    reg.load()
+    return reg
+
+
+class TestRegistryPanelLoading:
+    def test_panel_entry_loaded_and_resolvable(self, tmp_path, monkeypatch):
+        reg = _load_registry(
+            tmp_path,
+            monkeypatch,
+            {
+                "qwen3": "Qwen/Qwen3-8B-MLX",
+                "small": "org/small",
+                "judgem": "org/judge",
+                "my-panel": {
+                    "type": "panel",
+                    "classifier": "small",
+                    "judge": "judgem",
+                    "routes": {"default": ["qwen3"]},
+                },
+            },
+        )
+        assert reg.is_panel("my-panel") is True
+        assert reg.is_panel("my-panel:latest") is True
+        assert reg.is_panel("qwen3") is False
+        pc = reg.resolve_panel("my-panel")
+        assert pc.judge == "judgem"
+        # A panel name is NOT a normal model.
+        assert reg.resolve("my-panel") is None
+
+    def test_panel_with_missing_member_is_dropped(self, tmp_path, monkeypatch):
+        reg = _load_registry(
+            tmp_path,
+            monkeypatch,
+            {
+                "small": "org/small",
+                "judgem": "org/judge",
+                "bad-panel": {
+                    "type": "panel",
+                    "classifier": "small",
+                    "judge": "judgem",
+                    "routes": {"default": ["does-not-exist"]},
+                },
+            },
+        )
+        assert reg.is_panel("bad-panel") is False
