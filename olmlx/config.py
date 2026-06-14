@@ -1,4 +1,5 @@
 import logging
+import math
 import os
 from dataclasses import dataclass
 from pathlib import Path
@@ -280,9 +281,9 @@ class Settings(BaseSettings):
     #: must share the base model's exact tokenizer/vocabulary. ``alpha`` scales
     #: the tuning delta ``(expert - antiexpert)``; 1.0 is the paper's default.
     speculative_proxy_expert_model: Annotated[str, Field(min_length=1)] | None = None
-    speculative_proxy_antiexpert_model: (
-        Annotated[str, Field(min_length=1)] | None
-    ) = None
+    speculative_proxy_antiexpert_model: Annotated[str, Field(min_length=1)] | None = (
+        None
+    )
     speculative_proxy_alpha: float = 1.0
 
     #: Cross-request KV-cache reuse for speculative decoding (issue #421).
@@ -482,7 +483,7 @@ class Settings(BaseSettings):
             return self
         if not self.speculative:
             # Scope the requirement to an actually-enabled proxy-tuning config,
-            # mirroring how PLD/tree validators avoid rejecting inert settings.
+            # mirroring how the PLD validator avoids rejecting inert settings.
             return self
         missing = [
             name
@@ -496,14 +497,12 @@ class Settings(BaseSettings):
             if not val
         ]
         if missing:
+            env_hints = " / ".join(f"OLMLX_{name.upper()}" for name in missing)
             raise ValueError(
                 "speculative_strategy='proxy_tuning' requires "
                 + " and ".join(missing)
-                + " to be set (OLMLX_SPECULATIVE_PROXY_EXPERT_MODEL / "
-                "OLMLX_SPECULATIVE_PROXY_ANTIEXPERT_MODEL)."
+                + f" to be set ({env_hints})."
             )
-        import math
-
         if not math.isfinite(self.speculative_proxy_alpha):
             raise ValueError(
                 "speculative_proxy_alpha must be a finite number, got "

@@ -691,6 +691,9 @@ class ModelConfig:
                     f"global Settings produced a window smaller than the "
                     f"largest n-gram)."
                 )
+        # v1: proxy-tuning fields are global-only (no per-model models.json
+        # override, unlike draft_model/num_tokens above). Deliberate scope —
+        # see docs/superpowers/plans/2026-06-14-proxy-tuning-decode-mode.md.
         proxy_expert_model = settings.speculative_proxy_expert_model
         proxy_antiexpert_model = settings.speculative_proxy_antiexpert_model
         proxy_alpha = settings.speculative_proxy_alpha

@@ -45,6 +45,26 @@ def test_proxy_alpha_default_is_one():
     assert s.speculative_proxy_alpha == 1.0
 
 
+def test_proxy_alpha_rejects_non_finite():
+    with pytest.raises(ValueError, match="finite"):
+        Settings(
+            speculative=True,
+            speculative_strategy="proxy_tuning",
+            speculative_proxy_expert_model="org/expert",
+            speculative_proxy_antiexpert_model="org/anti",
+            speculative_proxy_alpha=float("inf"),
+        )
+
+
+def test_proxy_strategy_requires_expert_when_only_antiexpert_set():
+    with pytest.raises(ValueError, match="speculative_proxy_expert_model"):
+        Settings(
+            speculative=True,
+            speculative_strategy="proxy_tuning",
+            speculative_proxy_antiexpert_model="org/anti",
+        )
+
+
 def test_resolved_speculative_carries_proxy_fields(monkeypatch):
     from olmlx import config as config_mod
 
