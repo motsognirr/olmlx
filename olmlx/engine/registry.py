@@ -361,6 +361,11 @@ class ModelConfig:
     #: Applied by ``generate_chat`` when the request didn't set the flag.
     #: ``None`` means fall back to the engine default (think unless tools).
     enable_thinking: bool | None = None
+    #: Per-model default reasoning level for channel-format reasoners
+    #: (gpt-oss / Harmony): ``"low"``, ``"medium"``, or ``"high"``. Applied by
+    #: ``generate_chat`` when the caller didn't pass one; ignored by templates
+    #: that don't support ``reasoning_effort``. ``None`` uses the template default.
+    reasoning_effort: str | None = None
     #: Per-model override for the cross-request prompt cache toggle. When set,
     #: fully overrides ``OLMLX_PROMPT_CACHE`` for this model — useful when a
     #: specific architecture surfaces a checkpoint-path bug while the rest of
@@ -561,6 +566,15 @@ class ModelConfig:
         ):
             raise ValueError(
                 f"'enable_thinking' must be a bool or None, got {self.enable_thinking!r}"
+            )
+        if self.reasoning_effort is not None and self.reasoning_effort not in (
+            "low",
+            "medium",
+            "high",
+        ):
+            raise ValueError(
+                "'reasoning_effort' must be 'low', 'medium', 'high', or None, "
+                f"got {self.reasoning_effort!r}"
             )
         if self.prompt_cache is not None and not isinstance(self.prompt_cache, bool):
             raise ValueError(
@@ -930,6 +944,7 @@ class ModelConfig:
             flash_speculative_draft_model = entry.get("flash_speculative_draft_model")
             flash_speculative_tokens = entry.get("flash_speculative_tokens")
             enable_thinking_raw = entry.get("enable_thinking")
+            reasoning_effort_raw = entry.get("reasoning_effort")
             prompt_cache_raw = entry.get("prompt_cache")
             batching_raw = entry.get("batching")
             batch_completion_size_raw = entry.get("batch_completion_size")
@@ -1001,6 +1016,7 @@ class ModelConfig:
                 flash_speculative_draft_model=flash_speculative_draft_model,
                 flash_speculative_tokens=flash_speculative_tokens,
                 enable_thinking=enable_thinking_raw,
+                reasoning_effort=reasoning_effort_raw,
                 prompt_cache=prompt_cache_raw,
                 batching=batching_raw,
                 batch_completion_size=batch_completion_size_raw,
@@ -1045,6 +1061,7 @@ class ModelConfig:
             and self.flash_speculative_draft_model is None
             and self.flash_speculative_tokens is None
             and self.enable_thinking is None
+            and self.reasoning_effort is None
             and self.prompt_cache is None
             and self.batching is None
             and self.batch_completion_size is None
@@ -1116,6 +1133,8 @@ class ModelConfig:
             result["flash_speculative_tokens"] = self.flash_speculative_tokens
         if self.enable_thinking is not None:
             result["enable_thinking"] = self.enable_thinking
+        if self.reasoning_effort is not None:
+            result["reasoning_effort"] = self.reasoning_effort
         if self.prompt_cache is not None:
             result["prompt_cache"] = self.prompt_cache
         if self.batching is not None:
@@ -1205,11 +1224,78 @@ def validate_hf_path(hf_path: str) -> None:
         raise ValueError(f"HuggingFace path {hf_path!r} must be in 'owner/repo' format")
 
 
+@dataclass(frozen=True)
+class PanelConfig:
+    """A ``type: "panel"`` entry from models.json.
+
+    A panel is not a loadable model: it has no weights. ``classifier``,
+    ``judge`` and the per-route member lists all reference other
+    models.json entries by name. See engine/panel.py for the coordinator
+    that executes a panel.
+    """
+
+    name: str
+    classifier: str
+    judge: str
+    routes: dict[str, list[str]]
+    #: When to stop issuing tool calls and let the judge synthesize. ``"all"``
+    #: (default) finalizes only when no panelist proposes tools; ``"majority"``
+    #: finalizes once a majority of panelists are ready; ``"judge"`` asks the
+    #: judge each turn. See engine/panel.py.
+    stop_condition: str = "all"
+
+    @classmethod
+    def from_entry(cls, name: str, entry: dict) -> "PanelConfig":
+        classifier = entry.get("classifier")
+        judge = entry.get("judge")
+        routes = entry.get("routes")
+        stop_condition = entry.get("stop_condition", "all")
+        if stop_condition not in ("all", "majority", "judge"):
+            raise ValueError(
+                f"panel {name!r}: 'stop_condition' must be one of "
+                f"'all', 'majority', 'judge'; got {stop_condition!r}"
+            )
+        if not classifier or not isinstance(classifier, str):
+            raise ValueError(
+                f"panel {name!r}: 'classifier' must be a non-empty model name"
+            )
+        if not judge or not isinstance(judge, str):
+            raise ValueError(f"panel {name!r}: 'judge' must be a non-empty model name")
+        if not isinstance(routes, dict) or not routes:
+            raise ValueError(f"panel {name!r}: 'routes' must be a non-empty object")
+        for key, members in routes.items():
+            if (
+                not isinstance(members, list)
+                or not members
+                or not all(isinstance(m, str) and m for m in members)
+            ):
+                raise ValueError(
+                    f"panel {name!r}: route {key!r} must be a non-empty list "
+                    "of model names"
+                )
+        if "default" not in routes:
+            raise ValueError(f"panel {name!r}: 'routes' must contain a 'default' key")
+        return cls(
+            name=name,
+            classifier=classifier,
+            judge=judge,
+            routes=dict(routes),
+            stop_condition=stop_condition,
+        )
+
+    def all_member_names(self) -> set[str]:
+        names: set[str] = set()
+        for members in self.routes.values():
+            names.update(members)
+        return names
+
+
 class ModelRegistry:
     """Resolves Ollama model names to HuggingFace paths via config file."""
 
     def __init__(self):
         self._mappings: dict[str, ModelConfig] = {}
+        self._panels: dict[str, PanelConfig] = {}
         self._raw_unrecognized: dict[str, Any] = {}
         self._dirty_keys: set[str] = set()
         self._removed_keys: set[str] = set()
@@ -1246,15 +1332,25 @@ class ModelRegistry:
                     f"file is not overwritten."
                 )
             self._mappings = {}
+            self._panels = {}
             self._raw_unrecognized = {}
             self._dirty_keys = set()
             self._removed_keys = set()
             for k, v in raw.items():
+                normalized = self.normalize_name(k)
+                if isinstance(v, dict) and v.get("type") == "panel":
+                    try:
+                        self._panels[normalized] = PanelConfig.from_entry(normalized, v)
+                    except (ValueError, TypeError) as exc:
+                        logger.warning("Skipping invalid panel entry %r: %s", k, exc)
+                        self._raw_unrecognized[k] = v
+                    continue
                 try:
                     self._mappings[k] = ModelConfig.from_entry(v)
                 except (ValueError, TypeError) as exc:
                     logger.warning("Skipping invalid models.json entry %r: %s", k, exc)
                     self._raw_unrecognized[k] = v
+            self._validate_panels()
         if self._aliases_path.exists():
             try:
                 with open(self._aliases_path) as f:
@@ -1305,6 +1401,48 @@ class ModelRegistry:
         if name in self._mappings:
             return self._mappings[name]
         return None
+
+    def is_panel(self, name: str) -> bool:
+        """True if *name* resolves to a ``type: "panel"`` entry."""
+        return self.normalize_name(name) in self._panels
+
+    def resolve_panel(self, name: str) -> "PanelConfig | None":
+        """Resolve *name* to a PanelConfig, or None if it is not a panel."""
+        return self._panels.get(self.normalize_name(name))
+
+    def list_panels(self) -> dict[str, "PanelConfig"]:
+        """Return all configured panel name → PanelConfig mappings.
+
+        Panels are synthetic (no weights), so they're kept separate from
+        ``list_models`` — model-listing surfaces (``/v1/models``, ``/api/tags``,
+        the CLI) append these so panels are selectable by clients like opencode.
+        """
+        return dict(self._panels)
+
+    def _validate_panels(self) -> None:
+        """Drop panels referencing unknown models; warn on judge-in-panel.
+
+        Cross-reference validation runs after all entries are loaded so a
+        panel may reference members declared anywhere in the file.
+        """
+        for name, panel in list(self._panels.items()):
+            refs = {panel.classifier, panel.judge} | panel.all_member_names()
+            missing = sorted(r for r in refs if self.resolve(r) is None)
+            if missing:
+                logger.warning(
+                    "Dropping panel %r: references unknown models %s",
+                    name,
+                    missing,
+                )
+                del self._panels[name]
+                continue
+            if panel.judge in panel.all_member_names():
+                logger.warning(
+                    "Panel %r: judge %r is also a panelist; this invites "
+                    "self-preference bias.",
+                    name,
+                    panel.judge,
+                )
 
     def list_models(self) -> dict[str, ModelConfig]:
         """Return all known model name → ModelConfig mappings.

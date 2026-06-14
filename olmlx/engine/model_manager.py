@@ -555,6 +555,10 @@ class LoadedModel:
     # ``generate_chat`` consults this when the request didn't set the
     # flag.  None means defer to the engine default.
     enable_thinking: bool | None = None
+    # Per-model default reasoning level for channel-format reasoners
+    # (gpt-oss / Harmony): "low"/"medium"/"high". ``generate_chat`` consults
+    # this when the caller didn't pass ``reasoning_effort``.
+    reasoning_effort: str | None = None
     # Per-model override for the cross-request prompt cache toggle.
     # ``generate_chat`` honours this in place of ``settings.prompt_cache``
     # when set. None means defer to the global setting. Surfaced for
@@ -1526,6 +1530,7 @@ class ModelManager(SpeculativeLoaderMixin):
                         inference_timeout=model_config.inference_timeout,
                         sync_mode=model_config.sync_mode,
                         enable_thinking=model_config.enable_thinking,
+                        reasoning_effort=model_config.reasoning_effort,
                         prompt_cache=model_config.prompt_cache,
                         batching=model_config.batching,
                         batch_completion_size=model_config.batch_completion_size,

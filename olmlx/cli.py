@@ -1778,7 +1778,7 @@ def _format_size(size_bytes: int) -> str:
 
 
 def cmd_models_list(_args):
-    """List locally downloaded models."""
+    """List locally downloaded models and configured synthetic panels."""
     try:
         store = _create_store()
     except Exception as e:
@@ -1789,20 +1789,38 @@ def cmd_models_list(_args):
     except Exception as e:
         print(f"Error: {e}", file=sys.stderr)
         sys.exit(1)
-    if not models:
+
+    # Synthetic panel "models" have no weights, so they aren't in the store —
+    # pull them from the registry so they show up here and are selectable.
+    registry = _load_registry_for_audit()
+    panels = registry.list_panels() if registry is not None else {}
+
+    if not models and not panels:
         print("No models downloaded.")
         return
-    # Header
-    print(f"{'NAME':<30} {'SIZE':<12} {'PARAMS':<10} {'QUANT':<10} {'HF PATH'}")
-    print("-" * 90)
-    for m in sorted(models, key=lambda x: x.name or ""):
-        name = (m.name or "")[:30]
-        params = (m.parameter_size or "")[:10]
-        quant = (m.quantization_level or "")[:10]
-        print(
-            f"{name:<30} {_format_size(m.size):<12} "
-            f"{params:<10} {quant:<10} {m.hf_path}"
-        )
+
+    if models:
+        print(f"{'NAME':<30} {'SIZE':<12} {'PARAMS':<10} {'QUANT':<10} {'HF PATH'}")
+        print("-" * 90)
+        for m in sorted(models, key=lambda x: x.name or ""):
+            name = (m.name or "")[:30]
+            params = (m.parameter_size or "")[:10]
+            quant = (m.quantization_level or "")[:10]
+            print(
+                f"{name:<30} {_format_size(m.size):<12} "
+                f"{params:<10} {quant:<10} {m.hf_path}"
+            )
+
+    if panels:
+        if models:
+            print()
+        print("Panels (synthetic — selectable by name):")
+        for name, panel in sorted(panels.items()):
+            routes = ",".join(panel.routes)
+            print(
+                f"  {name:<30} judge={panel.judge}  "
+                f"routes={routes}  stop={panel.stop_condition}"
+            )
 
 
 def cmd_models_search(args):

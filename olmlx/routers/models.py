@@ -50,6 +50,17 @@ async def list_models(request: Request):
                 )
             )
 
+    # Synthetic panel models: no weights, but selectable by name. Mark the
+    # family as "panel" so clients can tell them apart.
+    for name in registry.list_panels():
+        models.append(
+            ModelInfo(
+                name=name,
+                model=name,
+                details=ModelDetails(family="panel"),
+            )
+        )
+
     return TagsResponse(models=models)
 
 

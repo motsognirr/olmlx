@@ -20,6 +20,7 @@ olmlx/
 │   └── voice/          # Push-to-talk STT (Whisper) + Kokoro TTS
 ├── engine/
 │   ├── inference.py    # generate_chat/completion/embeddings/transcription/rerank
+│   ├── panel.py        # Multi-model panel + judge coordinator (per-turn reconciler)
 │   ├── model_manager.py
 │   ├── speculative_loaders.py
 │   ├── spec_decoder_base.py  # SpecDecoderBase: shared mechanics for all speculative strategies
@@ -73,6 +74,8 @@ olmlx/
 **TTS priming** — The router primes the PCM source generator's first chunk before starting the response. Priming the ffmpeg-encoded stream instead wouldn't work: ffmpeg emits its container header before reading stdin, so an upstream `ValueError` from a non-TTS model would leak after the 200 has been sent.
 
 **Flash prefetcher teardown order** — Prefetcher must be closed before the weight store on model unload. Prefetch tasks submit work into the store's thread pool; reversing the order leaves in-flight tasks referencing a closed store.
+
+**Panel coordinator routes through generate_chat** — `engine/panel.py` is a per-turn reconciler that rides the client's tool loop: it returns a `generate_chat`-shaped result whose text is either the judge's prose or canonical Qwen `<tool_call>` blocks, so both routers' existing `parse_model_output` paths handle it unchanged. Every classifier/panelist/judge call MUST go through `generate_chat` — never call MLX directly — or the Metal-stream/inference-lock handling is bypassed. Panels need `max_loaded_models ≥ members + judge + classifier` to avoid reload thrash.
 
 ## Development
 
