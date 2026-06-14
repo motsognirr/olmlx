@@ -1067,6 +1067,31 @@ class TestBuildParser:
         assert dflash_moe == ["moe-eagle/m:latest"]
         assert global_used is False
 
+    def test_audit_pld_not_flagged_as_bad_without_draft(self, monkeypatch, tmp_path):
+        """PLD strategy needs no draft model — must not appear in ``bad``."""
+        from olmlx.cli import _audit_speculative_config
+        from olmlx.config import settings as _settings
+
+        models_json = tmp_path / "models.json"
+        models_json.write_text(
+            json.dumps(
+                {
+                    "pld/m:latest": {
+                        "hf_path": "pld/m",
+                        "speculative": True,
+                        "speculative_strategy": "pld",
+                    },
+                }
+            )
+        )
+        monkeypatch.setattr(_settings, "models_config", models_json)
+        monkeypatch.setattr(_settings, "speculative", False)
+        monkeypatch.setattr(_settings, "speculative_draft_model", None)
+
+        bad, dormant, flash, dflash_moe, global_used = _audit_speculative_config()
+        assert bad == [], "pld model should not be flagged as bad (no draft needed)"
+        assert dormant == []
+
     def test_per_model_flash_mismatch_in_distributed_exits(
         self, monkeypatch, tmp_path, capsys
     ):
