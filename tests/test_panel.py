@@ -259,3 +259,53 @@ class TestRunPanel:
         )
         assert merged == []
         assert answers == (["da", "db"], ["Answer A", "Answer B"])
+
+
+class TestPanelGenerateChatNonStream:
+    @pytest.mark.asyncio
+    async def test_tool_turn_returns_qwen_blocks(self, monkeypatch):
+        responses = {
+            "c": '{"route": "default"}',
+            "da": '<tool_call>\n{"name": "search", "arguments": {"q": "x"}}\n</tool_call>',
+            "db": "prose",
+        }
+        monkeypatch.setattr(
+            panel_mod, "generate_chat", _fake_generate_chat_factory(responses)
+        )
+        monkeypatch.setattr(
+            panel_mod, "_resolve_panel", lambda manager, name: _make_panel()
+        )
+        result = await panel_mod.panel_generate_chat(
+            manager=None,
+            model_name="p:latest",
+            messages=[{"role": "user", "content": "find x"}],
+            tools=[{"type": "function", "function": {"name": "search"}}],
+            stream=False,
+        )
+        # Router parses raw_text -> tool calls.
+        _t, _v, tool_uses = parse_model_output(result["raw_text"], has_tools=True)
+        assert [tu["name"] for tu in tool_uses] == ["search"]
+        assert result["done"] is True
+
+    @pytest.mark.asyncio
+    async def test_final_turn_returns_judge_answer(self, monkeypatch):
+        responses = {
+            "c": '{"route": "default"}',
+            "da": "Answer A",
+            "db": "Answer B",
+            "j": "Reconciled final answer.",
+        }
+        monkeypatch.setattr(
+            panel_mod, "generate_chat", _fake_generate_chat_factory(responses)
+        )
+        monkeypatch.setattr(
+            panel_mod, "_resolve_panel", lambda manager, name: _make_panel()
+        )
+        result = await panel_mod.panel_generate_chat(
+            manager=None,
+            model_name="p:latest",
+            messages=[{"role": "user", "content": "hi"}],
+            tools=None,
+            stream=False,
+        )
+        assert result["text"] == "Reconciled final answer."

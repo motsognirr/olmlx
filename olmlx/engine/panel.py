@@ -14,11 +14,13 @@ from __future__ import annotations
 
 import json
 import logging
+from collections.abc import AsyncGenerator
 from typing import TYPE_CHECKING
 
 from olmlx.engine.grammar import GrammarSpec
 from olmlx.engine.inference import generate_chat
 from olmlx.engine.tool_parser import parse_model_output
+from olmlx.utils.timing import TimingStats
 
 if TYPE_CHECKING:
     from olmlx.engine.model_manager import ModelManager
@@ -236,3 +238,107 @@ async def _run_panel(
 
     merged = merge_tool_calls(per_panelist_tools)
     return (members, answers), merged
+
+
+def _resolve_panel(manager: "ModelManager", model_name: str) -> "PanelConfig":
+    """Resolve *model_name* to its PanelConfig or raise (fail the request)."""
+    panel = manager.registry.resolve_panel(model_name)
+    if panel is None:
+        raise ValueError(f"{model_name!r} is not a configured panel model")
+    return panel
+
+
+async def _judge_answer(
+    manager: "ModelManager",
+    panel: "PanelConfig",
+    messages: list[dict],
+    member_names: list[str],
+    answers: list[str],
+    options: dict | None,
+    keep_alive: int | str | None,
+    max_tokens: int,
+    enable_thinking: bool | None,
+    stream: bool,
+):
+    """Run the judge (no tools) to synthesize the final answer.
+
+    Returns the judge's ``generate_chat`` result verbatim — an async
+    generator when ``stream`` else a dict — so the routers stream/format
+    it exactly as a single model's output.
+    """
+    judge_messages = build_judge_messages(messages, member_names, answers)
+    return await generate_chat(
+        manager,
+        panel.judge,
+        judge_messages,
+        options=options,
+        tools=None,  # judge must not redo work
+        stream=stream,
+        keep_alive=keep_alive,
+        max_tokens=max_tokens,
+        enable_thinking=enable_thinking,
+    )
+
+
+async def panel_generate_chat(
+    manager: "ModelManager",
+    model_name: str,
+    messages: list[dict],
+    options: dict | None = None,
+    tools: list[dict] | None = None,
+    stream: bool = True,
+    keep_alive: int | str | None = None,
+    max_tokens: int = 512,
+    cache_id: str = "",
+    enable_thinking: bool | None = None,
+    grammar_spec: GrammarSpec | None = None,
+) -> AsyncGenerator[dict, None] | dict:
+    """Drop-in, ``generate_chat``-compatible entry point for a panel model.
+
+    ``cache_id`` and ``grammar_spec`` are accepted for signature parity
+    but not applied to the panel as a whole (the judge/panelists manage
+    their own caching).
+    """
+    panel = _resolve_panel(manager, model_name)
+    if stream:
+        return _panel_stream(
+            manager,
+            panel,
+            messages,
+            options,
+            tools,
+            keep_alive,
+            max_tokens,
+            enable_thinking,
+        )
+
+    (member_names, answers), merged = await _run_panel(
+        manager,
+        panel,
+        messages,
+        tools,
+        options,
+        keep_alive,
+        max_tokens,
+        enable_thinking,
+    )
+    if merged:
+        raw = serialize_tool_calls_qwen(merged)
+        return {"text": "", "raw_text": raw, "done": True, "stats": TimingStats()}
+    return await _judge_answer(
+        manager,
+        panel,
+        messages,
+        member_names,
+        answers,
+        options,
+        keep_alive,
+        max_tokens,
+        enable_thinking,
+        stream=False,
+    )
+
+
+async def _panel_stream(*args, **kwargs):  # replaced in Task 9
+    raise NotImplementedError
+    yield {}  # pragma: no cover  (makes this an async generator)
