@@ -556,8 +556,12 @@ async def openai_completions(req: OpenAICompletionRequest, request: Request):
 )
 async def openai_list_models(request: Request):
     registry = request.app.state.registry
+    created = int(time.time())
     models = registry.list_models()
-    data = [OpenAIModel(id=name, created=int(time.time())) for name in models]
+    data = [OpenAIModel(id=name, created=created) for name in models]
+    # Synthetic panel models have no weights but are selectable by name, so
+    # clients (opencode, etc.) need to see them in the model list.
+    data += [OpenAIModel(id=name, created=created) for name in registry.list_panels()]
     return OpenAIModelList(data=data)
 
 

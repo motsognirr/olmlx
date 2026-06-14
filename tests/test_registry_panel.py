@@ -129,6 +129,11 @@ class TestRegistryPanelLoading:
         assert pc.judge == "judgem"
         # A panel name is NOT a normal model.
         assert reg.resolve("my-panel") is None
+        # ...but it IS listed for model-listing surfaces, separate from models.
+        panels = reg.list_panels()
+        assert "my-panel:latest" in panels
+        assert panels["my-panel:latest"].judge == "judgem"
+        assert "my-panel:latest" not in reg.list_models()
 
     def test_panel_with_missing_member_is_dropped(self, tmp_path, monkeypatch):
         reg = _load_registry(

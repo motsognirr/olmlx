@@ -1410,6 +1410,15 @@ class ModelRegistry:
         """Resolve *name* to a PanelConfig, or None if it is not a panel."""
         return self._panels.get(self.normalize_name(name))
 
+    def list_panels(self) -> dict[str, "PanelConfig"]:
+        """Return all configured panel name → PanelConfig mappings.
+
+        Panels are synthetic (no weights), so they're kept separate from
+        ``list_models`` — model-listing surfaces (``/v1/models``, ``/api/tags``,
+        the CLI) append these so panels are selectable by clients like opencode.
+        """
+        return dict(self._panels)
+
     def _validate_panels(self) -> None:
         """Drop panels referencing unknown models; warn on judge-in-panel.
 

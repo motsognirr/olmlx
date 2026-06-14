@@ -801,3 +801,73 @@ class TestRouterDispatchBehavioral:
         assert generate_called == [], (
             f"generate_chat was called unexpectedly: {generate_called}"
         )
+
+
+def _registry_with_panel(monkeypatch):
+    import json as _json
+    import pathlib
+    import tempfile
+
+    from olmlx.engine.registry import ModelRegistry
+
+    config = {
+        "small": "org/small",
+        "judge-m": "org/judge",
+        "panelist-m": "org/panelist",
+        "list-panel": {
+            "type": "panel",
+            "classifier": "small",
+            "judge": "judge-m",
+            "routes": {"default": ["panelist-m"]},
+        },
+    }
+    with tempfile.TemporaryDirectory() as td:
+        cfg = pathlib.Path(td) / "models.json"
+        cfg.write_text(_json.dumps(config))
+        monkeypatch.setattr("olmlx.engine.registry.settings.models_config", cfg)
+        reg = ModelRegistry()
+        reg.load()
+    return reg
+
+
+class TestPanelModelListing:
+    @pytest.mark.asyncio
+    async def test_openai_v1_models_includes_panel(self, monkeypatch):
+        from unittest.mock import MagicMock
+
+        from httpx import ASGITransport, AsyncClient
+        from olmlx.app import create_app
+
+        app = create_app()
+        app.state.registry = _registry_with_panel(monkeypatch)
+        app.state.model_manager = MagicMock()
+        app.state.model_store = MagicMock()
+
+        transport = ASGITransport(app=app, raise_app_exceptions=True)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            resp = await client.get("/v1/models")
+        assert resp.status_code == 200
+        ids = {m["id"] for m in resp.json()["data"]}
+        assert "list-panel:latest" in ids
+
+    @pytest.mark.asyncio
+    async def test_ollama_api_tags_includes_panel(self, monkeypatch):
+        from unittest.mock import MagicMock
+
+        from httpx import ASGITransport, AsyncClient
+        from olmlx.app import create_app
+
+        app = create_app()
+        app.state.registry = _registry_with_panel(monkeypatch)
+        app.state.model_manager = MagicMock()
+        store = MagicMock()
+        store.list_local.return_value = []
+        app.state.model_store = store
+
+        transport = ASGITransport(app=app, raise_app_exceptions=True)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            resp = await client.get("/api/tags")
+        assert resp.status_code == 200
+        entries = {m["name"]: m for m in resp.json()["models"]}
+        assert "list-panel:latest" in entries
+        assert entries["list-panel:latest"]["details"]["family"] == "panel"
