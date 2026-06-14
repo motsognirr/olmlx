@@ -408,3 +408,225 @@ class TestRouterDispatch:
         from olmlx.routers import chat as chat_router
 
         assert hasattr(chat_router, "panel_generate_chat")
+
+
+# ---------------------------------------------------------------------------
+# Gap 1 — Continuation-history re-routing stays stable
+# ---------------------------------------------------------------------------
+
+
+class TestContinuationRouting:
+    def test_first_user_text_stable_with_tool_history(self):
+        # A continuation history: system first, then the original user turn,
+        # then an assistant tool-call turn and a tool result.  first_user_text
+        # must still return the ORIGINAL user message (routing key is stable).
+        messages = [
+            {"role": "system", "content": "sys"},
+            {"role": "user", "content": "original task"},
+            {"role": "assistant", "content": "", "tool_calls": [{"id": "1"}]},
+            {"role": "tool", "content": "tool result", "tool_call_id": "1"},
+        ]
+        assert first_user_text(messages) == "original task"
+
+    @pytest.mark.asyncio
+    async def test_run_panel_routes_same_on_continuation(self, monkeypatch):
+        # Same classifier output -> same members, regardless of added history.
+        responses = {"c": '{"route": "code"}', "qa": "A", "qb": "B"}
+        monkeypatch.setattr(
+            panel_mod, "generate_chat", _fake_generate_chat_factory(responses)
+        )
+        base = [{"role": "user", "content": "write code"}]
+        continuation = base + [
+            {"role": "assistant", "content": "", "tool_calls": [{"id": "1"}]},
+            {"role": "tool", "content": "result", "tool_call_id": "1"},
+        ]
+        (members_a, _), _ = await panel_mod._run_panel(
+            None, _make_panel(), base, None, None, None, 128, None
+        )
+        (members_b, _), _ = await panel_mod._run_panel(
+            None, _make_panel(), continuation, None, None, None, 128, None
+        )
+        assert members_a == members_b == ["qa", "qb"]
+
+
+# ---------------------------------------------------------------------------
+# Gap 2 — Failure propagation
+# ---------------------------------------------------------------------------
+
+
+class TestFailurePropagation:
+    @staticmethod
+    def _raising_factory(responses: dict, raise_on: str):
+        async def _fake(
+            manager,
+            model_name,
+            messages,
+            options=None,
+            tools=None,
+            stream=False,
+            keep_alive=None,
+            max_tokens=512,
+            cache_id="",
+            enable_thinking=None,
+            grammar_spec=None,
+        ):
+            if model_name == raise_on:
+                raise RuntimeError(f"boom in {model_name}")
+            return {"text": responses[model_name], "done": True, "stats": None}
+
+        return _fake
+
+    @pytest.mark.asyncio
+    async def test_panelist_failure_propagates_nonstream(self, monkeypatch):
+        responses = {"c": '{"route": "default"}', "da": "A", "db": "B"}
+        monkeypatch.setattr(
+            panel_mod,
+            "generate_chat",
+            self._raising_factory(responses, raise_on="da"),
+        )
+        monkeypatch.setattr(panel_mod, "_resolve_panel", lambda m, n: _make_panel())
+        with pytest.raises(RuntimeError, match="boom in da"):
+            await panel_mod.panel_generate_chat(
+                manager=None,
+                model_name="p:latest",
+                messages=[{"role": "user", "content": "hi"}],
+                tools=None,
+                stream=False,
+            )
+
+    @pytest.mark.asyncio
+    async def test_classifier_failure_propagates_nonstream(self, monkeypatch):
+        responses = {"c": "unused"}
+        monkeypatch.setattr(
+            panel_mod,
+            "generate_chat",
+            self._raising_factory(responses, raise_on="c"),
+        )
+        monkeypatch.setattr(panel_mod, "_resolve_panel", lambda m, n: _make_panel())
+        with pytest.raises(RuntimeError, match="boom in c"):
+            await panel_mod.panel_generate_chat(
+                manager=None,
+                model_name="p:latest",
+                messages=[{"role": "user", "content": "hi"}],
+                tools=None,
+                stream=False,
+            )
+
+    @pytest.mark.asyncio
+    async def test_panelist_failure_propagates_stream(self, monkeypatch):
+        responses = {"c": '{"route": "default"}', "da": "A", "db": "B"}
+        monkeypatch.setattr(
+            panel_mod,
+            "generate_chat",
+            self._raising_factory(responses, raise_on="da"),
+        )
+        monkeypatch.setattr(panel_mod, "_resolve_panel", lambda m, n: _make_panel())
+        agen = await panel_mod.panel_generate_chat(
+            manager=None,
+            model_name="p:latest",
+            messages=[{"role": "user", "content": "hi"}],
+            tools=None,
+            stream=True,
+        )
+        with pytest.raises(RuntimeError, match="boom in da"):
+            await _drain(agen)
+
+
+# ---------------------------------------------------------------------------
+# Gap 4 — Router actually dispatches to the coordinator (behavioral)
+# ---------------------------------------------------------------------------
+
+
+class TestRouterDispatchBehavioral:
+    @pytest.mark.asyncio
+    async def test_panel_model_dispatches_to_panel_generate_chat(self, monkeypatch):
+        """Non-streaming request for a panel model calls panel_generate_chat,
+        NOT generate_chat."""
+        import json as _json
+
+        from httpx import ASGITransport, AsyncClient
+        from olmlx.app import create_app
+        from olmlx.engine.registry import ModelRegistry
+        from olmlx.utils.timing import TimingStats
+
+        # Build a registry that exposes a panel model.
+        import tempfile
+        import pathlib
+
+        config = {
+            "classifier-m": "org/small",
+            "judge-m": "org/judge",
+            "panelist-m": "org/panelist",
+            "my-panel": {
+                "type": "panel",
+                "classifier": "classifier-m",
+                "judge": "judge-m",
+                "routes": {"default": ["panelist-m"]},
+            },
+        }
+        with tempfile.TemporaryDirectory() as td:
+            cfg_path = pathlib.Path(td) / "models.json"
+            cfg_path.write_text(_json.dumps(config))
+            monkeypatch.setattr(
+                "olmlx.engine.registry.settings.models_config", cfg_path
+            )
+            reg = ModelRegistry()
+            reg.load()
+
+        assert reg.is_panel("my-panel") is True
+
+        panel_called: list[str] = []
+        generate_called: list[str] = []
+
+        async def fake_panel_generate_chat(
+            manager, model_name, messages, options=None, **kwargs
+        ):
+            panel_called.append(model_name)
+            return {
+                "text": "panel answer",
+                "done": True,
+                "stats": TimingStats(),
+            }
+
+        async def fake_generate_chat(
+            manager, model_name, messages, options=None, **kwargs
+        ):
+            generate_called.append(model_name)
+            return {
+                "text": "plain answer",
+                "done": True,
+                "stats": TimingStats(),
+            }
+
+        monkeypatch.setattr(
+            "olmlx.routers.openai.panel_generate_chat", fake_panel_generate_chat
+        )
+        monkeypatch.setattr("olmlx.routers.openai.generate_chat", fake_generate_chat)
+
+        app = create_app()
+        app.state.registry = reg
+        # model_manager can be a minimal stub — dispatch happens before any
+        # actual inference.
+        from unittest.mock import MagicMock
+
+        app.state.model_manager = MagicMock()
+        app.state.model_store = MagicMock()
+
+        transport = ASGITransport(app=app, raise_app_exceptions=True)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            resp = await client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "my-panel",
+                    "messages": [{"role": "user", "content": "hello"}],
+                    "stream": False,
+                },
+            )
+
+        assert resp.status_code == 200
+        assert panel_called == ["my-panel"], (
+            f"panel_generate_chat was not called; panel_called={panel_called}"
+        )
+        assert generate_called == [], (
+            f"generate_chat was called unexpectedly: {generate_called}"
+        )

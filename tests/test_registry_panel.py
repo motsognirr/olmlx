@@ -122,3 +122,44 @@ class TestRegistryPanelLoading:
             },
         )
         assert reg.is_panel("bad-panel") is False
+
+    # ---------------------------------------------------------------------------
+    # Gap 3 — Registry panel validation: judge-in-panel warns; missing judge drops
+    # ---------------------------------------------------------------------------
+
+    def test_judge_in_panel_warns_but_keeps(self, tmp_path, monkeypatch, caplog):
+        import logging
+
+        config = {
+            "qwen3": "Qwen/Qwen3-8B-MLX",
+            "small": "org/small",
+            "panel-x": {
+                "type": "panel",
+                "classifier": "small",
+                "judge": "qwen3",
+                "routes": {"default": ["qwen3"]},  # judge is also a member
+            },
+        }
+        with caplog.at_level(logging.WARNING):
+            reg = _load_registry(tmp_path, monkeypatch, config)
+        assert reg.is_panel("panel-x") is True  # kept, not dropped
+        # The warning from _validate_panels mentions self-preference bias.
+        assert any(
+            "self-preference" in r.message or "self-preference bias" in r.message
+            for r in caplog.records
+        ), (
+            f"Expected self-preference warning, got: {[r.message for r in caplog.records]}"
+        )
+
+    def test_missing_judge_drops_panel(self, tmp_path, monkeypatch):
+        config = {
+            "small": "org/small",
+            "panel-y": {
+                "type": "panel",
+                "classifier": "small",
+                "judge": "no-such-model",
+                "routes": {"default": ["small"]},
+            },
+        }
+        reg = _load_registry(tmp_path, monkeypatch, config)
+        assert reg.is_panel("panel-y") is False
