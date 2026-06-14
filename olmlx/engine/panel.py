@@ -178,6 +178,9 @@ async def classify(
         stream=False,
         keep_alive=keep_alive,
         max_tokens=32,
+        # Routing is a constrained JSON task — never spend tokens on reasoning,
+        # regardless of the request's or classifier model's thinking default.
+        enable_thinking=False,
         grammar_spec=route_grammar(panel),
     )
     text = (result.get("text") or "").strip()
@@ -369,7 +372,13 @@ async def _panel_stream(
     if merged:
         raw = serialize_tool_calls_qwen(merged)
         yield {"text": raw}
-        yield {"text": "", "done": True, "raw_text": raw, "done_reason": "stop"}
+        yield {
+            "text": "",
+            "done": True,
+            "raw_text": raw,
+            "done_reason": "stop",
+            "stats": TimingStats(),
+        }
         return
 
     judge_stream = await _judge_answer(

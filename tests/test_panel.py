@@ -212,6 +212,22 @@ class TestClassify:
         )
         assert members == ["da", "db"]
 
+    @pytest.mark.asyncio
+    async def test_classify_disables_thinking(self, monkeypatch):
+        # Routing is a constrained JSON task: the classifier must never be
+        # asked to think, regardless of model/request defaults.
+        captured = {}
+
+        async def _capture(manager, model_name, messages, **kwargs):
+            captured.update(kwargs)
+            return {"text": '{"route": "code"}', "done": True, "stats": None}
+
+        monkeypatch.setattr(panel_mod, "generate_chat", _capture)
+        await panel_mod.classify(
+            manager=None, panel=_make_panel(), user_text="write a function"
+        )
+        assert captured["enable_thinking"] is False
+
 
 class TestRunPanel:
     @pytest.mark.asyncio
@@ -370,6 +386,9 @@ class TestPanelGenerateChatStream:
         _t, _v, tool_uses = parse_model_output(full, has_tools=True)
         assert [tu["name"] for tu in tool_uses] == ["search"]
         assert chunks[-1].get("done") is True
+        # Done chunk carries stats, matching the non-streaming tool turn so the
+        # Ollama timing-metadata path stays symmetric.
+        assert chunks[-1].get("stats") is not None
 
     @pytest.mark.asyncio
     async def test_stream_final_turn_proxies_judge_stream(self, monkeypatch):
