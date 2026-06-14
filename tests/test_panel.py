@@ -100,3 +100,26 @@ class TestToolCallUnion:
         _thinking, _visible, tool_uses = parse_model_output(text, has_tools=True)
         reparsed = [{"name": tu["name"], "input": tu["input"]} for tu in tool_uses]
         assert reparsed == merged
+
+    def test_serialize_round_trips_tool_call_tag_in_args(self):
+        # An argument value containing the literal closing tag must survive
+        # the serialize -> parse_model_output round-trip (the panel emits
+        # this text and the routers re-parse it).
+        # With two calls, the non-greedy Qwen regex closes early inside the
+        # first arg, the first call is silently dropped, and only the second
+        # is returned — a real production failure.
+        merged = [
+            {"name": "search", "input": {"q": "see </tool_call> here"}},
+            {"name": "read", "input": {"path": "/tmp/foo"}},
+        ]
+        text = serialize_tool_calls_qwen(merged)
+        _t, _v, tool_uses = parse_model_output(text, has_tools=True)
+        reparsed = [{"name": tu["name"], "input": tu["input"]} for tu in tool_uses]
+        assert reparsed == merged
+
+    def test_merge_handles_none_input(self):
+        merged = merge_tool_calls([[{"name": "f", "input": None}]])
+        assert merged == [{"name": "f", "input": {}}]
+
+    def test_merge_no_panelists(self):
+        assert merge_tool_calls([]) == []

@@ -102,5 +102,11 @@ def serialize_tool_calls_qwen(tool_uses: list[dict]) -> str:
     blocks = []
     for tu in tool_uses:
         payload = json.dumps({"name": tu["name"], "arguments": tu.get("input") or {}})
+        # A literal "</tool_call>" inside an argument value would make the
+        # non-greedy Qwen parser regex close the block early and drop the
+        # call. Escaping the slash keeps the substring out of the text while
+        # remaining valid JSON: json.loads decodes "<\/tool_call>" back to
+        # "</tool_call>", so the round-trip is exact.
+        payload = payload.replace("</tool_call>", "<\\/tool_call>")
         blocks.append(f"<tool_call>\n{payload}\n</tool_call>")
     return "\n".join(blocks)
