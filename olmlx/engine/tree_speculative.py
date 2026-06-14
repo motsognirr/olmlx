@@ -391,12 +391,22 @@ def _patch_target_for_tree_forward(
 
     orig_call = type(inner).__call__
 
-    def _tree_call(self_: Any, inputs: mx.array, cache: Any = None) -> Any:
-        h = embed_fn(inputs)
+    def _tree_call(
+        self_: Any,
+        inputs: mx.array,
+        cache: Any = None,
+        input_embeddings: Any = None,
+    ) -> Any:
+        h = input_embeddings if input_embeddings is not None else embed_fn(inputs)
+        # Cast the additive mask to the hidden-state dtype: current mlx's
+        # scaled_dot_product_attention requires the mask to promote to the
+        # output dtype, and a float32 mask cannot downcast to a bf16 model.
+        # Mirrors mlx-lm's create_attention_mask, which builds in h.dtype.
+        mask = tree_mask.astype(h.dtype)
         if cache is None:
             cache = [None] * len(layers)
         for layer, c in zip(layers, cache):
-            h = layer(h, tree_mask, c)
+            h = layer(h, mask, c)
         return norm_fn(h)
 
     type(inner).__call__ = _tree_call  # type: ignore[method-assign]
