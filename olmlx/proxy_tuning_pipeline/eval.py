@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from typing import Any, Callable
 
 from olmlx.proxy_tuning_pipeline.eval_driver import generate_one
@@ -12,6 +13,8 @@ from olmlx.proxy_tuning_pipeline.eval_schema import (
     EvalScore,
     ShipDecision,
 )
+
+logger = logging.getLogger(__name__)
 
 
 def aggregate(scores: list[EvalScore]) -> list[AlphaSummary]:
@@ -129,18 +132,30 @@ def run_eval(
     base, expert, anti, tokenizer = loader(base_dir, expert_dir, antiexpert_dir)
 
     scores: list[EvalScore] = []
+    failures = 0
     for alpha in alphas:
         decoder = decoder_factory(base, expert, anti, alpha)
         for p in prompts:
-            completion = generate_one(
-                decoder, tokenizer, p.messages, max_tokens=max_tokens
-            )
-            conv, coh, rationale = judge.score(
-                prompt=p.messages[-1]["content"], completion=completion
-            )
+            try:
+                completion = generate_one(
+                    decoder, tokenizer, p.messages, max_tokens=max_tokens
+                )
+                conv, coh, rationale = judge.score(
+                    prompt=p.messages[-1]["content"], completion=completion
+                )
+            except Exception as e:  # noqa: BLE001 — one bad prompt must not abort the sweep
+                failures += 1
+                logger.warning(
+                    "eval: skipping prompt %s at alpha %s: %s", p.id, alpha, e
+                )
+                continue
             scores.append(
                 EvalScore(p.id, p.category, alpha, conv, coh, rationale, completion)
             )
+    if failures:
+        logger.warning(
+            "eval: %d prompt evaluation(s) failed and were skipped", failures
+        )
 
     summaries = aggregate(scores)
     decision = ship_decision(summaries)
@@ -151,6 +166,7 @@ def run_eval(
                 "ship": decision.ship,
                 "best_alpha": decision.best_alpha,
                 "reason": decision.reason,
+                "failures": failures,
                 "per_alpha": [vars(s) for s in summaries],
                 "scores": [vars(s) for s in scores],
             },

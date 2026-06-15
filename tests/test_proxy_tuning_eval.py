@@ -295,3 +295,50 @@ def test_run_eval_orchestration_with_fakes(tmp_path, monkeypatch):
     )
     assert report.ship is True
     assert out_path.exists()
+
+
+def test_run_eval_skips_failing_prompt(tmp_path, monkeypatch):
+    prompts = [
+        EvalPrompt("good", "convention_qa", [{"role": "user", "content": "hi"}]),
+        EvalPrompt("bad", "convention_qa", [{"role": "user", "content": "boom"}]),
+    ]
+
+    def fake_loader(base, expert, anti):
+        return ("BASE", "EXP", "ANTI", "TOK")
+
+    def fake_decoder_factory(base, expert, anti, alpha):
+        return object()
+
+    def fake_generate(decoder, tokenizer, messages, *, max_tokens):
+        return messages[-1]["content"]
+
+    class _Judge:
+        def score(self, *, prompt, completion):
+            if completion == "boom":
+                raise RuntimeError("judge transient failure")
+            return (5, 5, "ok")
+
+    monkeypatch.setattr("olmlx.proxy_tuning_pipeline.eval.generate_one", fake_generate)
+
+    out_path = tmp_path / "results.json"
+    # Only alpha 0.0 and 1.0; the "bad" prompt fails in both, "good" succeeds in both.
+    report = run_eval(
+        base_dir="b",
+        expert_dir="e",
+        antiexpert_dir="a",
+        prompts=prompts,
+        alphas=[0.0, 1.0],
+        judge=_Judge(),
+        out_path=str(out_path),
+        loader=fake_loader,
+        decoder_factory=fake_decoder_factory,
+        max_tokens=8,
+        preflight=lambda *a, **k: None,
+    )
+    import json
+
+    data = json.loads(out_path.read_text())
+    assert data["failures"] == 2  # "bad" failed at both alphas
+    # "good" scored at both alphas -> 2 scores; sweep completed despite failures
+    assert len(data["scores"]) == 2
+    assert report.best_alpha == 1.0
