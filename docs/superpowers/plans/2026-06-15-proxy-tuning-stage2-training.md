@@ -27,7 +27,15 @@
 - ✅ **Task 2** done — M⁻ converted to bf16. **Deviation:** the `chat_template` survived as a sidecar `chat_template.jinja` (4116 chars), so the Step-3 `tokenizer_config.json` check prints `False` but the loaded tokenizer *does* expose the template (`apply_chat_template` works). **The Task-2 Step-3 "copy from instruct sibling" remedy is unnecessary — skip it.**
 - ✅ **Task 3** done — clean `sft/` dir (7954 train + 692 valid).
 - ✅ **Task 4** done — 20-iter smoke-train passed (val loss 2.804→2.220, peak mem 6.5 GB); smoke adapters removed.
-- ⏳ **Tasks 5–8** remain — operator-run (full ~30–90 min LoRA, fuse, 4-bit quantize, gate).
+- ✅ **Task 5** done, **with a deviation from the constant-LR recipe.** A first run at constant `lr 1e-4` plateaued (val min ~2.017 @ iter 800, then rose). Re-ran with a **linear-warmup → cosine-decay** schedule (`~/.olmlx/proxy_tuning/lora_cosine.yaml`: warmup 100 @ 1e-7→1e-4, cosine 1e-4→1e-5 over 3900 post-warmup steps). Val bottomed at **iter 1800 (1.814)** then overfit, so the run was stopped early. **Best checkpoint = iter 1800**, staged into `~/.olmlx/proxy_tuning/adapters_best/` (md5-verified copy of `0001800_adapters.safetensors`).
+- ✅ **Task 6** done — fused M⁻ + the **iter-1800** adapter (from `adapters_best/`, not the final weights) → `qwen3-1.7b-olmlx-expert-bf16/`; generates coherent, code/olmlx-flavored text.
+- ✅ **Task 7** done — both quantized to 4-bit (4.501 bpw, 934 MB each): `qwen3-1.7b-olmlx-expert-4bit/`, `qwen3-1.7b-base-4bit/`; both load + generate.
+- ✅ **Task 8** done — gate PASSED: `OK: M-/M+ share one tokenizer and match the base vocabulary.`
+- **Hazard hit:** a parallel session checked this shared checkout out to `main` mid-train (per the parallel-session interference noted in project memory). All commits survived on `feat/proxy-tuning-stage2`; recovered with `git checkout`. Watch for branch thrash on long runs.
+
+**Stage 2 complete.** Stage-3 serving artifacts:
+- M⁺ (expert): `~/.olmlx/proxy_tuning/qwen3-1.7b-olmlx-expert-4bit`
+- M⁻ (anti-expert): `~/.olmlx/proxy_tuning/qwen3-1.7b-base-4bit`
 
 ---
 
