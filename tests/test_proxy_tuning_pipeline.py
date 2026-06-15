@@ -100,3 +100,26 @@ def test_extract_functions_skips_non_python_and_pycache(tmp_path):
     cache.mkdir()
     (cache / "x.py").write_text("def cached(): pass")
     assert list(extract_functions(tmp_path)) == []
+
+
+from olmlx.proxy_tuning_pipeline.extract import extract_invariants
+
+
+def test_extract_invariants_parses_bold_lead_paragraphs(tmp_path):
+    md = tmp_path / "CLAUDE.md"
+    md.write_text(
+        "# Title\n\n"
+        "## Non-Obvious Invariants\n\n"
+        "**Metal stream hazard** — All inference must run on one stream.\n\n"
+        "**MTP concat order** — embed first, opposite of EAGLE.\n\n"
+        "## Development\n\n"
+        "not an invariant\n"
+    )
+    units = list(extract_invariants(md))
+    titles = [u.instruction_hint for u in units]
+    assert any("Metal stream hazard" in t for t in titles)
+    assert any("MTP concat order" in t for t in titles)
+    assert all(u.kind == "invariant" for u in units)
+    # The trailing "## Development" content is not captured.
+    assert not any("not an invariant" in u.source_context for u in units)
+    assert len(units) == 2

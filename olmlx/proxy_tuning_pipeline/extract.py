@@ -60,3 +60,27 @@ def extract_functions(root: str | Path) -> Iterator[ExtractionUnit]:
                 instruction_hint=f"the `{node.name}` function and its olmlx conventions",
                 source_context=strip_secrets(segment[:_MAX_SOURCE_CHARS]),
             )
+
+
+def extract_invariants(claude_md_path: str | Path) -> Iterator[ExtractionUnit]:
+    """Yield one unit per `**Title** — ...` paragraph under the invariants section."""
+    path = Path(claude_md_path)
+    text = path.read_text()
+    # Isolate the "## Non-Obvious Invariants" section up to the next "## " heading.
+    m = re.search(r"^##\s+Non-Obvious Invariants\s*$", text, flags=re.MULTILINE)
+    if not m:
+        return
+    rest = text[m.end():]
+    nxt = re.search(r"^##\s+", rest, flags=re.MULTILINE)
+    section = rest[: nxt.start()] if nxt else rest
+    for para in re.split(r"\n\s*\n", section):
+        para = para.strip()
+        title_m = re.match(r"\*\*(.+?)\*\*", para)
+        if not title_m:
+            continue
+        yield ExtractionUnit(
+            kind="invariant",
+            provenance=f"{path.name}#non-obvious-invariants",
+            instruction_hint=f"the olmlx invariant: {title_m.group(1)}",
+            source_context=strip_secrets(para[:_MAX_SOURCE_CHARS]),
+        )
