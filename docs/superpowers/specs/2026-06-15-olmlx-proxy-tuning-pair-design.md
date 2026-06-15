@@ -159,6 +159,15 @@ For each unit, prompt GPT-5.4-mini with the **source context as grounding** to p
 
 **Output:** a ship/no-ship decision + (on ship) registered config.
 
+### Resolved decisions (2026-06-15, from Stage-3 brainstorming)
+Grounded in the merged proxy-tuning code (α is **global-only**, baked into `ProxyTuningDecoder` at load time; spec non-goal forbids changing the decode mode):
+- **α-sweep mechanism:** **load once, rebind α.** Load the dense base + M⁺ + M⁻ a single time, then per α construct/rebind `ProxyTuningDecoder` with that α and run a minimal greedy `prefill`/`step` driver (mirroring the engine's `default_stream` handling) over every prompt. Reuses the loader's model-loading; ~4× faster than reloading per α. *Fallback* to in-process reload-per-α if the standalone driver proves too coupled.
+- **Judge:** **GPT-5.4-mini**, reusing `expand.py`'s `OpenAIGenerator` (`OPENAI_API_KEY`, double-checked-lock client) — one call per completion, rubric returns `{convention_adherence: 1–5, coherence: 1–5, rationale}`.
+- **Steered base:** **Qwen3-8B-4bit** for the full sweep (`mlx-community_Qwen3-8B-4bit`, available locally); manual best-α spot-check on a 32B base.
+- **Prompt set:** ~50 fresh prompts authored as a committed `eval_prompts.jsonl` (3 rubric categories), reviewed by the user before the run.
+- **Ship gate (concrete):** ship if best-α **mean convention-adherence ≥ base + 0.5** (1–5 scale) **and mean coherence ≥ base − 0.2** (no meaningful degradation).
+- **Code home:** `olmlx/proxy_tuning_pipeline/eval.py` + an `eval` subcommand in `cli.py`, consistent with extract/expand/curate/verify. Result aggregation follows `olmlx/bench/results.py` dataclass patterns.
+
 ### Eval harness
 - **Held-out prompt set:** ~50–100 olmlx-style prompts — explain-this-invariant, "implement X following olmlx conventions", convention Q&A. Authored fresh (not drawn from training data) to test generalization.
 - **α sweep:** generate base (α=0) vs steered at α∈{0.5, 1.0, 1.5} for each prompt, via the real olmlx proxy-tuning path on a dense Qwen3 base (8B for cost; spot-check 32B).
