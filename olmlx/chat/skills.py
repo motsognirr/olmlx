@@ -9,6 +9,10 @@ logger = logging.getLogger(__name__)
 
 _FRONTMATTER_RE = re.compile(r"^---\s*\n(.*?)\n---\s*\n?(.*)", re.DOTALL)
 
+#: A skill name must be a safe filename stem (no path separators / traversal):
+#: a learned skill's name becomes ``<name>.md`` in the skills dir.
+_SKILL_NAME_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$")
+
 
 @dataclass
 class Skill:
@@ -16,6 +20,34 @@ class Skill:
     description: str
     content: str
     path: Path
+
+
+def validate_skill_name(name: str) -> str:
+    """Return *name* if it is a safe skill name, else raise ``ValueError``."""
+    if not _SKILL_NAME_RE.match(name or ""):
+        raise ValueError(
+            f"invalid skill name {name!r}: use 1-64 chars of letters, digits, "
+            "'-' or '_', starting with a letter or digit"
+        )
+    return name
+
+
+def write_skill_file(skills_dir: Path, name: str, description: str, body: str) -> Path:
+    """Write a markdown skill file with frontmatter; return its path.
+
+    The writable counterpart of ``load_skills_from_dir`` (the read path the
+    self-improving loop closes). Validates the name (filename safety) and
+    rejects an empty body so a later ``_parse_skill_file`` round-trips it.
+    """
+    validate_skill_name(name)
+    if not (body or "").strip():
+        raise ValueError("skill body cannot be empty")
+    description = (description or "").replace("\n", " ").strip()
+    skills_dir.mkdir(parents=True, exist_ok=True)
+    path = skills_dir / f"{name}.md"
+    content = f"---\nname: {name}\ndescription: {description}\n---\n\n{body.strip()}\n"
+    path.write_text(content, encoding="utf-8")
+    return path
 
 
 def _parse_skill_file(path: Path) -> Skill | None:
@@ -123,3 +155,20 @@ class SkillManager:
         if skill is None:
             return f"Skill '{name}' not found. Available: {', '.join(sorted(self._skills.keys()))}"
         return skill.content
+
+    def create_skill(self, name: str, description: str, body: str) -> Skill:
+        """Write a new skill to the skills dir and register it in-memory.
+
+        The self-improving write path (issue #448): an agent authors a skill
+        after a complex task and it becomes immediately available to this
+        manager and, via the on-disk file, to later runs.
+        """
+        path = write_skill_file(self.skills_dir, name, description, body)
+        skill = Skill(
+            name=name,
+            description=(description or "").replace("\n", " ").strip(),
+            content=body.strip(),
+            path=path,
+        )
+        self._skills[name] = skill
+        return skill

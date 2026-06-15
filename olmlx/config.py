@@ -394,6 +394,9 @@ class Settings(BaseSettings):
     # registry only exist when ``agent_enabled`` is true.
     agent_enabled: bool = False
     agent_db_path: Path = Path.home() / ".olmlx" / "agent.db"
+    #: Where learned skills (Phase 3) are written; shared with the chat skill
+    #: library by default so the agent's self-authored skills are reusable.
+    agent_skills_dir: Path = Path.home() / ".olmlx" / "skills"
     #: Default model for agent runs when a create request omits ``model``.
     #: Empty string means the request must supply one (else HTTP 422).
     agent_model: str = ""

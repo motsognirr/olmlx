@@ -17,6 +17,7 @@ bookkeeping).
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import TYPE_CHECKING
 
@@ -95,6 +96,36 @@ _RECALL_DEF = {
     },
 }
 
+_CREATE_SKILL_DEF = {
+    "type": "function",
+    "function": {
+        "name": "create_skill",
+        "description": (
+            "Author a reusable skill (markdown instructions) after solving a "
+            "non-trivial task, so future runs can load it on demand. Use a "
+            "short kebab/snake-case name."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "name": {
+                    "type": "string",
+                    "description": "Skill name (letters, digits, '-' or '_').",
+                },
+                "description": {
+                    "type": "string",
+                    "description": "One-line summary of when to use the skill.",
+                },
+                "body": {
+                    "type": "string",
+                    "description": "The skill's full markdown instructions.",
+                },
+            },
+            "required": ["name", "description", "body"],
+        },
+    },
+}
+
 
 class AgentToolManager(BuiltinToolManager):
     """Builtin tools plus the agent's control tools, bound to an AgentContext."""
@@ -102,7 +133,12 @@ class AgentToolManager(BuiltinToolManager):
     def __init__(self, config: ChatConfig, context: "AgentContext"):
         super().__init__(config)
         self._context = context
-        self._agent_defs: list[dict] = [_FINISH_DEF, _REMEMBER_DEF, _RECALL_DEF]
+        self._agent_defs: list[dict] = [
+            _FINISH_DEF,
+            _REMEMBER_DEF,
+            _RECALL_DEF,
+            _CREATE_SKILL_DEF,
+        ]
 
     @property
     def tool_names(self) -> set[str]:
@@ -119,6 +155,8 @@ class AgentToolManager(BuiltinToolManager):
             return await self._handle_remember(arguments)
         if name == "recall":
             return await self._handle_recall(arguments)
+        if name == "create_skill":
+            return await self._handle_create_skill(arguments)
         return await super().call_tool(name, arguments)
 
     def _handle_finish(self, arguments: dict) -> str:
@@ -162,3 +200,28 @@ class AgentToolManager(BuiltinToolManager):
         if not results:
             return "No relevant memories found."
         return "\n".join(f"- {r}" for r in results)
+
+    async def _handle_create_skill(self, arguments: dict) -> str | ToolError:
+        from olmlx.chat.skills import write_skill_file
+
+        name = str(arguments.get("name", "")).strip()
+        description = str(arguments.get("description", "")).strip()
+        body = str(arguments.get("body", ""))
+        try:
+            path = await asyncio.to_thread(
+                write_skill_file,
+                self._config.skills_dir,
+                name,
+                description,
+                body,
+            )
+        except ValueError as exc:
+            return ToolError(
+                message=f"Invalid skill: {exc}",
+                tool_name="create_skill",
+                is_user_error=True,
+            )
+        await self._context.store.upsert_skill(
+            name, description, body.strip(), source_run=self._context.run_id
+        )
+        return f"Created skill {name!r} at {path}."

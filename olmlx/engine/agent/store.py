@@ -82,6 +82,15 @@ CREATE VIRTUAL TABLE IF NOT EXISTS memory USING fts5(
     text,
     created_at UNINDEXED
 );
+
+CREATE TABLE IF NOT EXISTS skills (
+    name        TEXT PRIMARY KEY,
+    description TEXT NOT NULL DEFAULT '',
+    body        TEXT NOT NULL,
+    source_run  TEXT,
+    created_at  REAL NOT NULL,
+    updated_at  REAL NOT NULL
+);
 """
 
 _RUN_COLUMNS = (
@@ -407,6 +416,47 @@ class AgentStore:
             self._conn.execute(
                 f"DELETE FROM memory WHERE rowid IN ({placeholders})", rowids
             )
+
+    # -- learned skills --------------------------------------------------
+
+    async def upsert_skill(
+        self, name: str, description: str, body: str, source_run: str | None = None
+    ) -> None:
+        await asyncio.to_thread(self._upsert_skill, name, description, body, source_run)
+
+    def _upsert_skill(
+        self, name: str, description: str, body: str, source_run: str | None
+    ) -> None:
+        now = time.time()
+        with self._lock:
+            self._conn.execute(
+                "INSERT INTO skills (name, description, body, source_run, "
+                "created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?) "
+                "ON CONFLICT(name) DO UPDATE SET description=excluded.description, "
+                "body=excluded.body, source_run=excluded.source_run, "
+                "updated_at=excluded.updated_at",
+                (name, description, body, source_run, now, now),
+            )
+
+    async def get_skill(self, name: str) -> dict[str, Any] | None:
+        return await asyncio.to_thread(self._get_skill, name)
+
+    def _get_skill(self, name: str) -> dict[str, Any] | None:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM skills WHERE name = ?", (name,)
+            ).fetchone()
+        return dict(row) if row else None
+
+    async def list_skills(self) -> list[dict[str, Any]]:
+        return await asyncio.to_thread(self._list_skills)
+
+    def _list_skills(self) -> list[dict[str, Any]]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM skills ORDER BY name ASC"
+            ).fetchall()
+        return [dict(r) for r in rows]
 
     # -- startup recovery -----------------------------------------------
 

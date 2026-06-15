@@ -78,7 +78,7 @@ class AgentService:
         self._handles: dict[str, _RunHandle] = {}
 
     async def startup(self) -> None:
-        """Mark crash-orphaned ``running`` runs ``interrupted`` (resumable)."""
+        """Recover crash-orphaned runs and re-materialize learned skills."""
         interrupted = await self.store.mark_interrupted_runs()
         if interrupted:
             logger.info(
@@ -86,6 +86,34 @@ class AgentService:
                 len(interrupted),
                 ", ".join(interrupted),
             )
+        await self._materialize_skills()
+
+    async def _materialize_skills(self) -> None:
+        """Write SQLite-persisted learned skills to the skills dir.
+
+        SQLite is the durable record; the on-disk markdown files are what the
+        loader reads. Re-materializing at startup means learned skills survive a
+        wiped skills dir and are available to new runs.
+        """
+        from olmlx.chat.skills import write_skill_file
+
+        skills = await self.store.list_skills()
+        if not skills:
+            return
+        skills_dir = self._settings.agent_skills_dir
+        for skill in skills:
+            try:
+                await asyncio.to_thread(
+                    write_skill_file,
+                    skills_dir,
+                    skill["name"],
+                    skill["description"],
+                    skill["body"],
+                )
+            except ValueError:
+                logger.warning(
+                    "skipping malformed persisted skill %r", skill.get("name")
+                )
 
     # -- create / resume -------------------------------------------------
 
@@ -185,16 +213,25 @@ class AgentService:
     def _default_session(self, run: dict[str, Any], context: AgentContext) -> Any:
         from olmlx.chat.config import ChatConfig
         from olmlx.chat.session import ChatSession
+        from olmlx.chat.skills import SkillManager
         from olmlx.engine.agent.tools import AgentToolManager
 
         config = ChatConfig(
             model_name=run["model"],
             system_prompt=_AGENT_SYSTEM_PROMPT.format(goal=run["goal"]),
             max_turns=self._settings.agent_inner_max_turns,
+            skills_dir=self._settings.agent_skills_dir,
         )
+        # Load the learned-skill library so skills authored by earlier runs are
+        # offered to this one (the self-improving loop's read side).
+        skills = SkillManager(config.skills_dir)
+        skills.load()
         builtin = AgentToolManager(config, context)
         return ChatSession(
-            config=config, manager=self._manager_getter(), builtin=builtin
+            config=config,
+            manager=self._manager_getter(),
+            skills=skills,
+            builtin=builtin,
         )
 
     def _make_summarizer(self, model: str):
