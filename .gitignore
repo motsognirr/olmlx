@@ -16,3 +16,6 @@ htmlcov/
 .claude/scheduled_tasks.lock
 .worktrees/
 .bench-runs/
+
+# Proxy-tuning generated datasets (large, regenerable)
+data/proxy_tuning/

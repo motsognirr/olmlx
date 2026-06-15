@@ -1,0 +1,879 @@
+"""Tests for the proxy-tuning data pipeline (olmlx/proxy_tuning_pipeline)."""
+
+from __future__ import annotations
+
+import json
+import subprocess
+
+import pytest
+
+from olmlx.proxy_tuning_pipeline.cli import run_pipeline
+from olmlx.proxy_tuning_pipeline.curate import (
+    dedupe_examples,
+    quality_filter,
+    split_train_valid,
+)
+from olmlx.proxy_tuning_pipeline.expand import (
+    DEFAULT_MODEL,
+    OpenAIGenerator,
+    build_messages,
+    expand_units,
+    expand_units_checkpointed,
+    load_done_provenances,
+    load_examples,
+    parse_pairs,
+)
+from olmlx.proxy_tuning_pipeline.extract import (
+    dedupe_units,
+    extract_commits,
+    extract_docs,
+    extract_functions,
+    extract_invariants,
+    extract_repo,
+    extract_tests,
+    strip_secrets,
+)
+from olmlx.proxy_tuning_pipeline.schema import (
+    ChatExample,
+    ExtractionUnit,
+    read_jsonl,
+    write_jsonl,
+)
+
+
+def test_jsonl_round_trip(tmp_path):
+    rows = [{"a": 1, "b": "x"}, {"a": 2, "b": "y"}]
+    path = tmp_path / "out.jsonl"
+    write_jsonl(path, rows)
+    assert read_jsonl(path) == rows
+
+
+def test_extraction_unit_to_dict():
+    u = ExtractionUnit(
+        kind="function",
+        provenance="olmlx/foo.py:10",
+        instruction_hint="explain this",
+        source_context="def f(): ...",
+    )
+    assert u.to_dict() == {
+        "kind": "function",
+        "provenance": "olmlx/foo.py:10",
+        "instruction_hint": "explain this",
+        "source_context": "def f(): ...",
+    }
+
+
+def test_chat_example_to_jsonl_row_is_mlx_chat_format():
+    ex = ChatExample(
+        kind="function",
+        provenance="olmlx/foo.py:10",
+        user="How does f work?",
+        assistant="It returns nothing.",
+    )
+    # mlx-lm chat format: only the `messages` key reaches train.jsonl.
+    assert ex.to_chat_row() == {
+        "messages": [
+            {"role": "user", "content": "How does f work?"},
+            {"role": "assistant", "content": "It returns nothing."},
+        ]
+    }
+
+
+def test_strip_secrets_redacts_known_token_shapes():
+    text = (
+        "key sk-abc123def456ghi789jkl012mno345pqr and "
+        "hf_AbCdEfGhIjKlMnOpQrStUvWxYz012345 plus "
+        "OLMLX_SECRET=topsecretvalue123 done"
+    )
+    out = strip_secrets(text)
+    assert "sk-abc123" not in out
+    assert "hf_AbCdEf" not in out
+    assert "topsecretvalue123" not in out
+    assert "[REDACTED]" in out
+    # Non-secret text is preserved.
+    assert out.startswith("key ") and out.endswith(" done")
+
+
+def test_strip_secrets_leaves_ordinary_text_untouched():
+    text = "def generate_chat(model, messages): return run(model, messages)"
+    assert strip_secrets(text) == text
+
+
+def test_extract_functions_yields_unit_per_function(tmp_path):
+    src = tmp_path / "mod.py"
+    src.write_text(
+        "def add(a, b):\n"
+        '    """Return the sum of a and b."""\n'
+        "    return a + b\n"
+        "\n"
+        "def _private():\n"
+        "    return 1\n"
+    )
+    units = list(extract_functions(tmp_path))
+    by_name = {u.provenance: u for u in units}
+    # Both functions captured; provenance is file:lineno.
+    assert any(p.endswith("mod.py:1") for p in by_name)
+    add_unit = next(u for u in units if "def add" in u.source_context)
+    assert add_unit.kind == "function"
+    assert "Return the sum" in add_unit.source_context
+    assert "add" in add_unit.instruction_hint
+
+
+def test_extract_functions_skips_non_python_and_pycache(tmp_path):
+    (tmp_path / "note.txt").write_text("def not_python(): pass")
+    cache = tmp_path / "__pycache__"
+    cache.mkdir()
+    (cache / "x.py").write_text("def cached(): pass")
+    assert list(extract_functions(tmp_path)) == []
+
+
+def test_extract_invariants_parses_bold_lead_paragraphs(tmp_path):
+    md = tmp_path / "CLAUDE.md"
+    md.write_text(
+        "# Title\n\n"
+        "## Non-Obvious Invariants\n\n"
+        "**Metal stream hazard** — All inference must run on one stream.\n\n"
+        "**MTP concat order** — embed first, opposite of EAGLE.\n\n"
+        "## Development\n\n"
+        "not an invariant\n"
+    )
+    units = list(extract_invariants(md))
+    titles = [u.instruction_hint for u in units]
+    assert any("Metal stream hazard" in t for t in titles)
+    assert any("MTP concat order" in t for t in titles)
+    assert all(u.kind == "invariant" for u in units)
+    # The trailing "## Development" content is not captured.
+    assert not any("not an invariant" in u.source_context for u in units)
+    assert len(units) == 2
+
+
+def test_extract_docs_chunks_by_section(tmp_path):
+    d = tmp_path / "docs"
+    d.mkdir()
+    (d / "a.md").write_text(
+        "# Intro\n\nWelcome to olmlx.\n\n"
+        "## Speculative\n\nDraft then verify.\n\n"
+        "## Flash\n\nSSD-backed MoE.\n"
+    )
+    (d / "nested" / "b.md").parent.mkdir()
+    (d / "nested" / "b.md").write_text("# Nested\n\nbody here\n")
+    units = list(extract_docs(d))
+    headings = [u.instruction_hint for u in units]
+    assert any("Speculative" in h for h in headings)
+    assert any("Flash" in h for h in headings)
+    assert any("Nested" in h for h in headings)
+    assert all(u.kind == "doc" for u in units)
+    spec = next(u for u in units if "Speculative" in u.instruction_hint)
+    assert "Draft then verify" in spec.source_context
+
+
+def test_extract_tests_yields_unit_per_test_function(tmp_path):
+    t = tmp_path / "tests"
+    t.mkdir()
+    (t / "test_thing.py").write_text(
+        "def test_adds():\n"
+        '    """Addition works."""\n'
+        "    assert 1 + 1 == 2\n"
+        "\n"
+        "def helper():\n"
+        "    return 0\n"
+    )
+    units = list(extract_tests(t))
+    assert len(units) == 1
+    u = units[0]
+    assert u.kind == "test"
+    assert "test_adds" in u.instruction_hint
+    assert "assert 1 + 1 == 2" in u.source_context
+
+
+def _git(repo, *args):
+    subprocess.run(
+        ["git", "-C", str(repo), *args],
+        check=True,
+        capture_output=True,
+        env={
+            "GIT_AUTHOR_NAME": "t",
+            "GIT_AUTHOR_EMAIL": "t@t",
+            "GIT_COMMITTER_NAME": "t",
+            "GIT_COMMITTER_EMAIL": "t@t",
+            "PATH": __import__("os").environ.get("PATH", ""),
+        },
+    )
+
+
+def test_extract_commits_yields_message_and_diff(tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git(repo, "init")
+    (repo / "f.py").write_text("x = 1\n")
+    _git(repo, "add", "f.py")
+    _git(repo, "commit", "-m", "feat: add x constant")
+    units = list(extract_commits(repo, limit=10))
+    assert len(units) == 1
+    u = units[0]
+    assert u.kind == "commit"
+    assert "feat: add x constant" in u.source_context
+    assert "x = 1" in u.source_context  # diff body included
+    assert u.provenance.startswith("git:")
+
+
+def test_dedupe_units_drops_identical_source_context():
+    u1 = ExtractionUnit("function", "a.py:1", "h", "def f(): pass")
+    u2 = ExtractionUnit("function", "b.py:9", "h2", "def f(): pass")  # same source
+    u3 = ExtractionUnit("function", "c.py:1", "h", "def g(): pass")
+    out = dedupe_units([u1, u2, u3])
+    assert len(out) == 2
+    assert out[0] is u1 and out[1] is u3  # first occurrence kept, order preserved
+
+
+def test_extract_repo_composes_all_extractors(tmp_path):
+    repo = tmp_path / "repo"
+    (repo / "olmlx").mkdir(parents=True)
+    (repo / "olmlx" / "m.py").write_text('def f():\n    """doc."""\n    return 1\n')
+    (repo / "CLAUDE.md").write_text(
+        "## Non-Obvious Invariants\n\n**Inv one** — a rule.\n"
+    )
+    (repo / "docs").mkdir()
+    (repo / "docs" / "x.md").write_text("## Sec\n\nbody.\n")
+    (repo / "tests").mkdir()
+    (repo / "tests" / "test_m.py").write_text("def test_f():\n    assert True\n")
+    units = extract_repo(repo)
+    kinds = {u.kind for u in units}
+    # Commit extractor finds nothing here (no git repo) — that's fine.
+    assert {"function", "invariant", "doc", "test"} <= kinds
+
+
+# ---------------------------------------------------------------------------
+# Task 9: Generator protocol + build_messages + parse_pairs
+# ---------------------------------------------------------------------------
+
+
+def test_build_messages_grounds_in_source_and_requests_json():
+    u = ExtractionUnit("function", "a.py:1", "the `f` function", "def f(): return 1")
+    system, user = build_messages(u, n_pairs=3)
+    assert "ground" in system.lower()  # grounding discipline present
+    assert "JSON" in system or "json" in system
+    assert "def f(): return 1" in user  # source context embedded
+    assert "3" in user  # requested count
+    assert "the `f` function" in user  # instruction hint embedded
+
+
+def test_build_messages_truncates_oversized_source():
+    u = ExtractionUnit("doc", "d.md#s", "a doc", "x" * 99999)
+    _system, user = build_messages(u, n_pairs=2)
+    assert len(user) < 20000  # clamped well below the raw 99999
+
+
+def test_parse_pairs_extracts_valid_pairs():
+    text = '{"pairs": [{"instruction": "Q1", "response": "A1"}, {"instruction": "Q2", "response": "A2"}]}'
+    assert parse_pairs(text) == [("Q1", "A1"), ("Q2", "A2")]
+
+
+def test_parse_pairs_tolerates_code_fences_and_drops_incomplete():
+    text = (
+        "```json\n"
+        '{"pairs": [{"instruction": "Q", "response": "A"}, '
+        '{"instruction": "", "response": "x"}, '
+        '{"instruction": "only-q"}]}\n'
+        "```"
+    )
+    assert parse_pairs(text) == [("Q", "A")]
+
+
+def test_parse_pairs_returns_empty_on_garbage():
+    assert parse_pairs("not json at all") == []
+
+
+def test_parse_pairs_extracts_first_object_from_prose_wrapped_reply():
+    # Model wraps the JSON in prose and emits a trailing object — the balanced
+    # brace walk must grab only the first complete object, not span to the last }.
+    text = (
+        "Here is the JSON you asked for:\n"
+        '{"pairs": [{"instruction": "Q", "response": "A with {braces} inside"}]}\n\n'
+        'Also note: {"unrelated": true}'
+    )
+    assert parse_pairs(text) == [("Q", "A with {braces} inside")]
+
+
+# ---------------------------------------------------------------------------
+# Task 10: expand_units driver
+# ---------------------------------------------------------------------------
+
+
+class _FakeGenerator:
+    def __init__(self, reply: str):
+        self.reply = reply
+        self.calls = 0
+
+    def generate(self, system: str, user: str) -> str:
+        self.calls += 1
+        return self.reply
+
+
+def test_expand_units_produces_chat_examples_with_provenance():
+    units = [
+        ExtractionUnit("function", "a.py:1", "fn a", "def a(): pass"),
+        ExtractionUnit("doc", "d.md#s", "doc s", "body"),
+    ]
+    gen = _FakeGenerator(
+        '{"pairs": [{"instruction": "Q1", "response": "A1"}, '
+        '{"instruction": "Q2", "response": "A2"}]}'
+    )
+    examples = expand_units(units, gen, n_per_unit=2)
+    assert gen.calls == 2  # one generation call per unit
+    assert len(examples) == 4  # 2 pairs * 2 units
+    assert all(isinstance(e, ChatExample) for e in examples)
+    first = examples[0]
+    assert first.user == "Q1" and first.assistant == "A1"
+    assert first.provenance == "a.py:1" and first.kind == "function"
+
+
+def test_expand_units_skips_units_that_yield_no_pairs():
+    units = [ExtractionUnit("doc", "d.md#s", "doc", "body")]
+    gen = _FakeGenerator("garbage, not json")
+    assert expand_units(units, gen, n_per_unit=3) == []
+    assert gen.calls == 1  # the generator was still invoked
+
+
+def test_expand_units_continues_after_generator_exception():
+    class _ExplodingGenerator:
+        def generate(self, system: str, user: str) -> str:
+            raise RuntimeError("boom")
+
+    units = [
+        ExtractionUnit("doc", "a", "h", "b"),
+        ExtractionUnit("doc", "c", "h", "d"),
+    ]
+    # A raising generator must not abort the run; all-failed -> empty result.
+    assert expand_units(units, _ExplodingGenerator(), n_per_unit=2) == []
+
+
+# ---------------------------------------------------------------------------
+# Task 11: OpenAIGenerator (injectable client)
+# ---------------------------------------------------------------------------
+
+
+class _FakeMessage:
+    def __init__(self, content):
+        self.content = content
+
+
+class _FakeChoice:
+    def __init__(self, content):
+        self.message = _FakeMessage(content)
+
+
+class _FakeCompletion:
+    def __init__(self, content):
+        self.choices = [_FakeChoice(content)]
+
+
+class _FakeOpenAIClient:
+    def __init__(self, content):
+        self._content = content
+        self.last_kwargs = None
+
+        class _Completions:
+            def create(inner, **kwargs):
+                self.last_kwargs = kwargs
+                return _FakeCompletion(self._content)
+
+        class _Chat:
+            completions = _Completions()
+
+        self.chat = _Chat()
+
+
+def test_openai_generator_calls_chat_completions():
+    client = _FakeOpenAIClient('{"pairs": []}')
+    gen = OpenAIGenerator(client=client)
+    out = gen.generate("sys", "usr")
+    assert out == '{"pairs": []}'
+    assert client.last_kwargs["model"] == DEFAULT_MODEL
+    assert client.last_kwargs["messages"] == [
+        {"role": "system", "content": "sys"},
+        {"role": "user", "content": "usr"},
+    ]
+
+
+def test_openai_generator_honors_model_override():
+    client = _FakeOpenAIClient("x")
+    OpenAIGenerator(client=client, model="custom-model").generate("s", "u")
+    assert client.last_kwargs["model"] == "custom-model"
+
+
+# ---------------------------------------------------------------------------
+# Task 12: Curation — quality_filter + dedupe_examples
+# ---------------------------------------------------------------------------
+
+
+def _ex(user, assistant, kind="function", prov="a.py:1"):
+    return ChatExample(kind=kind, provenance=prov, user=user, assistant=assistant)
+
+
+def test_quality_filter_drops_too_short_and_too_long():
+    good = _ex(
+        "How does generate_chat route output?", "It calls parse_model_output ..."
+    )
+    too_short_q = _ex("hi", "a real-enough answer here please")
+    too_short_a = _ex("A perfectly reasonable question?", "no")
+    # Long-enough user so this exercises the assistant MAX-length guard, not
+    # the user MIN-length guard.
+    too_long = _ex("How does this work in practice?", "x" * 100_000)
+    out = quality_filter([good, too_short_q, too_short_a, too_long])
+    assert out == [good]
+
+
+def test_dedupe_examples_drops_normalized_duplicates():
+    a = _ex("How  does   F work?", "Answer A")
+    b = _ex("how does f work?", "answer a")  # same after normalization
+    c = _ex("Different question?", "Different answer")
+    out = dedupe_examples([a, b, c])
+    assert out == [a, c]  # first kept, order preserved
+
+
+# ---------------------------------------------------------------------------
+# Task 13: Curation — split_train_valid
+# ---------------------------------------------------------------------------
+
+
+def test_split_train_valid_ratio_and_determinism():
+    examples = [_ex(f"Q{i}?", f"answer number {i}") for i in range(100)]
+    train1, valid1 = split_train_valid(examples, valid_frac=0.1, seed=42)
+    assert len(valid1) == 10 and len(train1) == 90
+    # No overlap; union is the whole set.
+    assert {id(e) for e in train1}.isdisjoint({id(e) for e in valid1})
+    assert len(train1) + len(valid1) == 100
+    # Deterministic for a fixed seed.
+    train2, valid2 = split_train_valid(examples, valid_frac=0.1, seed=42)
+    assert [e.user for e in valid1] == [e.user for e in valid2]
+
+
+def test_split_train_valid_guarantees_at_least_one_valid():
+    examples = [_ex("Q?", "a real answer here")]
+    train, valid = split_train_valid(examples, valid_frac=0.1, seed=0)
+    assert len(valid) == 1 and len(train) == 0
+
+
+# ---------------------------------------------------------------------------
+# Task 14: CLI wiring + end-to-end test
+# ---------------------------------------------------------------------------
+
+
+def test_run_pipeline_end_to_end(tmp_path):
+    # Minimal fixture repo.
+    repo = tmp_path / "repo"
+    (repo / "olmlx").mkdir(parents=True)
+    (repo / "olmlx" / "m.py").write_text('def f():\n    """doc."""\n    return 1\n')
+    (repo / "CLAUDE.md").write_text(
+        "## Non-Obvious Invariants\n\n**Inv one** — a real rule about streams.\n"
+    )
+    out_dir = tmp_path / "out"
+
+    # Use a call-varying generator so each unit produces distinct (user, assistant)
+    # pairs that survive dedup and both reach the train/valid split.
+    class _VaryingGenerator:
+        def __init__(self):
+            self.calls = 0
+
+        def generate(self, system: str, user: str) -> str:
+            self.calls += 1
+            return (
+                f'{{"pairs": [{{"instruction": "Explain unit {self.calls} clearly?", '
+                f'"response": "A grounded answer about olmlx unit {self.calls} detail."}}]}}'
+            )
+
+    gen = _VaryingGenerator()
+    stats = run_pipeline(
+        repo_root=repo,
+        out_dir=out_dir,
+        generator=gen,
+        n_per_unit=1,
+        valid_frac=0.5,
+        seed=7,
+        concurrency=1,
+    )
+
+    # Artifacts written in mlx-lm chat format.
+    train = read_jsonl(out_dir / "train.jsonl")
+    valid = read_jsonl(out_dir / "valid.jsonl")
+    assert train and valid
+    assert set(train[0].keys()) == {"messages"}
+    roles = [m["role"] for m in train[0]["messages"]]
+    assert roles == ["user", "assistant"]
+
+    # Stats report generated-vs-kept (no silent truncation).
+    assert stats["units"] >= 2  # function + invariant
+    assert stats["generated"] >= 2
+    assert stats["kept"] == stats["train"] + stats["valid"]
+    assert stats["train"] == len(train) and stats["valid"] == len(valid)
+
+
+def test_run_pipeline_limit_units_bounds_expansion(tmp_path):
+    # A bounded run must process only `limit_units` units (cheap smoke run) and
+    # still write output — without this, a smoke run over the full repo only
+    # writes after expanding every unit, so interrupting it produces nothing.
+    repo = tmp_path / "repo"
+    (repo / "olmlx").mkdir(parents=True)
+    (repo / "olmlx" / "m.py").write_text(
+        'def f():\n    """doc f."""\n    return 1\n\n'
+        'def g():\n    """doc g."""\n    return 2\n'
+    )
+    (repo / "CLAUDE.md").write_text(
+        "## Non-Obvious Invariants\n\n**Inv one** — a real rule about streams.\n"
+    )
+    out_dir = tmp_path / "out"
+
+    class _CountingGenerator:
+        def __init__(self):
+            self.calls = 0
+
+        def generate(self, system: str, user: str) -> str:
+            self.calls += 1
+            return (
+                f'{{"pairs": [{{"instruction": "Q{self.calls} about olmlx?", '
+                f'"response": "A grounded answer about olmlx detail {self.calls}."}}]}}'
+            )
+
+    gen = _CountingGenerator()
+    stats = run_pipeline(
+        repo_root=repo,
+        out_dir=out_dir,
+        generator=gen,
+        n_per_unit=1,
+        valid_frac=0.5,
+        seed=3,
+        limit_units=2,
+        concurrency=1,
+    )
+    # Only 2 units expanded despite the repo extracting more.
+    assert gen.calls == 2
+    assert stats["units"] == 2
+    # Output is actually written (the whole point of a bounded smoke run).
+    assert (out_dir / "train.jsonl").exists()
+    assert stats["kept"] == stats["train"] + stats["valid"]
+
+
+def test_run_pipeline_limit_units_none_processes_all(tmp_path):
+    # Default (no limit) must process every extracted unit.
+    repo = tmp_path / "repo"
+    (repo / "olmlx").mkdir(parents=True)
+    (repo / "olmlx" / "m.py").write_text("def f():\n    return 1\n")
+    (repo / "CLAUDE.md").write_text("## Non-Obvious Invariants\n\n**Inv** — rule.\n")
+    n_units = len(extract_repo(repo))
+
+    class _G:
+        def __init__(self):
+            self.calls = 0
+
+        def generate(self, system: str, user: str) -> str:
+            self.calls += 1
+            return '{"pairs": []}'
+
+    gen = _G()
+    run_pipeline(
+        repo_root=repo,
+        out_dir=tmp_path / "out",
+        generator=gen,
+        n_per_unit=1,
+        valid_frac=0.1,
+        seed=0,
+        concurrency=1,
+    )
+    assert gen.calls == n_units
+
+
+def test_extract_functions_skips_unparseable_and_non_utf8(tmp_path):
+    # A syntactically broken file and a non-UTF8 file must be skipped, not crash
+    # extraction over the real repo.
+    (tmp_path / "broken.py").write_text("def f(:\n    pass\n")  # SyntaxError
+    (tmp_path / "binary.py").write_bytes(b"\xff\xfe def g(): pass")  # not UTF-8
+    (tmp_path / "ok.py").write_text("def good():\n    return 1\n")
+    units = list(extract_functions(tmp_path))
+    names = [u.instruction_hint for u in units]
+    assert any("good" in n for n in names)
+    assert len(units) == 1  # only the valid file contributed
+
+
+# ---------------------------------------------------------------------------
+# Checkpointed + concurrent expansion (full-run hardening)
+# ---------------------------------------------------------------------------
+
+
+class _PairGenerator:
+    """Returns one distinct pair per call; thread-safe call counter."""
+
+    def __init__(self):
+        import threading
+
+        self.calls = 0
+        self._lock = threading.Lock()
+
+    def generate(self, system: str, user: str) -> str:
+        with self._lock:
+            self.calls += 1
+            n = self.calls
+        return (
+            f'{{"pairs": [{{"instruction": "Q{n} about olmlx?", '
+            f'"response": "A grounded answer about olmlx detail {n}."}}]}}'
+        )
+
+
+def test_chat_example_dict_round_trip():
+    ex = ChatExample(kind="function", provenance="a.py:1", user="U", assistant="A")
+    assert ChatExample.from_dict(ex.to_dict()) == ex
+
+
+def test_expand_units_checkpointed_writes_raw_and_returns_count(tmp_path):
+    raw = tmp_path / "raw.jsonl"
+    units = [
+        ExtractionUnit("function", "a.py:1", "fn a", "def a(): pass"),
+        ExtractionUnit("doc", "d.md#s", "doc s", "body"),
+    ]
+    gen = _PairGenerator()
+    written = expand_units_checkpointed(
+        units, gen, n_per_unit=1, raw_path=raw, concurrency=4
+    )
+    assert written == 2
+    examples = load_examples(raw)
+    assert len(examples) == 2
+    assert {e.provenance for e in examples} == {"a.py:1", "d.md#s"}
+    assert all(isinstance(e, ChatExample) for e in examples)
+
+
+def test_expand_units_checkpointed_resume_skips_done_units(tmp_path):
+    raw = tmp_path / "raw.jsonl"
+    units = [
+        ExtractionUnit("function", "a.py:1", "fn a", "def a(): pass"),
+        ExtractionUnit("doc", "d.md#s", "doc s", "body"),
+    ]
+    # First pass over only the first unit.
+    gen1 = _PairGenerator()
+    expand_units_checkpointed(
+        units[:1], gen1, n_per_unit=1, raw_path=raw, concurrency=1
+    )
+    assert gen1.calls == 1
+
+    # Resume over the full list — the already-done unit must be skipped.
+    done = load_done_provenances(raw)
+    assert done == {"a.py:1"}
+    gen2 = _PairGenerator()
+    expand_units_checkpointed(
+        units, gen2, n_per_unit=1, raw_path=raw, concurrency=1, done=done
+    )
+    assert gen2.calls == 1  # only the not-done unit was generated
+    assert {e.provenance for e in load_examples(raw)} == {"a.py:1", "d.md#s"}
+
+
+def test_expand_units_checkpointed_processes_all_units_concurrently(tmp_path):
+    raw = tmp_path / "raw.jsonl"
+    units = [
+        ExtractionUnit("function", f"f{i}.py:1", f"fn {i}", f"def f{i}(): pass")
+        for i in range(25)
+    ]
+    gen = _PairGenerator()
+    written = expand_units_checkpointed(
+        units, gen, n_per_unit=1, raw_path=raw, concurrency=8
+    )
+    # Every unit produced exactly one pair; no loss under concurrency.
+    assert written == 25
+    assert len({e.provenance for e in load_examples(raw)}) == 25
+
+
+def test_load_done_provenances_missing_file_is_empty(tmp_path):
+    assert load_done_provenances(tmp_path / "nope.jsonl") == set()
+
+
+def test_openai_generator_default_max_retries():
+    gen = OpenAIGenerator(client=object())
+    assert gen._max_retries == 6
+
+
+def test_parse_pairs_handles_braces_inside_string_values():
+    # olmlx responses contain code with { } — the string-aware walker must not
+    # miscount depth on braces inside quoted values.
+    text = (
+        '{"pairs": [{"instruction": "Show the dict literal?", '
+        '"response": "Use `cfg = {\\"a\\": 1}` and close with }."}]}'
+    )
+    out = parse_pairs(text)
+    assert len(out) == 1
+    assert out[0][0] == "Show the dict literal?"
+    assert "{" in out[0][1] and "}" in out[0][1]
+
+
+def test_run_pipeline_refuses_mismatched_checkpoint_config(tmp_path):
+    repo = tmp_path / "repo"
+    (repo / "olmlx").mkdir(parents=True)
+    (repo / "olmlx" / "m.py").write_text("def f():\n    return 1\n")
+    out_dir = tmp_path / "out"
+
+    class _G:
+        def generate(self, system: str, user: str) -> str:
+            return '{"pairs": [{"instruction": "Q here?", "response": "A here long enough."}]}'
+
+    # First run records n_per_unit=1.
+    run_pipeline(
+        repo, out_dir, _G(), n_per_unit=1, valid_frac=0.5, seed=0, concurrency=1
+    )
+    # Reusing the same out_dir with a different n_per_unit must refuse.
+    with pytest.raises(ValueError, match="different config"):
+        run_pipeline(
+            repo, out_dir, _G(), n_per_unit=4, valid_frac=0.5, seed=0, concurrency=1
+        )
+
+
+def test_run_pipeline_adopts_legacy_raw_without_meta(tmp_path):
+    # A raw.jsonl from an older run (no raw.meta.json) must be resumable, not refused.
+    repo = tmp_path / "repo"
+    (repo / "olmlx").mkdir(parents=True)
+    (repo / "olmlx" / "m.py").write_text("def f():\n    return 1\n")
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    # Pre-seed a legacy checkpoint with no meta sidecar.
+    (out_dir / "raw.jsonl").write_text(
+        '{"kind": "function", "provenance": "olmlx/m.py:1", '
+        '"user": "Q?", "assistant": "A long enough answer here."}\n'
+    )
+
+    class _G:
+        def generate(self, system: str, user: str) -> str:
+            return '{"pairs": [{"instruction": "New Q?", "response": "New answer long enough."}]}'
+
+    stats = run_pipeline(
+        repo, out_dir, _G(), n_per_unit=1, valid_frac=0.5, seed=0, concurrency=1
+    )
+    # Did not raise; the legacy example is included and a meta sidecar now exists.
+    assert stats["generated"] >= 1
+    assert (out_dir / "raw.meta.json").exists()
+
+
+from olmlx.proxy_tuning_pipeline.curate import cap_kind_fraction  # noqa: E402
+
+
+def test_cap_kind_fraction_downsamples_to_target_share():
+    ex = [ChatExample("test", f"t{i}", f"Q{i}", f"A{i}") for i in range(30)]
+    ex += [ChatExample("function", f"f{i}", f"Q{i}", f"A{i}") for i in range(10)]
+    out = cap_kind_fraction(ex, kind="test", max_fraction=0.35, seed=1)
+    tests = [e for e in out if e.kind == "test"]
+    others = [e for e in out if e.kind != "test"]
+    assert len(others) == 10  # non-target kinds fully kept
+    # tests/(tests+others) <= 0.35
+    assert len(tests) / len(out) <= 0.35 + 1e-9
+    assert len(tests) == 5  # floor(0.35/0.65 * 10)
+
+
+def test_cap_kind_fraction_noop_when_already_under_cap():
+    ex = [ChatExample("test", f"t{i}", f"Q{i}", f"A{i}") for i in range(3)]
+    ex += [ChatExample("doc", f"d{i}", f"Q{i}", f"A{i}") for i in range(10)]
+    out = cap_kind_fraction(ex, kind="test", max_fraction=0.5, seed=1)
+    assert len(out) == 13  # nothing dropped (tests already < 50%)
+
+
+def test_cap_kind_fraction_deterministic():
+    ex = [ChatExample("test", f"t{i}", f"Q{i}", f"A{i}") for i in range(50)]
+    ex += [ChatExample("function", f"f{i}", f"Q{i}", f"A{i}") for i in range(10)]
+    a = cap_kind_fraction(ex, kind="test", max_fraction=0.35, seed=7)
+    b = cap_kind_fraction(ex, kind="test", max_fraction=0.35, seed=7)
+    assert [e.provenance for e in a] == [e.provenance for e in b]
+
+
+def test_run_pipeline_curate_only_skips_generation(tmp_path):
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    # Seed a checkpoint with 4 test + 1 function example.
+    rows = [
+        {
+            "kind": "test",
+            "provenance": f"t{i}",
+            "user": f"Question {i} about behavior?",
+            "assistant": f"Answer {i} long enough.",
+        }
+        for i in range(4)
+    ] + [
+        {
+            "kind": "function",
+            "provenance": "f0",
+            "user": "Question about the function?",
+            "assistant": "Answer f long enough.",
+        }
+    ]
+    (out_dir / "raw.jsonl").write_text("".join(json.dumps(r) + "\n" for r in rows))
+
+    class _Raises:
+        def generate(self, system, user):
+            raise AssertionError("curate_only must not generate")
+
+    stats = run_pipeline(
+        repo_root="/nonexistent",  # not read in curate_only
+        out_dir=out_dir,
+        generator=_Raises(),
+        n_per_unit=2,
+        valid_frac=0.25,
+        seed=0,
+        curate_only=True,
+        cap_kind=("test", 0.5),
+    )
+    # No generation; cap applied (tests downsampled to <=50%).
+    assert stats["units"] == 5
+    assert stats["cap_dropped"] >= 1
+    assert (out_dir / "train.jsonl").exists()
+
+
+def test_run_pipeline_curate_only_requires_checkpoint(tmp_path):
+    class _G:
+        def generate(self, system, user):
+            return "{}"
+
+    with pytest.raises(FileNotFoundError, match="curate-only"):
+        run_pipeline(
+            repo_root=".",
+            out_dir=tmp_path / "missing",
+            generator=_G(),
+            n_per_unit=2,
+            valid_frac=0.1,
+            seed=0,
+            curate_only=True,
+        )
+
+
+def test_extract_commits_tolerates_non_utf8_diff(tmp_path):
+    # A commit touching a file with non-UTF8 bytes must not crash extraction.
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git(repo, "init")
+    (repo / "data.bin").write_bytes(b"\xff\xfe\x00binary\x80content\n")
+    _git(repo, "add", "data.bin")
+    _git(repo, "commit", "-m", "add binary blob")
+    units = list(extract_commits(repo, limit=10))  # must not raise
+    assert len(units) == 1
+    assert "add binary blob" in units[0].source_context
+
+
+def test_openai_generator_ensure_client_is_idempotent():
+    gen = OpenAIGenerator(client=None, model="m")
+    sentinel = object()
+    gen._client = sentinel  # simulate an already-built client
+    assert gen._ensure_client() is sentinel
+    assert gen._ensure_client() is sentinel  # double-checked path returns same
+
+
+def test_split_train_valid_rejects_out_of_range_fraction():
+    ex = [
+        ChatExample("function", f"f{i}", f"Question {i}?", f"Answer {i} here.")
+        for i in range(4)
+    ]
+    with pytest.raises(ValueError, match="valid_frac"):
+        split_train_valid(ex, valid_frac=1.0, seed=0)
+    with pytest.raises(ValueError, match="valid_frac"):
+        split_train_valid(ex, valid_frac=-0.1, seed=0)
+
+
+def test_cap_kind_fraction_single_kind_preserves_data():
+    # If the whole set is the capped kind, capping is unsatisfiable — keep all
+    # rather than silently returning an empty list.
+    ex = [
+        ChatExample("test", f"t{i}", f"Question {i}?", f"Answer {i}.") for i in range(5)
+    ]
+    out = cap_kind_fraction(ex, kind="test", max_fraction=0.35, seed=0)
+    assert len(out) == 5
