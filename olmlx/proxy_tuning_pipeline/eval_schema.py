@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 # The three rubric categories the held-out prompt set spans.
@@ -52,29 +53,35 @@ class ShipDecision:
     per_alpha: list[AlphaSummary] = field(default_factory=list)
 
 
-def load_eval_prompts(path: str) -> list[EvalPrompt]:
+def load_eval_prompts(path: str | Path) -> list[EvalPrompt]:
     """Load + validate the held-out prompt JSONL.
 
-    Raises ValueError on an unknown category or a duplicate id — both would
-    silently skew the aggregate, so fail loud.
+    Raises ValueError on a missing required field, an unknown category, or a
+    duplicate id — all would silently skew the aggregate, so fail loud.
     """
     prompts: list[EvalPrompt] = []
     seen: set[str] = set()
     with open(path) as f:
-        for line in f:
+        for lineno, line in enumerate(f, start=1):
             line = line.strip()
             if not line:
                 continue
             row: dict[str, Any] = json.loads(line)
-            cat = row["category"]
+            try:
+                pid = row["id"]
+                cat = row["category"]
+                messages = row["messages"]
+            except KeyError as e:
+                raise ValueError(
+                    f"line {lineno}: prompt missing required field {e}"
+                ) from e
             if cat not in VALID_CATEGORIES:
                 raise ValueError(
-                    f"prompt {row.get('id')!r} has unknown category {cat!r}; "
+                    f"prompt {pid!r} has unknown category {cat!r}; "
                     f"expected one of {sorted(VALID_CATEGORIES)}"
                 )
-            pid = row["id"]
             if pid in seen:
                 raise ValueError(f"duplicate prompt id {pid!r}")
             seen.add(pid)
-            prompts.append(EvalPrompt(id=pid, category=cat, messages=row["messages"]))
+            prompts.append(EvalPrompt(id=pid, category=cat, messages=messages))
     return prompts

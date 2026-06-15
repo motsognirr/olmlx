@@ -69,3 +69,24 @@ def test_load_eval_prompts_rejects_duplicate_ids(tmp_path):
     p.write_text(json.dumps(row) + "\n" + json.dumps(row) + "\n")
     with pytest.raises(ValueError, match="duplicate"):
         load_eval_prompts(str(p))
+
+
+def test_load_eval_prompts_rejects_missing_field(tmp_path):
+    p = tmp_path / "prompts.jsonl"
+    p.write_text(
+        json.dumps({"id": "x", "category": "convention_qa"}) + "\n"
+    )  # no messages
+    with pytest.raises(ValueError, match="missing required field"):
+        load_eval_prompts(str(p))
+
+
+def test_load_eval_prompts_skips_blank_lines(tmp_path):
+    p = tmp_path / "prompts.jsonl"
+    row = {
+        "id": "a",
+        "category": "convention_qa",
+        "messages": [{"role": "user", "content": "hi"}],
+    }
+    p.write_text("\n" + json.dumps(row) + "\n\n")
+    prompts = load_eval_prompts(str(p))
+    assert [pr.id for pr in prompts] == ["a"]
