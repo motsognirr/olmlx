@@ -46,3 +46,26 @@ def test_chat_example_to_jsonl_row_is_mlx_chat_format():
             {"role": "assistant", "content": "It returns nothing."},
         ]
     }
+
+
+from olmlx.proxy_tuning_pipeline.extract import strip_secrets
+
+
+def test_strip_secrets_redacts_known_token_shapes():
+    text = (
+        "key sk-abc123def456ghi789jkl012mno345pqr and "
+        "hf_AbCdEfGhIjKlMnOpQrStUvWxYz012345 plus "
+        "OLMLX_SECRET=topsecretvalue123 done"
+    )
+    out = strip_secrets(text)
+    assert "sk-abc123" not in out
+    assert "hf_AbCdEf" not in out
+    assert "topsecretvalue123" not in out
+    assert "[REDACTED]" in out
+    # Non-secret text is preserved.
+    assert out.startswith("key ") and out.endswith(" done")
+
+
+def test_strip_secrets_leaves_ordinary_text_untouched():
+    text = "def generate_chat(model, messages): return run(model, messages)"
+    assert strip_secrets(text) == text
