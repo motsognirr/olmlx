@@ -20,6 +20,7 @@ from olmlx.engine.model_manager import (
 from olmlx.engine.registry import ModelRegistry
 from olmlx.models.store import ModelStore
 from olmlx.routers import (
+    agent,
     anthropic,
     audio,
     blobs,
@@ -141,10 +142,21 @@ async def _lifespan_inner(app: FastAPI):
     metrics_mod.REGISTRY.register(stats_collector)
     app.state.metrics_collector = stats_collector
 
+    # Autonomous agent (#445): recover crash-orphaned runs at startup. The
+    # service itself is built in create_app() (gated on agent_enabled) so the
+    # routes exist without a lifespan; this only runs the async startup scan.
+    agent_service = (
+        getattr(app.state, "agent_service", None) if settings.agent_enabled else None
+    )
+    if agent_service is not None:
+        await agent_service.startup()
+
     logger.info("olmlx server started on %s:%d", settings.host, settings.port)
     yield
 
     # Shutdown — drain in-flight requests before tearing down coordinator
+    if agent_service is not None:
+        await agent_service.aclose()
     await manager.stop()
     tracing_mod.shutdown_tracing()
     # Unregister so a subsequent create_app() (e.g. in tests) does not raise a
@@ -421,5 +433,19 @@ def create_app() -> FastAPI:
     app.include_router(audio.router)
     app.include_router(anthropic.router)
     app.include_router(metrics_router.router)
+
+    # Autonomous agent (#445): the HTTP surface and run registry only exist
+    # when explicitly enabled. The service resolves the model manager lazily
+    # (set later by the lifespan / test fixture), so it can be built here.
+    if settings.agent_enabled:
+        from olmlx.engine.agent.service import AgentService
+        from olmlx.engine.agent.store import AgentStore
+
+        store = AgentStore(settings.agent_db_path)
+        app.state.agent_service = AgentService(
+            store=store,
+            manager_getter=lambda: app.state.model_manager,
+        )
+        app.include_router(agent.router)
 
     return app
