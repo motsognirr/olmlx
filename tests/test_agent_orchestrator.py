@@ -103,6 +103,25 @@ class TestFinish:
         assert run["result"] == "the summary"
         assert run["iterations"] == 1
 
+    async def test_finish_summary_is_stripped(self, store):
+        await store.create_run(run_id="r1", goal="G", model="m", config={})
+        turn = {
+            "events": [
+                {
+                    "type": "tool_call",
+                    "name": "finish",
+                    "arguments": {"summary": "  padded summary \n"},
+                    "id": "t1",
+                },
+            ],
+            "messages": [_assistant("done", [{"function": {"name": "finish"}}])],
+        }
+        session = FakeSession([turn])
+        orch = Orchestrator(session=session, context=_ctx(store), budgets=Budgets())
+        result = await orch.run()
+        assert result["result"] == "padded summary"
+        assert (await store.get_run("r1"))["result"] == "padded summary"
+
     async def test_first_prompt_is_goal(self, store):
         await store.create_run(run_id="r1", goal="MY GOAL", model="m", config={})
         session = FakeSession([_finish_turn()])

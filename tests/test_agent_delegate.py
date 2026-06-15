@@ -179,6 +179,30 @@ class TestConcurrencyBounds:
         assert len(await store.list_children(child_id)) == 1
 
 
+class TestSubtreeCancel:
+    async def test_cancel_propagates_to_children(self, store):
+        from olmlx.engine.agent.orchestrator import AgentContext
+        from olmlx.engine.agent.service import _RunHandle
+
+        svc = _service(store, _finish_factory)
+        await store.create_run(run_id="p", goal="g", model="m", config={})
+        await store.create_run(
+            run_id="c", goal="s", model="m", config={}, parent_id="p", depth=1
+        )
+        pctx = AgentContext(run_id="p", store=store)
+        cctx = AgentContext(run_id="c", store=store)
+        svc._handles["p"] = _RunHandle(cancel_event=pctx.cancel_event, context=pctx)
+        svc._handles["c"] = _RunHandle(cancel_event=cctx.cancel_event, context=cctx)
+
+        await svc.cancel("p")
+
+        assert pctx.cancel_event.is_set()
+        # Cancellation reached the in-flight child so a parent blocked awaiting
+        # it can actually stop.
+        assert cctx.cancel_event.is_set()
+        assert (await store.get_run("c"))["status"] == "cancelled"
+
+
 class TestDelegateTool:
     @pytest.fixture
     def parent_tools(self, store):

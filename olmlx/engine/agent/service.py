@@ -333,6 +333,20 @@ class AgentService:
         run = await self.store.get_run(run_id)
         if run is None:
             return None
+        # Cancel the whole subtree: a parent blocked awaiting a delegated child
+        # only reaches its own cancel check after the child returns, so the
+        # cancel must also reach in-flight descendants (each has its own
+        # cancel_event) for it to take effect promptly.
+        await self._cancel_subtree(run_id, run)
+        return await self.store.get_run(run_id)
+
+    async def _cancel_subtree(
+        self, run_id: str, run: dict[str, Any] | None = None
+    ) -> None:
+        if run is None:
+            run = await self.store.get_run(run_id)
+            if run is None:
+                return
         handle = self._handles.get(run_id)
         if handle is not None:
             handle.cancel_event.set()
@@ -341,7 +355,8 @@ class AgentService:
         no_live_task = handle is None or handle.task is None or handle.task.done()
         if no_live_task and run["status"] in ACTIVE_STATUSES:
             await self.store.update_run(run_id, status="cancelled")
-        return await self.store.get_run(run_id)
+        for child in await self.store.list_children(run_id):
+            await self._cancel_subtree(child["id"], child)
 
     async def wait(self, run_id: str) -> None:
         """Await the background task for a run (test/shutdown helper)."""

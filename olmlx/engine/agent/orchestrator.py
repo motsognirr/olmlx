@@ -166,7 +166,7 @@ class Orchestrator:
                         finished = True
                         args = event.get("arguments")
                         if isinstance(args, dict):
-                            summary = str(args.get("summary", ""))
+                            summary = str(args.get("summary", "")).strip()
 
                 iterations += 1
                 runtime = elapsed()
