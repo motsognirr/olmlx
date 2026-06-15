@@ -37,7 +37,8 @@ olmlx/
 │   ├── flash/          # Sparse FFN + Flash-MoE (SSD-backed)
 │   ├── dflash/         # Block-diffusion speculative decoder + training
 │   ├── eagle/          # EAGLE speculative decoder + training
-│   └── mtp/            # Qwen3.6 native MTP head decoder
+│   ├── mtp/            # Qwen3.6 native MTP head decoder
+│   └── agent/          # Autonomous agent: orchestrator/store/memory/skills/delegate (OLMLX_AGENT_*)
 ├── routers/
 │   ├── anthropic.py / openai.py / responses.py / audio.py / rerank.py / metrics.py
 │   ├── streaming_common.py  # shared tools-mode buffering + keepalive
@@ -75,6 +76,8 @@ olmlx/
 **TTS priming** — The router primes the PCM source generator's first chunk before starting the response. Priming the ffmpeg-encoded stream instead wouldn't work: ffmpeg emits its container header before reading stdin, so an upstream `ValueError` from a non-TTS model would leak after the 200 has been sent.
 
 **Flash prefetcher teardown order** — Prefetcher must be closed before the weight store on model unload. Prefetch tasks submit work into the store's thread pool; reversing the order leaves in-flight tasks referencing a closed store.
+
+**Autonomous agent rides ChatSession** — `engine/agent/` (gated on `OLMLX_AGENT_ENABLED`) drives goal-pursuit by wrapping the existing `ChatSession` ReAct loop, never calling MLX directly — so the inference-lock / Metal-stream handling is reused unchanged (same constraint as the panel coordinator). The one behavioral extension is *continuation semantics*: a stop without the `finish` tool injects a nudge and the run continues. `finish` is detected from the `tool_call` **event stream**, not a return value; `AgentToolManager` subclasses `BuiltinToolManager` so `ChatSession` dispatches the control tools (`finish`/`remember`/`recall`/`create_skill`/`delegate`) transparently. `AgentStore` shares one SQLite connection across `asyncio.to_thread` worker threads (`check_same_thread=False` + a `threading.Lock`); all runtime I/O is offloaded so the event loop never blocks on disk. Subagents share the global inference lock — `DelegateRunner` serializes child generation behind a semaphore (a concurrency-limited queue, not wall-clock parallelism).
 
 **Panel coordinator routes through generate_chat** — `engine/panel.py` is a per-turn reconciler that rides the client's tool loop: it returns a `generate_chat`-shaped result whose text is either the judge's prose or canonical Qwen `<tool_call>` blocks, so both routers' existing `parse_model_output` paths handle it unchanged. Every classifier/panelist/judge call MUST go through `generate_chat` — never call MLX directly — or the Metal-stream/inference-lock handling is bypassed. Panels need `max_loaded_models ≥ members + judge + classifier` to avoid reload thrash.
 
