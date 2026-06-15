@@ -3107,6 +3107,8 @@ class ModelManager(SpeculativeLoaderMixin):
                 decoder = self._load_pld_decoder(model, spec_config)
             elif spec_config.strategy == "self_speculative":
                 decoder = self._load_self_speculative_decoder(model, spec_config)
+            elif spec_config.strategy == "proxy_tuning":
+                decoder = self._load_proxy_tuning_decoder(model, tokenizer, spec_config)
             else:
                 decoder = self._load_speculative_decoder(model, hf_path, spec_config)
             return model, tokenizer, is_vlm, caps, decoder

@@ -636,6 +636,33 @@ class TestBuildParser:
             _apply_serve_overrides(args)
         assert excinfo.value.code == 1
 
+    def test_audit_does_not_flag_proxy_tuning_without_draft(self, monkeypatch):
+        """proxy_tuning is draftless (steers via expert/anti-expert), so an
+        enabled proxy_tuning model with no speculative_draft_model must NOT be
+        flagged as misconfigured."""
+        from olmlx.cli import _audit_speculative_config
+        from olmlx.engine.registry import ModelConfig, ModelRegistry
+
+        reg = ModelRegistry()
+        reg._mappings = {
+            "org/base:latest": ModelConfig(
+                hf_path="org/base",
+                speculative=True,
+                speculative_strategy="proxy_tuning",
+            ),
+            # Contrast: classic with no draft IS still flagged.
+            "org/classic:latest": ModelConfig(
+                hf_path="org/classic",
+                speculative=True,
+                speculative_strategy="classic",
+            ),
+        }
+        bad, _dormant, _flash, _dflash_moe, _global_used = _audit_speculative_config(
+            reg
+        )
+        assert "org/base:latest" not in bad
+        assert "org/classic:latest" in bad
+
     def test_apply_serve_overrides_rejects_promoted_keys_in_experimental(
         self, monkeypatch, tmp_path
     ):

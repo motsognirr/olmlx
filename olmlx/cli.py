@@ -1042,7 +1042,11 @@ def _audit_speculative_config(
                 exc_info=True,
             )
             continue
-        _draftless = {"self_speculative", "pld"}
+        # Strategies that legitimately run without a ``speculative_draft_model``:
+        # ``self_speculative`` (target's own early layers), ``pld`` (n-gram
+        # prompt lookup), and ``proxy_tuning`` (steers via expert/anti-expert
+        # models configured under their own ``speculative_proxy_*`` knobs).
+        _draftless = {"self_speculative", "pld", "proxy_tuning"}
         if enabled and not draft and strategy not in _draftless:
             bad.append(name)
         elif not enabled and mc.speculative_draft_model:
@@ -3101,7 +3105,14 @@ def build_parser() -> argparse.ArgumentParser:
     serve_p.add_argument(
         "--speculative-strategy",
         dest="speculative_strategy",
-        choices=("classic", "dflash", "eagle", "pld", "self_speculative"),
+        choices=(
+            "classic",
+            "dflash",
+            "eagle",
+            "pld",
+            "self_speculative",
+            "proxy_tuning",
+        ),
         default=None,
         help=(
             "Speculative decoding strategy: 'classic' (standalone draft LM), "
@@ -3109,9 +3120,12 @@ def build_parser() -> argparse.ArgumentParser:
             "states), 'eagle' (autoregressive draft head conditioned on "
             "target last-layer hidden, arxiv 2401.15077), 'pld' "
             "(prompt-lookup decoding — n-gram lookup in the prompt+generated "
-            "history, no draft model required), or 'self_speculative' "
+            "history, no draft model required), 'self_speculative' "
             "(LayerSkip-style — uses target's own early layers as draft; "
-            "no external draft model required). Default: classic."
+            "no external draft model required), or 'proxy_tuning' "
+            "(decode-time logit arithmetic base + α·(expert−antiexpert); "
+            "set OLMLX_SPECULATIVE_PROXY_EXPERT_MODEL / "
+            "_ANTIEXPERT_MODEL). Default: classic."
         ),
     )
     serve_p.add_argument(
