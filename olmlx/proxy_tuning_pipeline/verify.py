@@ -18,7 +18,7 @@ from olmlx.engine.proxy_tuning import check_vocab_identity
 def _load_tokenizer(path: str) -> Any:
     from mlx_lm import load
 
-    _model, tokenizer = load(path)
+    _model, tokenizer = load(path)  # pyright: ignore[reportAssignmentType]
     return tokenizer
 
 
