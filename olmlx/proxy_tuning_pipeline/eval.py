@@ -39,9 +39,14 @@ def ship_decision(
     conv_margin: float = 0.5,
     coh_drop: float = 0.2,
 ) -> ShipDecision:
+    """Requires an alpha=0.0 baseline and at least one alpha>0 entry (both guaranteed by run_eval)."""
     by_alpha = {s.alpha: s for s in summaries}
-    base = by_alpha[0.0]
+    if 0.0 not in by_alpha:
+        raise ValueError("ship_decision requires an alpha=0.0 baseline summary")
     steered = [s for s in summaries if s.alpha > 0.0]
+    if not steered:
+        raise ValueError("ship_decision requires at least one alpha>0 summary")
+    base = by_alpha[0.0]
     best = max(steered, key=lambda s: s.mean_convention)
 
     conv_ok = best.mean_convention >= base.mean_convention + conv_margin

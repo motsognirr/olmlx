@@ -242,6 +242,18 @@ def test_ship_decision_blocks_on_insufficient_margin():
     assert d.ship is False
 
 
+def test_ship_decision_requires_baseline():
+    scores = [_score(1.0, 4, 5)]  # no alpha=0.0
+    with pytest.raises(ValueError, match="baseline"):
+        ship_decision(aggregate(scores))
+
+
+def test_ship_decision_requires_steered():
+    scores = [_score(0.0, 3, 5)]  # no alpha>0
+    with pytest.raises(ValueError, match="alpha>0"):
+        ship_decision(aggregate(scores))
+
+
 def test_run_eval_orchestration_with_fakes(tmp_path, monkeypatch):
     prompts = [EvalPrompt("a", "convention_qa", [{"role": "user", "content": "hi"}])]
 
