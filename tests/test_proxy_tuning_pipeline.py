@@ -500,3 +500,15 @@ def test_run_pipeline_end_to_end(tmp_path):
     assert stats["generated"] >= 2
     assert stats["kept"] == stats["train"] + stats["valid"]
     assert stats["train"] == len(train) and stats["valid"] == len(valid)
+
+
+def test_extract_functions_skips_unparseable_and_non_utf8(tmp_path):
+    # A syntactically broken file and a non-UTF8 file must be skipped, not crash
+    # extraction over the real repo.
+    (tmp_path / "broken.py").write_text("def f(:\n    pass\n")  # SyntaxError
+    (tmp_path / "binary.py").write_bytes(b"\xff\xfe def g(): pass")  # not UTF-8
+    (tmp_path / "ok.py").write_text("def good():\n    return 1\n")
+    units = list(extract_functions(tmp_path))
+    names = [u.instruction_hint for u in units]
+    assert any("good" in n for n in names)
+    assert len(units) == 1  # only the valid file contributed
