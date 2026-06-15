@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ast
 import re
+import subprocess
 from pathlib import Path
 from typing import Iterator
 
@@ -134,3 +135,32 @@ def extract_tests(tests_dir: str | Path) -> Iterator[ExtractionUnit]:
                 instruction_hint=f"the behavior enforced by `{node.name}`",
                 source_context=strip_secrets(segment[:_MAX_SOURCE_CHARS]),
             )
+
+
+def extract_commits(root: str | Path, limit: int = 400) -> Iterator[ExtractionUnit]:
+    """Yield one unit per commit: subject + body + diff (capped). Newest first."""
+    root = Path(root)
+    try:
+        shas = subprocess.run(
+            ["git", "-C", str(root), "log", f"-n{limit}", "--format=%H"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.split()
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        return
+    for sha in shas:
+        show = subprocess.run(
+            ["git", "-C", str(root), "show", "--format=%s%n%n%b", "--stat", "-p", sha],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout
+        if not show.strip():
+            continue
+        yield ExtractionUnit(
+            kind="commit",
+            provenance=f"git:{sha[:12]}",
+            instruction_hint="implementing this change the olmlx way (message -> diff)",
+            source_context=strip_secrets(show[:_MAX_SOURCE_CHARS]),
+        )

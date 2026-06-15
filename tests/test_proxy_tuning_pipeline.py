@@ -168,3 +168,39 @@ def test_extract_tests_yields_unit_per_test_function(tmp_path):
     assert u.kind == "test"
     assert "test_adds" in u.instruction_hint
     assert "assert 1 + 1 == 2" in u.source_context
+
+
+import subprocess
+
+from olmlx.proxy_tuning_pipeline.extract import extract_commits
+
+
+def _git(repo, *args):
+    subprocess.run(
+        ["git", "-C", str(repo), *args],
+        check=True,
+        capture_output=True,
+        env={
+            "GIT_AUTHOR_NAME": "t",
+            "GIT_AUTHOR_EMAIL": "t@t",
+            "GIT_COMMITTER_NAME": "t",
+            "GIT_COMMITTER_EMAIL": "t@t",
+            "PATH": __import__("os").environ.get("PATH", ""),
+        },
+    )
+
+
+def test_extract_commits_yields_message_and_diff(tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git(repo, "init")
+    (repo / "f.py").write_text("x = 1\n")
+    _git(repo, "add", "f.py")
+    _git(repo, "commit", "-m", "feat: add x constant")
+    units = list(extract_commits(repo, limit=10))
+    assert len(units) == 1
+    u = units[0]
+    assert u.kind == "commit"
+    assert "feat: add x constant" in u.source_context
+    assert "x = 1" in u.source_context  # diff body included
+    assert u.provenance.startswith("git:")
