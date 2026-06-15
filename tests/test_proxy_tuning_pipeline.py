@@ -204,3 +204,32 @@ def test_extract_commits_yields_message_and_diff(tmp_path):
     assert "feat: add x constant" in u.source_context
     assert "x = 1" in u.source_context  # diff body included
     assert u.provenance.startswith("git:")
+
+
+from olmlx.proxy_tuning_pipeline.extract import dedupe_units, extract_repo
+
+
+def test_dedupe_units_drops_identical_source_context():
+    u1 = ExtractionUnit("function", "a.py:1", "h", "def f(): pass")
+    u2 = ExtractionUnit("function", "b.py:9", "h2", "def f(): pass")  # same source
+    u3 = ExtractionUnit("function", "c.py:1", "h", "def g(): pass")
+    out = dedupe_units([u1, u2, u3])
+    assert len(out) == 2
+    assert out[0] is u1 and out[1] is u3  # first occurrence kept, order preserved
+
+
+def test_extract_repo_composes_all_extractors(tmp_path):
+    repo = tmp_path / "repo"
+    (repo / "olmlx").mkdir(parents=True)
+    (repo / "olmlx" / "m.py").write_text('def f():\n    """doc."""\n    return 1\n')
+    (repo / "CLAUDE.md").write_text(
+        "## Non-Obvious Invariants\n\n**Inv one** — a rule.\n"
+    )
+    (repo / "docs").mkdir()
+    (repo / "docs" / "x.md").write_text("## Sec\n\nbody.\n")
+    (repo / "tests").mkdir()
+    (repo / "tests" / "test_m.py").write_text("def test_f():\n    assert True\n")
+    units = extract_repo(repo)
+    kinds = {u.kind for u in units}
+    # Commit extractor finds nothing here (no git repo) — that's fine.
+    assert {"function", "invariant", "doc", "test"} <= kinds

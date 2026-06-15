@@ -71,7 +71,7 @@ def extract_invariants(claude_md_path: str | Path) -> Iterator[ExtractionUnit]:
     m = re.search(r"^##\s+Non-Obvious Invariants\s*$", text, flags=re.MULTILINE)
     if not m:
         return
-    rest = text[m.end():]
+    rest = text[m.end() :]
     nxt = re.search(r"^##\s+", rest, flags=re.MULTILINE)
     section = rest[: nxt.start()] if nxt else rest
     for para in re.split(r"\n\s*\n", section):
@@ -105,7 +105,9 @@ def extract_docs(docs_dir: str | Path) -> Iterator[ExtractionUnit]:
                 kind="doc",
                 provenance=f"docs/{rel}#{heading[:40]}",
                 instruction_hint=f"the olmlx documentation section: {heading}",
-                source_context=strip_secrets((parts[i] + "\n" + body)[:_MAX_SOURCE_CHARS]),
+                source_context=strip_secrets(
+                    (parts[i] + "\n" + body)[:_MAX_SOURCE_CHARS]
+                ),
             )
 
 
@@ -128,7 +130,9 @@ def extract_tests(tests_dir: str | Path) -> Iterator[ExtractionUnit]:
             segment = ast.get_source_segment(text, node) or ""
             if not segment.strip():
                 continue
-            rel = path.relative_to(tests_dir) if path.is_relative_to(tests_dir) else path
+            rel = (
+                path.relative_to(tests_dir) if path.is_relative_to(tests_dir) else path
+            )
             yield ExtractionUnit(
                 kind="test",
                 provenance=f"tests/{rel}:{node.lineno}",
@@ -164,3 +168,40 @@ def extract_commits(root: str | Path, limit: int = 400) -> Iterator[ExtractionUn
             instruction_hint="implementing this change the olmlx way (message -> diff)",
             source_context=strip_secrets(show[:_MAX_SOURCE_CHARS]),
         )
+
+
+def dedupe_units(units: list[ExtractionUnit]) -> list[ExtractionUnit]:
+    """Drop units whose `source_context` was already seen (order-preserving)."""
+    seen: set[str] = set()
+    out: list[ExtractionUnit] = []
+    for u in units:
+        key = " ".join(u.source_context.split()).lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(u)
+    return out
+
+
+def extract_repo(root: str | Path) -> list[ExtractionUnit]:
+    """Run every extractor over the repo and return deduped units.
+
+    Each extractor is best-effort: a missing CLAUDE.md / docs / tests / git
+    history simply contributes nothing rather than failing the whole run.
+    """
+    root = Path(root)
+    units: list[ExtractionUnit] = []
+    units += list(
+        extract_functions(root / "olmlx" if (root / "olmlx").is_dir() else root)
+    )
+    claude = root / "CLAUDE.md"
+    if claude.is_file():
+        units += list(extract_invariants(claude))
+    docs = root / "docs"
+    if docs.is_dir():
+        units += list(extract_docs(docs))
+    tests = root / "tests"
+    if tests.is_dir():
+        units += list(extract_tests(tests))
+    units += list(extract_commits(root))
+    return dedupe_units(units)
