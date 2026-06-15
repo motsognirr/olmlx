@@ -66,7 +66,7 @@ def extract_functions(root: str | Path) -> Iterator[ExtractionUnit]:
 def extract_invariants(claude_md_path: str | Path) -> Iterator[ExtractionUnit]:
     """Yield one unit per `**Title** — ...` paragraph under the invariants section."""
     path = Path(claude_md_path)
-    text = path.read_text()
+    text = path.read_text(encoding="utf-8", errors="replace")
     # Isolate the "## Non-Obvious Invariants" section up to the next "## " heading.
     m = re.search(r"^##\s+Non-Obvious Invariants\s*$", text, flags=re.MULTILINE)
     if not m:
@@ -91,7 +91,7 @@ def extract_docs(docs_dir: str | Path) -> Iterator[ExtractionUnit]:
     """Yield one unit per markdown section (## or # heading + its body)."""
     docs_dir = Path(docs_dir)
     for path in sorted(docs_dir.rglob("*.md")):
-        text = path.read_text()
+        text = path.read_text(encoding="utf-8", errors="replace")
         # Split on headings, keeping the heading with its following body.
         parts = re.split(r"(?m)^(#{1,3}\s+.*)$", text)
         # parts = [pre, heading1, body1, heading2, body2, ...]
@@ -154,12 +154,26 @@ def extract_commits(root: str | Path, limit: int = 400) -> Iterator[ExtractionUn
     except (subprocess.CalledProcessError, FileNotFoundError):
         return
     for sha in shas:
-        show = subprocess.run(
-            ["git", "-C", str(root), "show", "--format=%s%n%n%b", "--stat", "-p", sha],
-            check=True,
-            capture_output=True,
-            text=True,
-        ).stdout
+        try:
+            show = subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(root),
+                    "show",
+                    "--format=%s%n%n%b",
+                    "--stat",
+                    "-p",
+                    sha,
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout
+        except subprocess.CalledProcessError:
+            # Best-effort: skip a commit whose object can't be shown (shallow
+            # clone, pack race) rather than aborting the whole extraction.
+            continue
         if not show.strip():
             continue
         yield ExtractionUnit(

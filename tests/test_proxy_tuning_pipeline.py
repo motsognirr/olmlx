@@ -2,6 +2,18 @@
 
 from __future__ import annotations
 
+import subprocess
+
+from olmlx.proxy_tuning_pipeline.extract import (
+    dedupe_units,
+    extract_commits,
+    extract_docs,
+    extract_functions,
+    extract_invariants,
+    extract_repo,
+    extract_tests,
+    strip_secrets,
+)
 from olmlx.proxy_tuning_pipeline.schema import (
     ChatExample,
     ExtractionUnit,
@@ -48,9 +60,6 @@ def test_chat_example_to_jsonl_row_is_mlx_chat_format():
     }
 
 
-from olmlx.proxy_tuning_pipeline.extract import strip_secrets
-
-
 def test_strip_secrets_redacts_known_token_shapes():
     text = (
         "key sk-abc123def456ghi789jkl012mno345pqr and "
@@ -71,18 +80,15 @@ def test_strip_secrets_leaves_ordinary_text_untouched():
     assert strip_secrets(text) == text
 
 
-from olmlx.proxy_tuning_pipeline.extract import extract_functions
-
-
 def test_extract_functions_yields_unit_per_function(tmp_path):
     src = tmp_path / "mod.py"
     src.write_text(
-        'def add(a, b):\n'
+        "def add(a, b):\n"
         '    """Return the sum of a and b."""\n'
-        '    return a + b\n'
-        '\n'
-        'def _private():\n'
-        '    return 1\n'
+        "    return a + b\n"
+        "\n"
+        "def _private():\n"
+        "    return 1\n"
     )
     units = list(extract_functions(tmp_path))
     by_name = {u.provenance: u for u in units}
@@ -100,9 +106,6 @@ def test_extract_functions_skips_non_python_and_pycache(tmp_path):
     cache.mkdir()
     (cache / "x.py").write_text("def cached(): pass")
     assert list(extract_functions(tmp_path)) == []
-
-
-from olmlx.proxy_tuning_pipeline.extract import extract_invariants
 
 
 def test_extract_invariants_parses_bold_lead_paragraphs(tmp_path):
@@ -125,9 +128,6 @@ def test_extract_invariants_parses_bold_lead_paragraphs(tmp_path):
     assert len(units) == 2
 
 
-from olmlx.proxy_tuning_pipeline.extract import extract_docs
-
-
 def test_extract_docs_chunks_by_section(tmp_path):
     d = tmp_path / "docs"
     d.mkdir()
@@ -148,19 +148,16 @@ def test_extract_docs_chunks_by_section(tmp_path):
     assert "Draft then verify" in spec.source_context
 
 
-from olmlx.proxy_tuning_pipeline.extract import extract_tests
-
-
 def test_extract_tests_yields_unit_per_test_function(tmp_path):
     t = tmp_path / "tests"
     t.mkdir()
     (t / "test_thing.py").write_text(
-        'def test_adds():\n'
+        "def test_adds():\n"
         '    """Addition works."""\n'
-        '    assert 1 + 1 == 2\n'
-        '\n'
-        'def helper():\n'
-        '    return 0\n'
+        "    assert 1 + 1 == 2\n"
+        "\n"
+        "def helper():\n"
+        "    return 0\n"
     )
     units = list(extract_tests(t))
     assert len(units) == 1
@@ -168,11 +165,6 @@ def test_extract_tests_yields_unit_per_test_function(tmp_path):
     assert u.kind == "test"
     assert "test_adds" in u.instruction_hint
     assert "assert 1 + 1 == 2" in u.source_context
-
-
-import subprocess
-
-from olmlx.proxy_tuning_pipeline.extract import extract_commits
 
 
 def _git(repo, *args):
@@ -204,9 +196,6 @@ def test_extract_commits_yields_message_and_diff(tmp_path):
     assert "feat: add x constant" in u.source_context
     assert "x = 1" in u.source_context  # diff body included
     assert u.provenance.startswith("git:")
-
-
-from olmlx.proxy_tuning_pipeline.extract import dedupe_units, extract_repo
 
 
 def test_dedupe_units_drops_identical_source_context():
