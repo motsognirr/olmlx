@@ -198,18 +198,27 @@ class AgentService:
         """Run a child (delegated) run to completion inline and return its
         final state. Used by ``DelegateRunner``; generation still serializes on
         the global inference lock."""
+        run_id = run["id"]
         context = self._make_context(run)
         orch = self._build_orchestrator(run, context)
-        handle = _RunHandle(cancel_event=context.cancel_event, context=context)
-        self._handles[run["id"]] = handle
+        self._handles[run_id] = _RunHandle(
+            cancel_event=context.cancel_event, context=context
+        )
         try:
             await orch.run()
+        except asyncio.CancelledError:
+            # Cancellation must propagate (the parent run is being torn down),
+            # but finalize the child row so it isn't left dangling 'running'.
+            await self.store.update_run(run_id, status="cancelled")
+            raise
         except Exception as exc:  # noqa: BLE001 — surface to the parent
-            logger.exception("delegated run %s crashed", run["id"])
+            logger.exception("delegated run %s crashed", run_id)
             await self.store.update_run(
-                run["id"], status="failed", error=f"{type(exc).__name__}: {exc}"
+                run_id, status="failed", error=f"{type(exc).__name__}: {exc}"
             )
-        result = await self.store.get_run(run["id"])
+        finally:
+            self._handles.pop(run_id, None)
+        result = await self.store.get_run(run_id)
         return result or {}
 
     async def _run_wrapper(self, orch: Orchestrator, run_id: str, resume: bool) -> None:
@@ -226,6 +235,12 @@ class AgentService:
                 run_id,
                 {"type": "run_status", "status": "failed", "reason": "exception"},
             )
+        finally:
+            # Drop the handle once the run is terminal — queries read terminal
+            # state from the store, so keeping it would only leak memory across
+            # many runs. (Done in the wrapper, not _start, so a still-running
+            # task remains cancellable via its handle.)
+            self._handles.pop(run_id, None)
 
     def _budgets_for(self, run: dict[str, Any]) -> Budgets:
         cfg = run.get("config") or {}

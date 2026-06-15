@@ -91,6 +91,8 @@ class TestCreateRun:
         run = await _poll_status(client, run_id, "finished")
         assert run["result"] == "completed the goal"
         assert run["iterations"] == 1
+        # The run's _RunHandle is dropped once the background task is terminal.
+        assert run_id not in service._handles
 
     async def test_create_uses_default_model(self, agent_client):
         client, service = agent_client

@@ -108,6 +108,13 @@ class TestDelegateRunner:
         with pytest.raises(DelegateError):
             await svc._delegate_runner.delegate(parent_id="p", goal="   ")
 
+    async def test_child_handle_cleaned_up(self, store):
+        """run_child must not leak a _RunHandle after the child completes."""
+        svc = _service(store, _finish_factory)
+        await store.create_run(run_id="p", goal="g", model="m", config={})
+        await svc._delegate_runner.delegate(parent_id="p", goal="sub")
+        assert svc._handles == {}
+
 
 class TestSerializedExecution:
     async def test_children_generate_serially(self, store):
