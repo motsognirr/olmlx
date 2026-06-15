@@ -272,6 +272,17 @@ def test_parse_pairs_returns_empty_on_garbage():
     assert parse_pairs("not json at all") == []
 
 
+def test_parse_pairs_extracts_first_object_from_prose_wrapped_reply():
+    # Model wraps the JSON in prose and emits a trailing object — the balanced
+    # brace walk must grab only the first complete object, not span to the last }.
+    text = (
+        "Here is the JSON you asked for:\n"
+        '{"pairs": [{"instruction": "Q", "response": "A with {braces} inside"}]}\n\n'
+        'Also note: {"unrelated": true}'
+    )
+    assert parse_pairs(text) == [("Q", "A with {braces} inside")]
+
+
 # ---------------------------------------------------------------------------
 # Task 10: expand_units driver
 # ---------------------------------------------------------------------------
@@ -309,6 +320,20 @@ def test_expand_units_skips_units_that_yield_no_pairs():
     units = [ExtractionUnit("doc", "d.md#s", "doc", "body")]
     gen = _FakeGenerator("garbage, not json")
     assert expand_units(units, gen, n_per_unit=3) == []
+    assert gen.calls == 1  # the generator was still invoked
+
+
+def test_expand_units_continues_after_generator_exception():
+    class _ExplodingGenerator:
+        def generate(self, system: str, user: str) -> str:
+            raise RuntimeError("boom")
+
+    units = [
+        ExtractionUnit("doc", "a", "h", "b"),
+        ExtractionUnit("doc", "c", "h", "d"),
+    ]
+    # A raising generator must not abort the run; all-failed -> empty result.
+    assert expand_units(units, _ExplodingGenerator(), n_per_unit=2) == []
 
 
 # ---------------------------------------------------------------------------

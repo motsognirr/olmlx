@@ -42,19 +42,43 @@ def build_messages(unit: ExtractionUnit, n_pairs: int) -> tuple[str, str]:
     return _SYSTEM_PROMPT, user
 
 
+def _extract_json_object(text: str) -> str | None:
+    """Return the first balanced ``{...}`` span, or None.
+
+    A greedy ``\\{.*\\}`` regex over-grabs when the model wraps the JSON in
+    prose or emits a second object — it would span to the *last* ``}`` and
+    fail to parse, silently dropping good data. Walk braces instead so prose
+    and nested braces in values are handled correctly.
+    """
+    start = text.find("{")
+    if start == -1:
+        return None
+    depth = 0
+    for i in range(start, len(text)):
+        ch = text[i]
+        if ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                return text[start : i + 1]
+    return None
+
+
 def parse_pairs(text: str) -> list[tuple[str, str]]:
     """Parse a generator reply into (instruction, response) pairs; tolerant.
 
-    Strips ```json fences, ignores anything around the JSON object, and drops
-    pairs missing a non-empty instruction or response.
+    Strips ```json fences, extracts the first balanced JSON object (ignoring
+    surrounding prose), and drops pairs missing a non-empty instruction or
+    response.
     """
     text = text.strip()
     text = re.sub(r"^```(?:json)?\s*|\s*```$", "", text, flags=re.MULTILINE).strip()
-    m = re.search(r"\{.*\}", text, flags=re.DOTALL)
-    if not m:
+    obj = _extract_json_object(text)
+    if obj is None:
         return []
     try:
-        data = json.loads(m.group(0))
+        data = json.loads(obj)
     except json.JSONDecodeError:
         return []
     out: list[tuple[str, str]] = []
@@ -78,11 +102,13 @@ def expand_units(
 ) -> list[ChatExample]:
     """Expand each unit into ChatExamples via the generator (one call per unit)."""
     examples: list[ChatExample] = []
+    failures = 0
     for i, unit in enumerate(units):
         system, user = build_messages(unit, n_per_unit)
         try:
             reply = generator.generate(system, user)
         except Exception:  # noqa: BLE001 — one bad unit must not abort the run
+            failures += 1
             logger.warning("generation failed for %s", unit.provenance, exc_info=True)
             continue
         for instr, resp in parse_pairs(reply):
@@ -101,6 +127,15 @@ def expand_units(
                 len(units),
                 len(examples),
             )
+    # Surface systemic failure: a run where every call failed (bad key, bad
+    # model, exhausted quota) would otherwise silently produce an empty dataset
+    # only noticed at training time.
+    if failures:
+        logger.warning(
+            "expand_units: %d/%d units failed generation", failures, len(units)
+        )
+    if units and not examples:
+        logger.error("expand_units: produced 0 examples from %d units", len(units))
     return examples
 
 
@@ -126,6 +161,8 @@ class OpenAIGenerator:
         return self._client
 
     def generate(self, system: str, user: str) -> str:
+        # TODO: add retry/backoff on 429 / transient 5xx before the full run —
+        # a single rate-limit error currently drops one unit's pairs.
         resp = self._ensure_client().chat.completions.create(
             model=self._model,
             messages=[
