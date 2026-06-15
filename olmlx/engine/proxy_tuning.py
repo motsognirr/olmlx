@@ -141,9 +141,12 @@ class ProxyTuningDecoder(SpecDecoderBase):
         alpha: float = 1.0,
     ):
         super().__init__()
-        self._base = base_model
-        self._expert = expert_model
-        self._antiexpert = antiexpert_model
+        # Annotated ``Any`` so ``close()`` setting them to ``None`` doesn't
+        # narrow the type and provoke spurious optional-call warnings on the
+        # forward calls in ``_step_impl`` (which only runs pre-close).
+        self._base: Any = base_model
+        self._expert: Any = expert_model
+        self._antiexpert: Any = antiexpert_model
         # Base teardown reference for the inherited reset() path. We never call
         # _install_layer_hooks/_bind_draft, so _patched/_bound stay False and
         # reset() never actually touches _target — but set it for correctness.
@@ -161,6 +164,27 @@ class ProxyTuningDecoder(SpecDecoderBase):
         self._expert_cache = None
         self._antiexpert_cache = None
         self._pending_token = None
+
+    def close(self) -> None:
+        """Release per-request state and drop the expert / anti-expert models.
+
+        ``ModelManager`` calls ``close()`` on unload, eviction, and keep-alive
+        expiry. The base ``close()`` is just ``reset()`` (clears the KV caches),
+        but the expert and anti-expert are loaded *inline* and owned solely by
+        this decoder — multi-GB weights that would otherwise linger until the
+        decoder is itself garbage-collected. Drop their references here so their
+        memory frees immediately on unload, mirroring
+        :meth:`SpeculativeDecoder.close`'s eager cleanup. The base model is
+        owned by the ``LoadedModel`` (shared), so dropping our reference to it is
+        harmless. Idempotent — safe to call repeatedly (e.g. via ``__del__``).
+        """
+        try:
+            self.reset()
+        finally:
+            self._expert = None
+            self._antiexpert = None
+            self._base = None
+            self._target = None
 
     def _stats_extra(self) -> dict[str, Any]:
         return {"alpha": self._alpha}

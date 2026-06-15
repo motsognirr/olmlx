@@ -219,3 +219,23 @@ def test_strategy_label_is_proxy_tuning():
     from olmlx.engine.spec_decoder_base import _strategy_label_for
 
     assert _strategy_label_for(ProxyTuningDecoder) == "proxy_tuning"
+
+
+def test_close_releases_expert_and_antiexpert_models():
+    dec = _make_decoder()
+    dec.prefill(mx.array([[1, 2]]))
+    dec.close()
+    # Per-request KV caches cleared (reset ran) ...
+    assert dec._base_cache is None
+    assert dec._pending_token is None
+    # ... and the inline-owned models dropped so their weights free eagerly.
+    assert dec._expert is None
+    assert dec._antiexpert is None
+    assert dec._base is None
+
+
+def test_close_is_idempotent():
+    dec = _make_decoder()
+    dec.close()
+    dec.close()  # second call (and __del__) must not raise
+    assert dec._expert is None
