@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any
 
 from olmlx.proxy_tuning_pipeline.curate import (
+    cap_kind_fraction,
     dedupe_examples,
     quality_filter,
     split_train_valid,
@@ -30,6 +31,22 @@ from olmlx.proxy_tuning_pipeline.extract import extract_repo
 from olmlx.proxy_tuning_pipeline.schema import write_jsonl
 
 logger = logging.getLogger(__name__)
+
+
+def _parse_cap_kind(value: str) -> tuple[str, float]:
+    """Parse a ``KIND=FRACTION`` CLI value into ``(kind, fraction)``."""
+    try:
+        kind, frac = value.split("=", 1)
+        f = float(frac)
+    except ValueError:
+        raise argparse.ArgumentTypeError(
+            f"--cap-kind expects KIND=FRACTION (e.g. test=0.35), got {value!r}"
+        ) from None
+    if not (0.0 < f < 1.0):
+        raise argparse.ArgumentTypeError(
+            f"--cap-kind fraction must be in (0, 1), got {f}"
+        )
+    return kind, f
 
 
 def _guard_checkpoint_config(
@@ -74,6 +91,8 @@ def run_pipeline(
     seed: int,
     limit_units: int | None = None,
     concurrency: int = 8,
+    cap_kind: tuple[str, float] | None = None,
+    curate_only: bool = False,
 ) -> dict[str, Any]:
     """Extract -> expand (checkpointed) -> curate -> write. Returns a stats dict.
 
@@ -81,30 +100,43 @@ def run_pipeline(
     ``<out_dir>/raw.jsonl`` as they complete, so an interrupted run loses nothing
     durable and re-running skips units already present. ``limit_units`` caps how
     many units are expanded (cheap smoke run); ``concurrency`` is the generator
-    thread-pool size. Curation reads ``raw.jsonl`` back, so it works even on a
-    partially-generated checkpoint.
+    thread-pool size. ``cap_kind=(kind, fraction)`` downsamples an
+    over-represented kind to at most ``fraction`` of the curated set.
+
+    ``curate_only=True`` skips extraction and generation entirely and just
+    re-curates the existing ``raw.jsonl`` into train/valid — for cheaply trying a
+    different ``cap_kind``/``seed`` without touching (or re-extracting) the repo.
     """
     out_dir = Path(out_dir)
     raw_path = out_dir / "raw.jsonl"
-    _guard_checkpoint_config(out_dir, raw_path, repo_root, n_per_unit)
 
-    units = extract_repo(repo_root)
-    logger.info("extracted %d units", len(units))
-    if limit_units is not None:
-        units = units[:limit_units]
-        logger.info("limiting to %d units for this run", len(units))
-
-    done = load_done_provenances(raw_path)
-    if done:
-        logger.info("resume: %d units already in %s — skipping", len(done), raw_path)
-    expand_units_checkpointed(
-        units,
-        generator,
-        n_per_unit=n_per_unit,
-        raw_path=raw_path,
-        concurrency=concurrency,
-        done=done,
-    )
+    if curate_only:
+        if not raw_path.exists():
+            raise FileNotFoundError(
+                f"--curate-only needs an existing checkpoint at {raw_path}"
+            )
+        n_units = len(load_done_provenances(raw_path))
+    else:
+        _guard_checkpoint_config(out_dir, raw_path, repo_root, n_per_unit)
+        units = extract_repo(repo_root)
+        logger.info("extracted %d units", len(units))
+        if limit_units is not None:
+            units = units[:limit_units]
+            logger.info("limiting to %d units for this run", len(units))
+        done = load_done_provenances(raw_path)
+        if done:
+            logger.info(
+                "resume: %d units already in %s — skipping", len(done), raw_path
+            )
+        expand_units_checkpointed(
+            units,
+            generator,
+            n_per_unit=n_per_unit,
+            raw_path=raw_path,
+            concurrency=concurrency,
+            done=done,
+        )
+        n_units = len(units)
 
     examples = load_examples(raw_path)
     generated = len(examples)
@@ -113,7 +145,18 @@ def run_pipeline(
     # generator producing short/long junk; a large dedup-drop points at the
     # generator being repetitive. They need different fixes (filters vs prompt).
     filtered = quality_filter(examples)
-    examples = dedupe_examples(filtered)
+    deduped = dedupe_examples(filtered)
+    if cap_kind is not None:
+        examples = cap_kind_fraction(deduped, cap_kind[0], cap_kind[1], seed=seed)
+        logger.info(
+            "capped kind %r to <=%.0f%%: %d -> %d",
+            cap_kind[0],
+            cap_kind[1] * 100,
+            len(deduped),
+            len(examples),
+        )
+    else:
+        examples = deduped
     # Deterministic order regardless of concurrent generation order, so the
     # seeded train/valid split is reproducible across runs.
     examples.sort(key=lambda e: (e.provenance, e.user))
@@ -124,17 +167,18 @@ def run_pipeline(
     write_jsonl(out_dir / "valid.jsonl", (e.to_chat_row() for e in valid))
 
     stats = {
-        "units": len(units),
+        "units": n_units,
         "generated": generated,
         "quality_dropped": generated - len(filtered),
-        "dedup_dropped": len(filtered) - kept,
+        "dedup_dropped": len(filtered) - len(deduped),
+        "cap_dropped": len(deduped) - kept,
         "kept": kept,
         "dropped": generated - kept,
         "train": len(train),
         "valid": len(valid),
     }
     logger.info("pipeline stats: %s", stats)
-    if units and not kept:
+    if n_units and not kept:
         # Generator produced output but every pair was filtered/deduped away —
         # an empty dataset only otherwise noticed at training time.
         logger.error(
@@ -174,6 +218,19 @@ def main(argv: list[str] | None = None) -> None:
         default=8,
         help="generator thread-pool size (parallel API calls)",
     )
+    ap.add_argument(
+        "--cap-kind",
+        type=_parse_cap_kind,
+        default=None,
+        metavar="KIND=FRACTION",
+        help="downsample an over-represented kind, e.g. test=0.35",
+    )
+    ap.add_argument(
+        "--curate-only",
+        action="store_true",
+        help="skip extraction/generation; re-curate the existing raw.jsonl "
+        "(use to retry a different --cap-kind/--seed cheaply)",
+    )
     args = ap.parse_args(argv)
 
     stats = run_pipeline(
@@ -185,6 +242,8 @@ def main(argv: list[str] | None = None) -> None:
         seed=args.seed,
         limit_units=args.limit_units,
         concurrency=args.concurrency,
+        cap_kind=args.cap_kind,
+        curate_only=args.curate_only,
     )
     print(f"Done. {stats}")
 

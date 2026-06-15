@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import random
 
 from olmlx.proxy_tuning_pipeline.schema import ChatExample
@@ -9,6 +10,30 @@ from olmlx.proxy_tuning_pipeline.schema import ChatExample
 _MIN_USER_CHARS = 8
 _MIN_ASSISTANT_CHARS = 12
 _MAX_ASSISTANT_CHARS = 20_000
+
+
+def cap_kind_fraction(
+    examples: list[ChatExample],
+    kind: str,
+    max_fraction: float,
+    seed: int,
+) -> list[ChatExample]:
+    """Deterministically downsample one over-represented ``kind``.
+
+    Keeps every example of the other kinds; randomly samples ``kind`` down so it
+    is at most ``max_fraction`` of the returned set. No-op when ``kind`` is
+    already under the cap or ``max_fraction`` is not in (0, 1).
+    """
+    if not (0.0 < max_fraction < 1.0):
+        return list(examples)
+    others = [e for e in examples if e.kind != kind]
+    targeted = [e for e in examples if e.kind == kind]
+    # targeted / (targeted + others) <= max_fraction  ->  targeted <= f/(1-f)*others
+    cap = math.floor(max_fraction / (1.0 - max_fraction) * len(others))
+    if len(targeted) <= cap:
+        return list(examples)
+    kept = random.Random(seed).sample(targeted, cap)
+    return others + kept
 
 
 def quality_filter(examples: list[ChatExample]) -> list[ChatExample]:

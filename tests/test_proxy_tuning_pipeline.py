@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import subprocess
 
 import pytest
@@ -745,3 +746,92 @@ def test_run_pipeline_adopts_legacy_raw_without_meta(tmp_path):
     # Did not raise; the legacy example is included and a meta sidecar now exists.
     assert stats["generated"] >= 1
     assert (out_dir / "raw.meta.json").exists()
+
+
+from olmlx.proxy_tuning_pipeline.curate import cap_kind_fraction  # noqa: E402
+
+
+def test_cap_kind_fraction_downsamples_to_target_share():
+    ex = [ChatExample("test", f"t{i}", f"Q{i}", f"A{i}") for i in range(30)]
+    ex += [ChatExample("function", f"f{i}", f"Q{i}", f"A{i}") for i in range(10)]
+    out = cap_kind_fraction(ex, kind="test", max_fraction=0.35, seed=1)
+    tests = [e for e in out if e.kind == "test"]
+    others = [e for e in out if e.kind != "test"]
+    assert len(others) == 10  # non-target kinds fully kept
+    # tests/(tests+others) <= 0.35
+    assert len(tests) / len(out) <= 0.35 + 1e-9
+    assert len(tests) == 5  # floor(0.35/0.65 * 10)
+
+
+def test_cap_kind_fraction_noop_when_already_under_cap():
+    ex = [ChatExample("test", f"t{i}", f"Q{i}", f"A{i}") for i in range(3)]
+    ex += [ChatExample("doc", f"d{i}", f"Q{i}", f"A{i}") for i in range(10)]
+    out = cap_kind_fraction(ex, kind="test", max_fraction=0.5, seed=1)
+    assert len(out) == 13  # nothing dropped (tests already < 50%)
+
+
+def test_cap_kind_fraction_deterministic():
+    ex = [ChatExample("test", f"t{i}", f"Q{i}", f"A{i}") for i in range(50)]
+    ex += [ChatExample("function", f"f{i}", f"Q{i}", f"A{i}") for i in range(10)]
+    a = cap_kind_fraction(ex, kind="test", max_fraction=0.35, seed=7)
+    b = cap_kind_fraction(ex, kind="test", max_fraction=0.35, seed=7)
+    assert [e.provenance for e in a] == [e.provenance for e in b]
+
+
+def test_run_pipeline_curate_only_skips_generation(tmp_path):
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    # Seed a checkpoint with 4 test + 1 function example.
+    rows = [
+        {
+            "kind": "test",
+            "provenance": f"t{i}",
+            "user": f"Question {i} about behavior?",
+            "assistant": f"Answer {i} long enough.",
+        }
+        for i in range(4)
+    ] + [
+        {
+            "kind": "function",
+            "provenance": "f0",
+            "user": "Question about the function?",
+            "assistant": "Answer f long enough.",
+        }
+    ]
+    (out_dir / "raw.jsonl").write_text("".join(json.dumps(r) + "\n" for r in rows))
+
+    class _Raises:
+        def generate(self, system, user):
+            raise AssertionError("curate_only must not generate")
+
+    stats = run_pipeline(
+        repo_root="/nonexistent",  # not read in curate_only
+        out_dir=out_dir,
+        generator=_Raises(),
+        n_per_unit=2,
+        valid_frac=0.25,
+        seed=0,
+        curate_only=True,
+        cap_kind=("test", 0.5),
+    )
+    # No generation; cap applied (tests downsampled to <=50%).
+    assert stats["units"] == 5
+    assert stats["cap_dropped"] >= 1
+    assert (out_dir / "train.jsonl").exists()
+
+
+def test_run_pipeline_curate_only_requires_checkpoint(tmp_path):
+    class _G:
+        def generate(self, system, user):
+            return "{}"
+
+    with pytest.raises(FileNotFoundError, match="curate-only"):
+        run_pipeline(
+            repo_root=".",
+            out_dir=tmp_path / "missing",
+            generator=_G(),
+            n_per_unit=2,
+            valid_frac=0.1,
+            seed=0,
+            curate_only=True,
+        )
