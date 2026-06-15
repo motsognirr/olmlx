@@ -49,8 +49,9 @@ def split_train_valid(
 ) -> tuple[list[ChatExample], list[ChatExample]]:
     """Shuffle deterministically and split off a validation fraction.
 
-    Guarantees at least one validation example when the input is non-empty so
-    ``mlx_lm.lora`` always has a ``valid.jsonl`` to evaluate against.
+    Guarantees at least one validation example whenever the input is non-empty
+    (regardless of ``valid_frac``, including ``0.0``) so ``mlx_lm.lora`` always
+    has a ``valid.jsonl`` to evaluate against.
     """
     shuffled = list(examples)
     random.Random(seed).shuffle(shuffled)

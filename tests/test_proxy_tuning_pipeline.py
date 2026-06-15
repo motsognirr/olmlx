@@ -411,7 +411,9 @@ def test_quality_filter_drops_too_short_and_too_long():
     )
     too_short_q = _ex("hi", "a real-enough answer here please")
     too_short_a = _ex("A perfectly reasonable question?", "no")
-    too_long = _ex("Q?", "x" * 100_000)
+    # Long-enough user so this exercises the assistant MAX-length guard, not
+    # the user MIN-length guard.
+    too_long = _ex("How does this work in practice?", "x" * 100_000)
     out = quality_filter([good, too_short_q, too_short_a, too_long])
     assert out == [good]
 

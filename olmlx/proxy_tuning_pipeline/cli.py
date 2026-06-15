@@ -45,7 +45,11 @@ def run_pipeline(
     examples = expand_units(units, generator, n_per_unit=n_per_unit)
     generated = len(examples)
 
-    examples = dedupe_examples(quality_filter(examples))
+    # Track the two drop sources separately: a large quality-drop points at the
+    # generator producing short/long junk; a large dedup-drop points at the
+    # generator being repetitive. They need different fixes (filters vs prompt).
+    filtered = quality_filter(examples)
+    examples = dedupe_examples(filtered)
     kept = len(examples)
 
     train, valid = split_train_valid(examples, valid_frac=valid_frac, seed=seed)
@@ -55,12 +59,20 @@ def run_pipeline(
     stats = {
         "units": len(units),
         "generated": generated,
+        "quality_dropped": generated - len(filtered),
+        "dedup_dropped": len(filtered) - kept,
         "kept": kept,
         "dropped": generated - kept,
         "train": len(train),
         "valid": len(valid),
     }
     logger.info("pipeline stats: %s", stats)
+    if units and not kept:
+        # Generator produced output but every pair was filtered/deduped away —
+        # an empty dataset only otherwise noticed at training time.
+        logger.error(
+            "run_pipeline: 0 examples survived curation (generated=%d)", generated
+        )
     return stats
 
 
