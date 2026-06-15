@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import subprocess
 
+from olmlx.proxy_tuning_pipeline.expand import build_messages, parse_pairs
 from olmlx.proxy_tuning_pipeline.extract import (
     dedupe_units,
     extract_commits,
@@ -222,3 +223,44 @@ def test_extract_repo_composes_all_extractors(tmp_path):
     kinds = {u.kind for u in units}
     # Commit extractor finds nothing here (no git repo) — that's fine.
     assert {"function", "invariant", "doc", "test"} <= kinds
+
+
+# ---------------------------------------------------------------------------
+# Task 9: Generator protocol + build_messages + parse_pairs
+# ---------------------------------------------------------------------------
+
+
+def test_build_messages_grounds_in_source_and_requests_json():
+    u = ExtractionUnit("function", "a.py:1", "the `f` function", "def f(): return 1")
+    system, user = build_messages(u, n_pairs=3)
+    assert "ground" in system.lower()  # grounding discipline present
+    assert "JSON" in system or "json" in system
+    assert "def f(): return 1" in user  # source context embedded
+    assert "3" in user  # requested count
+    assert "the `f` function" in user  # instruction hint embedded
+
+
+def test_build_messages_truncates_oversized_source():
+    u = ExtractionUnit("doc", "d.md#s", "a doc", "x" * 99999)
+    _system, user = build_messages(u, n_pairs=2)
+    assert len(user) < 20000  # clamped well below the raw 99999
+
+
+def test_parse_pairs_extracts_valid_pairs():
+    text = '{"pairs": [{"instruction": "Q1", "response": "A1"}, {"instruction": "Q2", "response": "A2"}]}'
+    assert parse_pairs(text) == [("Q1", "A1"), ("Q2", "A2")]
+
+
+def test_parse_pairs_tolerates_code_fences_and_drops_incomplete():
+    text = (
+        "```json\n"
+        '{"pairs": [{"instruction": "Q", "response": "A"}, '
+        '{"instruction": "", "response": "x"}, '
+        '{"instruction": "only-q"}]}\n'
+        "```"
+    )
+    assert parse_pairs(text) == [("Q", "A")]
+
+
+def test_parse_pairs_returns_empty_on_garbage():
+    assert parse_pairs("not json at all") == []
