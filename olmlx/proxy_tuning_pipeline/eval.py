@@ -89,9 +89,9 @@ def ship_decision(
 def _default_loader(base_dir: str, expert_dir: str, antiexpert_dir: str):
     from mlx_lm import load
 
-    base, tok = load(base_dir)
-    expert, _ = load(expert_dir)
-    anti, _ = load(antiexpert_dir)
+    base, tok = load(base_dir)  # pyright: ignore[reportAssignmentType]
+    expert, _ = load(expert_dir)  # pyright: ignore[reportAssignmentType]
+    anti, _ = load(antiexpert_dir)  # pyright: ignore[reportAssignmentType]
     return base, expert, anti, tok
 
 
