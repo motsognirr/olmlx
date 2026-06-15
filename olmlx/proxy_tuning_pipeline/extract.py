@@ -106,3 +106,31 @@ def extract_docs(docs_dir: str | Path) -> Iterator[ExtractionUnit]:
                 instruction_hint=f"the olmlx documentation section: {heading}",
                 source_context=strip_secrets((parts[i] + "\n" + body)[:_MAX_SOURCE_CHARS]),
             )
+
+
+def extract_tests(tests_dir: str | Path) -> Iterator[ExtractionUnit]:
+    """Yield one unit per `def test_*` function (the behavior it enforces)."""
+    tests_dir = Path(tests_dir)
+    for path in sorted(tests_dir.rglob("test_*.py")):
+        if "__pycache__" in path.parts:
+            continue
+        try:
+            text = path.read_text()
+            tree = ast.parse(text)
+        except (SyntaxError, UnicodeDecodeError):
+            continue
+        for node in ast.walk(tree):
+            if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            if not node.name.startswith("test_"):
+                continue
+            segment = ast.get_source_segment(text, node) or ""
+            if not segment.strip():
+                continue
+            rel = path.relative_to(tests_dir) if path.is_relative_to(tests_dir) else path
+            yield ExtractionUnit(
+                kind="test",
+                provenance=f"tests/{rel}:{node.lineno}",
+                instruction_hint=f"the behavior enforced by `{node.name}`",
+                source_context=strip_secrets(segment[:_MAX_SOURCE_CHARS]),
+            )

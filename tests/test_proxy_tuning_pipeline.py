@@ -146,3 +146,25 @@ def test_extract_docs_chunks_by_section(tmp_path):
     assert all(u.kind == "doc" for u in units)
     spec = next(u for u in units if "Speculative" in u.instruction_hint)
     assert "Draft then verify" in spec.source_context
+
+
+from olmlx.proxy_tuning_pipeline.extract import extract_tests
+
+
+def test_extract_tests_yields_unit_per_test_function(tmp_path):
+    t = tmp_path / "tests"
+    t.mkdir()
+    (t / "test_thing.py").write_text(
+        'def test_adds():\n'
+        '    """Addition works."""\n'
+        '    assert 1 + 1 == 2\n'
+        '\n'
+        'def helper():\n'
+        '    return 0\n'
+    )
+    units = list(extract_tests(t))
+    assert len(units) == 1
+    u = units[0]
+    assert u.kind == "test"
+    assert "test_adds" in u.instruction_hint
+    assert "assert 1 + 1 == 2" in u.source_context
