@@ -84,3 +84,25 @@ def extract_invariants(claude_md_path: str | Path) -> Iterator[ExtractionUnit]:
             instruction_hint=f"the olmlx invariant: {title_m.group(1)}",
             source_context=strip_secrets(para[:_MAX_SOURCE_CHARS]),
         )
+
+
+def extract_docs(docs_dir: str | Path) -> Iterator[ExtractionUnit]:
+    """Yield one unit per markdown section (## or # heading + its body)."""
+    docs_dir = Path(docs_dir)
+    for path in sorted(docs_dir.rglob("*.md")):
+        text = path.read_text()
+        # Split on headings, keeping the heading with its following body.
+        parts = re.split(r"(?m)^(#{1,3}\s+.*)$", text)
+        # parts = [pre, heading1, body1, heading2, body2, ...]
+        for i in range(1, len(parts), 2):
+            heading = parts[i].lstrip("#").strip()
+            body = parts[i + 1].strip() if i + 1 < len(parts) else ""
+            if not body:
+                continue
+            rel = path.relative_to(docs_dir) if path.is_relative_to(docs_dir) else path
+            yield ExtractionUnit(
+                kind="doc",
+                provenance=f"docs/{rel}#{heading[:40]}",
+                instruction_hint=f"the olmlx documentation section: {heading}",
+                source_context=strip_secrets((parts[i] + "\n" + body)[:_MAX_SOURCE_CHARS]),
+            )

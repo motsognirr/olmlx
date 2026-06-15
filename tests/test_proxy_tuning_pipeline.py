@@ -123,3 +123,26 @@ def test_extract_invariants_parses_bold_lead_paragraphs(tmp_path):
     # The trailing "## Development" content is not captured.
     assert not any("not an invariant" in u.source_context for u in units)
     assert len(units) == 2
+
+
+from olmlx.proxy_tuning_pipeline.extract import extract_docs
+
+
+def test_extract_docs_chunks_by_section(tmp_path):
+    d = tmp_path / "docs"
+    d.mkdir()
+    (d / "a.md").write_text(
+        "# Intro\n\nWelcome to olmlx.\n\n"
+        "## Speculative\n\nDraft then verify.\n\n"
+        "## Flash\n\nSSD-backed MoE.\n"
+    )
+    (d / "nested" / "b.md").parent.mkdir()
+    (d / "nested" / "b.md").write_text("# Nested\n\nbody here\n")
+    units = list(extract_docs(d))
+    headings = [u.instruction_hint for u in units]
+    assert any("Speculative" in h for h in headings)
+    assert any("Flash" in h for h in headings)
+    assert any("Nested" in h for h in headings)
+    assert all(u.kind == "doc" for u in units)
+    spec = next(u for u in units if "Speculative" in u.instruction_hint)
+    assert "Draft then verify" in spec.source_context
