@@ -4,7 +4,13 @@ from __future__ import annotations
 
 import subprocess
 
-from olmlx.proxy_tuning_pipeline.expand import build_messages, expand_units, parse_pairs
+from olmlx.proxy_tuning_pipeline.expand import (
+    DEFAULT_MODEL,
+    OpenAIGenerator,
+    build_messages,
+    expand_units,
+    parse_pairs,
+)
 from olmlx.proxy_tuning_pipeline.extract import (
     dedupe_units,
     extract_commits,
@@ -303,3 +309,57 @@ def test_expand_units_skips_units_that_yield_no_pairs():
     units = [ExtractionUnit("doc", "d.md#s", "doc", "body")]
     gen = _FakeGenerator("garbage, not json")
     assert expand_units(units, gen, n_per_unit=3) == []
+
+
+# ---------------------------------------------------------------------------
+# Task 11: OpenAIGenerator (injectable client)
+# ---------------------------------------------------------------------------
+
+
+class _FakeMessage:
+    def __init__(self, content):
+        self.content = content
+
+
+class _FakeChoice:
+    def __init__(self, content):
+        self.message = _FakeMessage(content)
+
+
+class _FakeCompletion:
+    def __init__(self, content):
+        self.choices = [_FakeChoice(content)]
+
+
+class _FakeOpenAIClient:
+    def __init__(self, content):
+        self._content = content
+        self.last_kwargs = None
+
+        class _Completions:
+            def create(inner, **kwargs):
+                self.last_kwargs = kwargs
+                return _FakeCompletion(self._content)
+
+        class _Chat:
+            completions = _Completions()
+
+        self.chat = _Chat()
+
+
+def test_openai_generator_calls_chat_completions():
+    client = _FakeOpenAIClient('{"pairs": []}')
+    gen = OpenAIGenerator(client=client)
+    out = gen.generate("sys", "usr")
+    assert out == '{"pairs": []}'
+    assert client.last_kwargs["model"] == DEFAULT_MODEL
+    assert client.last_kwargs["messages"] == [
+        {"role": "system", "content": "sys"},
+        {"role": "user", "content": "usr"},
+    ]
+
+
+def test_openai_generator_honors_model_override():
+    client = _FakeOpenAIClient("x")
+    OpenAIGenerator(client=client, model="custom-model").generate("s", "u")
+    assert client.last_kwargs["model"] == "custom-model"

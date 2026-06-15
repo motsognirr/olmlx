@@ -96,7 +96,10 @@ def expand_units(
             )
         if (i + 1) % 100 == 0:
             logger.info(
-                "expanded %d/%d units, %d pairs so far", i + 1, len(units), len(examples)
+                "expanded %d/%d units, %d pairs so far",
+                i + 1,
+                len(units),
+                len(examples),
             )
     return examples
 
