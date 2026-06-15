@@ -386,6 +386,37 @@ class Settings(BaseSettings):
     flash_speculative_draft_model: Annotated[str, Field(min_length=1)] | None = None
     flash_speculative_tokens: Annotated[int, Field(gt=0)] = 4
 
+    # Autonomous agent (engine/agent/, routers/agent.py — issue #445). The
+    # orchestrator drives the existing ``ChatSession`` ReAct loop across many
+    # turns toward a goal, with hard budgets, stall detection, SQLite-persisted
+    # resumable runs, cross-session memory, self-improving skills, and bounded
+    # subagent delegation. Gated off by default; the HTTP surface and run
+    # registry only exist when ``agent_enabled`` is true.
+    agent_enabled: bool = False
+    agent_db_path: Path = Path.home() / ".olmlx" / "agent.db"
+    #: Default model for agent runs when a create request omits ``model``.
+    #: Empty string means the request must supply one (else HTTP 422).
+    agent_model: str = ""
+    #: Hard budgets enforced by the orchestrator regardless of model output.
+    #: ``token_budget`` / ``wallclock_timeout`` of ``None`` mean unlimited.
+    agent_max_iterations: Annotated[int, Field(gt=0)] = 50
+    agent_token_budget: Annotated[int, Field(gt=0)] | None = None
+    agent_wallclock_timeout: Annotated[float, Field(gt=0)] | None = None
+    #: Abort a run after this many consecutive iterations make no progress
+    #: (identical assistant output / no new memory). Run-level extension of
+    #: ``ChatSession``'s repetition + consecutive-tool-failure guards.
+    agent_stall_max_no_progress: Annotated[int, Field(gt=0)] = 3
+    #: Per-iteration max ReAct turns inside the wrapped ``ChatSession`` — kept
+    #: small so ``finish`` / budgets are checked often at the outer loop.
+    agent_inner_max_turns: Annotated[int, Field(gt=0)] = 8
+    #: Cross-session memory (Phase 2) bounds.
+    agent_memory_max_entries: Annotated[int, Field(gt=0)] = 1000
+    agent_memory_recall_k: Annotated[int, Field(gt=0)] = 5
+    #: Subagent delegation (Phase 4) bounds. ``depth`` 0 disables delegation
+    #: (root run is depth 0; a child would be depth 1 > depth cap of 0).
+    agent_max_subagent_depth: Annotated[int, Field(ge=0)] = 2
+    agent_max_subagent_fanout: Annotated[int, Field(gt=0)] = 4
+
     @model_validator(mode="after")
     def validate_auto_calibrate(self) -> "Settings":
         if self.kv_cache_auto_calibrate and (
