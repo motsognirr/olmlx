@@ -21,6 +21,16 @@
 
 ---
 
+## Execution status (updated 2026-06-15)
+
+- ✅ **Task 1** done — verifier committed. **Deviation:** the committed verifier checks each model's `config.json` `vocab_size` (151936 — the logits width proxy-tuning's arithmetic needs), **not** `len(tokenizer.get_vocab())` (151669). The Task-1 code block below is the original; the committed code reflects this fix. Task 8's `--base-vocab 151936` is therefore correct as written.
+- ✅ **Task 2** done — M⁻ converted to bf16. **Deviation:** the `chat_template` survived as a sidecar `chat_template.jinja` (4116 chars), so the Step-3 `tokenizer_config.json` check prints `False` but the loaded tokenizer *does* expose the template (`apply_chat_template` works). **The Task-2 Step-3 "copy from instruct sibling" remedy is unnecessary — skip it.**
+- ✅ **Task 3** done — clean `sft/` dir (7954 train + 692 valid).
+- ✅ **Task 4** done — 20-iter smoke-train passed (val loss 2.804→2.220, peak mem 6.5 GB); smoke adapters removed.
+- ⏳ **Tasks 5–8** remain — operator-run (full ~30–90 min LoRA, fuse, 4-bit quantize, gate).
+
+---
+
 ## File Structure
 
 | File | Responsibility | Action |
