@@ -198,3 +198,88 @@ def test_judge_raises_on_unparseable():
     judge = ProxyEvalJudge(_FakeGen("not json at all"))
     with pytest.raises(ValueError, match="judge"):
         judge.score(prompt="p", completion="c")
+
+
+from olmlx.proxy_tuning_pipeline.eval import aggregate, ship_decision, run_eval  # noqa: E402
+from olmlx.proxy_tuning_pipeline.eval_schema import EvalScore  # noqa: E402
+
+
+def _score(alpha, conv, coh, pid="p"):
+    return EvalScore(pid, "convention_qa", alpha, conv, coh, "r", "out")
+
+
+def test_aggregate_means_per_alpha():
+    scores = [
+        _score(0.0, 2, 4),
+        _score(0.0, 4, 4),
+        _score(1.0, 5, 4),
+        _score(1.0, 3, 4),
+    ]
+    summaries = {s.alpha: s for s in aggregate(scores)}
+    assert summaries[0.0].mean_convention == 3.0
+    assert summaries[1.0].mean_convention == 4.0
+    assert summaries[0.0].n == 2
+
+
+def test_ship_decision_ships_on_clear_lift():
+    scores = [_score(0.0, 3, 5), _score(1.0, 4, 5)]  # +1.0 conv, equal coherence
+    d = ship_decision(aggregate(scores))
+    assert d.ship is True
+    assert d.best_alpha == 1.0
+
+
+def test_ship_decision_blocks_on_coherence_drop():
+    # +1.0 conv but coherence falls 5 -> 4.0 (drop 1.0 > 0.2 allowed)
+    scores = [_score(0.0, 3, 5), _score(1.0, 4, 4)]
+    d = ship_decision(aggregate(scores))
+    assert d.ship is False
+    assert "coherence" in d.reason
+
+
+def test_ship_decision_blocks_on_insufficient_margin():
+    scores = [_score(0.0, 3, 5), _score(1.0, 3, 5)]  # no lift
+    d = ship_decision(aggregate(scores))
+    assert d.ship is False
+
+
+def test_run_eval_orchestration_with_fakes(tmp_path, monkeypatch):
+    prompts = [EvalPrompt("a", "convention_qa", [{"role": "user", "content": "hi"}])]
+
+    class _Dec:
+        def __init__(self):
+            self._alpha = None
+
+    def fake_loader(base, expert, anti):
+        return ("BASE", "EXP", "ANTI", "TOK")
+
+    def fake_decoder_factory(base, expert, anti, alpha):
+        d = _Dec()
+        d._alpha = alpha
+        return d
+
+    def fake_generate(decoder, tokenizer, messages, *, max_tokens):
+        return f"out@{decoder._alpha}"
+
+    class _Judge:
+        def score(self, *, prompt, completion):
+            alpha = float(completion.split("@")[1])
+            return (5 if alpha > 0 else 3, 5, "r")
+
+    monkeypatch.setattr("olmlx.proxy_tuning_pipeline.eval.generate_one", fake_generate)
+
+    out_path = tmp_path / "results.json"
+    report = run_eval(
+        base_dir="b",
+        expert_dir="e",
+        antiexpert_dir="a",
+        prompts=prompts,
+        alphas=[0.0, 1.0],
+        judge=_Judge(),
+        out_path=str(out_path),
+        loader=fake_loader,
+        decoder_factory=fake_decoder_factory,
+        max_tokens=8,
+        preflight=lambda *a, **k: None,
+    )
+    assert report.ship is True
+    assert out_path.exists()
