@@ -872,6 +872,8 @@ def test_split_train_valid_rejects_out_of_range_fraction():
 def test_cap_kind_fraction_single_kind_preserves_data():
     # If the whole set is the capped kind, capping is unsatisfiable — keep all
     # rather than silently returning an empty list.
-    ex = [ChatExample("test", f"t{i}", f"Question {i}?", f"Answer {i}.") for i in range(5)]
+    ex = [
+        ChatExample("test", f"t{i}", f"Question {i}?", f"Answer {i}.") for i in range(5)
+    ]
     out = cap_kind_fraction(ex, kind="test", max_fraction=0.35, seed=0)
     assert len(out) == 5
