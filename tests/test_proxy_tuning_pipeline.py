@@ -69,3 +69,34 @@ def test_strip_secrets_redacts_known_token_shapes():
 def test_strip_secrets_leaves_ordinary_text_untouched():
     text = "def generate_chat(model, messages): return run(model, messages)"
     assert strip_secrets(text) == text
+
+
+from olmlx.proxy_tuning_pipeline.extract import extract_functions
+
+
+def test_extract_functions_yields_unit_per_function(tmp_path):
+    src = tmp_path / "mod.py"
+    src.write_text(
+        'def add(a, b):\n'
+        '    """Return the sum of a and b."""\n'
+        '    return a + b\n'
+        '\n'
+        'def _private():\n'
+        '    return 1\n'
+    )
+    units = list(extract_functions(tmp_path))
+    by_name = {u.provenance: u for u in units}
+    # Both functions captured; provenance is file:lineno.
+    assert any(p.endswith("mod.py:1") for p in by_name)
+    add_unit = next(u for u in units if "def add" in u.source_context)
+    assert add_unit.kind == "function"
+    assert "Return the sum" in add_unit.source_context
+    assert "add" in add_unit.instruction_hint
+
+
+def test_extract_functions_skips_non_python_and_pycache(tmp_path):
+    (tmp_path / "note.txt").write_text("def not_python(): pass")
+    cache = tmp_path / "__pycache__"
+    cache.mkdir()
+    (cache / "x.py").write_text("def cached(): pass")
+    assert list(extract_functions(tmp_path)) == []
