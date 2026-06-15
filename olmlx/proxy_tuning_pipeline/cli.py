@@ -36,11 +36,22 @@ def run_pipeline(
     n_per_unit: int,
     valid_frac: float,
     seed: int,
+    limit_units: int | None = None,
 ) -> dict[str, Any]:
-    """Extract -> expand -> curate -> write. Returns a stats dict."""
+    """Extract -> expand -> curate -> write. Returns a stats dict.
+
+    ``limit_units`` caps how many extracted units are expanded (the expensive
+    per-unit generator calls). Use it for a cheap, *complete* smoke run that
+    actually writes output — the full repo extracts thousands of units, and
+    output is only written after expansion finishes, so an unbounded run that is
+    interrupted produces nothing.
+    """
     out_dir = Path(out_dir)
     units = extract_repo(repo_root)
     logger.info("extracted %d units", len(units))
+    if limit_units is not None:
+        units = units[:limit_units]
+        logger.info("limiting to %d units for this run", len(units))
 
     examples = expand_units(units, generator, n_per_unit=n_per_unit)
     generated = len(examples)
@@ -95,6 +106,12 @@ def main(argv: list[str] | None = None) -> None:
     )
     ap.add_argument("--seed", type=int, default=0, help="split shuffle seed")
     ap.add_argument("--model", default=DEFAULT_MODEL, help="OpenAI generator model id")
+    ap.add_argument(
+        "--limit-units",
+        type=int,
+        default=None,
+        help="cap units expanded (cheap smoke run; omit to process the whole repo)",
+    )
     args = ap.parse_args(argv)
 
     stats = run_pipeline(
@@ -104,6 +121,7 @@ def main(argv: list[str] | None = None) -> None:
         n_per_unit=args.n_per_unit,
         valid_frac=args.valid_frac,
         seed=args.seed,
+        limit_units=args.limit_units,
     )
     print(f"Done. {stats}")
 

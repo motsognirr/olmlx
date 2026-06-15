@@ -502,6 +502,78 @@ def test_run_pipeline_end_to_end(tmp_path):
     assert stats["train"] == len(train) and stats["valid"] == len(valid)
 
 
+def test_run_pipeline_limit_units_bounds_expansion(tmp_path):
+    # A bounded run must process only `limit_units` units (cheap smoke run) and
+    # still write output — without this, a smoke run over the full repo only
+    # writes after expanding every unit, so interrupting it produces nothing.
+    repo = tmp_path / "repo"
+    (repo / "olmlx").mkdir(parents=True)
+    (repo / "olmlx" / "m.py").write_text(
+        'def f():\n    """doc f."""\n    return 1\n\n'
+        'def g():\n    """doc g."""\n    return 2\n'
+    )
+    (repo / "CLAUDE.md").write_text(
+        "## Non-Obvious Invariants\n\n**Inv one** — a real rule about streams.\n"
+    )
+    out_dir = tmp_path / "out"
+
+    class _CountingGenerator:
+        def __init__(self):
+            self.calls = 0
+
+        def generate(self, system: str, user: str) -> str:
+            self.calls += 1
+            return (
+                f'{{"pairs": [{{"instruction": "Q{self.calls} about olmlx?", '
+                f'"response": "A grounded answer about olmlx detail {self.calls}."}}]}}'
+            )
+
+    gen = _CountingGenerator()
+    stats = run_pipeline(
+        repo_root=repo,
+        out_dir=out_dir,
+        generator=gen,
+        n_per_unit=1,
+        valid_frac=0.5,
+        seed=3,
+        limit_units=2,
+    )
+    # Only 2 units expanded despite the repo extracting more.
+    assert gen.calls == 2
+    assert stats["units"] == 2
+    # Output is actually written (the whole point of a bounded smoke run).
+    assert (out_dir / "train.jsonl").exists()
+    assert stats["kept"] == stats["train"] + stats["valid"]
+
+
+def test_run_pipeline_limit_units_none_processes_all(tmp_path):
+    # Default (no limit) must process every extracted unit.
+    repo = tmp_path / "repo"
+    (repo / "olmlx").mkdir(parents=True)
+    (repo / "olmlx" / "m.py").write_text("def f():\n    return 1\n")
+    (repo / "CLAUDE.md").write_text("## Non-Obvious Invariants\n\n**Inv** — rule.\n")
+    n_units = len(extract_repo(repo))
+
+    class _G:
+        def __init__(self):
+            self.calls = 0
+
+        def generate(self, system: str, user: str) -> str:
+            self.calls += 1
+            return '{"pairs": []}'
+
+    gen = _G()
+    run_pipeline(
+        repo_root=repo,
+        out_dir=tmp_path / "out",
+        generator=gen,
+        n_per_unit=1,
+        valid_frac=0.1,
+        seed=0,
+    )
+    assert gen.calls == n_units
+
+
 def test_extract_functions_skips_unparseable_and_non_utf8(tmp_path):
     # A syntactically broken file and a non-UTF8 file must be skipped, not crash
     # extraction over the real repo.
