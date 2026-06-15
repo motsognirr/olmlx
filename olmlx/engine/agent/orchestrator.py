@@ -221,7 +221,11 @@ class Orchestrator:
             fields["result"] = result
         if reason is not None and status != "finished":
             fields["error"] = reason
-        await self.store.update_run(self.run_id, **fields)
+        # Append the terminal event BEFORE committing the terminal status: an
+        # SSE consumer polls (drain events, then check status) and stops once it
+        # sees a terminal status with no pending events. Committing the status
+        # first opens a window where it stops before the final run_status event
+        # is written — so it would never receive it.
         await self.store.append_event(
             self.run_id,
             {
@@ -231,6 +235,7 @@ class Orchestrator:
                 "result": result,
             },
         )
+        await self.store.update_run(self.run_id, **fields)
         logger.info(
             "agent run %s -> %s (reason=%s, iterations=%d, tokens=%d)",
             self.run_id,

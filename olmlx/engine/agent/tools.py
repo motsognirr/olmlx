@@ -149,6 +149,13 @@ _CREATE_SKILL_DEF = {
 }
 
 
+#: Inherited builtin tools that make no sense for a headless autonomous run.
+#: ``question`` blocks on a human answer that never comes — it would return the
+#: raw ``__question__:`` sentinel and stall the loop — so it is dropped from the
+#: agent's toolset (the system prompt also tells the model not to ask).
+_EXCLUDED_BUILTINS = frozenset({"question"})
+
+
 class AgentToolManager(BuiltinToolManager):
     """Builtin tools plus the agent's control tools, bound to an AgentContext."""
 
@@ -165,11 +172,16 @@ class AgentToolManager(BuiltinToolManager):
 
     @property
     def tool_names(self) -> set[str]:
-        names = super().tool_names
+        names = super().tool_names - _EXCLUDED_BUILTINS
         return names | {d["function"]["name"] for d in self._agent_defs}
 
     def get_tool_definitions(self) -> list[dict]:
-        return super().get_tool_definitions() + list(self._agent_defs)
+        inherited = [
+            d
+            for d in super().get_tool_definitions()
+            if d["function"]["name"] not in _EXCLUDED_BUILTINS
+        ]
+        return inherited + list(self._agent_defs)
 
     async def call_tool(self, name: str, arguments: dict) -> str | ToolError:
         if name == "finish":

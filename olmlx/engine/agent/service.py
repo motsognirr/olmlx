@@ -228,12 +228,14 @@ class AgentService:
             raise
         except Exception as exc:  # noqa: BLE001 — surface any orchestrator failure
             logger.exception("agent run %s crashed", run_id)
-            await self.store.update_run(
-                run_id, status="failed", error=f"{type(exc).__name__}: {exc}"
-            )
+            # Event before status, so an SSE consumer can't stop on the terminal
+            # status before the terminal event is written (see _finalize).
             await self.store.append_event(
                 run_id,
                 {"type": "run_status", "status": "failed", "reason": "exception"},
+            )
+            await self.store.update_run(
+                run_id, status="failed", error=f"{type(exc).__name__}: {exc}"
             )
         finally:
             # Drop the handle once the run is terminal — queries read terminal

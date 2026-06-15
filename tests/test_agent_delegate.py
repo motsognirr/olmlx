@@ -116,21 +116,45 @@ class TestDelegateRunner:
         assert svc._handles == {}
 
 
-class TestSerializedExecution:
-    async def test_children_generate_serially(self, store):
-        state = {"active": 0, "max_active": 0}
+class TestConcurrencyBounds:
+    async def test_concurrent_siblings_respect_fanout(self, store, monkeypatch):
+        """Concurrent delegate() from one parent (a gather'd tool turn) must not
+        overshoot the fan-out cap — the check+create is atomic (TOCTOU guard)."""
+        monkeypatch.setattr("olmlx.config.settings.agent_max_subagent_fanout", 2)
+        svc = _service(store, _finish_factory)
+        await store.create_run(run_id="p", goal="g", model="m", config={})
+        runner: DelegateRunner = svc._delegate_runner
+        results = await asyncio.gather(
+            runner.delegate(parent_id="p", goal="a"),
+            runner.delegate(parent_id="p", goal="b"),
+            runner.delegate(parent_id="p", goal="c"),
+            return_exceptions=True,
+        )
+        errs = [r for r in results if isinstance(r, DelegateError)]
+        assert len(errs) == 1  # exactly one over-cap delegate rejected
+        assert len(await store.list_children("p")) == 2  # no overshoot
 
-        def factory(run, context, manager):
-            class _TrackSession:
+    async def test_nested_delegation_does_not_deadlock(self, store, monkeypatch):
+        """A child delegating a grandchild must not re-enter a held lock and
+        deadlock (admit lock is released before run_child runs the child)."""
+        monkeypatch.setattr("olmlx.config.settings.agent_max_subagent_depth", 2)
+
+        def nesting_factory(run, context, manager):
+            class _Nest:
                 def __init__(self):
                     self.messages = [{"role": "system", "content": "s"}]
 
                 async def send_message(self, user_text):
-                    state["active"] += 1
-                    state["max_active"] = max(state["max_active"], state["active"])
-                    await asyncio.sleep(0.02)
-                    state["active"] -= 1
-                    self.messages.append({"role": "assistant", "content": "x"})
+                    self.messages.append({"role": "user", "content": user_text})
+                    # Each level tries to delegate one level deeper; the depth
+                    # cap stops the recursion (raises, caught here).
+                    try:
+                        await context.delegate_runner.delegate(
+                            parent_id=context.run_id, goal="deeper"
+                        )
+                    except DelegateError:
+                        pass
+                    self.messages.append({"role": "assistant", "content": "done"})
                     yield {
                         "type": "tool_call",
                         "name": "finish",
@@ -139,18 +163,20 @@ class TestSerializedExecution:
                     }
                     yield {"type": "done"}
 
-            return _TrackSession()
+            return _Nest()
 
-        svc = _service(store, factory)
-        await store.create_run(run_id="p1", goal="g", model="m", config={})
-        await store.create_run(run_id="p2", goal="g", model="m", config={})
-        runner: DelegateRunner = svc._delegate_runner
-        await asyncio.gather(
-            runner.delegate(parent_id="p1", goal="a"),
-            runner.delegate(parent_id="p2", goal="b"),
+        svc = _service(store, nesting_factory)
+        await store.create_run(run_id="root", goal="g", model="m", config={})
+        # Would hang forever under a lock held across run_child.
+        result = await asyncio.wait_for(
+            svc._delegate_runner.delegate(parent_id="root", goal="child"),
+            timeout=5,
         )
-        # The shared semaphore must have prevented overlapping generation.
-        assert state["max_active"] == 1
+        assert result["status"] == "finished"
+        child_id = result["id"]
+        assert len(await store.list_children("root")) == 1
+        # The child (depth 1) successfully delegated a grandchild (depth 2).
+        assert len(await store.list_children(child_id)) == 1
 
 
 class TestDelegateTool:

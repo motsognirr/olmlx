@@ -56,6 +56,12 @@ class TestAgentToolManager:
         assert isinstance(await tools.call_tool("remember", {"text": "x"}), ToolError)
         assert isinstance(await tools.call_tool("recall", {"query": "x"}), ToolError)
 
+    def test_interactive_question_tool_excluded(self, tools):
+        # The headless agent must not offer the interactive 'question' tool.
+        assert "question" not in tools.tool_names
+        names = {d["function"]["name"] for d in tools.get_tool_definitions()}
+        assert "question" not in names
+
 
 class TestMemoryTools:
     @pytest.fixture

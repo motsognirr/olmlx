@@ -128,7 +128,11 @@ def _apply_block(session, block: str) -> None:
         return
     content = messages[sys_idx].get("content") or ""
     if _BLOCK_RE.search(content):
-        content = _BLOCK_RE.sub(block, content)
+        # Function replacement, not a string: the block is model/user-derived
+        # (remembered notes, goal) and may contain backslash sequences that
+        # re.sub would interpret as group backreferences (\1, \g<...>) —
+        # raising re.error or corrupting the prompt.
+        content = _BLOCK_RE.sub(lambda _m: block, content)
     else:
         content = f"{content}\n\n{block}" if content else block
     messages[sys_idx] = {**messages[sys_idx], "content": content}

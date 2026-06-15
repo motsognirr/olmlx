@@ -133,6 +133,19 @@ class TestInjectContext:
         assert content.count("## Agent memory") == 1
         assert "second note" in content
 
+    async def test_inject_with_backslash_note_does_not_raise(self, store):
+        # A remembered note with backslash sequences (Windows path, regex) must
+        # not be interpreted as a regex replacement backreference on re-inject.
+        await store.create_run(run_id="r1", goal="G", model="m", config={})
+        mem = MemoryManager(store, "r1")
+        await mem.record(r"deploy key at C:\1users\secret and pattern \g<0>")
+        session = self.FakeSession([{"role": "system", "content": "base"}])
+        await mem.inject_context(session, "G")  # first inject creates the block
+        await mem.inject_context(session, "G")  # second inject re-subs the block
+        content = session.messages[0]["content"]
+        assert r"C:\1users\secret" in content
+        assert content.count("## Agent memory") == 1
+
     async def test_inject_without_system_message(self, store):
         await store.create_run(run_id="r1", goal="G", model="m", config={})
         mem = MemoryManager(store, "r1")
