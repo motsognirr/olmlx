@@ -15,6 +15,9 @@ from olmlx.proxy_tuning_pipeline.expand import (
     OpenAIGenerator,
     build_messages,
     expand_units,
+    expand_units_checkpointed,
+    load_done_provenances,
+    load_examples,
     parse_pairs,
 )
 from olmlx.proxy_tuning_pipeline.extract import (
@@ -485,6 +488,7 @@ def test_run_pipeline_end_to_end(tmp_path):
         n_per_unit=1,
         valid_frac=0.5,
         seed=7,
+        concurrency=1,
     )
 
     # Artifacts written in mlx-lm chat format.
@@ -537,6 +541,7 @@ def test_run_pipeline_limit_units_bounds_expansion(tmp_path):
         valid_frac=0.5,
         seed=3,
         limit_units=2,
+        concurrency=1,
     )
     # Only 2 units expanded despite the repo extracting more.
     assert gen.calls == 2
@@ -570,6 +575,7 @@ def test_run_pipeline_limit_units_none_processes_all(tmp_path):
         n_per_unit=1,
         valid_frac=0.1,
         seed=0,
+        concurrency=1,
     )
     assert gen.calls == n_units
 
@@ -584,3 +590,97 @@ def test_extract_functions_skips_unparseable_and_non_utf8(tmp_path):
     names = [u.instruction_hint for u in units]
     assert any("good" in n for n in names)
     assert len(units) == 1  # only the valid file contributed
+
+
+# ---------------------------------------------------------------------------
+# Checkpointed + concurrent expansion (full-run hardening)
+# ---------------------------------------------------------------------------
+
+
+class _PairGenerator:
+    """Returns one distinct pair per call; thread-safe call counter."""
+
+    def __init__(self):
+        import threading
+
+        self.calls = 0
+        self._lock = threading.Lock()
+
+    def generate(self, system: str, user: str) -> str:
+        with self._lock:
+            self.calls += 1
+            n = self.calls
+        return (
+            f'{{"pairs": [{{"instruction": "Q{n} about olmlx?", '
+            f'"response": "A grounded answer about olmlx detail {n}."}}]}}'
+        )
+
+
+def test_chat_example_dict_round_trip():
+    ex = ChatExample(kind="function", provenance="a.py:1", user="U", assistant="A")
+    assert ChatExample.from_dict(ex.to_dict()) == ex
+
+
+def test_expand_units_checkpointed_writes_raw_and_returns_count(tmp_path):
+    raw = tmp_path / "raw.jsonl"
+    units = [
+        ExtractionUnit("function", "a.py:1", "fn a", "def a(): pass"),
+        ExtractionUnit("doc", "d.md#s", "doc s", "body"),
+    ]
+    gen = _PairGenerator()
+    written = expand_units_checkpointed(
+        units, gen, n_per_unit=1, raw_path=raw, concurrency=4
+    )
+    assert written == 2
+    examples = load_examples(raw)
+    assert len(examples) == 2
+    assert {e.provenance for e in examples} == {"a.py:1", "d.md#s"}
+    assert all(isinstance(e, ChatExample) for e in examples)
+
+
+def test_expand_units_checkpointed_resume_skips_done_units(tmp_path):
+    raw = tmp_path / "raw.jsonl"
+    units = [
+        ExtractionUnit("function", "a.py:1", "fn a", "def a(): pass"),
+        ExtractionUnit("doc", "d.md#s", "doc s", "body"),
+    ]
+    # First pass over only the first unit.
+    gen1 = _PairGenerator()
+    expand_units_checkpointed(
+        units[:1], gen1, n_per_unit=1, raw_path=raw, concurrency=1
+    )
+    assert gen1.calls == 1
+
+    # Resume over the full list — the already-done unit must be skipped.
+    done = load_done_provenances(raw)
+    assert done == {"a.py:1"}
+    gen2 = _PairGenerator()
+    expand_units_checkpointed(
+        units, gen2, n_per_unit=1, raw_path=raw, concurrency=1, done=done
+    )
+    assert gen2.calls == 1  # only the not-done unit was generated
+    assert {e.provenance for e in load_examples(raw)} == {"a.py:1", "d.md#s"}
+
+
+def test_expand_units_checkpointed_processes_all_units_concurrently(tmp_path):
+    raw = tmp_path / "raw.jsonl"
+    units = [
+        ExtractionUnit("function", f"f{i}.py:1", f"fn {i}", f"def f{i}(): pass")
+        for i in range(25)
+    ]
+    gen = _PairGenerator()
+    written = expand_units_checkpointed(
+        units, gen, n_per_unit=1, raw_path=raw, concurrency=8
+    )
+    # Every unit produced exactly one pair; no loss under concurrency.
+    assert written == 25
+    assert len({e.provenance for e in load_examples(raw)}) == 25
+
+
+def test_load_done_provenances_missing_file_is_empty(tmp_path):
+    assert load_done_provenances(tmp_path / "nope.jsonl") == set()
+
+
+def test_openai_generator_default_max_retries():
+    gen = OpenAIGenerator(client=object())
+    assert gen._max_retries == 6

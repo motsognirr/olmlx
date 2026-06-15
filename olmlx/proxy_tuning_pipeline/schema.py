@@ -44,6 +44,25 @@ class ChatExample:
             ]
         }
 
+    def to_dict(self) -> dict[str, Any]:
+        """Full row (with kind + provenance) for the checkpoint ``raw.jsonl``."""
+        return {
+            "kind": self.kind,
+            "provenance": self.provenance,
+            "user": self.user,
+            "assistant": self.assistant,
+        }
+
+    @classmethod
+    def from_dict(cls, d: dict[str, Any]) -> "ChatExample":
+        """Inverse of :meth:`to_dict` for reading back ``raw.jsonl``."""
+        return cls(
+            kind=d["kind"],
+            provenance=d["provenance"],
+            user=d["user"],
+            assistant=d["assistant"],
+        )
+
 
 def write_jsonl(path: str | Path, rows: Iterable[dict[str, Any]]) -> int:
     """Write rows as JSON Lines; return the number of rows written."""

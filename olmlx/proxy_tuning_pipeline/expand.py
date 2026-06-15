@@ -7,7 +7,14 @@ import logging
 import re
 from typing import Any, Protocol
 
-from olmlx.proxy_tuning_pipeline.schema import ChatExample, ExtractionUnit
+import concurrent.futures
+from pathlib import Path
+
+from olmlx.proxy_tuning_pipeline.schema import (
+    ChatExample,
+    ExtractionUnit,
+    read_jsonl,
+)
 
 # Clamp the grounding so a long unit can't blow the generator's context budget.
 _MAX_USER_CHARS = 12000
@@ -95,31 +102,39 @@ def parse_pairs(text: str) -> list[tuple[str, str]]:
 logger = logging.getLogger(__name__)
 
 
+def _examples_for_unit(
+    unit: ExtractionUnit, generator: Generator, n_per_unit: int
+) -> list[ChatExample]:
+    """One generate call -> parsed ChatExamples for a single unit. May raise."""
+    system, user = build_messages(unit, n_per_unit)
+    reply = generator.generate(system, user)
+    return [
+        ChatExample(
+            kind=unit.kind, provenance=unit.provenance, user=instr, assistant=resp
+        )
+        for instr, resp in parse_pairs(reply)
+    ]
+
+
 def expand_units(
     units: list[ExtractionUnit],
     generator: Generator,
     n_per_unit: int,
 ) -> list[ChatExample]:
-    """Expand each unit into ChatExamples via the generator (one call per unit)."""
+    """Expand each unit into ChatExamples via the generator (one call per unit).
+
+    In-memory, sequential. ``expand_units_checkpointed`` is the crash-safe,
+    concurrent variant used for the full run.
+    """
     examples: list[ChatExample] = []
     failures = 0
     for i, unit in enumerate(units):
-        system, user = build_messages(unit, n_per_unit)
         try:
-            reply = generator.generate(system, user)
+            examples.extend(_examples_for_unit(unit, generator, n_per_unit))
         except Exception:  # noqa: BLE001 — one bad unit must not abort the run
             failures += 1
             logger.warning("generation failed for %s", unit.provenance, exc_info=True)
             continue
-        for instr, resp in parse_pairs(reply):
-            examples.append(
-                ChatExample(
-                    kind=unit.kind,
-                    provenance=unit.provenance,
-                    user=instr,
-                    assistant=resp,
-                )
-            )
         if (i + 1) % 100 == 0:
             logger.info(
                 "expanded %d/%d units, %d pairs so far",
@@ -127,9 +142,6 @@ def expand_units(
                 len(units),
                 len(examples),
             )
-    # Surface systemic failure: a run where every call failed (bad key, bad
-    # model, exhausted quota) would otherwise silently produce an empty dataset
-    # only noticed at training time.
     if failures:
         logger.warning(
             "expand_units: %d/%d units failed generation", failures, len(units)
@@ -137,6 +149,79 @@ def expand_units(
     if units and not examples:
         logger.error("expand_units: produced 0 examples from %d units", len(units))
     return examples
+
+
+def load_done_provenances(raw_path: str | Path) -> set[str]:
+    """Provenances already present in the checkpoint file (for resume)."""
+    p = Path(raw_path)
+    if not p.exists():
+        return set()
+    return {row["provenance"] for row in read_jsonl(p)}
+
+
+def load_examples(raw_path: str | Path) -> list[ChatExample]:
+    """Read the checkpoint file back into ChatExamples (empty if absent)."""
+    p = Path(raw_path)
+    if not p.exists():
+        return []
+    return [ChatExample.from_dict(row) for row in read_jsonl(p)]
+
+
+def expand_units_checkpointed(
+    units: list[ExtractionUnit],
+    generator: Generator,
+    n_per_unit: int,
+    raw_path: str | Path,
+    concurrency: int = 8,
+    *,
+    done: set[str] | None = None,
+) -> int:
+    """Expand units concurrently, appending each unit's pairs to ``raw_path``.
+
+    Crash-safe and resumable: every unit's pairs are flushed to ``raw_path`` the
+    moment that unit finishes, so an interrupt loses at most the in-flight units.
+    Units whose provenance is in ``done`` are skipped (resume). Returns the
+    number of pairs written this run.
+
+    Generator calls run in a bounded thread pool (the OpenAI client releases the
+    GIL during network I/O); the single main thread is the only writer, so
+    ``raw_path`` needs no locking.
+    """
+    done = done or set()
+    todo = [u for u in units if u.provenance not in done]
+    raw_path = Path(raw_path)
+    raw_path.parent.mkdir(parents=True, exist_ok=True)
+
+    written = 0
+    failures = 0
+    with (
+        raw_path.open("a") as f,
+        concurrent.futures.ThreadPoolExecutor(max_workers=max(concurrency, 1)) as pool,
+    ):
+        fut_to_unit = {
+            pool.submit(_examples_for_unit, u, generator, n_per_unit): u for u in todo
+        }
+        for i, fut in enumerate(concurrent.futures.as_completed(fut_to_unit), 1):
+            unit = fut_to_unit[fut]
+            try:
+                examples = fut.result()
+            except Exception:  # noqa: BLE001 — one bad unit must not abort the run
+                failures += 1
+                logger.warning(
+                    "generation failed for %s", unit.provenance, exc_info=True
+                )
+                continue
+            for e in examples:
+                f.write(json.dumps(e.to_dict(), ensure_ascii=False) + "\n")
+                written += 1
+            f.flush()  # checkpoint durability: survive a crash on the next unit
+            if i % 100 == 0:
+                logger.info(
+                    "expanded %d/%d units, %d pairs written", i, len(todo), written
+                )
+    if failures:
+        logger.warning("expand: %d/%d units failed generation", failures, len(todo))
+    return written
 
 
 DEFAULT_MODEL = "gpt-5.4-mini"
@@ -149,20 +234,23 @@ class OpenAIGenerator:
     ``openai.OpenAI()`` (reads ``OPENAI_API_KEY`` from the environment).
     """
 
-    def __init__(self, client: Any = None, model: str = DEFAULT_MODEL):
+    def __init__(
+        self, client: Any = None, model: str = DEFAULT_MODEL, max_retries: int = 6
+    ):
         self._client = client
         self._model = model
+        self._max_retries = max_retries
 
     def _ensure_client(self) -> Any:
         if self._client is None:
             from openai import OpenAI
 
-            self._client = OpenAI()
+            # The SDK auto-retries 429 / transient 5xx with exponential backoff;
+            # raise the cap above the default 2 for a multi-hour batch run.
+            self._client = OpenAI(max_retries=self._max_retries)
         return self._client
 
     def generate(self, system: str, user: str) -> str:
-        # TODO: add retry/backoff on 429 / transient 5xx before the full run —
-        # a single rate-limit error currently drops one unit's pairs.
         resp = self._ensure_client().chat.completions.create(
             model=self._model,
             messages=[

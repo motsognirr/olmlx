@@ -21,7 +21,9 @@ from olmlx.proxy_tuning_pipeline.expand import (
     DEFAULT_MODEL,
     Generator,
     OpenAIGenerator,
-    expand_units,
+    expand_units_checkpointed,
+    load_done_provenances,
+    load_examples,
 )
 from olmlx.proxy_tuning_pipeline.extract import extract_repo
 from olmlx.proxy_tuning_pipeline.schema import write_jsonl
@@ -37,23 +39,38 @@ def run_pipeline(
     valid_frac: float,
     seed: int,
     limit_units: int | None = None,
+    concurrency: int = 8,
 ) -> dict[str, Any]:
-    """Extract -> expand -> curate -> write. Returns a stats dict.
+    """Extract -> expand (checkpointed) -> curate -> write. Returns a stats dict.
 
-    ``limit_units`` caps how many extracted units are expanded (the expensive
-    per-unit generator calls). Use it for a cheap, *complete* smoke run that
-    actually writes output — the full repo extracts thousands of units, and
-    output is only written after expansion finishes, so an unbounded run that is
-    interrupted produces nothing.
+    Generation is crash-safe and resumable: each unit's pairs are appended to
+    ``<out_dir>/raw.jsonl`` as they complete, so an interrupted run loses nothing
+    durable and re-running skips units already present. ``limit_units`` caps how
+    many units are expanded (cheap smoke run); ``concurrency`` is the generator
+    thread-pool size. Curation reads ``raw.jsonl`` back, so it works even on a
+    partially-generated checkpoint.
     """
     out_dir = Path(out_dir)
+    raw_path = out_dir / "raw.jsonl"
     units = extract_repo(repo_root)
     logger.info("extracted %d units", len(units))
     if limit_units is not None:
         units = units[:limit_units]
         logger.info("limiting to %d units for this run", len(units))
 
-    examples = expand_units(units, generator, n_per_unit=n_per_unit)
+    done = load_done_provenances(raw_path)
+    if done:
+        logger.info("resume: %d units already in %s — skipping", len(done), raw_path)
+    expand_units_checkpointed(
+        units,
+        generator,
+        n_per_unit=n_per_unit,
+        raw_path=raw_path,
+        concurrency=concurrency,
+        done=done,
+    )
+
+    examples = load_examples(raw_path)
     generated = len(examples)
 
     # Track the two drop sources separately: a large quality-drop points at the
@@ -61,6 +78,9 @@ def run_pipeline(
     # generator being repetitive. They need different fixes (filters vs prompt).
     filtered = quality_filter(examples)
     examples = dedupe_examples(filtered)
+    # Deterministic order regardless of concurrent generation order, so the
+    # seeded train/valid split is reproducible across runs.
+    examples.sort(key=lambda e: (e.provenance, e.user))
     kept = len(examples)
 
     train, valid = split_train_valid(examples, valid_frac=valid_frac, seed=seed)
@@ -112,6 +132,12 @@ def main(argv: list[str] | None = None) -> None:
         default=None,
         help="cap units expanded (cheap smoke run; omit to process the whole repo)",
     )
+    ap.add_argument(
+        "--concurrency",
+        type=int,
+        default=8,
+        help="generator thread-pool size (parallel API calls)",
+    )
     args = ap.parse_args(argv)
 
     stats = run_pipeline(
@@ -122,6 +148,7 @@ def main(argv: list[str] | None = None) -> None:
         valid_frac=args.valid_frac,
         seed=args.seed,
         limit_units=args.limit_units,
+        concurrency=args.concurrency,
     )
     print(f"Done. {stats}")
 
