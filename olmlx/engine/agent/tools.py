@@ -52,6 +52,49 @@ _FINISH_DEF = {
     },
 }
 
+_REMEMBER_DEF = {
+    "type": "function",
+    "function": {
+        "name": "remember",
+        "description": (
+            "Save a durable note to long-term memory (survives restart and "
+            "context truncation). Use for decisions, facts learned, and "
+            "progress worth recalling later."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "text": {
+                    "type": "string",
+                    "description": "The note to remember.",
+                },
+            },
+            "required": ["text"],
+        },
+    },
+}
+
+_RECALL_DEF = {
+    "type": "function",
+    "function": {
+        "name": "recall",
+        "description": (
+            "Search long-term memory for notes relevant to a query. Returns "
+            "the matching notes."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "What to search memory for.",
+                },
+            },
+            "required": ["query"],
+        },
+    },
+}
+
 
 class AgentToolManager(BuiltinToolManager):
     """Builtin tools plus the agent's control tools, bound to an AgentContext."""
@@ -59,7 +102,7 @@ class AgentToolManager(BuiltinToolManager):
     def __init__(self, config: ChatConfig, context: "AgentContext"):
         super().__init__(config)
         self._context = context
-        self._agent_defs: list[dict] = [_FINISH_DEF]
+        self._agent_defs: list[dict] = [_FINISH_DEF, _REMEMBER_DEF, _RECALL_DEF]
 
     @property
     def tool_names(self) -> set[str]:
@@ -72,6 +115,10 @@ class AgentToolManager(BuiltinToolManager):
     async def call_tool(self, name: str, arguments: dict) -> str | ToolError:
         if name == "finish":
             return self._handle_finish(arguments)
+        if name == "remember":
+            return await self._handle_remember(arguments)
+        if name == "recall":
+            return await self._handle_recall(arguments)
         return await super().call_tool(name, arguments)
 
     def _handle_finish(self, arguments: dict) -> str:
@@ -79,3 +126,39 @@ class AgentToolManager(BuiltinToolManager):
         self._context.finish_summary = summary
         self._context.finished = True
         return f"Run marked complete. Summary recorded: {summary or '(none)'}"
+
+    async def _handle_remember(self, arguments: dict) -> str | ToolError:
+        if self._context.memory is None:
+            return ToolError(
+                message="Memory is not available for this run.",
+                tool_name="remember",
+                is_user_error=False,
+            )
+        text = str(arguments.get("text", "")).strip()
+        if not text:
+            return ToolError(
+                message="remember requires non-empty 'text'.",
+                tool_name="remember",
+                is_user_error=True,
+            )
+        await self._context.memory.record(text)
+        return "Saved to memory."
+
+    async def _handle_recall(self, arguments: dict) -> str | ToolError:
+        if self._context.memory is None:
+            return ToolError(
+                message="Memory is not available for this run.",
+                tool_name="recall",
+                is_user_error=False,
+            )
+        query = str(arguments.get("query", "")).strip()
+        if not query:
+            return ToolError(
+                message="recall requires a non-empty 'query'.",
+                tool_name="recall",
+                is_user_error=True,
+            )
+        results = await self._context.memory.recall(query)
+        if not results:
+            return "No relevant memories found."
+        return "\n".join(f"- {r}" for r in results)

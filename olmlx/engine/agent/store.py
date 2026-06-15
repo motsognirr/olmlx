@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import sqlite3
 import threading
 import time
@@ -73,6 +74,13 @@ CREATE TABLE IF NOT EXISTS events (
     data        TEXT NOT NULL,
     created_at  REAL NOT NULL,
     PRIMARY KEY (run_id, seq)
+);
+
+CREATE VIRTUAL TABLE IF NOT EXISTS memory USING fts5(
+    run_id UNINDEXED,
+    scope UNINDEXED,
+    text,
+    created_at UNINDEXED
 );
 """
 
@@ -321,6 +329,85 @@ class AgentStore:
             for r in rows
         ]
 
+    # -- memory (FTS5) ---------------------------------------------------
+
+    async def add_memory(self, run_id: str, text: str, scope: str = "note") -> int:
+        return await asyncio.to_thread(self._add_memory, run_id, text, scope)
+
+    def _add_memory(self, run_id: str, text: str, scope: str) -> int:
+        with self._lock:
+            cur = self._conn.execute(
+                "INSERT INTO memory (run_id, scope, text, created_at) "
+                "VALUES (?, ?, ?, ?)",
+                (run_id, scope, text, time.time()),
+            )
+            return int(cur.lastrowid or 0)
+
+    async def search_memory(
+        self, run_id: str, query: str, limit: int
+    ) -> list[dict[str, Any]]:
+        return await asyncio.to_thread(self._search_memory, run_id, query, limit)
+
+    def _search_memory(
+        self, run_id: str, query: str, limit: int
+    ) -> list[dict[str, Any]]:
+        match = _fts_match_query(query)
+        if not match:
+            return []
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT rowid, scope, text, created_at FROM memory "
+                "WHERE run_id = ? AND text MATCH ? ORDER BY rank LIMIT ?",
+                (run_id, match, limit),
+            ).fetchall()
+        return [_row_to_memory(r) for r in rows]
+
+    async def recent_memory(self, run_id: str, limit: int) -> list[dict[str, Any]]:
+        return await asyncio.to_thread(self._recent_memory, run_id, limit)
+
+    def _recent_memory(self, run_id: str, limit: int) -> list[dict[str, Any]]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT rowid, scope, text, created_at FROM memory "
+                "WHERE run_id = ? ORDER BY created_at DESC, rowid DESC LIMIT ?",
+                (run_id, limit),
+            ).fetchall()
+        return [_row_to_memory(r) for r in rows]
+
+    async def list_memory(self, run_id: str) -> list[dict[str, Any]]:
+        return await asyncio.to_thread(self._list_memory, run_id)
+
+    def _list_memory(self, run_id: str) -> list[dict[str, Any]]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT rowid, scope, text, created_at FROM memory "
+                "WHERE run_id = ? ORDER BY created_at ASC, rowid ASC",
+                (run_id,),
+            ).fetchall()
+        return [_row_to_memory(r) for r in rows]
+
+    async def count_memory(self, run_id: str) -> int:
+        return await asyncio.to_thread(self._count_memory, run_id)
+
+    def _count_memory(self, run_id: str) -> int:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT COUNT(*) AS n FROM memory WHERE run_id = ?", (run_id,)
+            ).fetchone()
+        return int(row["n"])
+
+    async def delete_memory(self, rowids: list[int]) -> None:
+        await asyncio.to_thread(self._delete_memory, rowids)
+
+    def _delete_memory(self, rowids: list[int]) -> None:
+        if not rowids:
+            return
+        placeholders = ",".join("?" for _ in rowids)
+        with self._lock:
+            self._conn.execute(
+                f"DELETE FROM memory WHERE rowid IN ({placeholders})", rowids
+            )
+
     # -- startup recovery -----------------------------------------------
 
     async def mark_interrupted_runs(self) -> list[str]:
@@ -351,3 +438,26 @@ def _row_to_run(row: sqlite3.Row) -> dict[str, Any]:
     run = {key: row[key] for key in _RUN_COLUMNS}
     run["config"] = json.loads(run["config"]) if run["config"] else {}
     return run
+
+
+def _row_to_memory(row: sqlite3.Row) -> dict[str, Any]:
+    return {
+        "id": row["rowid"],
+        "scope": row["scope"],
+        "text": row["text"],
+        "created_at": row["created_at"],
+    }
+
+
+def _fts_match_query(query: str) -> str:
+    """Build a safe FTS5 MATCH expression from free-form text.
+
+    User/model text contains punctuation that is FTS5 query syntax (``"``,
+    ``*``, ``(``, ``-``, ``:`` …) and would raise ``OperationalError``. Extract
+    alphanumeric word tokens and OR them as quoted terms — a tolerant "any of
+    these words" recall, never a syntax error.
+    """
+    tokens = re.findall(r"\w+", query.lower())
+    if not tokens:
+        return ""
+    return " OR ".join(f'"{tok}"' for tok in tokens)

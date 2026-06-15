@@ -22,6 +22,7 @@ from typing import TYPE_CHECKING, Any, AsyncIterator, Callable
 
 from olmlx.config import Settings
 from olmlx.config import settings as global_settings
+from olmlx.engine.agent.memory import MemoryManager
 from olmlx.engine.agent.orchestrator import AgentContext, Budgets, Orchestrator
 from olmlx.engine.agent.store import AgentStore
 
@@ -136,6 +137,13 @@ class AgentService:
 
     def _start(self, run: dict[str, Any], *, resume: bool) -> None:
         context = AgentContext(run_id=run["id"], store=self.store, depth=run["depth"])
+        context.memory = MemoryManager(
+            self.store,
+            run["id"],
+            max_entries=self._settings.agent_memory_max_entries,
+            recall_k=self._settings.agent_memory_recall_k,
+            summarizer=self._make_summarizer(run["model"]),
+        )
         session = self._make_session(run, context)
         orch = Orchestrator(
             session=session, context=context, budgets=self._budgets_for(run)
@@ -188,6 +196,44 @@ class AgentService:
         return ChatSession(
             config=config, manager=self._manager_getter(), builtin=builtin
         )
+
+    def _make_summarizer(self, model: str):
+        """An LLM-backed memory summarizer (best-effort; MemoryManager falls
+        back to a concat summary if this raises)."""
+
+        async def summarize(texts: list[str]) -> str:
+            from olmlx.engine.inference import generate_chat
+
+            joined = "\n".join(f"- {t}" for t in texts)
+            messages = [
+                {
+                    "role": "system",
+                    "content": "Compress the notes into a concise summary that "
+                    "preserves decisions, facts, and progress. Be brief.",
+                },
+                {"role": "user", "content": f"Notes:\n{joined}"},
+            ]
+            parts: list[str] = []
+            async for chunk in await generate_chat(
+                self._manager_getter(),
+                model,
+                messages,
+                stream=True,
+                max_tokens=256,
+                enable_thinking=False,
+            ):
+                if (
+                    chunk.get("done")
+                    or chunk.get("cache_info")
+                    or "thinking_expected" in chunk
+                ):
+                    continue
+                text = chunk.get("text", "")
+                if text:
+                    parts.append(text)
+            return "".join(parts).strip() or "Summary unavailable."
+
+        return summarize
 
     # -- queries ---------------------------------------------------------
 

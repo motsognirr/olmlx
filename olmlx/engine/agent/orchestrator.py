@@ -124,11 +124,6 @@ class Orchestrator:
         last_sig: str | None = None
         no_progress = 0
 
-        # Inject memory/skill context into the system prompt before the loop
-        # (Phase 2 hook; a no-op when memory is unset).
-        if self.context.memory is not None:
-            await self.context.memory.inject_context(self.session, goal)
-
         try:
             while True:
                 boundary = self._check_boundary(iterations, tokens, start)
@@ -136,6 +131,12 @@ class Orchestrator:
                     return await self._finalize(
                         boundary[0], iterations, tokens, reason=boundary[1]
                     )
+
+                # Refresh the tiered memory/skill context block in the system
+                # prompt each iteration (Phase 2 hook; no-op when memory unset).
+                # Re-derived from the store, so it survives context truncation.
+                if self.context.memory is not None:
+                    await self.context.memory.inject_context(self.session, goal)
 
                 prompt = goal if first else CONTINUATION_NUDGE
                 first = False

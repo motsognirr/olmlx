@@ -49,3 +49,34 @@ class TestAgentToolManager:
         from olmlx.chat.errors import ToolError
 
         assert isinstance(result, ToolError)
+
+    async def test_remember_recall_without_memory_errors(self, tools):
+        from olmlx.chat.errors import ToolError
+
+        assert isinstance(await tools.call_tool("remember", {"text": "x"}), ToolError)
+        assert isinstance(await tools.call_tool("recall", {"query": "x"}), ToolError)
+
+
+class TestMemoryTools:
+    @pytest.fixture
+    def mem_tools(self, context):
+        from olmlx.engine.agent.memory import MemoryManager
+
+        context.memory = MemoryManager(context.store, context.run_id)
+        return AgentToolManager(ChatConfig(model_name="m"), context)
+
+    async def test_remember_then_recall(self, mem_tools, context):
+        # create_run so the run exists for memory rows (FTS table is global but
+        # keep the lifecycle realistic).
+        await context.store.create_run(
+            run_id=context.run_id, goal="g", model="m", config={}
+        )
+        result = await mem_tools.call_tool(
+            "remember", {"text": "the build uses bazel not make"}
+        )
+        assert "saved" in result.lower()
+        recalled = await mem_tools.call_tool("recall", {"query": "build bazel"})
+        assert "bazel" in recalled
+
+    async def test_remember_and_recall_in_tool_names(self, mem_tools):
+        assert {"remember", "recall"} <= mem_tools.tool_names
