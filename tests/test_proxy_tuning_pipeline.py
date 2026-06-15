@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import subprocess
 
-from olmlx.proxy_tuning_pipeline.expand import build_messages, parse_pairs
+from olmlx.proxy_tuning_pipeline.expand import build_messages, expand_units, parse_pairs
 from olmlx.proxy_tuning_pipeline.extract import (
     dedupe_units,
     extract_commits,
@@ -264,3 +264,42 @@ def test_parse_pairs_tolerates_code_fences_and_drops_incomplete():
 
 def test_parse_pairs_returns_empty_on_garbage():
     assert parse_pairs("not json at all") == []
+
+
+# ---------------------------------------------------------------------------
+# Task 10: expand_units driver
+# ---------------------------------------------------------------------------
+
+
+class _FakeGenerator:
+    def __init__(self, reply: str):
+        self.reply = reply
+        self.calls = 0
+
+    def generate(self, system: str, user: str) -> str:
+        self.calls += 1
+        return self.reply
+
+
+def test_expand_units_produces_chat_examples_with_provenance():
+    units = [
+        ExtractionUnit("function", "a.py:1", "fn a", "def a(): pass"),
+        ExtractionUnit("doc", "d.md#s", "doc s", "body"),
+    ]
+    gen = _FakeGenerator(
+        '{"pairs": [{"instruction": "Q1", "response": "A1"}, '
+        '{"instruction": "Q2", "response": "A2"}]}'
+    )
+    examples = expand_units(units, gen, n_per_unit=2)
+    assert gen.calls == 2  # one generation call per unit
+    assert len(examples) == 4  # 2 pairs * 2 units
+    assert all(isinstance(e, ChatExample) for e in examples)
+    first = examples[0]
+    assert first.user == "Q1" and first.assistant == "A1"
+    assert first.provenance == "a.py:1" and first.kind == "function"
+
+
+def test_expand_units_skips_units_that_yield_no_pairs():
+    units = [ExtractionUnit("doc", "d.md#s", "doc", "body")]
+    gen = _FakeGenerator("garbage, not json")
+    assert expand_units(units, gen, n_per_unit=3) == []
