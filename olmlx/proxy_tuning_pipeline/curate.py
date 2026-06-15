@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import logging
 import math
 import random
 
 from olmlx.proxy_tuning_pipeline.schema import ChatExample
+
+logger = logging.getLogger(__name__)
 
 _MIN_USER_CHARS = 8
 _MIN_ASSISTANT_CHARS = 12
@@ -28,6 +31,17 @@ def cap_kind_fraction(
         return list(examples)
     others = [e for e in examples if e.kind != kind]
     targeted = [e for e in examples if e.kind == kind]
+    if not others:
+        # Nothing of another kind to dilute with — the cap is unsatisfiable
+        # without dropping everything. Preserve the data rather than return [].
+        logger.warning(
+            "cap_kind_fraction: dataset is entirely kind %r; cannot cap to %.0f%% "
+            "without emptying it — keeping all %d examples.",
+            kind,
+            max_fraction * 100,
+            len(targeted),
+        )
+        return list(examples)
     # targeted / (targeted + others) <= max_fraction  ->  targeted <= f/(1-f)*others
     cap = math.floor(max_fraction / (1.0 - max_fraction) * len(others))
     if len(targeted) <= cap:

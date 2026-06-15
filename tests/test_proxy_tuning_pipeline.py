@@ -867,3 +867,11 @@ def test_split_train_valid_rejects_out_of_range_fraction():
         split_train_valid(ex, valid_frac=1.0, seed=0)
     with pytest.raises(ValueError, match="valid_frac"):
         split_train_valid(ex, valid_frac=-0.1, seed=0)
+
+
+def test_cap_kind_fraction_single_kind_preserves_data():
+    # If the whole set is the capped kind, capping is unsatisfiable — keep all
+    # rather than silently returning an empty list.
+    ex = [ChatExample("test", f"t{i}", f"Question {i}?", f"Answer {i}.") for i in range(5)]
+    out = cap_kind_fraction(ex, kind="test", max_fraction=0.35, seed=0)
+    assert len(out) == 5
