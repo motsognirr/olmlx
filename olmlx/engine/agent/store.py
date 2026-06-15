@@ -52,6 +52,7 @@ CREATE TABLE IF NOT EXISTS runs (
     tokens      INTEGER NOT NULL DEFAULT 0,
     result      TEXT,
     error       TEXT,
+    runtime_seconds REAL NOT NULL DEFAULT 0,
     created_at  REAL NOT NULL,
     updated_at  REAL NOT NULL
 );
@@ -105,13 +106,24 @@ _RUN_COLUMNS = (
     "tokens",
     "result",
     "error",
+    "runtime_seconds",
     "created_at",
     "updated_at",
 )
 
 #: Columns ``update_run`` accepts. ``updated_at`` is always stamped.
 _UPDATABLE = frozenset(
-    {"goal", "status", "model", "iterations", "tokens", "result", "error", "config"}
+    {
+        "goal",
+        "status",
+        "model",
+        "iterations",
+        "tokens",
+        "result",
+        "error",
+        "config",
+        "runtime_seconds",
+    }
 )
 
 
@@ -129,6 +141,18 @@ class AgentStore:
         with self._lock:
             self._conn.execute("PRAGMA journal_mode=WAL")
             self._conn.executescript(_SCHEMA)
+            self._migrate()
+
+    def _migrate(self) -> None:
+        """Add columns introduced after the initial schema (idempotent)."""
+        cols = {
+            row["name"]
+            for row in self._conn.execute("PRAGMA table_info(runs)").fetchall()
+        }
+        if "runtime_seconds" not in cols:
+            self._conn.execute(
+                "ALTER TABLE runs ADD COLUMN runtime_seconds REAL NOT NULL DEFAULT 0"
+            )
 
     def close(self) -> None:
         with self._lock:
@@ -188,6 +212,7 @@ class AgentStore:
             "tokens": 0,
             "result": None,
             "error": None,
+            "runtime_seconds": 0.0,
             "created_at": now,
             "updated_at": now,
         }

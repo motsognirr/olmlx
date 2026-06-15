@@ -106,6 +106,11 @@ class Orchestrator:
         goal = run["goal"]
         iterations = run["iterations"]
         tokens = run["tokens"]
+        # Accumulated *active* runtime from prior sessions of this run, so the
+        # wall-clock budget is cumulative across resume — consistent with
+        # iterations/tokens (which also persist). Paused time is excluded: only
+        # time spent actually running counts.
+        prior_runtime = run["runtime_seconds"]
 
         if resume:
             checkpoint = await self.store.latest_checkpoint(self.run_id)
@@ -124,12 +129,20 @@ class Orchestrator:
         last_sig: str | None = None
         no_progress = 0
 
+        def elapsed() -> float:
+            return prior_runtime + (self.clock() - start)
+
         try:
             while True:
-                boundary = self._check_boundary(iterations, tokens, start)
+                runtime = elapsed()
+                boundary = self._check_boundary(iterations, tokens, runtime)
                 if boundary is not None:
                     return await self._finalize(
-                        boundary[0], iterations, tokens, reason=boundary[1]
+                        boundary[0],
+                        iterations,
+                        tokens,
+                        runtime,
+                        reason=boundary[1],
                     )
 
                 # Refresh the tiered memory/skill context block in the system
@@ -156,17 +169,21 @@ class Orchestrator:
                             summary = str(args.get("summary", ""))
 
                 iterations += 1
+                runtime = elapsed()
                 new_messages = self.session.messages[before:]
                 await self.store.append_checkpoint(
                     self.run_id, self.session.messages, iterations, tokens
                 )
                 await self.store.update_run(
-                    self.run_id, iterations=iterations, tokens=tokens
+                    self.run_id,
+                    iterations=iterations,
+                    tokens=tokens,
+                    runtime_seconds=runtime,
                 )
 
                 if finished:
                     return await self._finalize(
-                        "finished", iterations, tokens, result=summary
+                        "finished", iterations, tokens, runtime, result=summary
                     )
 
                 sig = _iteration_signature(new_messages)
@@ -177,16 +194,22 @@ class Orchestrator:
                 last_sig = sig
                 if no_progress >= self.budgets.stall_max_no_progress:
                     return await self._finalize(
-                        "failed", iterations, tokens, reason="stall"
+                        "failed", iterations, tokens, runtime, reason="stall"
                     )
         except asyncio.CancelledError:
-            await self._finalize("cancelled", iterations, tokens, reason="cancelled")
+            await self._finalize(
+                "cancelled", iterations, tokens, elapsed(), reason="cancelled"
+            )
             raise
 
     def _check_boundary(
-        self, iterations: int, tokens: int, start: float
+        self, iterations: int, tokens: int, runtime: float
     ) -> tuple[str, str] | None:
-        """Return ``(status, reason)`` if a guard trips at this boundary, else None."""
+        """Return ``(status, reason)`` if a guard trips at this boundary, else None.
+
+        ``runtime`` is the cumulative active wall-clock (prior sessions + this
+        one), so the timeout survives resume rather than resetting per session.
+        """
         if self.context.cancel_event.is_set():
             return ("cancelled", "cancelled")
         if iterations >= self.budgets.max_iterations:
@@ -198,7 +221,7 @@ class Orchestrator:
             return ("failed", "token_budget")
         if (
             self.budgets.wallclock_timeout is not None
-            and (self.clock() - start) >= self.budgets.wallclock_timeout
+            and runtime >= self.budgets.wallclock_timeout
         ):
             return ("failed", "wallclock_timeout")
         return None
@@ -208,6 +231,7 @@ class Orchestrator:
         status: str,
         iterations: int,
         tokens: int,
+        runtime: float,
         *,
         reason: str | None = None,
         result: str | None = None,
@@ -216,6 +240,7 @@ class Orchestrator:
             "status": status,
             "iterations": iterations,
             "tokens": tokens,
+            "runtime_seconds": runtime,
         }
         if result is not None:
             fields["result"] = result

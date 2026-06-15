@@ -48,6 +48,20 @@ class FakeSession:
         yield {"type": "done"}
 
 
+def _clock(values):
+    """A fake monotonic clock that yields the given values, then clamps to the
+    last one — so a test need not predict the exact number of clock() calls."""
+    seq = list(values)
+    i = {"n": 0}
+
+    def clock():
+        v = seq[min(i["n"], len(seq) - 1)]
+        i["n"] += 1
+        return v
+
+    return clock
+
+
 def _ctx(store, run_id="r1", **kw):
     return AgentContext(run_id=run_id, store=store, **kw)
 
@@ -159,16 +173,40 @@ class TestBudgets:
         await store.create_run(run_id="r1", goal="G", model="m", config={})
         turns = [{"messages": [_assistant(f"s{i}")]} for i in range(5)]
         session = FakeSession(turns)
-        times = iter([0.0, 0.0, 100.0, 100.0])  # start, boundary1, boundary2...
+        # Clock stays at 0 for the first iteration's checks, then jumps past the
+        # timeout. Clamps to the last value so the exact number of clock() calls
+        # doesn't matter.
         orch = Orchestrator(
             session=session,
             context=_ctx(store),
             budgets=Budgets(
                 max_iterations=99, wallclock_timeout=10.0, stall_max_no_progress=99
             ),
-            clock=lambda: next(times),
+            clock=_clock([0.0, 0.0, 0.0, 100.0]),
         )
         result = await orch.run()
+        assert result["status"] == "failed"
+        assert result["reason"] == "wallclock_timeout"
+
+    async def test_wallclock_is_cumulative_across_resume(self, store):
+        """Prior active runtime counts toward the timeout on resume, so a run
+        can't extend past its limit by resuming."""
+        await store.create_run(run_id="r1", goal="G", model="m", config={})
+        # Pretend a prior session already used 8s of a 10s budget.
+        await store.append_checkpoint(
+            "r1", [{"role": "system", "content": "s"}], iterations=1, tokens=0
+        )
+        await store.update_run("r1", status="interrupted", runtime_seconds=8.0)
+        session = FakeSession([{"messages": [_assistant("s")]}])
+        orch = Orchestrator(
+            session=session,
+            context=_ctx(store),
+            budgets=Budgets(
+                max_iterations=99, wallclock_timeout=10.0, stall_max_no_progress=99
+            ),
+            clock=_clock([0.0, 5.0]),  # +5s this session → 8+5=13 ≥ 10
+        )
+        result = await orch.run(resume=True)
         assert result["status"] == "failed"
         assert result["reason"] == "wallclock_timeout"
 
