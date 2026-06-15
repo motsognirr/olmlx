@@ -78,6 +78,8 @@ def split_train_valid(
     (regardless of ``valid_frac``, including ``0.0``) so ``mlx_lm.lora`` always
     has a ``valid.jsonl`` to evaluate against.
     """
+    if not (0.0 <= valid_frac < 1.0):
+        raise ValueError(f"valid_frac must be in [0, 1), got {valid_frac}")
     shuffled = list(examples)
     random.Random(seed).shuffle(shuffled)
     n_valid = max(1, round(len(shuffled) * valid_frac)) if shuffled else 0

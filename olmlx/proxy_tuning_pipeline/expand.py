@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+import threading
 from typing import Any, Protocol
 
 import concurrent.futures
@@ -253,14 +254,19 @@ class OpenAIGenerator:
         self._client = client
         self._model = model
         self._max_retries = max_retries
+        self._client_lock = threading.Lock()
 
     def _ensure_client(self) -> Any:
+        # Double-checked lock: under concurrency the first batch of worker
+        # threads would otherwise each construct a client.
         if self._client is None:
-            from openai import OpenAI
+            with self._client_lock:
+                if self._client is None:
+                    from openai import OpenAI
 
-            # The SDK auto-retries 429 / transient 5xx with exponential backoff;
-            # raise the cap above the default 2 for a multi-hour batch run.
-            self._client = OpenAI(max_retries=self._max_retries)
+                    # The SDK auto-retries 429 / transient 5xx with exponential
+                    # backoff; raise the cap above the default 2 for a long run.
+                    self._client = OpenAI(max_retries=self._max_retries)
         return self._client
 
     def generate(self, system: str, user: str) -> str:

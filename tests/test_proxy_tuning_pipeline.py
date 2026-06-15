@@ -835,3 +835,35 @@ def test_run_pipeline_curate_only_requires_checkpoint(tmp_path):
             seed=0,
             curate_only=True,
         )
+
+
+def test_extract_commits_tolerates_non_utf8_diff(tmp_path):
+    # A commit touching a file with non-UTF8 bytes must not crash extraction.
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git(repo, "init")
+    (repo / "data.bin").write_bytes(b"\xff\xfe\x00binary\x80content\n")
+    _git(repo, "add", "data.bin")
+    _git(repo, "commit", "-m", "add binary blob")
+    units = list(extract_commits(repo, limit=10))  # must not raise
+    assert len(units) == 1
+    assert "add binary blob" in units[0].source_context
+
+
+def test_openai_generator_ensure_client_is_idempotent():
+    gen = OpenAIGenerator(client=None, model="m")
+    sentinel = object()
+    gen._client = sentinel  # simulate an already-built client
+    assert gen._ensure_client() is sentinel
+    assert gen._ensure_client() is sentinel  # double-checked path returns same
+
+
+def test_split_train_valid_rejects_out_of_range_fraction():
+    ex = [
+        ChatExample("function", f"f{i}", f"Question {i}?", f"Answer {i} here.")
+        for i in range(4)
+    ]
+    with pytest.raises(ValueError, match="valid_frac"):
+        split_train_valid(ex, valid_frac=1.0, seed=0)
+    with pytest.raises(ValueError, match="valid_frac"):
+        split_train_valid(ex, valid_frac=-0.1, seed=0)

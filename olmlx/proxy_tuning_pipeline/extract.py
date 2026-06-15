@@ -169,6 +169,9 @@ def extract_commits(root: str | Path, limit: int = 400) -> Iterator[ExtractionUn
                 check=True,
                 capture_output=True,
                 text=True,
+                # A diff can contain non-UTF8 bytes (binary files, latin-1 in
+                # old commits); decode leniently so it doesn't crash extraction.
+                errors="replace",
             ).stdout
         except subprocess.CalledProcessError:
             # Best-effort: skip a commit whose object can't be shown (shallow
