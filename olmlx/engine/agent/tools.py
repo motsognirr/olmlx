@@ -96,6 +96,28 @@ _RECALL_DEF = {
     },
 }
 
+_DELEGATE_DEF = {
+    "type": "function",
+    "function": {
+        "name": "delegate",
+        "description": (
+            "Delegate a focused sub-task to a child agent that works on it "
+            "independently and returns its result. Use to decompose a large "
+            "goal. Children run one at a time."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "goal": {
+                    "type": "string",
+                    "description": "The sub-task goal for the child agent.",
+                },
+            },
+            "required": ["goal"],
+        },
+    },
+}
+
 _CREATE_SKILL_DEF = {
     "type": "function",
     "function": {
@@ -138,6 +160,7 @@ class AgentToolManager(BuiltinToolManager):
             _REMEMBER_DEF,
             _RECALL_DEF,
             _CREATE_SKILL_DEF,
+            _DELEGATE_DEF,
         ]
 
     @property
@@ -157,6 +180,8 @@ class AgentToolManager(BuiltinToolManager):
             return await self._handle_recall(arguments)
         if name == "create_skill":
             return await self._handle_create_skill(arguments)
+        if name == "delegate":
+            return await self._handle_delegate(arguments)
         return await super().call_tool(name, arguments)
 
     def _handle_finish(self, arguments: dict) -> str:
@@ -225,3 +250,29 @@ class AgentToolManager(BuiltinToolManager):
             name, description, body.strip(), source_run=self._context.run_id
         )
         return f"Created skill {name!r} at {path}."
+
+    async def _handle_delegate(self, arguments: dict) -> str | ToolError:
+        from olmlx.engine.agent.delegate import DelegateError
+
+        runner = self._context.delegate_runner
+        if runner is None:
+            return ToolError(
+                message="Delegation is not available for this run.",
+                tool_name="delegate",
+                is_user_error=False,
+            )
+        goal = str(arguments.get("goal", "")).strip()
+        try:
+            result = await runner.delegate(parent_id=self._context.run_id, goal=goal)
+        except DelegateError as exc:
+            return ToolError(message=str(exc), tool_name="delegate", is_user_error=True)
+        status = result.get("status")
+        if status == "finished":
+            return f"Subagent finished. Result: {result.get('result') or '(none)'}"
+        # Failure / cancellation surfaces to the parent as a tool error so the
+        # parent model can decide whether to continue or finish.
+        return ToolError(
+            message=(f"Subagent {status}: {result.get('error') or 'no result'}"),
+            tool_name="delegate",
+            is_user_error=False,
+        )

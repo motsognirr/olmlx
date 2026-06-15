@@ -22,6 +22,7 @@ from typing import TYPE_CHECKING, Any, AsyncIterator, Callable
 
 from olmlx.config import Settings
 from olmlx.config import settings as global_settings
+from olmlx.engine.agent.delegate import DelegateRunner
 from olmlx.engine.agent.memory import MemoryManager
 from olmlx.engine.agent.orchestrator import AgentContext, Budgets, Orchestrator
 from olmlx.engine.agent.store import AgentStore
@@ -76,6 +77,7 @@ class AgentService:
         self._session_factory = session_factory
         self._id_factory = id_factory or (lambda: uuid.uuid4().hex)
         self._handles: dict[str, _RunHandle] = {}
+        self._delegate_runner = DelegateRunner(self)
 
     async def startup(self) -> None:
         """Recover crash-orphaned runs and re-materialize learned skills."""
@@ -163,7 +165,7 @@ class AgentService:
         self._start(run, resume=True)
         return await self.store.get_run(run_id)
 
-    def _start(self, run: dict[str, Any], *, resume: bool) -> None:
+    def _make_context(self, run: dict[str, Any]) -> AgentContext:
         context = AgentContext(run_id=run["id"], store=self.store, depth=run["depth"])
         context.memory = MemoryManager(
             self.store,
@@ -172,13 +174,43 @@ class AgentService:
             recall_k=self._settings.agent_memory_recall_k,
             summarizer=self._make_summarizer(run["model"]),
         )
+        # Shared runner; bounded delegation (Phase 4). Children get their own
+        # context via this same path, so the tree nests up to the depth cap.
+        context.delegate_runner = self._delegate_runner
+        return context
+
+    def _build_orchestrator(
+        self, run: dict[str, Any], context: AgentContext
+    ) -> Orchestrator:
         session = self._make_session(run, context)
-        orch = Orchestrator(
+        return Orchestrator(
             session=session, context=context, budgets=self._budgets_for(run)
         )
+
+    def _start(self, run: dict[str, Any], *, resume: bool) -> None:
+        context = self._make_context(run)
+        orch = self._build_orchestrator(run, context)
         handle = _RunHandle(cancel_event=context.cancel_event, context=context)
         self._handles[run["id"]] = handle
         handle.task = asyncio.create_task(self._run_wrapper(orch, run["id"], resume))
+
+    async def run_child(self, run: dict[str, Any]) -> dict[str, Any]:
+        """Run a child (delegated) run to completion inline and return its
+        final state. Used by ``DelegateRunner``; generation still serializes on
+        the global inference lock."""
+        context = self._make_context(run)
+        orch = self._build_orchestrator(run, context)
+        handle = _RunHandle(cancel_event=context.cancel_event, context=context)
+        self._handles[run["id"]] = handle
+        try:
+            await orch.run()
+        except Exception as exc:  # noqa: BLE001 — surface to the parent
+            logger.exception("delegated run %s crashed", run["id"])
+            await self.store.update_run(
+                run["id"], status="failed", error=f"{type(exc).__name__}: {exc}"
+            )
+        result = await self.store.get_run(run["id"])
+        return result or {}
 
     async def _run_wrapper(self, orch: Orchestrator, run_id: str, resume: bool) -> None:
         try:
