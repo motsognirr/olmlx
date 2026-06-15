@@ -146,3 +146,55 @@ def test_generate_one_empty_on_immediate_eos():
         dec, _FakeTok(), [{"role": "user", "content": "hi"}], max_tokens=20
     )
     assert out == ""
+
+
+# ---------------------------------------------------------------------------
+# Stage-3: ProxyEvalJudge tests
+# ---------------------------------------------------------------------------
+
+from olmlx.proxy_tuning_pipeline.eval_judge import ProxyEvalJudge  # noqa: E402
+
+
+class _FakeGen:
+    def __init__(self, reply):
+        self.reply = reply
+        self.last_system = None
+        self.last_user = None
+
+    def generate(self, system, user):
+        self.last_system = system
+        self.last_user = user
+        return self.reply
+
+
+def test_judge_parses_scores_and_builds_prompt():
+    gen = _FakeGen('{"convention_adherence": 4, "coherence": 5, "rationale": "good"}')
+    judge = ProxyEvalJudge(gen)
+    score = judge.score(
+        prompt="Explain the invariant.",
+        completion="The invariant is ...",
+    )
+    assert score == (4, 5, "good")
+    assert "Explain the invariant." in gen.last_user
+    assert "The invariant is ..." in gen.last_user
+
+
+def test_judge_clamps_out_of_range():
+    gen = _FakeGen('{"convention_adherence": 9, "coherence": 0, "rationale": "x"}')
+    judge = ProxyEvalJudge(gen)
+    conv, coh, _ = judge.score(prompt="p", completion="c")
+    assert (conv, coh) == (5, 1)
+
+
+def test_judge_tolerates_fenced_json():
+    gen = _FakeGen(
+        '```json\n{"convention_adherence": 3, "coherence": 3, "rationale": "ok"}\n```'
+    )
+    judge = ProxyEvalJudge(gen)
+    assert judge.score(prompt="p", completion="c") == (3, 3, "ok")
+
+
+def test_judge_raises_on_unparseable():
+    judge = ProxyEvalJudge(_FakeGen("not json at all"))
+    with pytest.raises(ValueError, match="judge"):
+        judge.score(prompt="p", completion="c")
