@@ -4,6 +4,12 @@ from __future__ import annotations
 
 import subprocess
 
+from olmlx.proxy_tuning_pipeline.cli import run_pipeline
+from olmlx.proxy_tuning_pipeline.curate import (
+    dedupe_examples,
+    quality_filter,
+    split_train_valid,
+)
 from olmlx.proxy_tuning_pipeline.expand import (
     DEFAULT_MODEL,
     OpenAIGenerator,
@@ -388,3 +394,107 @@ def test_openai_generator_honors_model_override():
     client = _FakeOpenAIClient("x")
     OpenAIGenerator(client=client, model="custom-model").generate("s", "u")
     assert client.last_kwargs["model"] == "custom-model"
+
+
+# ---------------------------------------------------------------------------
+# Task 12: Curation — quality_filter + dedupe_examples
+# ---------------------------------------------------------------------------
+
+
+def _ex(user, assistant, kind="function", prov="a.py:1"):
+    return ChatExample(kind=kind, provenance=prov, user=user, assistant=assistant)
+
+
+def test_quality_filter_drops_too_short_and_too_long():
+    good = _ex(
+        "How does generate_chat route output?", "It calls parse_model_output ..."
+    )
+    too_short_q = _ex("hi", "a real-enough answer here please")
+    too_short_a = _ex("A perfectly reasonable question?", "no")
+    too_long = _ex("Q?", "x" * 100_000)
+    out = quality_filter([good, too_short_q, too_short_a, too_long])
+    assert out == [good]
+
+
+def test_dedupe_examples_drops_normalized_duplicates():
+    a = _ex("How  does   F work?", "Answer A")
+    b = _ex("how does f work?", "answer a")  # same after normalization
+    c = _ex("Different question?", "Different answer")
+    out = dedupe_examples([a, b, c])
+    assert out == [a, c]  # first kept, order preserved
+
+
+# ---------------------------------------------------------------------------
+# Task 13: Curation — split_train_valid
+# ---------------------------------------------------------------------------
+
+
+def test_split_train_valid_ratio_and_determinism():
+    examples = [_ex(f"Q{i}?", f"answer number {i}") for i in range(100)]
+    train1, valid1 = split_train_valid(examples, valid_frac=0.1, seed=42)
+    assert len(valid1) == 10 and len(train1) == 90
+    # No overlap; union is the whole set.
+    assert {id(e) for e in train1}.isdisjoint({id(e) for e in valid1})
+    assert len(train1) + len(valid1) == 100
+    # Deterministic for a fixed seed.
+    train2, valid2 = split_train_valid(examples, valid_frac=0.1, seed=42)
+    assert [e.user for e in valid1] == [e.user for e in valid2]
+
+
+def test_split_train_valid_guarantees_at_least_one_valid():
+    examples = [_ex("Q?", "a real answer here")]
+    train, valid = split_train_valid(examples, valid_frac=0.1, seed=0)
+    assert len(valid) == 1 and len(train) == 0
+
+
+# ---------------------------------------------------------------------------
+# Task 14: CLI wiring + end-to-end test
+# ---------------------------------------------------------------------------
+
+
+def test_run_pipeline_end_to_end(tmp_path):
+    # Minimal fixture repo.
+    repo = tmp_path / "repo"
+    (repo / "olmlx").mkdir(parents=True)
+    (repo / "olmlx" / "m.py").write_text('def f():\n    """doc."""\n    return 1\n')
+    (repo / "CLAUDE.md").write_text(
+        "## Non-Obvious Invariants\n\n**Inv one** — a real rule about streams.\n"
+    )
+    out_dir = tmp_path / "out"
+
+    # Use a call-varying generator so each unit produces distinct (user, assistant)
+    # pairs that survive dedup and both reach the train/valid split.
+    class _VaryingGenerator:
+        def __init__(self):
+            self.calls = 0
+
+        def generate(self, system: str, user: str) -> str:
+            self.calls += 1
+            return (
+                f'{{"pairs": [{{"instruction": "Explain unit {self.calls} clearly?", '
+                f'"response": "A grounded answer about olmlx unit {self.calls} detail."}}]}}'
+            )
+
+    gen = _VaryingGenerator()
+    stats = run_pipeline(
+        repo_root=repo,
+        out_dir=out_dir,
+        generator=gen,
+        n_per_unit=1,
+        valid_frac=0.5,
+        seed=7,
+    )
+
+    # Artifacts written in mlx-lm chat format.
+    train = read_jsonl(out_dir / "train.jsonl")
+    valid = read_jsonl(out_dir / "valid.jsonl")
+    assert train and valid
+    assert set(train[0].keys()) == {"messages"}
+    roles = [m["role"] for m in train[0]["messages"]]
+    assert roles == ["user", "assistant"]
+
+    # Stats report generated-vs-kept (no silent truncation).
+    assert stats["units"] >= 2  # function + invariant
+    assert stats["generated"] >= 2
+    assert stats["kept"] == stats["train"] + stats["valid"]
+    assert stats["train"] == len(train) and stats["valid"] == len(valid)
