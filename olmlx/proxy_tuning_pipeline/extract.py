@@ -41,7 +41,7 @@ def extract_functions(root: str | Path) -> Iterator[ExtractionUnit]:
     root = Path(root)
     for path in _iter_py_files(root):
         try:
-            text = path.read_text()
+            text = path.read_text(encoding="utf-8", errors="replace")
             tree = ast.parse(text)
         except (SyntaxError, UnicodeDecodeError):
             continue
@@ -118,7 +118,7 @@ def extract_tests(tests_dir: str | Path) -> Iterator[ExtractionUnit]:
         if "__pycache__" in path.parts:
             continue
         try:
-            text = path.read_text()
+            text = path.read_text(encoding="utf-8", errors="replace")
             tree = ast.parse(text)
         except (SyntaxError, UnicodeDecodeError):
             continue

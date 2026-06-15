@@ -8,6 +8,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 from pathlib import Path
 from typing import Any
@@ -31,6 +32,39 @@ from olmlx.proxy_tuning_pipeline.schema import write_jsonl
 logger = logging.getLogger(__name__)
 
 
+def _guard_checkpoint_config(
+    out_dir: Path, raw_path: Path, repo_root: str | Path, n_per_unit: int
+) -> None:
+    """Refuse to mix a checkpoint built for a different repo/config into a run.
+
+    Resuming ``raw.jsonl`` only makes sense for the same repo + ``n_per_unit``;
+    reusing an ``--out`` across a different repo or config would silently pollute
+    the dataset (aider review). Records the config in a ``raw.meta.json`` sidecar
+    and refuses on mismatch. Backward-compatible: a pre-existing ``raw.jsonl``
+    with no sidecar (e.g. from an in-flight run started by older code) is adopted
+    with a warning so it can still be resumed.
+    """
+    meta_path = out_dir / "raw.meta.json"
+    current = {"repo_root": str(Path(repo_root).resolve()), "n_per_unit": n_per_unit}
+    if raw_path.exists() and meta_path.exists():
+        prev = json.loads(meta_path.read_text())
+        if prev != current:
+            raise ValueError(
+                f"{raw_path} was built for a different config ({prev}) than this "
+                f"run ({current}). Use a fresh --out, or delete {raw_path} and "
+                f"{meta_path} to start over."
+            )
+    elif raw_path.exists():
+        logger.warning(
+            "%s has no recorded config; assuming it matches this run (%s). "
+            "Delete it if this is a different repo/config.",
+            raw_path,
+            current,
+        )
+    out_dir.mkdir(parents=True, exist_ok=True)
+    meta_path.write_text(json.dumps(current))
+
+
 def run_pipeline(
     repo_root: str | Path,
     out_dir: str | Path,
@@ -52,6 +86,8 @@ def run_pipeline(
     """
     out_dir = Path(out_dir)
     raw_path = out_dir / "raw.jsonl"
+    _guard_checkpoint_config(out_dir, raw_path, repo_root, n_per_unit)
+
     units = extract_repo(repo_root)
     logger.info("extracted %d units", len(units))
     if limit_units is not None:

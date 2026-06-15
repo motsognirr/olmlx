@@ -53,17 +53,30 @@ def _extract_json_object(text: str) -> str | None:
     """Return the first balanced ``{...}`` span, or None.
 
     A greedy ``\\{.*\\}`` regex over-grabs when the model wraps the JSON in
-    prose or emits a second object — it would span to the *last* ``}`` and
-    fail to parse, silently dropping good data. Walk braces instead so prose
-    and nested braces in values are handled correctly.
+    prose or emits a second object. Walk braces instead — and track JSON
+    string/escape state so a literal ``{`` or ``}`` *inside a quoted value*
+    (very common here: the responses contain olmlx code snippets) doesn't
+    miscount the depth and drop otherwise-valid data.
     """
     start = text.find("{")
     if start == -1:
         return None
     depth = 0
+    in_str = False
+    escaped = False
     for i in range(start, len(text)):
         ch = text[i]
-        if ch == "{":
+        if in_str:
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == '"':
+                in_str = False
+            continue
+        if ch == '"':
+            in_str = True
+        elif ch == "{":
             depth += 1
         elif ch == "}":
             depth -= 1

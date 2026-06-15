@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import subprocess
 
+import pytest
+
 from olmlx.proxy_tuning_pipeline.cli import run_pipeline
 from olmlx.proxy_tuning_pipeline.curate import (
     dedupe_examples,
@@ -684,3 +686,62 @@ def test_load_done_provenances_missing_file_is_empty(tmp_path):
 def test_openai_generator_default_max_retries():
     gen = OpenAIGenerator(client=object())
     assert gen._max_retries == 6
+
+
+def test_parse_pairs_handles_braces_inside_string_values():
+    # olmlx responses contain code with { } — the string-aware walker must not
+    # miscount depth on braces inside quoted values.
+    text = (
+        '{"pairs": [{"instruction": "Show the dict literal?", '
+        '"response": "Use `cfg = {\\"a\\": 1}` and close with }."}]}'
+    )
+    out = parse_pairs(text)
+    assert len(out) == 1
+    assert out[0][0] == "Show the dict literal?"
+    assert "{" in out[0][1] and "}" in out[0][1]
+
+
+def test_run_pipeline_refuses_mismatched_checkpoint_config(tmp_path):
+    repo = tmp_path / "repo"
+    (repo / "olmlx").mkdir(parents=True)
+    (repo / "olmlx" / "m.py").write_text("def f():\n    return 1\n")
+    out_dir = tmp_path / "out"
+
+    class _G:
+        def generate(self, system: str, user: str) -> str:
+            return '{"pairs": [{"instruction": "Q here?", "response": "A here long enough."}]}'
+
+    # First run records n_per_unit=1.
+    run_pipeline(
+        repo, out_dir, _G(), n_per_unit=1, valid_frac=0.5, seed=0, concurrency=1
+    )
+    # Reusing the same out_dir with a different n_per_unit must refuse.
+    with pytest.raises(ValueError, match="different config"):
+        run_pipeline(
+            repo, out_dir, _G(), n_per_unit=4, valid_frac=0.5, seed=0, concurrency=1
+        )
+
+
+def test_run_pipeline_adopts_legacy_raw_without_meta(tmp_path):
+    # A raw.jsonl from an older run (no raw.meta.json) must be resumable, not refused.
+    repo = tmp_path / "repo"
+    (repo / "olmlx").mkdir(parents=True)
+    (repo / "olmlx" / "m.py").write_text("def f():\n    return 1\n")
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    # Pre-seed a legacy checkpoint with no meta sidecar.
+    (out_dir / "raw.jsonl").write_text(
+        '{"kind": "function", "provenance": "olmlx/m.py:1", '
+        '"user": "Q?", "assistant": "A long enough answer here."}\n'
+    )
+
+    class _G:
+        def generate(self, system: str, user: str) -> str:
+            return '{"pairs": [{"instruction": "New Q?", "response": "New answer long enough."}]}'
+
+    stats = run_pipeline(
+        repo, out_dir, _G(), n_per_unit=1, valid_frac=0.5, seed=0, concurrency=1
+    )
+    # Did not raise; the legacy example is included and a meta sidecar now exists.
+    assert stats["generated"] >= 1
+    assert (out_dir / "raw.meta.json").exists()
