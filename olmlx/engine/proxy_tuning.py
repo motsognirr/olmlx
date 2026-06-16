@@ -17,10 +17,16 @@ plumbing (lifecycle, stream bridge, dispatch); the algorithm is its own.
 
 Hard constraint: all three models must share one exact tokenizer / vocabulary.
 
-v1 targets **dense** model families only (Qwen2.5/Qwen3 dense, Llama 3.x).
-Hybrid linear-attention / GDN families are out of scope — this decoder installs
-no ``GDNStateCapture`` and runs every forward on the default stream (the same
-stream the speculative path decodes on).
+Supports **dense and hybrid GatedDeltaNet (linear-attention) / MoE** bases
+(Qwen2.5/Qwen3 dense, Qwen3-Next/Qwen3.5 hybrid, Llama 3.x). Unlike the
+speculative decoders, proxy-tuning needs **no** ``GDNStateCapture``: that
+machinery exists only to roll back rejected draft tokens, and proxy-tuning
+never speculates (no draft -> verify -> accept, no cache trimming — every model
+advances one token per step over the same committed sequence). Per-token
+forward + ``make_prompt_cache`` maintains GDN recurrent state correctly, and
+everything runs on the default stream, so the GDN cross-stream hazard does not
+apply. MoE routing is internal to the forward; only final-position logits are
+used. All three models must still share one exact tokenizer/vocabulary.
 """
 
 from __future__ import annotations
@@ -121,8 +127,10 @@ class ProxyTuningDecoder(SpecDecoderBase):
     committed token sequence, so the caches stay aligned with no trimming.
 
     Installs **no** layer hooks, **no** draft bind, and **no** GDN capture
-    (dense-only v1), so the base-class ``reset()`` teardown is effectively a
-    no-op beyond clearing the caches in :meth:`_reset_state`.
+    (proxy-tuning never rejects tokens, so rollback capture is unneeded — this
+    is why hybrid GDN/MoE bases work without it), so the base-class ``reset()``
+    teardown is effectively a no-op beyond clearing the caches in
+    :meth:`_reset_state`.
 
     Implements the speculative decoder protocol (``prefill() -> int``,
     ``step() -> (list[int], int)``) so it slots into ``speculative_stream``
