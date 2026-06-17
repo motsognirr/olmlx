@@ -29,9 +29,22 @@ def _load_config_vocab_size(path: str) -> int:
     proxy-tuning's per-token logit arithmetic needs to line up across M/M-/M+ —
     distinct from ``len(tokenizer.get_vocab())`` (Qwen3 = 151669, the count of
     actual token entries).
+
+    Hybrid/VLM-style configs (e.g. ``qwen3_5``, ``qwen3_next``) nest
+    ``vocab_size`` under ``text_config`` and leave the top level unset, so fall
+    back there before failing.
     """
     with open(os.path.join(path, "config.json")) as f:
-        return int(json.load(f)["vocab_size"])
+        config = json.load(f)
+    vocab_size = config.get("vocab_size")
+    if vocab_size is None:
+        vocab_size = config.get("text_config", {}).get("vocab_size")
+    if vocab_size is None:
+        raise ValueError(
+            f"config.json at {path} has no vocab_size (checked top level and "
+            f"text_config) — cannot verify the proxy-tuning pair's logits width."
+        )
+    return int(vocab_size)
 
 
 def assert_serveable_pair(

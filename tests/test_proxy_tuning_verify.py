@@ -2,9 +2,33 @@
 
 from __future__ import annotations
 
+import json
+
 import pytest
 
-from olmlx.proxy_tuning_pipeline.verify import assert_serveable_pair
+from olmlx.proxy_tuning_pipeline.verify import (
+    _load_config_vocab_size,
+    assert_serveable_pair,
+)
+
+
+def test_load_config_vocab_size_top_level(tmp_path):
+    (tmp_path / "config.json").write_text(json.dumps({"vocab_size": 151936}))
+    assert _load_config_vocab_size(str(tmp_path)) == 151936
+
+
+def test_load_config_vocab_size_nested_text_config(tmp_path):
+    # qwen3_5 / qwen3_next nest vocab_size under text_config (top level unset).
+    (tmp_path / "config.json").write_text(
+        json.dumps({"model_type": "qwen3_5", "text_config": {"vocab_size": 248320}})
+    )
+    assert _load_config_vocab_size(str(tmp_path)) == 248320
+
+
+def test_load_config_vocab_size_missing_raises(tmp_path):
+    (tmp_path / "config.json").write_text(json.dumps({"model_type": "weird"}))
+    with pytest.raises(ValueError, match="vocab_size"):
+        _load_config_vocab_size(str(tmp_path))
 
 
 class _FakeTokenizer:
