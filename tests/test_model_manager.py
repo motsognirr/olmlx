@@ -1024,6 +1024,104 @@ class TestDetectModelKind:
             kind = manager._detect_model_kind("test/model")
         assert kind == "text"
 
+    def test_gemma4_unified_text_routes_to_text(self, registry, mock_store):
+        """mlx-community 'gemma4_unified' text checkpoints (e.g.
+        gemma-4-12B-it-4bit) route to the mlx-lm text path (language tower
+        only); their multimodal weight layout (vision_embedder.*) loads in
+        neither mlx-lm's gemma4_text nor mlx-vlm 0.4.4's gemma4.  Detection must
+        NOT rewrite config.json on disk — the earlier approach corrupted the
+        shared store copy.
+        """
+        local_dir = mock_store.local_path("mlx-community/gemma-4-12B-it-4bit")
+        local_dir.mkdir(parents=True)
+        config = {
+            "model_type": "gemma4_unified",
+            "architectures": ["Gemma4UnifiedForConditionalGeneration"],
+            "text_config": {"model_type": "gemma4_unified_text"},
+            "vision_config": {"model_type": "gemma4_unified_vision"},
+            "audio_config": {"model_type": "gemma4_unified_audio"},
+        }
+        cfg_path = local_dir / "config.json"
+        original = json.dumps(config)
+        cfg_path.write_text(original)
+
+        manager = self._make_manager(registry, mock_store)
+        kind = manager._detect_model_kind("mlx-community/gemma-4-12B-it-4bit")
+
+        assert kind == "text"
+        # config.json must be byte-for-byte untouched on disk.
+        assert cfg_path.read_text() == original
+        assert json.loads(cfg_path.read_text())["model_type"] == "gemma4_unified"
+
+    def test_standard_gemma4_vlm_unaffected(self, tmp_path, registry, mock_store):
+        """Standard 'gemma4' checkpoints (e4b/31b) keep their VLM routing."""
+        config_path = self._make_config(
+            tmp_path,
+            {"model_type": "gemma4", "vision_config": {"hidden_size": 1024}},
+        )
+        manager = self._make_manager(registry, mock_store)
+        with patch("huggingface_hub.hf_hub_download", return_value=config_path):
+            kind = manager._detect_model_kind("test/gemma4")
+        assert kind == "vlm"
+
+
+class TestGemma4UnifiedTextLoader:
+    """Dispatch logic for loading the language tower of 'gemma4_unified'
+    checkpoints (the heavy weight load itself is covered by the live test).
+    """
+
+    def _write_config(self, d, cfg):
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "config.json").write_text(json.dumps(cfg))
+
+    def test_dispatch_missing_config(self, tmp_path):
+        from olmlx.engine.model_manager import _maybe_load_gemma4_unified_text
+
+        assert _maybe_load_gemma4_unified_text(str(tmp_path)) is None
+
+    def test_dispatch_skips_non_unified(self, tmp_path):
+        from olmlx.engine.model_manager import _maybe_load_gemma4_unified_text
+
+        self._write_config(tmp_path, {"model_type": "gemma4", "vision_config": {}})
+        assert _maybe_load_gemma4_unified_text(str(tmp_path)) is None
+
+    def test_dispatch_skips_unified_non_text(self, tmp_path):
+        from olmlx.engine.model_manager import _maybe_load_gemma4_unified_text
+
+        self._write_config(
+            tmp_path,
+            {
+                "model_type": "gemma4_unified",
+                "text_config": {"model_type": "something_else"},
+            },
+        )
+        assert _maybe_load_gemma4_unified_text(str(tmp_path)) is None
+
+    def test_dispatch_invokes_loader_for_unified_text(self, tmp_path, monkeypatch):
+        import olmlx.engine.model_manager as mm
+
+        self._write_config(
+            tmp_path,
+            {
+                "model_type": "gemma4_unified",
+                "text_config": {"model_type": "gemma4_unified_text"},
+            },
+        )
+        sentinel = (object(), object())
+        called = {}
+
+        def fake_loader(load_path, cfg):
+            called["load_path"] = load_path
+            called["cfg"] = cfg
+            return sentinel
+
+        monkeypatch.setattr(mm, "_load_gemma4_unified_text", fake_loader)
+        result = mm._maybe_load_gemma4_unified_text(str(tmp_path))
+
+        assert result is sentinel
+        assert called["load_path"] == str(tmp_path)
+        assert called["cfg"]["model_type"] == "gemma4_unified"
+
 
 class TestProbeCacheCapabilities:
     """Exercise _probe_cache_capabilities, including the probe-failure path
