@@ -337,6 +337,9 @@ class TestThinkingTrackerGemma4:
         think, visible, started, ended = self._drain(t, chunks)
         assert think == "reasoning"
         assert visible == "visible"
+        # Event flags must fire correctly even when the delimiters straddle
+        # chunk boundaries.
+        assert started and ended
 
     def test_gemma4_tool_call_suppressed_from_visible(self):
         t = ThinkingTracker()
@@ -373,3 +376,32 @@ class TestThinkingTrackerGemma4:
         t.strip_on_repetition()
         assert "<|channel>thought" not in t.accumulated
         assert not t.in_thinking
+
+    def test_flush_implicit_thinking_no_close_routes_to_thinking(self):
+        # thinking expected (implicit), buffered content, never a close tag →
+        # flushed as thinking (the old implicit-mode contract).
+        t = ThinkingTracker(template_has_thinking=True)
+        td, vd, _te, _ts = t.feed("Still thinking")
+        assert td is None and vd is None  # held in the detect buffer
+        think_delta, visible_delta, started = t.flush()
+        assert think_delta == "Still thinking"
+        assert visible_delta is None
+        assert started and t.in_thinking
+
+    def test_flush_plain_content_routes_to_visible(self):
+        # No thinking expected → plain content streams during feed; flush adds
+        # nothing.
+        t = ThinkingTracker()
+        td, vd, _te, _ts = t.feed("plain answer")
+        assert vd == "plain answer"
+        assert t.flush() == (None, None, False)
+
+    def test_flush_disabled_surfaces_buffer_as_visible(self):
+        # Thinking disabled + implicit + no close → the buffered (would-be
+        # thinking) content is surfaced as visible, never as thinking.
+        t = ThinkingTracker(thinking_disabled=True, template_has_thinking=True)
+        t.feed("buffered content")
+        think_delta, visible_delta, started = t.flush()
+        assert think_delta is None
+        assert visible_delta == "buffered content"
+        assert not started

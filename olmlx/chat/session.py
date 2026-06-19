@@ -419,10 +419,12 @@ class ThinkingTracker:
             self._think_emitted += len(think_text)
             think_delta = think_text
 
+        # ``flush_split_thinking`` only yields content in the ``detect``/
+        # ``passthrough`` phases, both of which leave ``_in_thinking`` False —
+        # so flush returns thinking XOR visible, never a think→visible
+        # transition needing a ``thinking_end`` between them.
         visible_delta: str | None = None
         if content_buf:
-            if self._in_thinking:
-                self._in_thinking = False
             visible = (
                 self._tool_stripper.feed(content_buf) + self._tool_stripper.flush()
             )
