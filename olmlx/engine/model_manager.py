@@ -194,7 +194,10 @@ def _load_with_model_type_fallback(mlx_lm, load_path, **kwargs):
     """
     # mlx-community 'gemma4_unified' text checkpoints (e.g. gemma-4-12B-it-4bit)
     # need a dedicated loader: their model_type has no mlx-lm module and their
-    # multimodal weights must be dropped to load the language tower.
+    # multimodal weights must be dropped to load the language tower. The loader
+    # materializes weights eagerly and ignores kwargs like ``lazy`` — these
+    # checkpoints are dense text towers, so the lazy flash-MoE caller never
+    # routes here.
     gemma4_unified = _maybe_load_gemma4_unified_text(str(load_path))
     if gemma4_unified is not None:
         return gemma4_unified
