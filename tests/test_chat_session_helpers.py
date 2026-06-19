@@ -12,6 +12,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 from olmlx.chat.config import ChatConfig
 from olmlx.chat.session import (
     ChatSession,
+    ThinkingTracker,
     _parse_turn_output,
     _ToolMarkupStripper,
     _longest_partial_tag_suffix,
@@ -306,3 +307,69 @@ class TestToolMarkupStripper:
         )
         assert out == "beforemidafter"
         assert s.flush() == ""
+
+
+class TestThinkingTrackerGemma4:
+    def _drain(self, tracker, chunks):
+        think, visible = [], []
+        started = ended = False
+        for c in chunks:
+            td, vd, te, ts = tracker.feed(c)
+            if td:
+                think.append(td)
+            if vd:
+                visible.append(vd)
+            started = started or ts
+            ended = ended or te
+        return "".join(think), "".join(visible), started, ended
+
+    def test_gemma4_channel_split_single_chunk(self):
+        t = ThinkingTracker()
+        raw = "<|channel>thought\nreasoning here<channel|>The answer is 4."
+        think, visible, started, ended = self._drain(t, [raw])
+        assert think == "reasoning here"
+        assert visible == "The answer is 4."
+        assert started and ended
+
+    def test_gemma4_channel_split_across_chunks(self):
+        t = ThinkingTracker()
+        chunks = ["<|channel>thought\nrea", "soning<chan", "nel|>visible"]
+        think, visible, started, ended = self._drain(t, chunks)
+        assert think == "reasoning"
+        assert visible == "visible"
+
+    def test_gemma4_tool_call_suppressed_from_visible(self):
+        t = ThinkingTracker()
+        raw = (
+            "<|channel>thought\nI will call it.<channel|>"
+            '<|tool_call>call:get_weather{city:<|"|>Paris<|"|>}<tool_call|>'
+        )
+        think, visible, _, _ = self._drain(t, [raw])
+        assert think == "I will call it."
+        assert visible == ""
+        # Raw markup is preserved for the turn-end parse.
+        assert "<|tool_call>" in t.accumulated
+        assert "<|channel>thought" in t.accumulated
+
+    def test_accumulated_is_raw(self):
+        t = ThinkingTracker()
+        chunks = ["<|channel>thought\nx<channel|>", "<|tool_call>call:f{}<tool_call|>"]
+        for c in chunks:
+            t.feed(c)
+        assert t.accumulated == "".join(chunks)
+
+    def test_gemma4_thinking_disabled_strips_channel(self):
+        t = ThinkingTracker(thinking_disabled=True)
+        raw = "<|channel>thought\nhidden reasoning<channel|>visible answer"
+        think, visible, started, ended = self._drain(t, [raw])
+        assert think == ""
+        assert visible == "visible answer"
+        assert not started
+
+    def test_gemma4_repetition_strip_truncates_at_channel(self):
+        t = ThinkingTracker()
+        t.feed("<|channel>thought\nlooping looping looping")
+        assert t.in_thinking
+        t.strip_on_repetition()
+        assert "<|channel>thought" not in t.accumulated
+        assert not t.in_thinking
