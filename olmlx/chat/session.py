@@ -73,6 +73,74 @@ _THINK_CLOSE = "</think>"
 _THINK_BLOCK_RE = re.compile(r"<think>.*?</think>", re.DOTALL)
 _THINK_CONTENT_RE = re.compile(r"<think>(.*?)</think>", re.DOTALL)
 
+# Gemma-4 native tool-call markup (plain text, not special tokens). Display
+# is suppressed during streaming; the raw markup stays in the tracker's
+# accumulated text so parse_model_output still extracts the call at turn end.
+_TOOL_CALL_OPEN = "<|tool_call>"
+_TOOL_CALL_CLOSE = "<tool_call|>"
+
+
+def _longest_partial_tag_suffix(buf: str, tag: str) -> int:
+    """Largest ``k`` (``0 < k < len(tag)``) such that ``buf[-k:] == tag[:k]``.
+
+    Used to hold back the trailing bytes of *buf* that might be the start of
+    *tag* straddling a chunk boundary.
+    """
+    for k in range(min(len(tag) - 1, len(buf)), 0, -1):
+        if buf[-k:] == tag[:k]:
+            return k
+    return 0
+
+
+class _ToolMarkupStripper:
+    """Remove ``<|tool_call>…<tool_call|>`` spans from a stream of text.
+
+    Holds partial open/close delimiters across chunk boundaries. Display-only:
+    callers keep the raw text elsewhere for parsing.
+    """
+
+    def __init__(self) -> None:
+        self._buf = ""
+        self._inside = False
+
+    def feed(self, text: str) -> str:
+        self._buf += text
+        out: list[str] = []
+        while self._buf:
+            if not self._inside:
+                idx = self._buf.find(_TOOL_CALL_OPEN)
+                if idx != -1:
+                    out.append(self._buf[:idx])
+                    self._buf = self._buf[idx + len(_TOOL_CALL_OPEN) :]
+                    self._inside = True
+                    continue
+                keep = _longest_partial_tag_suffix(self._buf, _TOOL_CALL_OPEN)
+                out.append(self._buf[: len(self._buf) - keep] if keep else self._buf)
+                self._buf = self._buf[len(self._buf) - keep :] if keep else ""
+                break
+            idx = self._buf.find(_TOOL_CALL_CLOSE)
+            if idx != -1:
+                self._buf = self._buf[idx + len(_TOOL_CALL_CLOSE) :]
+                self._inside = False
+                continue
+            keep = _longest_partial_tag_suffix(self._buf, _TOOL_CALL_CLOSE)
+            self._buf = self._buf[len(self._buf) - keep :] if keep else ""
+            break
+        return "".join(out)
+
+    def flush(self) -> str:
+        """Emit any held-back bytes at stream end.
+
+        A partial open-tag held while *outside* a call was literal text. Bytes
+        held while *inside* an unterminated call are dropped (no close arrived).
+        """
+        if self._inside:
+            self._buf = ""
+            return ""
+        out = self._buf
+        self._buf = ""
+        return out
+
 
 class _TokenEvent(TypedDict):
     type: Literal["token"]

@@ -10,7 +10,12 @@ All tests are hermetic: generate_chat is mocked, no model, no GPU.
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from olmlx.chat.config import ChatConfig
-from olmlx.chat.session import ChatSession, _parse_turn_output
+from olmlx.chat.session import (
+    ChatSession,
+    _parse_turn_output,
+    _ToolMarkupStripper,
+    _longest_partial_tag_suffix,
+)
 from olmlx.engine.template_caps import TemplateCaps
 
 
@@ -230,3 +235,63 @@ class TestStreamOneTurn:
         assert result["repetition_stopped"] is True
         # Incomplete think block stripped from the accumulated text
         assert "<think>" not in result["full_text"]
+
+
+class TestLongestPartialTagSuffix:
+    def test_no_partial(self):
+        assert _longest_partial_tag_suffix("hello", "<|tool_call>") == 0
+
+    def test_full_partial(self):
+        assert _longest_partial_tag_suffix("abc<|to", "<|tool_call>") == 4
+
+    def test_does_not_count_full_tag(self):
+        # A complete tag is not a "partial" — len must be < tag length.
+        assert _longest_partial_tag_suffix("<|tool_call>", "<|tool_call>") < len(
+            "<|tool_call>"
+        )
+
+
+class TestToolMarkupStripper:
+    def test_passes_plain_text(self):
+        s = _ToolMarkupStripper()
+        assert s.feed("hello world") == "hello world"
+        assert s.flush() == ""
+
+    def test_removes_whole_tool_call_in_one_chunk(self):
+        s = _ToolMarkupStripper()
+        out = s.feed("before<|tool_call>call:f{a:1}<tool_call|>after")
+        assert out == "beforeafter"
+        assert s.flush() == ""
+
+    def test_removes_tool_call_split_across_chunks(self):
+        s = _ToolMarkupStripper()
+        out = "".join(
+            [
+                s.feed("vis<|tool_"),
+                s.feed("call>call:f{a:"),
+                s.feed("1}<tool_"),
+                s.feed("call|>tail"),
+            ]
+        )
+        assert out == "vistail"
+        assert s.flush() == ""
+
+    def test_holds_partial_open_then_resolves_as_literal(self):
+        s = _ToolMarkupStripper()
+        # "<|too" looks like a partial open tag, held back...
+        assert s.feed("x<|too") == "x"
+        # ...but the next chunk shows it was literal text.
+        assert s.feed("ls are fun") == "<|tools are fun"
+        assert s.flush() == ""
+
+    def test_flush_emits_held_partial_when_outside(self):
+        s = _ToolMarkupStripper()
+        assert s.feed("done<|tool") == "done"
+        # Stream ended mid partial open-tag; it was literal.
+        assert s.flush() == "<|tool"
+
+    def test_flush_drops_unterminated_tool_call(self):
+        s = _ToolMarkupStripper()
+        assert s.feed("a<|tool_call>call:f{") == "a"
+        # Unterminated tool call (no close) — drop it from display.
+        assert s.flush() == ""
