@@ -396,6 +396,18 @@ class TestThinkingTrackerGemma4:
         assert vd == "plain answer"
         assert t.flush() == (None, None, False)
 
+    def test_flush_emits_stripper_held_partial_open_tag(self):
+        # Visible content ends with bytes that look like a partial
+        # <|tool_call> open tag; the stripper holds them. At stream end, with
+        # no trailing splitter content, flush() must still surface them as
+        # visible rather than dropping them (aider review).
+        t = ThinkingTracker()
+        _td, vd, _te, _ts = t.feed("answer<|too")
+        assert vd == "answer"
+        think_delta, visible_delta, _started = t.flush()
+        assert think_delta is None
+        assert visible_delta == "<|too"
+
     def test_flush_disabled_surfaces_buffer_as_visible(self):
         # Thinking disabled + implicit + no close → the buffered (would-be
         # thinking) content is surfaced as visible, never as thinking.

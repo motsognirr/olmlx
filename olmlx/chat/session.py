@@ -419,18 +419,21 @@ class ThinkingTracker:
             self._think_emitted += len(think_text)
             think_delta = think_text
 
+        # Always flush the tool stripper, even when the splitter left no
+        # content: it may hold a partial ``<|tool_call>`` open-tag from an
+        # earlier streamed fragment that turned out to be literal visible text
+        # (dropping it would lose visible bytes at stream end).
         # ``flush_split_thinking`` only yields content in the ``detect``/
         # ``passthrough`` phases, both of which leave ``_in_thinking`` False —
         # so flush returns thinking XOR visible, never a think→visible
         # transition needing a ``thinking_end`` between them.
+        visible = (
+            self._tool_stripper.feed(content_buf or "") + self._tool_stripper.flush()
+        )
         visible_delta: str | None = None
-        if content_buf:
-            visible = (
-                self._tool_stripper.feed(content_buf) + self._tool_stripper.flush()
-            )
-            if visible:
-                self._visible_emitted += len(visible)
-                visible_delta = visible
+        if visible:
+            self._visible_emitted += len(visible)
+            visible_delta = visible
 
         return think_delta, visible_delta, thinking_started
 

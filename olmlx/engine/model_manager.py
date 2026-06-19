@@ -287,7 +287,9 @@ def _load_gemma4_unified_text(load_path: str, config: dict) -> tuple[Any, Any]:
 
     weights: dict[str, Any] = {}
     for shard in sorted(glob.glob(str(Path(load_path) / "*.safetensors"))):
-        weights.update(mx.load(shard))
+        # mx.load is typed Union[array, dict, tuple]; the dict case is what
+        # safetensors returns. Same suppression as pre_shard.py / flash loaders.
+        weights.update(mx.load(shard))  # pyright: ignore[reportCallIssue]
     # Keep only the language tower; the multimodal weights (vision_embedder,
     # embed_vision, embed_audio) are intentionally dropped for the text path.
     prefix = "language_model."
