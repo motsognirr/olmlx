@@ -111,3 +111,60 @@ def test_load_does_not_mutate_config_on_disk():
     _load_with_model_type_fallback(mlx_lm, str(_model_dir()))
 
     assert config_path.read_text() == before
+
+
+def test_session_tracker_splits_real_gemma4_turn():
+    """Feed a real gemma-4 thinking+tool-call turn through ThinkingTracker and
+    assert the visible channel is free of channel/tool markup while the raw
+    accumulated text still carries the tool call for parsing."""
+    import mlx_lm
+
+    from olmlx.chat.session import ThinkingTracker
+    from olmlx.engine.model_manager import _load_with_model_type_fallback
+    from olmlx.engine.tool_parser import parse_model_output
+
+    model, tokenizer = _load_with_model_type_fallback(mlx_lm, str(_model_dir()))
+    tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": "get_weather",
+                "description": "Get weather for a city",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"city": {"type": "string"}},
+                    "required": ["city"],
+                },
+            },
+        }
+    ]
+    prompt = tokenizer.apply_chat_template(
+        [{"role": "user", "content": "What's the weather in Paris?"}],
+        tools=tools,
+        add_generation_prompt=True,
+        tokenize=False,
+    )
+    raw = mlx_lm.generate(
+        model, tokenizer, prompt=prompt, max_tokens=256, verbose=False
+    )
+
+    tracker = ThinkingTracker(template_has_thinking=True)
+    visible_parts = []
+    # Feed token-by-token to exercise chunk-boundary handling.
+    for ch in raw:
+        _td, vd, _te, _ts = tracker.feed(ch)
+        if vd:
+            visible_parts.append(vd)
+    f_think, f_visible, _started = tracker.flush()
+    if f_visible:
+        visible_parts.append(f_visible)
+    visible = "".join(visible_parts)
+
+    assert "<|channel" not in visible
+    assert "<channel|" not in visible
+    assert "<|tool_call" not in visible
+    # Raw text still parses into a tool call.
+    _thinking, _vis, tool_uses = parse_model_output(
+        tracker.accumulated, has_tools=True, thinking_expected=True
+    )
+    assert tool_uses and tool_uses[0]["name"] == "get_weather"
