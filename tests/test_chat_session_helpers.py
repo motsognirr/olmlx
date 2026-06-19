@@ -245,10 +245,12 @@ class TestLongestPartialTagSuffix:
         assert _longest_partial_tag_suffix("abc<|to", "<|tool_call>") == 4
 
     def test_does_not_count_full_tag(self):
-        # A complete tag is not a "partial" — len must be < tag length.
-        assert _longest_partial_tag_suffix("<|tool_call>", "<|tool_call>") < len(
-            "<|tool_call>"
-        )
+        # A complete tag is not a "partial" — must return exactly 0.
+        assert _longest_partial_tag_suffix("<|tool_call>", "<|tool_call>") == 0
+
+    def test_partial_close_tag(self):
+        assert _longest_partial_tag_suffix("done<tool_", "<tool_call|>") == 6
+        assert _longest_partial_tag_suffix("done", "<tool_call|>") == 0
 
 
 class TestToolMarkupStripper:
@@ -294,4 +296,13 @@ class TestToolMarkupStripper:
         s = _ToolMarkupStripper()
         assert s.feed("a<|tool_call>call:f{") == "a"
         # Unterminated tool call (no close) — drop it from display.
+        assert s.flush() == ""
+
+    def test_removes_two_consecutive_tool_calls(self):
+        s = _ToolMarkupStripper()
+        out = s.feed(
+            "before<|tool_call>call:f1{}<tool_call|>mid"
+            "<|tool_call>call:f2{}<tool_call|>after"
+        )
+        assert out == "beforemidafter"
         assert s.flush() == ""
