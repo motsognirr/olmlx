@@ -192,6 +192,16 @@ def _load_with_model_type_fallback(mlx_lm, load_path, **kwargs):
     So we load the model first with the real config, then patch config.json
     temporarily to load only the tokenizer.
     """
+    # mlx-community 'gemma4_unified' text checkpoints (e.g. gemma-4-12B-it-4bit)
+    # need a dedicated loader: their model_type has no mlx-lm module and their
+    # multimodal weights must be dropped to load the language tower. The loader
+    # materializes weights eagerly and ignores kwargs like ``lazy`` — these
+    # checkpoints are dense text towers, so the lazy flash-MoE caller never
+    # routes here.
+    gemma4_unified = _maybe_load_gemma4_unified_text(str(load_path))
+    if gemma4_unified is not None:
+        return gemma4_unified
+
     _sanitize_model_config_in_place(load_path)
     kwargs.setdefault("tokenizer_config", {"trust_remote_code": True})
     try:
@@ -236,6 +246,108 @@ def _load_with_model_type_fallback(mlx_lm, load_path, **kwargs):
     # trigger the model-type remapping fallback with a misleading error.
     _ensure_tokenizer_eos_in_stops(tokenizer)
     return model, tokenizer
+
+
+def _load_gemma4_unified_text(load_path: str, config: dict) -> tuple[Any, Any]:
+    """Load only the *language tower* of a mlx-community ``gemma4_unified``
+    checkpoint (e.g. ``gemma-4-12B-it-4bit``) via mlx-lm's ``gemma4_text``.
+
+    These repos ship the full multimodal checkpoint under a non-standard
+    ``gemma4_unified`` model_type whose vision tower is stored under a
+    ``vision_embedder.*`` prefix.  That layout matches neither mlx-lm's
+    ``gemma4_text`` module (it wants the language tower under ``model.*``) nor
+    mlx-vlm 0.4.4's ``gemma4`` module (it models the vision tower as
+    ``vision_tower`` + ``embed_vision``, so the 11 ``vision_embedder.*`` params
+    have no home).  For text inference we build ``gemma4_text`` from
+    ``text_config``, load the ``language_model.*`` weights (stripping the
+    prefix), and drop the multimodal weights.  Standard ``gemma4`` checkpoints
+    (e4b/31b) are unaffected and keep their normal mlx-vlm routing.
+    """
+    import glob
+
+    import mlx.core as mx
+    import mlx.nn as nn
+    import mlx_lm
+    from mlx_lm.models import gemma4_text
+
+    text_cfg = dict(config.get("text_config", {}))
+    # gemma4_text's own module_type; the checkpoint carries
+    # "gemma4_unified_text" which the mlx-lm ModelArgs doesn't recognise.
+    text_cfg["model_type"] = "gemma4_text"
+    args = gemma4_text.ModelArgs.from_dict(text_cfg)
+    model = gemma4_text.Model(args)
+
+    quant = config.get("quantization") or config.get("quantization_config")
+    if quant:
+        nn.quantize(
+            model,
+            group_size=quant.get("group_size", 64),
+            bits=quant.get("bits", 4),
+        )
+
+    weights: dict[str, Any] = {}
+    for shard in sorted(glob.glob(str(Path(load_path) / "*.safetensors"))):
+        # mx.load is typed Union[array, dict, tuple]; the dict case is what
+        # safetensors returns. Same suppression as pre_shard.py / flash loaders.
+        weights.update(mx.load(shard))  # pyright: ignore[reportCallIssue]
+    # Keep only the language tower; the multimodal weights (vision_embedder,
+    # embed_vision, embed_audio) are intentionally dropped for the text path.
+    prefix = "language_model."
+    lang_weights = {
+        k[len(prefix) :]: v for k, v in weights.items() if k.startswith(prefix)
+    }
+    if not lang_weights:
+        raise ValueError(
+            f"gemma4_unified checkpoint at {load_path} has no "
+            f"'{prefix}*' weights; cannot load the language tower."
+        )
+    lang_weights = model.sanitize(lang_weights)
+    model.load_weights(list(lang_weights.items()), strict=True)
+    mx.eval(model.parameters())
+
+    # Thread the full eos_token_id list into the tokenizer's stop set.  Gemma 4
+    # terminates turns with ``<turn|>`` (id 106) and pauses for tool results at
+    # ``<|tool_response>`` (id 50) — both are stop tokens alongside ``<eos>``
+    # (id 1).  Without them generation runs past every turn/tool boundary and
+    # degenerates into a repetition loop.  generation_config.json wins over
+    # config.json (mirrors mlx-lm's load_config precedence).
+    eos_token_ids = config.get("eos_token_id")
+    gen_config_file = Path(load_path) / "generation_config.json"
+    if gen_config_file.exists():
+        try:
+            gen_config = json.loads(gen_config_file.read_text())
+        except (OSError, ValueError):
+            gen_config = {}
+        if gen_config.get("eos_token_id") is not None:
+            eos_token_ids = gen_config["eos_token_id"]
+
+    tokenizer = mlx_lm.utils.load_tokenizer(
+        Path(load_path),
+        {"trust_remote_code": True},
+        eos_token_ids=eos_token_ids,
+    )
+    _ensure_tokenizer_eos_in_stops(tokenizer)
+    return model, tokenizer
+
+
+def _maybe_load_gemma4_unified_text(load_path: str) -> tuple[Any, Any] | None:
+    """Return ``(model, tokenizer)`` for a text-routable ``gemma4_unified``
+    checkpoint, or ``None`` if this isn't one (so callers fall through to the
+    normal mlx-lm load).  Reads config.json only — never mutates it.
+    """
+    config_file = Path(load_path) / "config.json"
+    if not config_file.exists():
+        return None
+    try:
+        config = json.loads(config_file.read_text())
+    except (OSError, ValueError):
+        return None
+    if config.get("model_type", "").lower() != "gemma4_unified":
+        return None
+    text_model_type = config.get("text_config", {}).get("model_type", "").lower()
+    if text_model_type != "gemma4_unified_text":
+        return None
+    return _load_gemma4_unified_text(load_path, config)
 
 
 def _is_serializable_cache(cache: list) -> bool:
@@ -1776,6 +1888,22 @@ class ModelManager(SpeculativeLoaderMixin):
                 return "unknown"
 
         model_type = config.get("model_type", "").lower()
+
+        # mlx-community ships some Gemma 4 checkpoints (e.g. gemma-4-12B-it-4bit)
+        # under a non-standard 'gemma4_unified' model_type whose multimodal
+        # weight layout (vision_embedder.*) loads in neither mlx-lm's
+        # gemma4_text nor mlx-vlm 0.4.4's gemma4 module.  The language tower
+        # (language_model.*) loads cleanly via mlx-lm's gemma4_text, so route
+        # to the text path (_load_with_model_type_fallback dispatches to
+        # _load_gemma4_unified_text).  Standard 'gemma4' checkpoints (e4b/31b)
+        # don't carry this model_type and keep their normal VLM routing.
+        # NOTE: in-memory inspection only — never rewrite config.json on disk.
+        if model_type == "gemma4_unified":
+            text_model_type = (
+                config.get("text_config", {}).get("model_type", "").lower()
+            )
+            if text_model_type == "gemma4_unified_text":
+                return "text"
 
         # Whisper STT (issue #366). Check before the empty-model_type return:
         # mlx-community whisper repos ship a non-HF config.json carrying

@@ -10,7 +10,13 @@ All tests are hermetic: generate_chat is mocked, no model, no GPU.
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from olmlx.chat.config import ChatConfig
-from olmlx.chat.session import ChatSession, _parse_turn_output
+from olmlx.chat.session import (
+    ChatSession,
+    ThinkingTracker,
+    _parse_turn_output,
+    _ToolMarkupStripper,
+    _longest_partial_tag_suffix,
+)
 from olmlx.engine.template_caps import TemplateCaps
 
 
@@ -230,3 +236,184 @@ class TestStreamOneTurn:
         assert result["repetition_stopped"] is True
         # Incomplete think block stripped from the accumulated text
         assert "<think>" not in result["full_text"]
+
+
+class TestLongestPartialTagSuffix:
+    def test_no_partial(self):
+        assert _longest_partial_tag_suffix("hello", "<|tool_call>") == 0
+
+    def test_full_partial(self):
+        assert _longest_partial_tag_suffix("abc<|to", "<|tool_call>") == 4
+
+    def test_does_not_count_full_tag(self):
+        # A complete tag is not a "partial" — must return exactly 0.
+        assert _longest_partial_tag_suffix("<|tool_call>", "<|tool_call>") == 0
+
+    def test_partial_close_tag(self):
+        assert _longest_partial_tag_suffix("done<tool_", "<tool_call|>") == 6
+        assert _longest_partial_tag_suffix("done", "<tool_call|>") == 0
+
+
+class TestToolMarkupStripper:
+    def test_passes_plain_text(self):
+        s = _ToolMarkupStripper()
+        assert s.feed("hello world") == "hello world"
+        assert s.flush() == ""
+
+    def test_removes_whole_tool_call_in_one_chunk(self):
+        s = _ToolMarkupStripper()
+        out = s.feed("before<|tool_call>call:f{a:1}<tool_call|>after")
+        assert out == "beforeafter"
+        assert s.flush() == ""
+
+    def test_removes_tool_call_split_across_chunks(self):
+        s = _ToolMarkupStripper()
+        out = "".join(
+            [
+                s.feed("vis<|tool_"),
+                s.feed("call>call:f{a:"),
+                s.feed("1}<tool_"),
+                s.feed("call|>tail"),
+            ]
+        )
+        assert out == "vistail"
+        assert s.flush() == ""
+
+    def test_holds_partial_open_then_resolves_as_literal(self):
+        s = _ToolMarkupStripper()
+        # "<|too" looks like a partial open tag, held back...
+        assert s.feed("x<|too") == "x"
+        # ...but the next chunk shows it was literal text.
+        assert s.feed("ls are fun") == "<|tools are fun"
+        assert s.flush() == ""
+
+    def test_flush_emits_held_partial_when_outside(self):
+        s = _ToolMarkupStripper()
+        assert s.feed("done<|tool") == "done"
+        # Stream ended mid partial open-tag; it was literal.
+        assert s.flush() == "<|tool"
+
+    def test_flush_drops_unterminated_tool_call(self):
+        s = _ToolMarkupStripper()
+        assert s.feed("a<|tool_call>call:f{") == "a"
+        # Unterminated tool call (no close) — drop it from display.
+        assert s.flush() == ""
+
+    def test_removes_two_consecutive_tool_calls(self):
+        s = _ToolMarkupStripper()
+        out = s.feed(
+            "before<|tool_call>call:f1{}<tool_call|>mid"
+            "<|tool_call>call:f2{}<tool_call|>after"
+        )
+        assert out == "beforemidafter"
+        assert s.flush() == ""
+
+
+class TestThinkingTrackerGemma4:
+    def _drain(self, tracker, chunks):
+        think, visible = [], []
+        started = ended = False
+        for c in chunks:
+            td, vd, te, ts = tracker.feed(c)
+            if td:
+                think.append(td)
+            if vd:
+                visible.append(vd)
+            started = started or ts
+            ended = ended or te
+        return "".join(think), "".join(visible), started, ended
+
+    def test_gemma4_channel_split_single_chunk(self):
+        t = ThinkingTracker()
+        raw = "<|channel>thought\nreasoning here<channel|>The answer is 4."
+        think, visible, started, ended = self._drain(t, [raw])
+        assert think == "reasoning here"
+        assert visible == "The answer is 4."
+        assert started and ended
+
+    def test_gemma4_channel_split_across_chunks(self):
+        t = ThinkingTracker()
+        chunks = ["<|channel>thought\nrea", "soning<chan", "nel|>visible"]
+        think, visible, started, ended = self._drain(t, chunks)
+        assert think == "reasoning"
+        assert visible == "visible"
+        # Event flags must fire correctly even when the delimiters straddle
+        # chunk boundaries.
+        assert started and ended
+
+    def test_gemma4_tool_call_suppressed_from_visible(self):
+        t = ThinkingTracker()
+        raw = (
+            "<|channel>thought\nI will call it.<channel|>"
+            '<|tool_call>call:get_weather{city:<|"|>Paris<|"|>}<tool_call|>'
+        )
+        think, visible, _, _ = self._drain(t, [raw])
+        assert think == "I will call it."
+        assert visible == ""
+        # Raw markup is preserved for the turn-end parse.
+        assert "<|tool_call>" in t.accumulated
+        assert "<|channel>thought" in t.accumulated
+
+    def test_accumulated_is_raw(self):
+        t = ThinkingTracker()
+        chunks = ["<|channel>thought\nx<channel|>", "<|tool_call>call:f{}<tool_call|>"]
+        for c in chunks:
+            t.feed(c)
+        assert t.accumulated == "".join(chunks)
+
+    def test_gemma4_thinking_disabled_strips_channel(self):
+        t = ThinkingTracker(thinking_disabled=True)
+        raw = "<|channel>thought\nhidden reasoning<channel|>visible answer"
+        think, visible, started, ended = self._drain(t, [raw])
+        assert think == ""
+        assert visible == "visible answer"
+        assert not started
+
+    def test_gemma4_repetition_strip_truncates_at_channel(self):
+        t = ThinkingTracker()
+        t.feed("<|channel>thought\nlooping looping looping")
+        assert t.in_thinking
+        t.strip_on_repetition()
+        assert "<|channel>thought" not in t.accumulated
+        assert not t.in_thinking
+
+    def test_flush_implicit_thinking_no_close_routes_to_thinking(self):
+        # thinking expected (implicit), buffered content, never a close tag →
+        # flushed as thinking (the old implicit-mode contract).
+        t = ThinkingTracker(template_has_thinking=True)
+        td, vd, _te, _ts = t.feed("Still thinking")
+        assert td is None and vd is None  # held in the detect buffer
+        think_delta, visible_delta, started = t.flush()
+        assert think_delta == "Still thinking"
+        assert visible_delta is None
+        assert started and t.in_thinking
+
+    def test_flush_plain_content_routes_to_visible(self):
+        # No thinking expected → plain content streams during feed; flush adds
+        # nothing.
+        t = ThinkingTracker()
+        td, vd, _te, _ts = t.feed("plain answer")
+        assert vd == "plain answer"
+        assert t.flush() == (None, None, False)
+
+    def test_flush_emits_stripper_held_partial_open_tag(self):
+        # Visible content ends with bytes that look like a partial
+        # <|tool_call> open tag; the stripper holds them. At stream end, with
+        # no trailing splitter content, flush() must still surface them as
+        # visible rather than dropping them (aider review).
+        t = ThinkingTracker()
+        _td, vd, _te, _ts = t.feed("answer<|too")
+        assert vd == "answer"
+        think_delta, visible_delta, _started = t.flush()
+        assert think_delta is None
+        assert visible_delta == "<|too"
+
+    def test_flush_disabled_surfaces_buffer_as_visible(self):
+        # Thinking disabled + implicit + no close → the buffered (would-be
+        # thinking) content is surfaced as visible, never as thinking.
+        t = ThinkingTracker(thinking_disabled=True, template_has_thinking=True)
+        t.feed("buffered content")
+        think_delta, visible_delta, started = t.flush()
+        assert think_delta is None
+        assert visible_delta == "buffered content"
+        assert not started

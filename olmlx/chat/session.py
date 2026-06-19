@@ -22,6 +22,11 @@ from olmlx.engine.inference import (
 )
 from olmlx.engine.model_manager import LoadedModel, ModelManager
 from olmlx.engine.tool_parser import parse_model_output
+from olmlx.routers.thinking_split import (
+    _THINKING_PAIRS,
+    flush_split_thinking,
+    split_thinking_parts,
+)
 from olmlx.utils import memory as memory_utils
 from olmlx.utils import tracing as _tracing
 
@@ -72,6 +77,74 @@ _THINK_OPEN = "<think>"
 _THINK_CLOSE = "</think>"
 _THINK_BLOCK_RE = re.compile(r"<think>.*?</think>", re.DOTALL)
 _THINK_CONTENT_RE = re.compile(r"<think>(.*?)</think>", re.DOTALL)
+
+# Gemma-4 native tool-call markup (plain text, not special tokens). Display
+# is suppressed during streaming; the raw markup stays in the tracker's
+# accumulated text so parse_model_output still extracts the call at turn end.
+_TOOL_CALL_OPEN = "<|tool_call>"
+_TOOL_CALL_CLOSE = "<tool_call|>"
+
+
+def _longest_partial_tag_suffix(buf: str, tag: str) -> int:
+    """Largest ``k`` (``0 < k < len(tag)``) such that ``buf[-k:] == tag[:k]``.
+
+    Used to hold back the trailing bytes of *buf* that might be the start of
+    *tag* straddling a chunk boundary.
+    """
+    for k in range(min(len(tag) - 1, len(buf)), 0, -1):
+        if buf[-k:] == tag[:k]:
+            return k
+    return 0
+
+
+class _ToolMarkupStripper:
+    """Remove ``<|tool_call>…<tool_call|>`` spans from a stream of text.
+
+    Holds partial open/close delimiters across chunk boundaries. Display-only:
+    callers keep the raw text elsewhere for parsing.
+    """
+
+    def __init__(self) -> None:
+        self._buf = ""
+        self._inside = False
+
+    def feed(self, text: str) -> str:
+        self._buf += text
+        out: list[str] = []
+        while self._buf:
+            if not self._inside:
+                idx = self._buf.find(_TOOL_CALL_OPEN)
+                if idx != -1:
+                    out.append(self._buf[:idx])
+                    self._buf = self._buf[idx + len(_TOOL_CALL_OPEN) :]
+                    self._inside = True
+                    continue
+                keep = _longest_partial_tag_suffix(self._buf, _TOOL_CALL_OPEN)
+                out.append(self._buf[: len(self._buf) - keep] if keep else self._buf)
+                self._buf = self._buf[len(self._buf) - keep :] if keep else ""
+                break
+            idx = self._buf.find(_TOOL_CALL_CLOSE)
+            if idx != -1:
+                self._buf = self._buf[idx + len(_TOOL_CALL_CLOSE) :]
+                self._inside = False
+                continue
+            keep = _longest_partial_tag_suffix(self._buf, _TOOL_CALL_CLOSE)
+            self._buf = self._buf[len(self._buf) - keep :] if keep else ""
+            break
+        return "".join(out)
+
+    def flush(self) -> str:
+        """Emit any held-back bytes at stream end.
+
+        A partial open-tag held while *outside* a call was literal text. Bytes
+        held while *inside* an unterminated call are dropped (no close arrived).
+        """
+        if self._inside:
+            self._buf = ""
+            return ""
+        out = self._buf
+        self._buf = ""
+        return out
 
 
 class _TokenEvent(TypedDict):
@@ -215,12 +288,15 @@ class _TurnStreamResult(TypedDict):
 
 
 class ThinkingTracker:
-    """Tracks <think> tag boundaries during streaming generation.
+    """Splits streaming output into thinking vs visible, with tool markup
+    suppressed from the visible channel.
 
-    Handles both explicit ``<think>...</think>`` tags and implicit
-    thinking (template-injected ``<think>`` at position 0). State
-    mutations are deterministic — callers check ``has_content()``
-    after each ``feed()`` to emit events.
+    Delegates thinking-tag detection to the shared
+    ``routers.thinking_split`` state machine (``<think>…</think>`` AND
+    Gemma-4 ``<|channel>thought\\n…<channel|>``), and runs the visible
+    channel through ``_ToolMarkupStripper`` so Gemma-4's
+    ``<|tool_call>…<tool_call|>`` markup never reaches the display. The raw
+    text is kept verbatim in ``accumulated`` for the turn-end parse step.
     """
 
     def __init__(
@@ -229,18 +305,24 @@ class ThinkingTracker:
         thinking_disabled: bool = False,
         template_has_thinking: bool = False,
     ):
-        self._implicit_mode = implicit_mode
         self._thinking_disabled = thinking_disabled
-        self._template_has_thinking = template_has_thinking
         self._accumulated = ""
-        self._open_pos = -1
-        self._close_pos = -1
-        self._scan_pos = 0
         self._think_emitted = 0
         self._visible_emitted = 0
         self._in_thinking = False
         self._just_started = False
-        self._thinking_start_emitted = False
+        # A template that injects <think> (implicit) or otherwise advertises
+        # thinking widens the splitter's orphan-detection window and enables
+        # the orphan-</think> heuristic; pre-tag content is then held as
+        # potential thinking. When thinking is NOT expected, drive the detect
+        # window to 0 so plain content streams token-by-token (an explicit
+        # <think>/channel opener — full or split across chunks — is still
+        # caught via find() + the partial-tag hold-back).
+        expected = bool(implicit_mode or template_has_thinking)
+        self._split_state: dict = {"thinking_expected": expected}
+        if not expected:
+            self._split_state["detect_limit"] = 0
+        self._tool_stripper = _ToolMarkupStripper()
 
     @property
     def accumulated(self) -> str:
@@ -264,104 +346,115 @@ class ThinkingTracker:
         return self._visible_emitted
 
     def feed(self, text: str) -> tuple[str | None, str | None, bool, bool]:
-        """Ingest a chunk of text.
-
-        Returns ``(think_delta, visible_delta, thinking_ended, thinking_started)`` where
-        each delta is a new substring to emit (or None) and
-        ``thinking_ended`` is True when a visible delta transitions out
-        of thinking mode, ``thinking_started`` on the first thinking chunk.
-        """
+        """Ingest a chunk; return (think_delta, visible_delta, thinking_ended,
+        thinking_started)."""
         self._accumulated += text
+        parts = split_thinking_parts(text, self._split_state)
 
-        # Scan for tag boundaries
-        new_scan = max(0, self._scan_pos - len(_THINK_CLOSE) + 1)
-        self._scan_pos = len(self._accumulated)
+        think_parts: list[str] = []
+        visible_parts: list[str] = []
+        thinking_started = False
+        thinking_ended = False
 
-        if self._open_pos == -1:
-            pos = self._accumulated.find(_THINK_OPEN, new_scan)
-            if pos != -1:
-                self._open_pos = pos
-                self._implicit_mode = False
+        for channel, fragment in parts:
+            if channel == "thinking":
+                if self._thinking_disabled:
+                    continue
+                if not self._in_thinking:
+                    thinking_started = True
+                    self._in_thinking = True
+                think_parts.append(fragment)
+                self._think_emitted += len(fragment)
+            else:  # content
+                if self._in_thinking:
+                    thinking_ended = True
+                    self._in_thinking = False
+                visible = self._tool_stripper.feed(fragment)
+                if visible:
+                    visible_parts.append(visible)
+                    self._visible_emitted += len(visible)
 
-        if self._close_pos == -1:
-            search_from = max(
-                (self._open_pos + len(_THINK_OPEN)) if self._open_pos >= 0 else 0,
-                new_scan,
-            )
-            pos = self._accumulated.find(_THINK_CLOSE, search_from)
-            if pos != -1:
-                self._close_pos = pos
+        self._just_started = thinking_started
+        think_delta = "".join(think_parts) or None
+        visible_delta = "".join(visible_parts) or None
+        return think_delta, visible_delta, thinking_ended, thinking_started
 
-        think_content, visible = self._classify()
-        self._just_started = bool(not self._in_thinking and think_content)
-        think_delta = self._emit_think(think_content)
-        visible_delta, thinking_ended = self._emit_visible(visible)
-        return think_delta, visible_delta, thinking_ended, self._just_started
+    def flush(self) -> tuple[str | None, str | None, bool]:
+        """Flush the splitter's held buffer at stream end.
 
-    def flush_disabled(self) -> str | None:
-        """Flush buffered content as visible when thinking is disabled."""
-        if self._implicit_mode and self._close_pos == -1 and self._thinking_disabled:
-            if len(self._accumulated) > self._visible_emitted:
-                text = self._accumulated[self._visible_emitted :]
-                self._visible_emitted = len(self._accumulated)
-                return text
-        return None
+        Returns ``(think_delta, visible_delta, thinking_started)``. Classifies
+        the leftover by phase:
+
+        - thinking disabled → everything surfaces as visible (thinking is
+          never shown; an unconfirmed/implicit block can't be hidden);
+        - still in ``detect`` with thinking expected → implicit thinking that
+          never saw a close tag, surfaced as thinking (the old implicit-mode
+          contract);
+        - ``in_think`` (unterminated explicit block) → thinking;
+        - otherwise (plain/passthrough leftover) → visible.
+        """
+        phase = self._split_state.get("phase", "detect")
+        thinking_expected = bool(self._split_state.get("thinking_expected"))
+        thinking_buf, content_buf = flush_split_thinking(self._split_state)
+
+        if self._thinking_disabled:
+            leftover = (thinking_buf or "") + (content_buf or "")
+            visible = self._tool_stripper.feed(leftover) + self._tool_stripper.flush()
+            if visible:
+                self._visible_emitted += len(visible)
+                return None, visible, False
+            return None, None, False
+
+        think_text = thinking_buf or ""
+        if phase == "detect" and thinking_expected and content_buf:
+            think_text += content_buf
+            content_buf = ""
+
+        think_delta: str | None = None
+        thinking_started = False
+        if think_text:
+            if not self._in_thinking:
+                thinking_started = True
+                self._in_thinking = True
+            self._think_emitted += len(think_text)
+            think_delta = think_text
+
+        # Always flush the tool stripper, even when the splitter left no
+        # content: it may hold a partial ``<|tool_call>`` open-tag from an
+        # earlier streamed fragment that turned out to be literal visible text
+        # (dropping it would lose visible bytes at stream end).
+        # ``flush_split_thinking`` only yields content in the ``detect``/
+        # ``passthrough`` phases, both of which leave ``_in_thinking`` False —
+        # so flush returns thinking XOR visible, never a think→visible
+        # transition needing a ``thinking_end`` between them.
+        visible = (
+            self._tool_stripper.feed(content_buf or "") + self._tool_stripper.flush()
+        )
+        visible_delta: str | None = None
+        if visible:
+            self._visible_emitted += len(visible)
+            visible_delta = visible
+
+        return think_delta, visible_delta, thinking_started
 
     def strip_on_repetition(self) -> int | None:
-        """Truncate accumulated text at the open tag position.
+        """Truncate accumulated text at the start of the open thinking block.
 
-        Cuts before the opening <think> tag to fully remove the incomplete block.
+        Removes an incomplete thinking block so the turn-end parse sees a
+        clean prefix. Searches for the latest open tag of any known pair.
         """
-        if self._in_thinking and self._open_pos >= 0:
-            self._accumulated = self._accumulated[: self._open_pos]
+        if not self._in_thinking:
+            return None
+        cut = max(
+            (self._accumulated.rfind(open_tag) for open_tag, _ in _THINKING_PAIRS),
+            default=-1,
+        )
+        if cut >= 0:
+            self._accumulated = self._accumulated[:cut]
             self._visible_emitted = len(self._accumulated)
             self._in_thinking = False
             return self._visible_emitted
         return None
-
-    def _classify(self) -> tuple[str, str]:
-        has_thinking = self._open_pos >= 0 or self._implicit_mode
-        implicit_strip = (
-            self._thinking_disabled
-            and self._template_has_thinking
-            and self._open_pos == -1
-            and self._close_pos >= 0
-        )
-        if has_thinking:
-            cs = (self._open_pos + len(_THINK_OPEN)) if self._open_pos >= 0 else 0
-            if self._close_pos >= 0:
-                think_content = self._accumulated[cs : self._close_pos]
-                visible = self._accumulated[self._close_pos + len(_THINK_CLOSE) :]
-            else:
-                think_content = self._accumulated[cs:]
-                visible = ""
-            if self._thinking_disabled:
-                think_content = ""
-        elif implicit_strip:
-            think_content = ""
-            visible = self._accumulated[self._close_pos + len(_THINK_CLOSE) :]
-        else:
-            think_content = ""
-            visible = self._accumulated
-        return think_content, visible
-
-    def _emit_think(self, think_content: str) -> str | None:
-        if len(think_content) > self._think_emitted:
-            self._in_thinking = True
-            delta = think_content[self._think_emitted :]
-            self._think_emitted = len(think_content)
-            return delta
-        return None
-
-    def _emit_visible(self, visible: str) -> tuple[str | None, bool]:
-        if len(visible) > self._visible_emitted:
-            thinking_ended = self._in_thinking
-            if thinking_ended:
-                self._in_thinking = False
-            delta = visible[self._visible_emitted :]
-            self._visible_emitted = len(visible)
-            return delta, thinking_ended
-        return None, False
 
 
 class ChatSession:
@@ -1014,16 +1107,24 @@ class ChatSession:
                     yield {"type": "repetition_detected"}
                     break
 
-        # Flush disabled-thinking content
-        if flush_text := tracker.flush_disabled():
-            yield {"type": "token", "text": flush_text}
+        # Flush the splitter's held buffer at stream end (skip on repetition —
+        # that output is being discarded by strip_on_repetition below).
+        if not repetition_stopped:
+            flush_think, flush_visible, flush_started = tracker.flush()
+            if flush_started:
+                yield {"type": "thinking_start"}
+            if flush_think:
+                yield {"type": "thinking_token", "text": flush_think}
+            if flush_visible:
+                yield {"type": "token", "text": flush_visible}
 
         # Strip incomplete thinking on repetition BEFORE yielding final events
         was_in_thinking = tracker.in_thinking
         if repetition_stopped:
             tracker.strip_on_repetition()
 
-        # Close any open thinking block (only if content was stripped mid-think)
+        # Close any open thinking block (unclosed <think>/channel block, or
+        # content stripped mid-think on repetition)
         if was_in_thinking:
             yield {"type": "thinking_end"}
 
