@@ -35,16 +35,21 @@ jobs:
 
       - name: Exploratory testing sweep
         uses: anthropics/claude-code-action@v1
+        env:
+          # gh CLI in the agent's Bash shell needs an explicit token. FACTORY_PAT
+          # so issues filed here trigger Factory · Plan (GITHUB_TOKEN-created
+          # issues do not trigger workflows).
+          GH_TOKEN: ${{ secrets.FACTORY_PAT }}
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           # FACTORY_PAT so the issues you file actually trigger Factory · Plan
           # (issues opened with GITHUB_TOKEN do not trigger workflows).
           github_token: ${{ secrets.FACTORY_PAT }}
-          # No --allowedTools: that flag REPLACES claude-code-action's default
-          # tool set, and an explicit code-tool list silently drops the GitHub
-          # MCP tools (issue create/search), leaving the explorer unable to file
-          # issues. The action's defaults already include the code tools + the
-          # GitHub tools, so we rely on those and scope behavior via the prompt.
+          # No --allowedTools: agent mode (a non-@claude trigger) provides NO
+          # GitHub MCP server, so the only way to touch GitHub is the `gh` CLI
+          # via Bash. An allow-list that dropped Bash would leave the explorer
+          # unable to file issues. Keep the default tool set (incl. Bash) and
+          # scope behavior via the prompt.
           claude_args: --max-turns 120
           prompt: |
             You are the EXPLORATORY TESTER for olmlx. Your job is to find real
@@ -88,10 +93,12 @@ jobs:
             crashes, schema violations, dropped tool calls, streaming protocol
             errors, mismatches between an API surface and its spec.
 
-            FILING RULES:
+            FILING RULES (use the `gh` CLI, authenticated via $GH_TOKEN, for all
+            GitHub I/O — there is no GitHub MCP tool in this run):
             - Before filing, search existing OPEN issues for a semantic
-              duplicate. If found, do not file again (optionally add a
-              confirming comment).
+              duplicate (`gh issue list --state open` / `gh search issues`). If
+              found, do not file again (optionally add a confirming comment).
+            - File with `gh issue create --label source:explorer`.
             - File at most 5 issues this run; pick the most severe/clear.
             - Each issue: precise title; reproduction (exact request + model +
               command); observed vs expected; relevant server log excerpt.

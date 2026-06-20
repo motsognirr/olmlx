@@ -95,3 +95,13 @@ runs at a time on the Mac.
   factory-plan.yml), but the stray label can still mislead a human into opening
   a PR by hand. If you see `plan:approved` on an issue no human approved, remove
   it and investigate.
+- **Agents reach GitHub via the `gh` CLI, not an MCP server.** On a non-@claude
+  trigger, claude-code-action runs in *agent mode*, which provides no GitHub MCP
+  tools — so each workflow sets `GH_TOKEN` and the agents shell out to `gh`. The
+  planner only needs `gh`, so its Bash is scoped to `Bash(gh:*)`. Explore /
+  Implement / Babysit need a **full shell** (pytest, git, uv), so they run with
+  unrestricted Bash on the self-hosted runner: a prompt injection in issue/PR/CI
+  content they read could execute arbitrary commands on that machine. The prompts
+  harden against this, but treat the runner as exposed to whoever can open issues
+  or PRs the factory acts on — run it on a dedicated/isolated host, not a daily
+  driver, and keep `FACTORY_PAT` minimally scoped.
