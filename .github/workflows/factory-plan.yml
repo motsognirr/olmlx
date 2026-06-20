@@ -27,9 +27,11 @@ jobs:
     runs-on: [self-hosted, agent]
     # Skip issues a human is explicitly routing to the interactive @claude
     # bot (handled by claude.yml), and skip our own triage-close loop.
+    # `|| ''` guards title-only issues: a null body must not silently skip
+    # triage.
     if: >
-      !contains(github.event.issue.body, '@claude') &&
-      !contains(github.event.issue.title, '@claude')
+      !contains(github.event.issue.title || '', '@claude') &&
+      !contains(github.event.issue.body || '', '@claude')
     permissions:
       contents: read
       issues: write

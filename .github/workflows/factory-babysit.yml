@@ -19,6 +19,10 @@ on:
   issue_comment:
     types: [created]
   workflow_run:
+    # These names MUST match the `name:` of ci.yml ("CI") and
+    # aider-code-review.yml ("Aider Code Review") exactly — workflow_run keys
+    # off the workflow name. If either is renamed, update this list or the
+    # babysitter stops waking on CI/review completion.
     workflows: ["CI", "Aider Code Review"]
     types: [completed]
 
@@ -54,7 +58,16 @@ jobs:
             else if (e.workflow_run) num = (e.workflow_run.pull_requests[0] || {}).number;
             if (!num) { core.setOutput('is_factory', 'false'); return; }
             const { data: pr } = await github.rest.pulls.get({ ...context.repo, pull_number: num });
-            const isFactory = pr.head.ref.startsWith('factory/') && pr.state === 'open';
+            // SECURITY (#470): this job is privileged (write token + secrets)
+            // and checks out + runs the PR head's code (pytest). Restrict to
+            // same-repo PRs so a fork can never name a branch `factory/*` and
+            // get arbitrary code executed on the self-hosted runner. Factory
+            // PRs are always pushed to this repo by the implementer, never a
+            // fork, so this never blocks the happy path.
+            const sameRepo = pr.head.repo &&
+              pr.head.repo.full_name === `${context.repo.owner}/${context.repo.repo}`;
+            const isFactory = sameRepo && pr.head.ref.startsWith('factory/') &&
+              pr.state === 'open';
             core.setOutput('is_factory', String(isFactory));
             core.setOutput('pr', String(num));
             core.setOutput('head_ref', pr.head.ref);
