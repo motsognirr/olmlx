@@ -53,10 +53,6 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
-          # TEMP (remove after verifying agent-mode tool access): stream the full
-          # JSON so we can see exactly which tools run. WARNING: may surface
-          # secrets in logs — drop this once the factory is confirmed working.
-          show_full_output: true
           # SECURITY — APPROVAL-GATE INVARIANT: the planner MUST stay on the
           # default GITHUB_TOKEN. Do NOT add a `github_token: FACTORY_PAT`
           # override, and keep GH_TOKEN (above) on GITHUB_TOKEN too. The single
