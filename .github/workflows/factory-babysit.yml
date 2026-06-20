@@ -1,0 +1,117 @@
+name: Factory · Babysit
+
+# Stage 3: drive a factory PR to a decision — fix-and-loop, or merge.
+#
+# Event-driven (no idle polling). Each wake-up, Claude gathers the FULL
+# current state of the PR (CI status + every reviewer comment from CI, Aider
+# GPT, and Aider DeepSeek), TRIAGES each finding into {fix | dismiss}, and:
+#   - any fix items  -> patch, push (re-triggers CI + reviews -> next wake-up)
+#   - clean + green  -> post a triage summary, then MERGE
+#   - stuck/ambiguous -> label `needs-human`, comment, stop (no merge)
+#
+# This is the "auto-merge on green" gate: the agent owns the merge, so AI
+# review findings are judged (not just counted) and don't need to be wired up
+# as required status checks.
+
+on:
+  pull_request_review:
+    types: [submitted]
+  issue_comment:
+    types: [created]
+  workflow_run:
+    workflows: ["CI", "Aider Code Review"]
+    types: [completed]
+
+concurrency:
+  # Serialize all wake-ups for one PR so two events can't push/merge at once.
+  group: factory-babysit-${{ github.event.pull_request.number || github.event.issue.number || github.event.workflow_run.pull_requests[0].number }}
+  cancel-in-progress: false
+
+jobs:
+  babysit:
+    runs-on: [self-hosted, agent]
+    permissions:
+      contents: write
+      issues: write
+      pull-requests: write
+      checks: read
+      actions: read
+      id-token: write
+    steps:
+      # Resolve the PR across the three event shapes and confirm it's a
+      # factory PR (head branch `factory/*`). Everything else is ignored so
+      # this workflow never touches human PRs.
+      - name: Resolve factory PR
+        id: resolve
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.FACTORY_PAT }}
+          script: |
+            const e = context.payload;
+            let num;
+            if (e.pull_request) num = e.pull_request.number;
+            else if (e.issue && e.issue.pull_request) num = e.issue.number;
+            else if (e.workflow_run) num = (e.workflow_run.pull_requests[0] || {}).number;
+            if (!num) { core.setOutput('is_factory', 'false'); return; }
+            const { data: pr } = await github.rest.pulls.get({ ...context.repo, pull_number: num });
+            const isFactory = pr.head.ref.startsWith('factory/') && pr.state === 'open';
+            core.setOutput('is_factory', String(isFactory));
+            core.setOutput('pr', String(num));
+            core.setOutput('head_ref', pr.head.ref);
+
+      - name: Checkout PR head
+        if: steps.resolve.outputs.is_factory == 'true'
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ steps.resolve.outputs.head_ref }}
+          fetch-depth: 0
+          token: ${{ secrets.FACTORY_PAT }}
+
+      - name: Triage and decide
+        if: steps.resolve.outputs.is_factory == 'true'
+        uses: anthropics/claude-code-action@v1
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          # FACTORY_PAT so pushed fixes re-trigger CI/reviews and so the agent
+          # can merge. See .github/factory/README.md.
+          github_token: ${{ secrets.FACTORY_PAT }}
+          claude_args: --max-turns 80 --allowedTools "Edit,Read,Write,Bash,Grep,Glob"
+          prompt: |
+            You are the BABYSIT agent for the olmlx software factory, driving
+            PR #${{ steps.resolve.outputs.pr }} to a decision: FIX or MERGE.
+
+            Gather the FULL current state with the GitHub tools:
+            - CI / check-run status for the latest commit.
+            - Every review comment and PR comment, including the Aider GPT and
+              Aider DeepSeek reviewers.
+
+            TRIAGE every finding into exactly one bucket:
+            - FIX: CI/test failures (always), or reviewer findings that are
+              real correctness, security, or CLAUDE.md-invariant problems.
+            - DISMISS: nits, style, subjective preferences, false positives, or
+              out-of-scope suggestions. Reply once explaining why, and resolve
+              the thread.
+
+            Read CLAUDE.md before judging — many "issues" reviewers raise are
+            actually deliberate invariants (Metal stream usage, concat order,
+            prefill chunking, etc.). Defending a correct invariant counts as a
+            valid DISMISS.
+
+            THEN decide:
+            - If the FIX bucket is non-empty: apply the fixes on this branch,
+              run `uv run ruff check . && uv run ruff format --check . &&
+              uv run pytest -m "not real_model"` until green, commit (author
+              "Daniel Palmqvist <daniel.u.palmqvist@gmail.com>"), and push.
+              Pushing re-triggers CI + reviews and you'll be woken again.
+            - If the FIX bucket is empty AND CI is green: post a concise triage
+              summary comment ("Fixed: …  Dismissed (reason): …"), then MERGE
+              the PR (squash). The linked issue auto-closes via "Closes #N".
+
+            LOOP GUARD: count prior factory fix-commits on this branch. If you
+            have already looped ~3 times without converging, OR a finding is
+            genuinely ambiguous / architectural / outside the approved plan,
+            STOP: add the `needs-human` label to the PR, comment the specific
+            blocker, and do not merge.
+
+            Be idempotent: if there's nothing actionable and CI isn't done yet,
+            do nothing and exit.

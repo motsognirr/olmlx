@@ -16,7 +16,9 @@ permissions:
   contents: read
 
 concurrency:
-  group: real-model-smoke
+  # Shared with Factory · Explore: serializes ALL real-inference jobs on the
+  # single Mac runner so they never contend for the GPU / inference lock / RAM.
+  group: inference-serial
   cancel-in-progress: false
 
 jobs:
