@@ -117,6 +117,16 @@ jobs:
             prefill chunking, etc.). Defending a correct invariant counts as a
             valid DISMISS.
 
+            MERGE READINESS (check this BEFORE any merge): every wake-up may
+            fire from CI completing *or* a reviewer completing, so the two race.
+            Do NOT merge until ALL expected checks for the CURRENT head commit
+            have finished — this explicitly includes the Aider reviewers
+            (`gpt-review`, `deepseek-review`) and CI. If any of them is still
+            queued / in-progress for the head SHA, or any reviewer hasn't posted
+            its findings for this SHA yet, do nothing and exit — you'll be
+            re-woken when they finish. This stops a merge from slipping through
+            after CI goes green but before the AI review gate has run.
+
             THEN decide:
             - If the FIX bucket is non-empty: apply the fixes on this branch,
               run `uv sync --no-editable && uv run ruff check . &&
@@ -124,7 +134,8 @@ jobs:
               until green, commit (author
               "Daniel Palmqvist <daniel.u.palmqvist@gmail.com>"), and push.
               Pushing re-triggers CI + reviews and you'll be woken again.
-            - If the FIX bucket is empty AND CI is green: post a concise triage
+            - If the FIX bucket is empty AND CI is green AND all reviewers are
+              done for the head SHA (see MERGE READINESS): post a concise triage
               summary comment ("Fixed: …  Dismissed (reason): …"), then MERGE
               the PR (squash). The linked issue auto-closes via "Closes #N".
 
