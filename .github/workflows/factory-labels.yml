@@ -1,0 +1,39 @@
+name: Factory labels
+
+# One-shot (re-runnable) setup that creates the labels the agentic software
+# factory relies on. Run manually once after merging the factory workflows:
+#   Actions → "Factory labels" → Run workflow
+# Idempotent: existing labels are left untouched.
+
+on:
+  workflow_dispatch:
+
+permissions:
+  issues: write
+
+jobs:
+  labels:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Create factory labels
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const labels = [
+              { name: 'plan:proposed', color: 'fbca04', description: 'Planner posted a plan; awaiting human approval' },
+              { name: 'plan:approved', color: '0e8a16', description: 'Plan approved — implementer may start (the one manual gate)' },
+              { name: 'plan:rejected', color: 'cccccc', description: 'Planner triaged as dup/invalid; closed' },
+              { name: 'source:explorer', color: '1d76db', description: 'Filed by the nightly exploratory tester' },
+              { name: 'source:human', color: 'c5def5', description: 'Filed by a human' },
+              { name: 'in-progress', color: '5319e7', description: 'Implementer is working on this issue' },
+              { name: 'needs-human', color: 'b60205', description: 'Babysitter escalated — manual attention required' },
+            ];
+            for (const l of labels) {
+              try {
+                await github.rest.issues.createLabel({ ...context.repo, ...l });
+                core.info(`created ${l.name}`);
+              } catch (e) {
+                if (e.status === 422) { core.info(`exists  ${l.name}`); }
+                else { throw e; }
+              }
+            }

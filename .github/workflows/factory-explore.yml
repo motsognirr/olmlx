@@ -1,0 +1,102 @@
+name: Factory · Explore
+
+# Stage 0: the exploratory tester that feeds the factory.
+#
+# Nightly broad sweep on the inference runner: boot a real olmlx server,
+# exercise a matrix of use cases against real (tiny) models, and file a
+# deduplicated issue for every genuine problem found. Those issues flow into
+# Stage 1 (Plan), closing the loop.
+
+on:
+  schedule:
+    - cron: "0 4 * * *" # after real-model-smoke (03:00) so they don't queue-fight at 03:00
+  workflow_dispatch:
+
+concurrency:
+  # Shared with real-model-smoke: only ONE real-inference job runs at a time
+  # on the Mac, so they never contend for the GPU / inference lock / RAM.
+  group: inference-serial
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  issues: write
+  id-token: write
+
+jobs:
+  explore:
+    runs-on: [self-hosted, inference]
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Install dependencies
+        run: uv sync --no-editable
+
+      - name: Exploratory testing sweep
+        uses: anthropics/claude-code-action@v1
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          # FACTORY_PAT so the issues you file actually trigger Factory · Plan
+          # (issues opened with GITHUB_TOKEN do not trigger workflows).
+          github_token: ${{ secrets.FACTORY_PAT }}
+          claude_args: --max-turns 120 --allowedTools "Edit,Read,Write,Bash,Grep,Glob"
+          prompt: |
+            You are the EXPLORATORY TESTER for olmlx. Your job is to find real
+            bugs by exercising the running server across its use cases, and to
+            file a deduplicated GitHub issue for each genuine problem.
+
+            Read CLAUDE.md first for the architecture and invariants.
+
+            ENVIRONMENT
+            - Start the server yourself: `uv run olmlx` serves on
+              http://localhost:11434. Run it in the background, wait until
+              `/api/version` responds, and tail its log so you can attach
+              relevant output to any issue.
+            - Use SMALL models so the sweep is fast (e.g.
+              mlx-community/Qwen2.5-0.5B-Instruct-4bit,
+              mlx-community/Qwen3-4B-4bit). Pull what you need via
+              `uv run olmlx models pull <repo>`; the runner caches HF blobs.
+            - KNOWN NON-BUG: a clean run may SIGBUS at Metal teardown
+              (exit 138) AFTER correct output. Do NOT file that — it's
+              documented (#470).
+
+            USE-CASE MATRIX (cover as many as time allows; vary inputs):
+            - Ollama API: /api/chat, /api/generate (stream + non-stream),
+              /api/embed, /api/tags, /api/show, /api/ps.
+            - OpenAI API: /v1/chat/completions (stream + non-stream),
+              /v1/completions, /v1/embeddings, /v1/models.
+            - Anthropic API: /v1/messages (stream + non-stream).
+            - Responses API: /v1/responses.
+            - Tool / function calling across providers (does the model emit a
+              tool call, is it parsed, does a follow-up turn work?).
+            - JSON mode + JSON-Schema (grammar) constrained output.
+            - Multi-turn conversations + prompt cache reuse.
+            - Rerank: /v1/rerank, /rerank.
+            - Audio: /v1/audio/transcriptions, /v1/audio/speech (if models
+              available; otherwise note as skipped, don't file).
+            - Speculative decoding paths if cheaply exercisable.
+            - Error handling: malformed requests, unknown model, empty input —
+              expect clean 4xx, not 500s/hangs.
+
+            WHAT COUNTS AS A BUG: wrong/garbled output, 500s, hangs/timeouts,
+            crashes, schema violations, dropped tool calls, streaming protocol
+            errors, mismatches between an API surface and its spec.
+
+            FILING RULES:
+            - Before filing, search existing OPEN issues for a semantic
+              duplicate. If found, do not file again (optionally add a
+              confirming comment).
+            - File at most 5 issues this run; pick the most severe/clear.
+            - Each issue: precise title; reproduction (exact request + model +
+              command); observed vs expected; relevant server log excerpt.
+              Add the `source:explorer` label.
+            - If you find nothing reproducible, file nothing and summarize what
+              you exercised.
+
+            HARD RULE: your only repository output is GitHub issues. NEVER push
+            commits, create branches, or open PRs, even though the token may
+            technically allow it. (Ideally this workflow's token is scoped to
+            issues-only — see .github/factory/README.md.)
+
+            Always shut the server down cleanly before finishing.

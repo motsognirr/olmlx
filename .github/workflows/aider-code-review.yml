@@ -9,6 +9,9 @@ permissions:
   pull-requests: write
 
 jobs:
+  # NOTE: the `gpt-review` and `deepseek-review` job names are referenced by
+  # factory-babysit.yml's MERGE READINESS gate (it waits for these reviewer
+  # check runs before merging). If you rename them, update that gate too.
   gpt-review:
     runs-on: ubuntu-latest
     # Same-repo PRs only: fork PRs don't receive repo secrets, so the review
