@@ -57,10 +57,15 @@ jobs:
           # body drive code to merge. The plan comment doesn't need to trigger
           # anything downstream, so GITHUB_TOKEN is sufficient.
           #
-          # Read-only code tools: the planner must never edit/push (it also
-          # only has contents:read). GitHub comment/label/close tools are
-          # provided by the action and remain available.
-          claude_args: --max-turns 40 --allowedTools "Read,Grep,Glob"
+          # Read-only on code: the planner must never edit/push (it also only
+          # has contents:read). We DISALLOW the code-mutating tools rather than
+          # allow-listing read tools, because claude-code-action's
+          # `--allowedTools` REPLACES the default tool set — an allow-list of
+          # "Read,Grep,Glob" silently drops the GitHub MCP tools too, leaving
+          # the planner unable to comment/label/close (it just burns turns on
+          # permission denials and exits as a no-op). `--disallowedTools` keeps
+          # every GitHub tool available while still blocking Edit/Write/Bash.
+          claude_args: --max-turns 40 --disallowedTools "Edit,Write,Bash"
           prompt: |
             You are the PLANNING agent for the olmlx software factory.
 

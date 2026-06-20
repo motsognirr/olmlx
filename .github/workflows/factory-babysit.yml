@@ -108,7 +108,12 @@ jobs:
           # FACTORY_PAT so pushed fixes re-trigger CI/reviews and so the agent
           # can merge. See .github/factory/README.md.
           github_token: ${{ secrets.FACTORY_PAT }}
-          claude_args: --max-turns 80 --allowedTools "Edit,Read,Write,Bash,Grep,Glob"
+          # No --allowedTools: that flag REPLACES claude-code-action's default
+          # tool set, and an explicit code-tool list silently drops the GitHub
+          # MCP tools (PR comments, reviews, labels, merge) the babysitter needs
+          # to triage and merge. The action's defaults include both the code
+          # tools and the GitHub tools; behavior is scoped via the prompt.
+          claude_args: --max-turns 80
           prompt: |
             You are the BABYSIT agent for the olmlx software factory, driving
             PR #${{ steps.resolve.outputs.pr }} to a decision: FIX or MERGE.
