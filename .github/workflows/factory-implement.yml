@@ -79,3 +79,24 @@ jobs:
               is wrong or infeasible, STOP: comment on the issue explaining
               why, add the `needs-human` label, and do NOT open a PR.
             - Do NOT merge the PR. The babysitter handles review + merge.
+
+      # If the implementer crashed before finishing, don't leave the issue
+      # stuck `in-progress` with no PR. Drop the label and escalate so a human
+      # (or a re-run) can pick it up.
+      - name: Escalate on failure
+        if: failure()
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.FACTORY_PAT }}
+          script: |
+            const issue_number = ${{ github.event.issue.number }};
+            await github.rest.issues.removeLabel({
+              ...context.repo, issue_number, name: 'in-progress',
+            }).catch(() => {});
+            await github.rest.issues.addLabels({
+              ...context.repo, issue_number, labels: ['needs-human'],
+            });
+            await github.rest.issues.createComment({
+              ...context.repo, issue_number,
+              body: 'Implementer run failed before opening a PR (see the Actions log). Removed `in-progress` and labeled `needs-human`.',
+            });
