@@ -28,7 +28,10 @@ on:
 
 concurrency:
   # Serialize all wake-ups for one PR so two events can't push/merge at once.
-  group: factory-babysit-${{ github.event.pull_request.number || github.event.issue.number || github.event.workflow_run.pull_requests[0].number }}
+  # `|| github.run_id` guarantees a unique group for non-PR triggers (e.g. a
+  # push-CI run on main with no associated PR), so they don't all collide on a
+  # bare `factory-babysit-` group. The resolve step exits fast for those anyway.
+  group: factory-babysit-${{ github.event.pull_request.number || github.event.issue.number || github.event.workflow_run.pull_requests[0].number || github.run_id }}
   cancel-in-progress: false
 
 jobs:
@@ -118,12 +121,16 @@ jobs:
             MERGE READINESS (check this BEFORE any merge): every wake-up may
             fire from CI completing *or* a reviewer completing, so the two race.
             Do NOT merge until ALL expected checks for the CURRENT head commit
-            have finished — this explicitly includes the Aider reviewers
-            (`gpt-review`, `deepseek-review`) and CI. If any of them is still
-            queued / in-progress for the head SHA, or any reviewer hasn't posted
-            its findings for this SHA yet, do nothing and exit — you'll be
-            re-woken when they finish. This stops a merge from slipping through
-            after CI goes green but before the AI review gate has run.
+            have finished — this includes CI and the Aider reviewer check runs
+            (currently `gpt-review` and `deepseek-review`, defined in
+            aider-code-review.yml — if those job names change, the readiness
+            wait must follow). Don't just match those exact names blindly:
+            treat any pending check run on the head SHA as "not ready". If any
+            check is still queued / in-progress for the head SHA, or any
+            reviewer hasn't posted its findings for this SHA yet, do nothing and
+            exit — you'll be re-woken when they finish. This stops a merge from
+            slipping through after CI goes green but before the AI review gate
+            has run.
 
             THEN decide:
             - If the FIX bucket is non-empty: apply the fixes on this branch,
