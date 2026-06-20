@@ -2929,6 +2929,57 @@ class ModelManager(SpeculativeLoaderMixin):
 
         return wrapped, tokenizer, is_vlm, caps
 
+    def _build_speculative_decoder(
+        self,
+        model: Any,
+        hf_path: str,
+        spec_config: SpeculativeConfig,
+        *,
+        tokenizer: Any = None,
+        is_vlm: bool = False,
+        unwrap_language_model: bool = False,
+    ) -> Any:
+        """Dispatch ``spec_config.strategy`` to the matching decoder loader.
+
+        Single source of truth for the strategy → ``_load_*_decoder`` mapping,
+        shared by the flash-MoE, VLM, and text branches of ``_load_model``
+        (which previously each carried a near-identical if/elif chain).
+
+        ``is_vlm`` is forwarded to the pld and classic loaders (the only two
+        that accept it). ``unwrap_language_model`` selects the
+        self-speculative target: the VLM path drafts off the inner
+        ``model.language_model`` while the dense/flash-MoE paths draft off the
+        model itself — callers that don't pass it keep the model unwrapped.
+        ``tokenizer`` is consumed only by ``proxy_tuning``.
+
+        Branches for strategies a given caller can't reach (e.g. ``eagle`` /
+        ``mtp`` / ``proxy_tuning`` are rejected upstream on flash-MoE and VLM
+        targets via ``_FLASH_MOE_INCOMPATIBLE_STRATEGIES``) are simply never
+        exercised from that path; keeping them here costs nothing and avoids a
+        silent fall-through to classic speculative.
+        """
+        strategy = spec_config.strategy
+        if strategy == "dflash":
+            return self._load_dflash_decoder(model, spec_config)
+        if strategy == "eagle":
+            return self._load_eagle_decoder(model, spec_config)
+        if strategy == "mtp":
+            return self._load_mtp_decoder(model, spec_config)
+        if strategy == "pld":
+            return self._load_pld_decoder(model, spec_config, is_vlm=is_vlm)
+        if strategy == "self_speculative":
+            target = (
+                getattr(model, "language_model", model)
+                if unwrap_language_model
+                else model
+            )
+            return self._load_self_speculative_decoder(target, spec_config)
+        if strategy == "proxy_tuning":
+            return self._load_proxy_tuning_decoder(model, tokenizer, spec_config)
+        return self._load_speculative_decoder(
+            model, hf_path, spec_config, is_vlm=is_vlm
+        )
+
     def _load_model(
         self,
         hf_path: str,
@@ -3052,18 +3103,13 @@ class ModelManager(SpeculativeLoaderMixin):
                     hf_path, load_path, flash_moe_dir, flash_moe_config=flash_moe_config
                 )
                 if spec_enabled:
-                    if spec_config.strategy == "pld":
-                        decoder = self._load_pld_decoder(
-                            model, spec_config, is_vlm=is_vlm
-                        )
-                    elif spec_config.strategy == "self_speculative":
-                        decoder = self._load_self_speculative_decoder(
-                            model, spec_config
-                        )
-                    else:
-                        decoder = self._load_speculative_decoder(
-                            model, hf_path, spec_config, is_vlm=is_vlm
-                        )
+                    decoder = self._build_speculative_decoder(
+                        model,
+                        hf_path,
+                        spec_config,
+                        tokenizer=tokenizer,
+                        is_vlm=is_vlm,
+                    )
                     return model, tokenizer, is_vlm, caps, decoder
                 return model, tokenizer, is_vlm, caps, None
 
@@ -3185,21 +3231,14 @@ class ModelManager(SpeculativeLoaderMixin):
                         "speculative instead"
                     )
                 if spec_enabled:
-                    if spec_config.strategy == "dflash":
-                        decoder = self._load_dflash_decoder(model, spec_config)
-                    elif spec_config.strategy == "pld":
-                        decoder = self._load_pld_decoder(
-                            model, spec_config, is_vlm=True
-                        )
-                    elif spec_config.strategy == "self_speculative":
-                        spec_target = getattr(model, "language_model", model)
-                        decoder = self._load_self_speculative_decoder(
-                            spec_target, spec_config
-                        )
-                    else:
-                        decoder = self._load_speculative_decoder(
-                            model, hf_path, spec_config, is_vlm=True
-                        )
+                    decoder = self._build_speculative_decoder(
+                        model,
+                        hf_path,
+                        spec_config,
+                        tokenizer=processor,
+                        is_vlm=True,
+                        unwrap_language_model=True,
+                    )
                     return model, processor, True, caps, decoder
                 return model, processor, True, caps, None
             except OSError as exc:
@@ -3225,20 +3264,9 @@ class ModelManager(SpeculativeLoaderMixin):
             )
 
         if spec_enabled:
-            if spec_config.strategy == "dflash":
-                decoder = self._load_dflash_decoder(model, spec_config)
-            elif spec_config.strategy == "eagle":
-                decoder = self._load_eagle_decoder(model, spec_config)
-            elif spec_config.strategy == "mtp":
-                decoder = self._load_mtp_decoder(model, spec_config)
-            elif spec_config.strategy == "pld":
-                decoder = self._load_pld_decoder(model, spec_config)
-            elif spec_config.strategy == "self_speculative":
-                decoder = self._load_self_speculative_decoder(model, spec_config)
-            elif spec_config.strategy == "proxy_tuning":
-                decoder = self._load_proxy_tuning_decoder(model, tokenizer, spec_config)
-            else:
-                decoder = self._load_speculative_decoder(model, hf_path, spec_config)
+            decoder = self._build_speculative_decoder(
+                model, hf_path, spec_config, tokenizer=tokenizer
+            )
             return model, tokenizer, is_vlm, caps, decoder
 
         return model, tokenizer, is_vlm, caps, None

@@ -6252,3 +6252,134 @@ class TestWhisperLoad:
         manager._close_loaded_model(lm)
 
         assert whisper_transcribe.ModelHolder.model is other
+
+
+class TestBuildSpeculativeDecoder:
+    """Unit tests for the consolidated ``_build_speculative_decoder`` dispatch.
+
+    This helper replaces three near-identical ``spec_config.strategy``
+    if/elif chains in ``_load_model`` (flash-MoE, VLM, and text paths). Each
+    case pins that a given strategy routes to the right ``_load_*_decoder``
+    method with the right arguments, including the per-path variations:
+    ``is_vlm`` (pld / classic) and ``unwrap_language_model`` (self-speculative
+    target unwrap on the VLM path).
+    """
+
+    def _manager(self, registry, mock_store):
+        manager = ModelManager(registry, mock_store)
+        # Replace every concrete loader with a recording stub returning a
+        # unique sentinel so we can assert both dispatch target and that the
+        # helper propagates the loader's return value unchanged.
+        for name in (
+            "_load_dflash_decoder",
+            "_load_eagle_decoder",
+            "_load_mtp_decoder",
+            "_load_pld_decoder",
+            "_load_self_speculative_decoder",
+            "_load_proxy_tuning_decoder",
+            "_load_speculative_decoder",
+        ):
+            setattr(manager, name, MagicMock(return_value=f"{name}-result"))
+        return manager
+
+    def test_dflash(self, registry, mock_store):
+        manager = self._manager(registry, mock_store)
+        model = MagicMock()
+        cfg = SpeculativeConfig(
+            enabled=True, draft_model=None, num_tokens=None, strategy="dflash"
+        )
+        result = manager._build_speculative_decoder(model, "hf/path", cfg)
+        manager._load_dflash_decoder.assert_called_once_with(model, cfg)
+        assert result == "_load_dflash_decoder-result"
+
+    def test_eagle(self, registry, mock_store):
+        manager = self._manager(registry, mock_store)
+        model = MagicMock()
+        cfg = SpeculativeConfig(
+            enabled=True, draft_model=None, num_tokens=None, strategy="eagle"
+        )
+        result = manager._build_speculative_decoder(model, "hf/path", cfg)
+        manager._load_eagle_decoder.assert_called_once_with(model, cfg)
+        assert result == "_load_eagle_decoder-result"
+
+    def test_mtp(self, registry, mock_store):
+        manager = self._manager(registry, mock_store)
+        model = MagicMock()
+        cfg = SpeculativeConfig(
+            enabled=True, draft_model=None, num_tokens=None, strategy="mtp"
+        )
+        result = manager._build_speculative_decoder(model, "hf/path", cfg)
+        manager._load_mtp_decoder.assert_called_once_with(model, cfg)
+        assert result == "_load_mtp_decoder-result"
+
+    def test_pld_text(self, registry, mock_store):
+        manager = self._manager(registry, mock_store)
+        model = MagicMock()
+        cfg = SpeculativeConfig(
+            enabled=True, draft_model=None, num_tokens=None, strategy="pld"
+        )
+        manager._build_speculative_decoder(model, "hf/path", cfg)
+        manager._load_pld_decoder.assert_called_once_with(model, cfg, is_vlm=False)
+
+    def test_pld_vlm(self, registry, mock_store):
+        manager = self._manager(registry, mock_store)
+        model = MagicMock()
+        cfg = SpeculativeConfig(
+            enabled=True, draft_model=None, num_tokens=None, strategy="pld"
+        )
+        manager._build_speculative_decoder(model, "hf/path", cfg, is_vlm=True)
+        manager._load_pld_decoder.assert_called_once_with(model, cfg, is_vlm=True)
+
+    def test_self_speculative_no_unwrap(self, registry, mock_store):
+        manager = self._manager(registry, mock_store)
+        model = MagicMock()
+        cfg = SpeculativeConfig(
+            enabled=True, draft_model=None, num_tokens=None, strategy="self_speculative"
+        )
+        manager._build_speculative_decoder(model, "hf/path", cfg)
+        manager._load_self_speculative_decoder.assert_called_once_with(model, cfg)
+
+    def test_self_speculative_unwrap_language_model(self, registry, mock_store):
+        manager = self._manager(registry, mock_store)
+        model = MagicMock()
+        cfg = SpeculativeConfig(
+            enabled=True, draft_model=None, num_tokens=None, strategy="self_speculative"
+        )
+        manager._build_speculative_decoder(
+            model, "hf/path", cfg, is_vlm=True, unwrap_language_model=True
+        )
+        manager._load_self_speculative_decoder.assert_called_once_with(
+            model.language_model, cfg
+        )
+
+    def test_proxy_tuning(self, registry, mock_store):
+        manager = self._manager(registry, mock_store)
+        model = MagicMock()
+        tok = MagicMock()
+        cfg = SpeculativeConfig(
+            enabled=True, draft_model=None, num_tokens=None, strategy="proxy_tuning"
+        )
+        manager._build_speculative_decoder(model, "hf/path", cfg, tokenizer=tok)
+        manager._load_proxy_tuning_decoder.assert_called_once_with(model, tok, cfg)
+
+    def test_classic_text(self, registry, mock_store):
+        manager = self._manager(registry, mock_store)
+        model = MagicMock()
+        cfg = SpeculativeConfig(
+            enabled=True, draft_model=None, num_tokens=None, strategy="classic"
+        )
+        manager._build_speculative_decoder(model, "hf/path", cfg)
+        manager._load_speculative_decoder.assert_called_once_with(
+            model, "hf/path", cfg, is_vlm=False
+        )
+
+    def test_classic_vlm(self, registry, mock_store):
+        manager = self._manager(registry, mock_store)
+        model = MagicMock()
+        cfg = SpeculativeConfig(
+            enabled=True, draft_model=None, num_tokens=None, strategy="classic"
+        )
+        manager._build_speculative_decoder(model, "hf/path", cfg, is_vlm=True)
+        manager._load_speculative_decoder.assert_called_once_with(
+            model, "hf/path", cfg, is_vlm=True
+        )
