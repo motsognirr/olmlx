@@ -43,7 +43,10 @@ jobs:
         uses: anthropics/claude-code-action@v1
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
-          claude_args: --max-turns 40
+          # Read-only code tools: the planner must never edit/push (it also
+          # only has contents:read). GitHub comment/label/close tools are
+          # provided by the action and remain available.
+          claude_args: --max-turns 40 --allowedTools "Read,Grep,Glob"
           prompt: |
             You are the PLANNING agent for the olmlx software factory.
 

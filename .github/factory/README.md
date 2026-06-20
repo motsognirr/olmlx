@@ -58,6 +58,10 @@ runs at a time on the Mac.
    issues wouldn't reach Plan, and the implementer's PR wouldn't reach CI or
    Babysit. The factory would silently stall without it.
 
+   *Least privilege (optional):* the explorer only files issues, so for tighter
+   scoping you can give `factory-explore.yml` a second, issues-only PAT instead
+   of the full `FACTORY_PAT`. The explorer prompt also hard-forbids pushing.
+
 3. **`CLAUDE_CODE_OAUTH_TOKEN` secret.** Already used by `claude.yml`.
 
 4. **Create the labels.** Run the **Factory labels** workflow once.

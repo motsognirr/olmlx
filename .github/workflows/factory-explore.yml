@@ -94,4 +94,9 @@ jobs:
             - If you find nothing reproducible, file nothing and summarize what
               you exercised.
 
+            HARD RULE: your only repository output is GitHub issues. NEVER push
+            commits, create branches, or open PRs, even though the token may
+            technically allow it. (Ideally this workflow's token is scoped to
+            issues-only — see .github/factory/README.md.)
+
             Always shut the server down cleanly before finishing.
