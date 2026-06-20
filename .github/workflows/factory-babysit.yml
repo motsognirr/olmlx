@@ -80,13 +80,11 @@ jobs:
           fetch-depth: 0
           token: ${{ secrets.FACTORY_PAT }}
 
-      # Install deps before the agent runs ruff/pytest, so a fresh runner or a
-      # PR that adds dependencies doesn't fail spuriously and get misread as a
-      # code bug (matches the implementer + explorer).
-      - name: Install dependencies
-        if: steps.resolve.outputs.is_factory == 'true'
-        run: uv sync --no-editable
-
+      # NOTE: dependency install is intentionally NOT a hard step here. A
+      # transient `uv sync` failure must not crash the job before the agent can
+      # triage / escalate `needs-human`. The agent runs `uv sync --no-editable`
+      # itself inside its fix-loop command, so a sync failure becomes something
+      # it observes and triages rather than a job-level short-circuit.
       - name: Triage and decide
         if: steps.resolve.outputs.is_factory == 'true'
         uses: anthropics/claude-code-action@v1
