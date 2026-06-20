@@ -53,6 +53,11 @@ jobs:
 
       - name: Implement the approved plan
         uses: anthropics/claude-code-action@v1
+        env:
+          # gh CLI in the agent's Bash shell needs an explicit token. FACTORY_PAT
+          # so the PR it opens triggers CI + the Aider reviews + the babysitter
+          # (a PR opened with GITHUB_TOKEN does not trigger other workflows).
+          GH_TOKEN: ${{ secrets.FACTORY_PAT }}
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           # FACTORY_PAT (a fine-grained PAT or GitHub App installation token)
@@ -61,21 +66,26 @@ jobs:
           # babysitter would never fire and the loop would stall. See
           # .github/factory/README.md.
           github_token: ${{ secrets.FACTORY_PAT }}
-          # No --allowedTools: that flag REPLACES claude-code-action's default
-          # tool set, and an explicit code-tool list silently drops the GitHub
-          # MCP tools (PR create, comments), which the implementer needs to open
-          # its PR. The action's defaults include both the code tools and the
-          # GitHub tools; behavior is scoped via the prompt + branch naming.
+          # No --allowedTools: agent mode (a non-@claude trigger) provides NO
+          # GitHub MCP server, so the only way to touch GitHub is the `gh` CLI
+          # via Bash. An allow-list that dropped Bash would leave the implementer
+          # unable to open its PR. Keep the default tool set (incl. Bash) and
+          # scope behavior via the prompt + branch naming.
           claude_args: --max-turns 80
           prompt: |
             You are the IMPLEMENTATION agent for the olmlx software factory.
 
             Implement the APPROVED plan for issue #${{ github.event.issue.number }}.
 
+            Use the `gh` CLI (authenticated via $GH_TOKEN) for all GitHub
+            operations — reading the issue/plan, pushing, and opening the PR.
+            There is no GitHub MCP tool in this run.
+
             Steps:
             1. Read the issue and find the approved implementation plan in its
-               comments (the one that earned the `plan:approved` label). Follow
-               it. Read CLAUDE.md and respect every invariant it lists.
+               comments (the one that earned the `plan:approved` label) with
+               `gh issue view ${{ github.event.issue.number }} --comments`.
+               Follow it. Read CLAUDE.md and respect every invariant it lists.
             2. Create a branch named `factory/issue-${{ github.event.issue.number }}`.
             3. This repo is TDD: write the failing test(s) the plan calls for
                FIRST, then implement until they pass.
