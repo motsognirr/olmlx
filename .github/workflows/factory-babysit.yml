@@ -80,6 +80,13 @@ jobs:
           fetch-depth: 0
           token: ${{ secrets.FACTORY_PAT }}
 
+      # Install deps before the agent runs ruff/pytest, so a fresh runner or a
+      # PR that adds dependencies doesn't fail spuriously and get misread as a
+      # code bug (matches the implementer + explorer).
+      - name: Install dependencies
+        if: steps.resolve.outputs.is_factory == 'true'
+        run: uv sync --no-editable
+
       - name: Triage and decide
         if: steps.resolve.outputs.is_factory == 'true'
         uses: anthropics/claude-code-action@v1
@@ -112,8 +119,9 @@ jobs:
 
             THEN decide:
             - If the FIX bucket is non-empty: apply the fixes on this branch,
-              run `uv run ruff check . && uv run ruff format --check . &&
-              uv run pytest -m "not real_model"` until green, commit (author
+              run `uv sync --no-editable && uv run ruff check . &&
+              uv run ruff format --check . && uv run pytest -m "not real_model"`
+              until green, commit (author
               "Daniel Palmqvist <daniel.u.palmqvist@gmail.com>"), and push.
               Pushing re-triggers CI + reviews and you'll be woken again.
             - If the FIX bucket is empty AND CI is green: post a concise triage
