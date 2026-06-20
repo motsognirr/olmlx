@@ -83,3 +83,15 @@ runs at a time on the Mac.
   finding) escalate here instead of merging or spinning forever.
 - **CLAUDE.md is law.** Every agent reads it first; many reviewer "bugs" are
   deliberate invariants, and defending one is a valid dismissal.
+- **The gate trusts the approver.** Applying `plan:approved` starts a
+  privileged run (`FACTORY_PAT` + arbitrary code on the self-hosted runner), so
+  the security of the whole factory reduces to the security of whoever can
+  apply that label. Keep approval rights to trusted human accounts with 2FA;
+  treat a compromised approver account as a full runner compromise.
+- **A `plan:approved` you didn't apply is unsafe.** The planner has
+  `issues: write`, so a prompt-injected planner *can* stamp `plan:approved` on
+  an issue. It can't start the implementer that way (its label is applied with
+  `GITHUB_TOKEN`, which doesn't trigger `issues: labeled` workflows — see
+  factory-plan.yml), but the stray label can still mislead a human into opening
+  a PR by hand. If you see `plan:approved` on an issue no human approved, remove
+  it and investigate.
