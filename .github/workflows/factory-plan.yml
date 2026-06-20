@@ -25,6 +25,9 @@ jobs:
     # runner so it never contends with inference work. On a single machine,
     # tag that machine both `agent` and `inference`.
     runs-on: [self-hosted, agent]
+    # A read-only planning run shouldn't hold the shared `agent` runner if the
+    # agent hangs — free it after 30 min (well above a normal --max-turns 40 run).
+    timeout-minutes: 30
     # Skip issues a human is explicitly routing to the interactive @claude
     # bot (handled by claude.yml), and skip our own triage-close loop.
     # `|| ''` guards title-only issues: a null body must not silently skip
@@ -43,6 +46,17 @@ jobs:
         uses: anthropics/claude-code-action@v1
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          # SECURITY — APPROVAL-GATE INVARIANT: the planner MUST stay on the
+          # default GITHUB_TOKEN here. Do NOT add a `github_token: FACTORY_PAT`
+          # override. The single human approval gate is enforced mechanically,
+          # not just by the prompt: even a prompt-injected planner that managed
+          # to apply `plan:approved` cannot start the implementer, because labels
+          # applied with GITHUB_TOKEN do NOT trigger other workflows
+          # (factory-implement fires on `issues: labeled`). Giving the planner a
+          # PAT would silently remove that protection and let an untrusted issue
+          # body drive code to merge. The plan comment doesn't need to trigger
+          # anything downstream, so GITHUB_TOKEN is sufficient.
+          #
           # Read-only code tools: the planner must never edit/push (it also
           # only has contents:read). GitHub comment/label/close tools are
           # provided by the action and remain available.

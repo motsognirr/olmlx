@@ -17,8 +17,21 @@ concurrency:
 
 jobs:
   implement:
-    if: github.event.label.name == 'plan:approved'
+    # The `plan:approved` label is the one human gate. Require BOTH the label
+    # AND that a real user account applied it (`sender.type == 'User'`), so no
+    # automation token — a prompt-injected planner, a bot, or a GitHub App —
+    # can start a privileged implementation run. This is belt-and-suspenders on
+    # top of the planner being GITHUB_TOKEN-only (see factory-plan.yml): that
+    # already stops the planner's labels from triggering this workflow at all;
+    # this also rejects any other bot/app that might apply the label.
+    if: >
+      github.event.label.name == 'plan:approved' &&
+      github.event.sender.type == 'User'
     runs-on: [self-hosted, agent]
+    # Implementation runs tests + can loop; cap the run so a hung agent doesn't
+    # hold the shared `agent` runner indefinitely (--max-turns 80 normally
+    # finishes well under this).
+    timeout-minutes: 60
     permissions:
       contents: write
       issues: write
