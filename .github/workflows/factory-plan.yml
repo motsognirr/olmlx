@@ -64,12 +64,15 @@ jobs:
           #
           # Tools: agent mode (a non-@claude `issues` trigger) provides NO GitHub
           # MCP server — the only way to touch GitHub is the `gh` CLI via Bash.
-          # So we must NOT restrict tools (an earlier --allowedTools/
-          # --disallowedTools that dropped Bash left the planner unable to act at
-          # all). The planner stays read-only on the REPO via
-          # `permissions: contents: read` — it physically cannot push code or
-          # open PRs no matter which tools it holds.
-          claude_args: --max-turns 40
+          # The planner processes UNTRUSTED issue text on a self-hosted runner,
+          # so we scope Bash to `gh` only (`Bash(gh:*)`) rather than granting a
+          # full shell: it can read/comment/label/close via gh but cannot run
+          # arbitrary commands under prompt injection. Read/Grep/Glob cover code
+          # exploration. (Dropping Bash entirely — as earlier revisions did —
+          # left the planner unable to act at all.) It is additionally read-only
+          # on the REPO via `permissions: contents: read`, and its GH_TOKEN is
+          # GITHUB_TOKEN scoped to contents:read + issues:write.
+          claude_args: --max-turns 40 --allowedTools "Read,Grep,Glob,Bash(gh:*)"
           prompt: |
             You are the PLANNING agent for the olmlx software factory.
 
