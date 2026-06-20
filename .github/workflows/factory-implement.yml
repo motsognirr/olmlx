@@ -61,7 +61,12 @@ jobs:
           # babysitter would never fire and the loop would stall. See
           # .github/factory/README.md.
           github_token: ${{ secrets.FACTORY_PAT }}
-          claude_args: --max-turns 80 --allowedTools "Edit,Read,Write,Bash,Grep,Glob"
+          # No --allowedTools: that flag REPLACES claude-code-action's default
+          # tool set, and an explicit code-tool list silently drops the GitHub
+          # MCP tools (PR create, comments), which the implementer needs to open
+          # its PR. The action's defaults include both the code tools and the
+          # GitHub tools; behavior is scoped via the prompt + branch naming.
+          claude_args: --max-turns 80
           prompt: |
             You are the IMPLEMENTATION agent for the olmlx software factory.
 
