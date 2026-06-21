@@ -25,6 +25,86 @@ from olmlx.engine.registry import SpeculativeConfig
 logger = logging.getLogger(__name__)
 
 
+def _quant_descriptor_from_path(model_path: Path) -> str:
+    """Return a quant descriptor string for a model at *model_path*.
+
+    Reads ``config.json`` and looks for a ``"quantization"`` or
+    ``"quantization_config"`` block (the same fields ``model_manager.py``
+    already uses for ``nn.quantize``). Falls back to ``quantize_config.json``
+    (GPTQ format). Returns ``f"q{bits}_g{group_size}"`` or ``"bf16"`` if no
+    quantization block is present.
+    """
+    cfg_path = model_path / "config.json"
+    try:
+        cfg = json.loads(cfg_path.read_text()) if cfg_path.exists() else {}
+    except Exception:
+        cfg = {}
+
+    quant_block = cfg.get("quantization") or cfg.get("quantization_config")
+    if not quant_block:
+        gptq_path = model_path / "quantize_config.json"
+        if gptq_path.exists():
+            try:
+                quant_block = json.loads(gptq_path.read_text())
+            except Exception:
+                quant_block = None
+
+    if quant_block and isinstance(quant_block, dict):
+        bits = quant_block.get("bits")
+        group_size = quant_block.get("group_size", 64)
+        if bits is not None:
+            return f"q{bits}_g{group_size}"
+
+    return "bf16"
+
+
+def _detect_live_quant(model: Any) -> str:
+    """Return a quant descriptor by inspecting a loaded MLX model.
+
+    Walks the model looking for the first ``nn.QuantizedLinear`` via
+    ``module.modules()``. Returns ``f"q{bits}_g{group_size}"`` or ``"bf16"``
+    if none are found.
+    """
+    import mlx.nn as nn
+
+    try:
+        for _name, module in model.named_modules():
+            if isinstance(module, nn.QuantizedLinear):
+                bits = module.bits
+                group_size = module.group_size
+                return f"q{bits}_g{group_size}"
+    except Exception:
+        pass
+    return "bf16"
+
+
+def _check_quant_compat(
+    draft_quant: str | None,
+    live_quant: str,
+    *,
+    draft_path: Path,
+) -> None:
+    """Warn (or raise, in strict mode) when the draft's recorded target quant
+    does not match the live target's effective quantization.
+
+    ``draft_quant=None`` means the draft checkpoint predates this field; skip
+    silently (backwards compatibility).
+    """
+    if draft_quant is None:
+        return
+    if draft_quant == live_quant:
+        return
+    msg = (
+        f"DFlash/EAGLE draft at {draft_path} was trained on a '{draft_quant}' "
+        f"target but the loaded target is '{live_quant}' — acceptance rate may "
+        "degrade to ~0.4%%. Retrain the draft against the current target or "
+        "set OLMLX_SPEC_STRICT_COMPAT=1 to treat this as an error."
+    )
+    if settings.spec_strict_compat:
+        raise RuntimeError(msg)
+    logger.warning(msg)
+
+
 def _resolve_attention_causal(dflash_cfg: dict) -> bool:
     """Detect legacy draft checkpoints that were trained with causal attention.
 
@@ -199,6 +279,7 @@ class SpeculativeLoaderMixin:
             or ["full_attention"] * draft_cfg_dict["num_hidden_layers"]
         )
 
+        draft_quant_raw = dflash_cfg.get("target_quant")
         draft_config = DraftConfig(
             hidden_size=draft_cfg_dict["hidden_size"],
             num_hidden_layers=draft_cfg_dict["num_hidden_layers"],
@@ -219,6 +300,7 @@ class SpeculativeLoaderMixin:
             sliding_window=draft_cfg_dict.get("sliding_window"),
             final_logit_softcapping=draft_cfg_dict.get("final_logit_softcapping"),
             attention_causal=_resolve_attention_causal(dflash_cfg),
+            target_quant=draft_quant_raw,
         )
 
         draft_model = DFlashDraftModel(draft_config)
@@ -289,6 +371,14 @@ class SpeculativeLoaderMixin:
                 f"not match target vocab_size ({target_vocab}). The draft "
                 "must be trained against a target with the same vocabulary."
             )
+
+        # Quant compatibility check: warn (or raise in strict mode) when the
+        # draft was trained on a target with a different quantization.
+        _check_quant_compat(
+            draft_config.target_quant,
+            _detect_live_quant(target_model),
+            draft_path=Path(load_path),
+        )
 
         # ``draft_config.block_size`` is treated as the *draft token
         # count* directly (matching the convention #287 ships with —
@@ -399,6 +489,7 @@ class SpeculativeLoaderMixin:
                 f"keys: {missing}"
             )
 
+        eagle_draft_quant_raw = eagle_cfg.get("target_quant")
         draft_config = EagleConfig(
             hidden_size=draft_cfg_dict["hidden_size"],
             num_hidden_layers=draft_cfg_dict["num_hidden_layers"],
@@ -412,6 +503,7 @@ class SpeculativeLoaderMixin:
             max_position_embeddings=draft_cfg_dict["max_position_embeddings"],
             block_size=int(eagle_cfg["block_size"]),
             rope_scaling=draft_cfg_dict.get("rope_scaling"),
+            target_quant=eagle_draft_quant_raw,
         )
 
         draft_model = EagleDraftModel(draft_config)
@@ -498,6 +590,14 @@ class SpeculativeLoaderMixin:
                 "mismatch would crash inside input_proj at the first "
                 "prefill. Retrain the draft against the current target."
             )
+
+        # Quant compatibility check: warn (or raise in strict mode) when the
+        # draft was trained on a target with a different quantization.
+        _check_quant_compat(
+            draft_config.target_quant,
+            _detect_live_quant(target_model),
+            draft_path=Path(load_path),
+        )
 
         block_size = (
             spec_config.num_tokens

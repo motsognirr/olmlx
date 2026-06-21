@@ -286,6 +286,12 @@ class Settings(BaseSettings):
     )
     speculative_proxy_alpha: float = 1.0
 
+    #: Strict quantization compatibility for speculative decoding (issue #516).
+    #: When True, a mismatch between the draft's recorded target_quant and the
+    #: live target's detected quantization raises RuntimeError instead of just
+    #: emitting a warning. Default False (warn only).
+    spec_strict_compat: bool = False
+
     #: Cross-request KV-cache reuse for speculative decoding (issue #421).
     #: Max persisted speculative cache lineages held on the per-model
     #: decoder. Each slot is a full *live* target (+draft) KV snapshot — a

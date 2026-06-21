@@ -100,6 +100,7 @@ def _build_eagle_config(
     *,
     num_hidden_layers: int,
     block_size: int,
+    target_quant: str | None = None,
 ) -> EagleConfig:
     """Derive an ``EagleConfig`` from the target's config.json."""
     text_cfg = _text_config(target_cfg)
@@ -177,6 +178,7 @@ def _build_eagle_config(
             if "rope_scaling" in text_cfg
             else target_cfg.get("rope_scaling")
         ),
+        target_quant=target_quant,
     )
 
 
@@ -310,6 +312,8 @@ def _config_to_disk(
         # distribution at inference (~5% acceptance vs ~50% expected).
         # Persist it here so ``_load_eagle_decoder`` can wire it in.
         eagle_block["target_layer_id"] = int(target_layer_id)
+    if cfg.target_quant is not None:
+        eagle_block["target_quant"] = cfg.target_quant
     return {
         "hidden_size": cfg.hidden_size,
         "num_hidden_layers": cfg.num_hidden_layers,
@@ -409,10 +413,13 @@ def prepare_eagle_draft(
     if hasattr(target, "freeze"):
         target.freeze()
 
+    from olmlx.engine.speculative_loaders import _quant_descriptor_from_path
+
     eagle_cfg = _build_eagle_config(
         target_cfg,
         num_hidden_layers=num_hidden_layers,
         block_size=block_size,
+        target_quant=_quant_descriptor_from_path(model_path),
     )
 
     draft = EagleDraftModel(eagle_cfg)
