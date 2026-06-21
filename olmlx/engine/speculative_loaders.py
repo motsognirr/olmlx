@@ -38,6 +38,11 @@ def _quant_descriptor_from_path(model_path: Path) -> str:
     try:
         cfg = json.loads(cfg_path.read_text()) if cfg_path.exists() else {}
     except Exception:
+        logger.warning(
+            "_quant_descriptor_from_path: failed to read/parse %s — defaulting to bf16",
+            cfg_path,
+            exc_info=True,
+        )
         cfg = {}
 
     quant_block = cfg.get("quantization") or cfg.get("quantization_config")
@@ -47,6 +52,11 @@ def _quant_descriptor_from_path(model_path: Path) -> str:
             try:
                 quant_block = json.loads(gptq_path.read_text())
             except Exception:
+                logger.warning(
+                    "_quant_descriptor_from_path: failed to read/parse %s — defaulting to bf16",
+                    gptq_path,
+                    exc_info=True,
+                )
                 quant_block = None
 
     if quant_block and isinstance(quant_block, dict):
@@ -75,7 +85,10 @@ def _detect_live_quant(model: Any) -> str:
                 group_size = module.group_size
                 return f"q{bits}_g{group_size}"
     except Exception:
-        pass
+        logger.debug(
+            "_detect_live_quant: named_modules() inspection failed — defaulting to bf16",
+            exc_info=True,
+        )
     return "bf16"
 
 
