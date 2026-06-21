@@ -62,6 +62,18 @@ def test_quant_descriptor_from_quantization_config(tmp_path: Path) -> None:
     assert _quant_descriptor_from_path(tmp_path) == "q4_g32"
 
 
+def test_quant_descriptor_null_group_size(tmp_path: Path) -> None:
+    """config.json with group_size: null → falls back to 64, not 'q4_gNone'."""
+    cfg = {
+        "quantization": {"bits": 4, "group_size": None},
+    }
+    (tmp_path / "config.json").write_text(json.dumps(cfg))
+
+    from olmlx.engine.speculative_loaders import _quant_descriptor_from_path
+
+    assert _quant_descriptor_from_path(tmp_path) == "q4_g64"
+
+
 def test_quant_descriptor_from_gptq_config(tmp_path: Path) -> None:
     """quantize_config.json (GPTQ format) with only bits → 'q4_g64' (default group_size)."""
     cfg = {"hidden_size": 512, "vocab_size": 1000}

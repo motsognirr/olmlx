@@ -51,7 +51,7 @@ def _quant_descriptor_from_path(model_path: Path) -> str:
 
     if quant_block and isinstance(quant_block, dict):
         bits = quant_block.get("bits")
-        group_size = quant_block.get("group_size", 64)
+        group_size = quant_block.get("group_size") or 64
         if bits is not None:
             return f"q{bits}_g{group_size}"
 
