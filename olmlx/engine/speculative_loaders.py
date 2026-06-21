@@ -95,15 +95,16 @@ def _check_quant_compat(
         return
     if draft_quant == live_quant:
         return
-    msg = (
+    base_msg = (
         f"DFlash/EAGLE draft at {draft_path} was trained on a '{draft_quant}' "
         f"target but the loaded target is '{live_quant}' — acceptance rate may "
-        "degrade to ~0.4%%. Retrain the draft against the current target or "
-        "set OLMLX_SPEC_STRICT_COMPAT=1 to treat this as an error."
+        "degrade to ~0.4%. Retrain the draft against the current target."
     )
     if settings.spec_strict_compat:
-        raise RuntimeError(msg)
-    logger.warning(msg)
+        raise RuntimeError(base_msg)
+    logger.warning(
+        "%s Set OLMLX_SPEC_STRICT_COMPAT=1 to treat this as an error.", base_msg
+    )
 
 
 def _resolve_attention_causal(dflash_cfg: dict) -> bool:
