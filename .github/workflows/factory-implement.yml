@@ -52,6 +52,7 @@ jobs:
             });
 
       - name: Implement the approved plan
+        id: implement
         uses: anthropics/claude-code-action@v1
         env:
           # gh CLI in the agent's Bash shell needs an explicit token. FACTORY_PAT
@@ -66,12 +67,16 @@ jobs:
           # babysitter would never fire and the loop would stall. See
           # .github/factory/README.md.
           github_token: ${{ secrets.FACTORY_PAT }}
-          # No --allowedTools: agent mode (a non-@claude trigger) provides NO
-          # GitHub MCP server, so the only way to touch GitHub is the `gh` CLI
-          # via Bash. An allow-list that dropped Bash would leave the implementer
-          # unable to open its PR. Keep the default tool set (incl. Bash) and
-          # scope behavior via the prompt + branch naming.
-          claude_args: --max-turns 80
+          # In agent mode (a non-@claude trigger) tools are NOT auto-approved:
+          # without an explicit --allowedTools the agent's Bash/Edit/Write calls
+          # are denied non-interactively (seen as a high `permission_denials_count`
+          # with no branch/PR produced). So allow-list the tools the implementer
+          # needs. `Bash` (no parens) permits all shell commands — git, uv,
+          # pytest, and the `gh` CLI it uses for GitHub (there is no GitHub MCP
+          # server in agent mode). This does NOT regress #536: that concern was
+          # an allow-list excluding MCP tools on the @claude path; there are no
+          # MCP tools here.
+          claude_args: --max-turns 80 --allowedTools "Bash,Edit,Write,Read,Grep,Glob"
           prompt: |
             You are the IMPLEMENTATION agent for the olmlx software factory.
 
@@ -108,16 +113,34 @@ jobs:
               why, add the `needs-human` label, and do NOT open a PR.
             - Do NOT merge the PR. The babysitter handles review + merge.
 
-      # If the implementer crashed before finishing, don't leave the issue
-      # stuck `in-progress` with no PR. Drop the label and escalate so a human
-      # (or a re-run) can pick it up.
-      - name: Escalate on failure
-        if: failure()
+      # The implementer must not leave the issue stuck `in-progress` with no PR.
+      # Two failure modes: (a) the agent step crashed; (b) the agent exited
+      # "success" but produced nothing — e.g. its tool calls were denied so it
+      # never pushed a branch or opened a PR. Both look the same from the issue's
+      # side: no open PR from `factory/issue-N`. Run always(), and treat
+      # "no PR for the branch" as failure regardless of the agent's exit code.
+      - name: Verify a PR was opened (else escalate)
+        if: always()
         uses: actions/github-script@v7
         with:
           github-token: ${{ secrets.FACTORY_PAT }}
           script: |
             const issue_number = ${{ github.event.issue.number }};
+            const head = `factory/issue-${issue_number}`;
+            const agentFailed = '${{ steps.implement.outcome }}' === 'failure';
+            const prs = await github.rest.pulls.list({
+              ...context.repo, state: 'open',
+              head: `${context.repo.owner}:${head}`,
+            });
+            if (!agentFailed && prs.data.length > 0) {
+              core.info(`PR #${prs.data[0].number} opened from ${head}; implementer succeeded.`);
+              return;
+            }
+            const reason = agentFailed
+              ? 'Implementer run failed before opening a PR (see the Actions log).'
+              : 'Implementer exited without opening a PR — its tool calls were likely '
+                + 'denied (check `permission_denials_count` in the Actions log). '
+                + 'No branch/PR was produced.';
             await github.rest.issues.removeLabel({
               ...context.repo, issue_number, name: 'in-progress',
             }).catch(() => {});
@@ -126,5 +149,6 @@ jobs:
             });
             await github.rest.issues.createComment({
               ...context.repo, issue_number,
-              body: 'Implementer run failed before opening a PR (see the Actions log). Removed `in-progress` and labeled `needs-human`.',
+              body: `${reason} Removed \`in-progress\` and labeled \`needs-human\`.`,
             });
+            core.setFailed(reason);
