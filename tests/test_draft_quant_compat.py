@@ -263,6 +263,130 @@ def test_detect_live_quant_quantized_model() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Decoder constructors propagate target_quant to _target_quant
+# ---------------------------------------------------------------------------
+
+
+def test_dflash_decoder_sets_target_quant() -> None:
+    """DFlashDecoder.__init__ propagates draft_config.target_quant to _target_quant."""
+    import mlx.nn as nn
+
+    from olmlx.engine.dflash.decoder import DFlashDecoder
+    from olmlx.engine.dflash.draft_model import DraftConfig, DFlashDraftModel
+
+    cfg = DraftConfig(
+        hidden_size=256,
+        num_hidden_layers=2,
+        num_attention_heads=4,
+        num_key_value_heads=4,
+        head_dim=64,
+        intermediate_size=512,
+        vocab_size=1000,
+        rms_norm_eps=1e-6,
+        rope_theta=10000.0,
+        max_position_embeddings=512,
+        block_size=4,
+        num_target_layers=2,
+        target_layer_ids=[1, 3],
+        mask_token_id=0,
+        target_quant="q4_g64",
+    )
+    target = MagicMock(spec=nn.Module)
+    draft = DFlashDraftModel(cfg)
+    decoder = DFlashDecoder(
+        target_model=target, draft_model=draft, draft_config=cfg, block_size=4
+    )
+    assert decoder._target_quant == "q4_g64"
+
+
+def test_dflash_decoder_target_quant_none_defaults_empty() -> None:
+    """DFlashDecoder._target_quant is '' when draft_config.target_quant is None."""
+    import mlx.nn as nn
+
+    from olmlx.engine.dflash.decoder import DFlashDecoder
+    from olmlx.engine.dflash.draft_model import DraftConfig, DFlashDraftModel
+
+    cfg = DraftConfig(
+        hidden_size=256,
+        num_hidden_layers=2,
+        num_attention_heads=4,
+        num_key_value_heads=4,
+        head_dim=64,
+        intermediate_size=512,
+        vocab_size=1000,
+        rms_norm_eps=1e-6,
+        rope_theta=10000.0,
+        max_position_embeddings=512,
+        block_size=4,
+        num_target_layers=2,
+        target_layer_ids=[1, 3],
+        mask_token_id=0,
+    )
+    target = MagicMock(spec=nn.Module)
+    draft = DFlashDraftModel(cfg)
+    decoder = DFlashDecoder(
+        target_model=target, draft_model=draft, draft_config=cfg, block_size=4
+    )
+    assert decoder._target_quant == ""
+
+
+def test_eagle_decoder_sets_target_quant() -> None:
+    """EagleDecoder.__init__ propagates target_quant to _target_quant."""
+    import mlx.nn as nn
+
+    from olmlx.engine.eagle.decoder import EagleDecoder
+    from olmlx.engine.eagle.draft_model import EagleConfig, EagleDraftModel
+
+    cfg = EagleConfig(
+        hidden_size=64,
+        num_hidden_layers=1,
+        num_attention_heads=2,
+        num_key_value_heads=2,
+        head_dim=32,
+        intermediate_size=128,
+        vocab_size=1000,
+        rms_norm_eps=1e-6,
+        rope_theta=10000.0,
+        max_position_embeddings=512,
+        block_size=4,
+    )
+    target = MagicMock(spec=nn.Module)
+    target.layers = [MagicMock()]
+    draft = EagleDraftModel(cfg)
+    decoder = EagleDecoder(
+        target_model=target, draft_model=draft, block_size=4, target_quant="q4_g64"
+    )
+    assert decoder._target_quant == "q4_g64"
+
+
+def test_eagle_decoder_target_quant_none_defaults_empty() -> None:
+    """EagleDecoder._target_quant is '' when target_quant is not passed."""
+    import mlx.nn as nn
+
+    from olmlx.engine.eagle.decoder import EagleDecoder
+    from olmlx.engine.eagle.draft_model import EagleConfig, EagleDraftModel
+
+    cfg = EagleConfig(
+        hidden_size=64,
+        num_hidden_layers=1,
+        num_attention_heads=2,
+        num_key_value_heads=2,
+        head_dim=32,
+        intermediate_size=128,
+        vocab_size=1000,
+        rms_norm_eps=1e-6,
+        rope_theta=10000.0,
+        max_position_embeddings=512,
+        block_size=4,
+    )
+    target = MagicMock(spec=nn.Module)
+    target.layers = [MagicMock()]
+    draft = EagleDraftModel(cfg)
+    decoder = EagleDecoder(target_model=target, draft_model=draft, block_size=4)
+    assert decoder._target_quant == ""
+
+
+# ---------------------------------------------------------------------------
 # stats_summary includes target_quant
 # ---------------------------------------------------------------------------
 

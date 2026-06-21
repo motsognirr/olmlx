@@ -640,6 +640,7 @@ class SpeculativeLoaderMixin:
             draft_model=draft_model,
             block_size=block_size,
             target_layer_id=target_layer_id,
+            target_quant=draft_config.target_quant,
         )
 
     def _load_mtp_decoder(
