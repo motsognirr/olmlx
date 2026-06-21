@@ -112,12 +112,13 @@ jobs:
           # FACTORY_PAT so pushed fixes re-trigger CI/reviews and so the agent
           # can merge. See .github/factory/README.md.
           github_token: ${{ secrets.FACTORY_PAT }}
-          # No --allowedTools: agent mode (a non-@claude trigger) provides NO
-          # GitHub MCP server, so the only way to touch GitHub is the `gh` CLI
-          # via Bash. An allow-list that dropped Bash would leave the babysitter
-          # unable to comment / label / merge. Keep the default tool set (incl.
-          # Bash) and scope behavior via the prompt.
-          claude_args: --max-turns 80
+          # In agent mode (a non-@claude trigger) tools are NOT auto-approved:
+          # without an explicit --allowedTools the agent's Bash/Edit/Write calls
+          # are denied non-interactively, leaving it unable to push fixes, comment,
+          # label, or merge. Allow-list the tools it needs. `Bash` (no parens)
+          # permits all shell commands — git, uv, pytest, and the `gh` CLI it uses
+          # for GitHub (there is no GitHub MCP server in agent mode).
+          claude_args: --max-turns 80 --allowedTools "Bash,Edit,Write,Read,Grep,Glob"
           prompt: |
             You are the BABYSIT agent for the olmlx software factory, driving
             PR #${{ steps.resolve.outputs.pr }} to a decision: FIX or MERGE.

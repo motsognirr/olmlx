@@ -45,12 +45,13 @@ jobs:
           # FACTORY_PAT so the issues you file actually trigger Factory · Plan
           # (issues opened with GITHUB_TOKEN do not trigger workflows).
           github_token: ${{ secrets.FACTORY_PAT }}
-          # No --allowedTools: agent mode (a non-@claude trigger) provides NO
-          # GitHub MCP server, so the only way to touch GitHub is the `gh` CLI
-          # via Bash. An allow-list that dropped Bash would leave the explorer
-          # unable to file issues. Keep the default tool set (incl. Bash) and
-          # scope behavior via the prompt.
-          claude_args: --max-turns 120
+          # In agent mode (a non-@claude trigger) tools are NOT auto-approved:
+          # without an explicit --allowedTools the agent's Bash/Edit/Write calls
+          # are denied non-interactively, leaving it unable to run the server or
+          # file issues. Allow-list the tools it needs. `Bash` (no parens) permits
+          # all shell commands — uv, the server, and the `gh` CLI it uses for
+          # GitHub (there is no GitHub MCP server in agent mode).
+          claude_args: --max-turns 120 --allowedTools "Bash,Edit,Write,Read,Grep,Glob"
           prompt: |
             You are the EXPLORATORY TESTER for olmlx. Your job is to find real
             bugs by exercising the running server across its use cases, and to
