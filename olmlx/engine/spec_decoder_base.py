@@ -209,6 +209,10 @@ class SpecDecoderBase(abc.ABC):
         self._stats_proposed: int = 0
         self._stats_accepted_draft: int = 0
 
+        # Quant descriptor of the target the draft was trained against.
+        # Set by subclasses from the draft config's target_quant field.
+        self._target_quant: str = ""
+
         # Tracing label, resolved once — span() evaluates its kwargs
         # eagerly even with tracing disabled, and step()/_verify_greedy
         # run per decode step, so a per-call lookup would re-execute
@@ -419,6 +423,7 @@ class SpecDecoderBase(abc.ABC):
             "accepted_draft": accepted_draft,
             "acceptance_rate": accepted_draft / proposed if proposed else 0.0,
             "avg_tokens_per_step": (accepted_draft + steps) / steps if steps else 0.0,
+            "target_quant": self._target_quant,
         }
         summary.update(self._stats_extra())
         return summary

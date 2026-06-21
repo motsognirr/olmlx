@@ -108,6 +108,7 @@ class EagleDecoder(SpecDecoderBase):
         draft_model: EagleDraftModel,
         block_size: int = 4,
         target_layer_id: int | None = None,
+        target_quant: str | None = None,
     ):
         super().__init__()
         if make_prompt_cache is None:
@@ -120,6 +121,7 @@ class EagleDecoder(SpecDecoderBase):
         self._target = target_model
         self._draft = draft_model
         self._block_size = block_size
+        self._target_quant = target_quant or ""
         # Default to the deepest (last) layer, i.e. ``len(layers) - 1``.
         # In practice trained checkpoints always supply
         # ``target_layer_id`` (recorded by ``olmlx eagle prepare`` from

@@ -209,6 +209,7 @@ def _build_draft_config(
     num_hidden_layers: int,
     block_size: int,
     mask_token_id: int,
+    target_quant: str | None = None,
 ) -> DraftConfig:
     """Derive a DraftConfig from the target's config.json.
 
@@ -351,6 +352,7 @@ def _build_draft_config(
         # ``{}`` (and ``{}`` carries no useful information either).
         rope_scaling=text_cfg.get("rope_scaling") or target_cfg.get("rope_scaling"),
         final_logit_softcapping=text_cfg.get("final_logit_softcapping"),
+        target_quant=target_quant,
     )
 
 
@@ -963,12 +965,15 @@ def prepare_dflash_draft(
                 "mask_token_id (CLI: --mask-token-id N) for this target."
             )
 
+    from olmlx.engine.speculative_loaders import _quant_descriptor_from_path
+
     draft_config = _build_draft_config(
         target_cfg,
         target_layer_ids=layer_ids,
         num_hidden_layers=num_hidden_layers,
         block_size=block_size,
         mask_token_id=int(mask_token_id),
+        target_quant=_quant_descriptor_from_path(model_path),
     )
 
     draft = DFlashDraftModel(draft_config)
@@ -1472,6 +1477,11 @@ def _draft_config_to_disk(cfg: DraftConfig) -> dict[str, Any]:
             "target_layer_ids": list(cfg.target_layer_ids),
             "mask_token_id": cfg.mask_token_id,
             "dflash_attention_version": 1 if cfg.attention_causal else 2,
+            **(
+                {"target_quant": cfg.target_quant}
+                if cfg.target_quant is not None
+                else {}
+            ),
         },
     }
     if cfg.rope_scaling is not None:

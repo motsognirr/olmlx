@@ -60,6 +60,7 @@ class EagleConfig:
     max_position_embeddings: int
     block_size: int
     rope_scaling: dict[str, Any] | None = None
+    target_quant: str | None = None
 
     def __post_init__(self) -> None:
         if self.block_size < 1:

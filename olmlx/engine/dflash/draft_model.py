@@ -62,6 +62,7 @@ class DraftConfig:
     sliding_window: int | None = None
     final_logit_softcapping: float | None = None
     attention_causal: bool = False
+    target_quant: str | None = None
 
     def __post_init__(self) -> None:
         if not self.layer_types:

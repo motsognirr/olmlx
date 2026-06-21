@@ -164,6 +164,7 @@ class DFlashDecoder(SpecDecoderBase):
         self._draft = draft_model
         self._config = draft_config
         self._block_size = block_size
+        self._target_quant = draft_config.target_quant or ""
 
         # State (populated by prefill()). The hook/capture lifecycle
         # fields (``_patched``/``_bound``/``_capture``/``_capture_buffer``)
