@@ -2959,6 +2959,27 @@ class ModelManager(SpeculativeLoaderMixin):
         silent fall-through to classic speculative.
         """
         strategy = spec_config.strategy
+
+        # Bundled-subdir probe: when no draft is configured and the strategy
+        # supports training a draft alongside the target, check whether
+        # <target-local-dir>/<strategy>/ exists and looks like a valid checkpoint.
+        # Precedence: explicit draft_model > curated map (#513, future) > probe.
+        if strategy in {"dflash", "eagle"} and not spec_config.draft_model:
+            from olmlx.engine.speculative_loaders import _probe_bundled_draft_dir
+
+            _target_local: Path | None = None
+            if Path(hf_path).is_absolute():
+                _target_local = Path(hf_path)
+            elif self.store is not None:
+                _target_local = self.store.local_path(hf_path)
+            if _target_local is not None:
+                _bundled = _probe_bundled_draft_dir(_target_local, strategy)
+                if _bundled is not None:
+                    logger.info(
+                        "Auto-detected bundled %s draft at %s", strategy, _bundled
+                    )
+                    spec_config = spec_config._replace(draft_model=str(_bundled))
+
         if strategy == "dflash":
             return self._load_dflash_decoder(model, spec_config)
         if strategy == "eagle":

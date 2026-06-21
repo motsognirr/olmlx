@@ -6383,3 +6383,182 @@ class TestBuildSpeculativeDecoder:
         manager._load_speculative_decoder.assert_called_once_with(
             model, "hf/path", cfg, is_vlm=True
         )
+
+
+class TestProbeBundledDraft:
+    """Unit tests for ``_probe_bundled_draft_dir`` pure helper."""
+
+    def test_probe_returns_path_when_both_present(self, tmp_path):
+        from olmlx.engine.speculative_loaders import _probe_bundled_draft_dir
+
+        d = tmp_path / "dflash"
+        d.mkdir()
+        (d / "config.json").write_text("{}")
+        (d / "model.safetensors").write_bytes(b"")
+        assert _probe_bundled_draft_dir(tmp_path, "dflash") == d
+
+    def test_probe_returns_path_for_eagle(self, tmp_path):
+        from olmlx.engine.speculative_loaders import _probe_bundled_draft_dir
+
+        d = tmp_path / "eagle"
+        d.mkdir()
+        (d / "config.json").write_text("{}")
+        (d / "weights.safetensors").write_bytes(b"")
+        assert _probe_bundled_draft_dir(tmp_path, "eagle") == d
+
+    def test_probe_returns_none_when_dir_missing(self, tmp_path):
+        from olmlx.engine.speculative_loaders import _probe_bundled_draft_dir
+
+        assert _probe_bundled_draft_dir(tmp_path, "dflash") is None
+
+    def test_probe_returns_none_when_config_missing(self, tmp_path):
+        from olmlx.engine.speculative_loaders import _probe_bundled_draft_dir
+
+        d = tmp_path / "dflash"
+        d.mkdir()
+        (d / "model.safetensors").write_bytes(b"")
+        assert _probe_bundled_draft_dir(tmp_path, "dflash") is None
+
+    def test_probe_returns_none_when_weights_missing(self, tmp_path):
+        from olmlx.engine.speculative_loaders import _probe_bundled_draft_dir
+
+        d = tmp_path / "dflash"
+        d.mkdir()
+        (d / "config.json").write_text("{}")
+        assert _probe_bundled_draft_dir(tmp_path, "dflash") is None
+
+
+class TestBuildSpeculativeDecoderBundledProbe:
+    """Integration tests: ``_build_speculative_decoder`` auto-detects bundled draft."""
+
+    def _manager_with_mocks(self, registry, mock_store):
+        manager = ModelManager(registry, mock_store)
+        for name in (
+            "_load_dflash_decoder",
+            "_load_eagle_decoder",
+            "_load_speculative_decoder",
+        ):
+            setattr(manager, name, MagicMock(return_value=f"{name}-result"))
+        return manager
+
+    def test_build_speculative_uses_bundled_draft_when_unset(
+        self, tmp_path, registry, mock_store
+    ):
+        """When draft_model is None and a bundled subdir is present, it is used."""
+        bundled = tmp_path / "dflash"
+        bundled.mkdir()
+        (bundled / "config.json").write_text("{}")
+        (bundled / "model-00001-of-00001.safetensors").write_bytes(b"")
+
+        mock_store.local_path = MagicMock(return_value=tmp_path)
+
+        manager = self._manager_with_mocks(registry, mock_store)
+        model = MagicMock()
+        cfg = SpeculativeConfig(
+            enabled=True, draft_model=None, num_tokens=None, strategy="dflash"
+        )
+        manager._build_speculative_decoder(model, "ns/model", cfg)
+
+        call_args = manager._load_dflash_decoder.call_args
+        used_cfg = call_args[0][1]
+        assert used_cfg.draft_model == str(bundled)
+
+    def test_build_speculative_explicit_draft_wins_over_bundled(
+        self, tmp_path, registry, mock_store
+    ):
+        """Explicit draft_model path takes precedence over a bundled probe."""
+        bundled = tmp_path / "dflash"
+        bundled.mkdir()
+        (bundled / "config.json").write_text("{}")
+        (bundled / "model.safetensors").write_bytes(b"")
+
+        mock_store.local_path = MagicMock(return_value=tmp_path)
+
+        manager = self._manager_with_mocks(registry, mock_store)
+        model = MagicMock()
+        cfg = SpeculativeConfig(
+            enabled=True,
+            draft_model="/explicit/path",
+            num_tokens=None,
+            strategy="dflash",
+        )
+        manager._build_speculative_decoder(model, "ns/model", cfg)
+
+        call_args = manager._load_dflash_decoder.call_args
+        used_cfg = call_args[0][1]
+        assert used_cfg.draft_model == "/explicit/path"
+
+    def test_build_speculative_no_probe_for_classic_strategy(
+        self, tmp_path, registry, mock_store
+    ):
+        """The bundled-probe is never run for the 'classic' strategy."""
+        bundled = tmp_path / "dflash"
+        bundled.mkdir()
+        (bundled / "config.json").write_text("{}")
+        (bundled / "model.safetensors").write_bytes(b"")
+
+        mock_store.local_path = MagicMock(return_value=tmp_path)
+
+        manager = self._manager_with_mocks(registry, mock_store)
+        model = MagicMock()
+        cfg = SpeculativeConfig(
+            enabled=True, draft_model=None, num_tokens=None, strategy="classic"
+        )
+        manager._build_speculative_decoder(model, "ns/model", cfg)
+
+        # classic routes to _load_speculative_decoder, not dflash
+        manager._load_speculative_decoder.assert_called_once()
+        manager._load_dflash_decoder.assert_not_called()
+        # The cfg passed through should be unchanged (draft_model still None)
+        call_args = manager._load_speculative_decoder.call_args
+        used_cfg = call_args[0][2]
+        assert used_cfg.draft_model is None
+
+    def test_build_speculative_uses_bundled_draft_eagle(
+        self, tmp_path, registry, mock_store
+    ):
+        """Bundled probe also works for the eagle strategy."""
+        bundled = tmp_path / "eagle"
+        bundled.mkdir()
+        (bundled / "config.json").write_text("{}")
+        (bundled / "weights.safetensors").write_bytes(b"")
+
+        mock_store.local_path = MagicMock(return_value=tmp_path)
+
+        manager = self._manager_with_mocks(registry, mock_store)
+        model = MagicMock()
+        cfg = SpeculativeConfig(
+            enabled=True, draft_model=None, num_tokens=None, strategy="eagle"
+        )
+        manager._build_speculative_decoder(model, "ns/model", cfg)
+
+        call_args = manager._load_eagle_decoder.call_args
+        used_cfg = call_args[0][1]
+        assert used_cfg.draft_model == str(bundled)
+
+    def test_build_speculative_absolute_hf_path_uses_probe(
+        self, tmp_path, registry, mock_store
+    ):
+        """For absolute hf_path, the probe uses the path directly (no store lookup)."""
+        target_dir = tmp_path / "local_model"
+        target_dir.mkdir()
+        bundled = target_dir / "dflash"
+        bundled.mkdir()
+        (bundled / "config.json").write_text("{}")
+        (bundled / "model.safetensors").write_bytes(b"")
+
+        mock_local_path = MagicMock(return_value=tmp_path)
+        mock_store.local_path = mock_local_path
+
+        manager = self._manager_with_mocks(registry, mock_store)
+        model = MagicMock()
+        cfg = SpeculativeConfig(
+            enabled=True, draft_model=None, num_tokens=None, strategy="dflash"
+        )
+        manager._build_speculative_decoder(model, str(target_dir), cfg)
+
+        call_args = manager._load_dflash_decoder.call_args
+        used_cfg = call_args[0][1]
+        assert used_cfg.draft_model == str(bundled)
+        # store.local_path must NOT have been called for absolute hf_path
+        mock_local_path.assert_not_called()

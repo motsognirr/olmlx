@@ -153,6 +153,28 @@ def _resolve_attention_causal(dflash_cfg: dict) -> bool:
     return True
 
 
+def _probe_bundled_draft_dir(local_dir: Path, strategy: str) -> Path | None:
+    """Return ``local_dir / strategy`` if it looks like a valid draft checkpoint.
+
+    A candidate is valid when ``config.json`` exists and at least one
+    ``.safetensors`` file is present — the same validity bar applied by
+    ``_load_dflash_decoder`` / ``_load_eagle_decoder`` after path resolution.
+    The check is intentionally shallow: full schema validation still runs
+    inside those loaders, so a malformed-but-present draft surfaces as a
+    clear schema error rather than a "no draft configured" message.
+
+    Returns ``None`` when the subdir is absent or fails either criterion.
+
+    # Future: curated-map lookup (#513) inserts before this call in
+    # ``_build_speculative_decoder`` — bundled probe is the last fallback
+    # before raising an error.
+    """
+    candidate = local_dir / strategy
+    if (candidate / "config.json").exists() and any(candidate.glob("*.safetensors")):
+        return candidate
+    return None
+
+
 class SpeculativeLoaderMixin:
     """Draft-model loading for speculative decoding (mixed into ModelManager)."""
 
@@ -242,9 +264,11 @@ class SpeculativeLoaderMixin:
             )
         if not spec_config.draft_model:
             raise ValueError(
-                "speculative_strategy='dflash' requires speculative_draft_model "
-                "to be set (OLMLX_SPECULATIVE_DRAFT_MODEL or per-model "
-                "'speculative_draft_model' in models.json)"
+                "speculative_strategy='dflash' requires a draft model but none "
+                "was found. Tried: OLMLX_SPECULATIVE_DRAFT_MODEL / per-model "
+                "'speculative_draft_model' in models.json, and a bundled "
+                "<target-dir>/dflash/ subdir probe. "
+                "Set speculative_draft_model or run 'olmlx dflash prepare'."
             )
 
         logger.info("Loading dflash draft model %s", spec_config.draft_model)
@@ -459,9 +483,11 @@ class SpeculativeLoaderMixin:
             )
         if not spec_config.draft_model:
             raise ValueError(
-                "speculative_strategy='eagle' requires speculative_draft_model "
-                "to be set (OLMLX_SPECULATIVE_DRAFT_MODEL or per-model "
-                "'speculative_draft_model' in models.json)"
+                "speculative_strategy='eagle' requires a draft model but none "
+                "was found. Tried: OLMLX_SPECULATIVE_DRAFT_MODEL / per-model "
+                "'speculative_draft_model' in models.json, and a bundled "
+                "<target-dir>/eagle/ subdir probe. "
+                "Set speculative_draft_model or run 'olmlx eagle prepare'."
             )
 
         logger.info("Loading EAGLE draft model %s", spec_config.draft_model)
