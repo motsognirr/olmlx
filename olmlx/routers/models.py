@@ -67,11 +67,9 @@ async def list_models(request: Request):
 @router.post("/api/show")
 async def show_model(req: ShowRequest, request: Request):
     store = request.app.state.model_store
-    manifest = store.show(req.model)
+    manifest = store.show(req.name)
     if manifest is None:
-        return JSONResponse(
-            {"error": f"model '{req.model}' not found"}, status_code=404
-        )
+        return JSONResponse({"error": f"model '{req.name}' not found"}, status_code=404)
     return ShowResponse(
         details=ModelDetails(
             format=manifest.format,
