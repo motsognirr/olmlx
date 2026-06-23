@@ -193,6 +193,29 @@ class TestCompileCache:
         c2 = compile_for_tokenizer(gpt2_tokenizer, gpt2_tokenizer.vocab_size, s2)
         assert c1 is not c2
 
+    def test_json_object_uses_object_schema_not_builtin_grammar(self, gpt2_tokenizer):
+        """Regression for #550: json_object mode must call compile_json_schema
+        with {"type": "object"}, NOT compile_builtin_json_grammar (which allows arrays)."""
+        import xgrammar as xgr
+
+        spec = GrammarSpec("json_object")
+        compiled = compile_for_tokenizer(
+            gpt2_tokenizer, gpt2_tokenizer.vocab_size, spec
+        )
+
+        matcher = xgr.GrammarMatcher(compiled)
+        lbracket_ids = [
+            tid
+            for tid, tok in enumerate(
+                gpt2_tokenizer.convert_ids_to_tokens(range(gpt2_tokenizer.vocab_size))
+            )
+            if tok is not None and tok.strip() == "["
+        ]
+        if lbracket_ids:
+            assert not matcher.accept_token(lbracket_ids[0]), (
+                "json_object grammar must reject '[' as first token"
+            )
+
     def test_drop_for_tokenizer_removes_entries(self, gpt2_tokenizer):
         """Wire-up safety: ``drop_for_tokenizer`` must remove the cache
         entries for the *specific* tokenizer being unloaded so that a
@@ -376,9 +399,9 @@ class TestLogitsProcessor:
         logits = mx.zeros((1, gpt2_tokenizer.vocab_size))
         # Prompt tokens — should not be fed to the matcher.
         out = proc([1, 2, 3], logits)
-        # Some tokens must be masked to -inf (the JSON grammar starts with
-        # whitespace or `{`/`[`/`"`/digit/`-`/`t`/`f`/`n`); ordinary words
-        # should be -inf.
+        # Some tokens must be masked to -inf (json_object mode constrains the
+        # root to `{`, so only `{` and leading whitespace are allowed);
+        # ordinary words should be -inf.
         out_np = (out == -mx.inf).sum().item()
         assert out_np > 0, "expected at least one token to be masked"
 
@@ -414,6 +437,32 @@ class TestLogitsProcessor:
         logits = mx.zeros((1, gpt2_tokenizer.vocab_size), dtype=mx.float16)
         out = proc([1, 2, 3], logits)
         assert out.dtype == mx.float16
+
+    def test_json_object_masks_array_start(self, gpt2_tokenizer):
+        """json_object mode must not allow a JSON array at the root.
+
+        After the initial prompt call, tokens that would start a JSON array
+        ('[') must all be masked to -inf.
+        """
+        spec = GrammarSpec("json_object")
+        proc = make_processor(gpt2_tokenizer, gpt2_tokenizer.vocab_size, spec)
+        logits = mx.zeros((1, gpt2_tokenizer.vocab_size))
+        proc([1, 2, 3], logits)  # prompt call — does not advance matcher
+
+        bracket_ids = [
+            tid
+            for tid, tok in enumerate(
+                gpt2_tokenizer.convert_ids_to_tokens(range(gpt2_tokenizer.vocab_size))
+            )
+            if tok is not None and "[" in tok
+        ]
+        assert bracket_ids, "gpt2 tokenizer must contain '[' tokens"
+
+        mask_out = proc([1, 2, 3], logits)
+        mask_np = mask_out.squeeze(0).tolist()
+        assert all(mask_np[tid] == float("-inf") for tid in bracket_ids), (
+            "json_object mode must mask all '[' tokens; compile_builtin_json_grammar allows them"
+        )
 
     def test_terminated_matcher_returns_logits_unmodified(self, gpt2_tokenizer):
         """When the matcher is fully terminated, the processor should

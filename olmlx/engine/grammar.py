@@ -53,9 +53,9 @@ _JSON_SCHEMA_TYPES = frozenset(
 class GrammarSpec:
     """Describes a grammar constraint for a single request.
 
-    ``kind="json_object"`` allows any well-formed JSON value (xgrammar's
-    builtin JSON grammar). ``kind="json_schema"`` requires ``schema`` to be
-    a JSON-Schema dict.
+    ``kind="json_object"`` constrains output to a JSON object (``{}``),
+    matching the OpenAI spec guarantee. ``kind="json_schema"`` requires
+    ``schema`` to be a JSON-Schema dict.
 
     Note: ``frozen=True`` would normally generate ``__hash__``, but the
     ``schema`` field is a dict and not hashable, so attempting to hash a
@@ -219,7 +219,7 @@ def compile_for_tokenizer(tokenizer: Any, vocab_size: int, spec: GrammarSpec) ->
     # Compile outside the lock — see docstring.
     compiler = _get_compiler(tokenizer, vocab_size)
     if spec.kind == "json_object":
-        compiled = compiler.compile_builtin_json_grammar()
+        compiled = compiler.compile_json_schema({"type": "object"})
     else:
         assert spec.schema is not None  # post_init enforces
         compiled = compiler.compile_json_schema(spec.schema)
