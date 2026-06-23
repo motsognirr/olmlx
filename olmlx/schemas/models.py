@@ -1,4 +1,4 @@
-from pydantic import BaseModel
+from pydantic import AliasChoices, BaseModel, Field
 
 
 class ModelDetails(BaseModel):
@@ -24,7 +24,7 @@ class TagsResponse(BaseModel):
 
 
 class ShowRequest(BaseModel):
-    model: str
+    name: str = Field(validation_alias=AliasChoices("name", "model"))
     verbose: bool = False
 
 
