@@ -527,6 +527,10 @@ def _extract_gemma4_blocks(text: str) -> tuple[str, list[str]]:
 
         close = text.find("<channel|>", marker_end)
         if close < 0:
+            # Truncated block: stream ended before the closer was emitted.
+            tail = text[marker_end:].strip()
+            if tail:
+                blocks.append(tail)
             break
 
         content = text[marker_end:close].strip()
@@ -591,6 +595,16 @@ def parse_model_output(
                     else orphan_thinking
                 )
             text = text[orphan_idx + len("</think>") :].lstrip("\n")
+
+    # Detect truncated thinking block: opener present but stream ended before
+    # the matching </think> could be emitted (e.g. max_tokens hit mid-reasoning).
+    open_pos = text.find("<think>")
+    if open_pos != -1 and text.find("</think>", open_pos) == -1:
+        pre = text[:open_pos].strip()
+        partial = text[open_pos + len("<think>") :].strip()
+        if partial:
+            thinking = f"{thinking}\n{partial}".strip() if thinking else partial
+        text = pre
 
     tool_uses: list[dict] = []
     if has_tools:
