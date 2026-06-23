@@ -147,6 +147,7 @@ class ModelStore:
         resolved = self.registry.resolve(name)
         hf_path = resolved.hf_path if resolved is not None else None
         if hf_path is not None:
+            hf_path = _strip_ollama_tag(hf_path)
             d = self.local_path(hf_path)
             if (d / "manifest.json").exists():
                 return (d, True)
