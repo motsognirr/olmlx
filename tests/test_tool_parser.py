@@ -812,3 +812,35 @@ class TestGemma4Thinking:
         thinking, visible, tools = parse_model_output(text, has_tools=True)
         assert len(tools) == 1
         assert tools[0]["name"] == "func"
+
+
+class TestTruncatedThinking:
+    def test_unclosed_think_opener_classifies_as_thinking(self):
+        """max_tokens hits mid-reasoning: raw <think> must not leak into content."""
+        text = '<think>\nOkay, the user said "Say hi." I need to respond'
+        thinking, visible, tools = parse_model_output(text, has_tools=False)
+        assert "Okay, the user" in thinking
+        assert "<think>" not in visible
+        assert visible == ""
+
+    def test_unclosed_think_with_prior_content(self):
+        """Non-thinking preamble before the opener survives; partial thinking is
+        classified as thinking."""
+        text = "Sure! <think>Let me reason about"
+        thinking, visible, tools = parse_model_output(text, has_tools=False)
+        assert "Let me reason" in thinking
+        assert visible.strip() == "Sure!"
+
+    def test_complete_pair_still_works(self):
+        """Regression guard: complete pairs still extracted correctly."""
+        text = "<think>reasoning</think>The answer is 42."
+        thinking, visible, tools = parse_model_output(text, has_tools=False)
+        assert thinking == "reasoning"
+        assert visible == "The answer is 42."
+
+    def test_truncated_gemma4_block_classifies_as_thinking(self):
+        """Gemma4 opener without closer must not silently drop partial content."""
+        text = "<|channel>thought\nThis is partial reasoning without a close tag"
+        thinking, visible, tools = parse_model_output(text, has_tools=False)
+        assert "partial reasoning" in thinking
+        assert "<|channel>" not in visible
