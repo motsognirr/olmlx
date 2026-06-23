@@ -127,7 +127,7 @@ async def _stream_openai_sse(
                 done_reason = chunk.get("done_reason")
                 finish_reason = (
                     "length"
-                    if done_reason == "timeout"
+                    if done_reason in ("timeout", "length")
                     else format_done().get("finish_reason", "stop")
                 )
                 done_choice = format_done()
@@ -247,7 +247,7 @@ async def _stream_openai_sse_with_tools(
             yield f"data: {_chunk({'delta': {'role': 'assistant', 'content': None}, 'finish_reason': None})}\n\n"
             if visible_text:
                 yield f"data: {_chunk({'delta': {'content': visible_text}, 'finish_reason': None})}\n\n"
-            fr = "length" if done_reason == "timeout" else "stop"
+            fr = "length" if done_reason in ("timeout", "length") else "stop"
             yield f"data: {_chunk({'delta': {}, 'finish_reason': fr})}\n\n"
 
         yield "data: [DONE]\n\n"
@@ -460,7 +460,7 @@ async def openai_chat(req: OpenAIChatRequest, request: Request):
         done_reason = result.get("done_reason")
         if tool_uses:
             finish_reason = "tool_calls"
-        elif done_reason == "timeout":
+        elif done_reason in ("timeout", "length"):
             finish_reason = "length"
         else:
             finish_reason = "stop"
@@ -541,7 +541,7 @@ async def openai_completions(req: OpenAICompletionRequest, request: Request):
                     index=0,
                     text=result.get("text", ""),
                     finish_reason="length"
-                    if result.get("done_reason") == "timeout"
+                    if result.get("done_reason") in ("timeout", "length")
                     else "stop",
                 )
             ],

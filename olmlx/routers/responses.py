@@ -287,7 +287,7 @@ def _build_response_object(
 ) -> ResponsesResponse:
     incomplete = None
     status = "completed"
-    if done_reason == "timeout":
+    if done_reason in ("timeout", "length"):
         status = "incomplete"
         incomplete = {"reason": "max_output_tokens"}
     return ResponsesResponse(
@@ -460,7 +460,9 @@ async def _stream_response(
                 {"output_index": out_index, "item": item},
             )
 
-        final_status = "incomplete" if done_reason == "timeout" else "completed"
+        final_status = (
+            "incomplete" if done_reason in ("timeout", "length") else "completed"
+        )
         final = base_response(final_status, output_items, stats, done_reason)
         yield ev("response.completed", {"response": final})
 

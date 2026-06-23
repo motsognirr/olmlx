@@ -470,7 +470,7 @@ async def _stream_buffered_with_tools(
 
     if tool_uses:
         stop_reason = "tool_use"
-    elif done_reason == "timeout":
+    elif done_reason in ("timeout", "length"):
         stop_reason = "max_tokens"
     else:
         stop_reason = "end_turn"
@@ -614,7 +614,9 @@ async def _stream_thinking_state_machine(result):
         block_idx += 1
 
     yield {
-        "stop_reason": "max_tokens" if done_reason == "timeout" else "end_turn",
+        "stop_reason": "max_tokens"
+        if done_reason in ("timeout", "length")
+        else "end_turn",
         "output_tokens": output_tokens,
     }
 
@@ -908,7 +910,7 @@ async def anthropic_messages(req: AnthropicMessagesRequest, request: Request):
         done_reason = result.get("done_reason")
         if tool_uses:
             stop_reason = "tool_use"
-        elif done_reason == "timeout":
+        elif done_reason in ("timeout", "length"):
             stop_reason = "max_tokens"
         else:
             stop_reason = "end_turn"

@@ -2993,6 +2993,7 @@ async def _stream_completion_batched(
     stop_hit = False
     timed_out = False
     lagged = False
+    max_tokens_hit = False
     terminal_seen = False
     start_ns = time.monotonic_ns()
     first_token_ns: int | None = None
@@ -3060,6 +3061,7 @@ async def _stream_completion_batched(
                                 "Batched generation truncated: consumer lag "
                                 "exceeded the backpressure limit"
                             )
+                        max_tokens_hit = event["reason"] == "length"
                         if event["reason"] == "cancelled" and not (
                             stop_hit or timed_out or lagged
                         ):
@@ -3161,6 +3163,9 @@ async def _stream_completion_batched(
             done_chunk["done_reason"] = "timeout"
         elif stop_hit:
             done_chunk["done_reason"] = "stop"
+        elif max_tokens_hit:
+            # Scheduler exhausted the token budget — mirrors exclusive path.
+            done_chunk["done_reason"] = "length"
         try:
             _metrics.observe_inference(lm.name, surface_var.get(), stats)
         except Exception:
@@ -3582,8 +3587,12 @@ async def _stream_completion(
             done_chunk["raw_text"] = raw_text
         if timed_out:
             done_chunk["done_reason"] = "timeout"
-        if stop_hit:
+        elif stop_hit:
             done_chunk["done_reason"] = "stop"
+        elif max_tokens > 0 and stats.eval_count >= max_tokens:
+            # Stream terminated at the token budget (no EOS / stop sequence).
+            # "length" mirrors OpenAI's finish_reason and the batched path.
+            done_chunk["done_reason"] = "length"
         try:
             _metrics.observe_inference(lm.name, surface_var.get(), stats)
         except Exception:

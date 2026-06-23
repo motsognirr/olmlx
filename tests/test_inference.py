@@ -5685,3 +5685,181 @@ def test_completion_functions_accept_audio_param():
         inf._full_completion_inner,
     ):
         assert "audio" in inspect.signature(fn).parameters, fn.__name__
+
+
+class TestFinishReasonLength:
+    """Tests that done_reason='length' is emitted when max_tokens is exhausted."""
+
+    def _make_stream(self, n_tokens: int):
+        """Create a mock CancellableStream that yields exactly n_tokens tokens."""
+        mock_stream = MagicMock(spec=CancellableStream)
+        mock_stream.drain_and_join = AsyncMock()
+        mock_stream._thread = None
+
+        tokens = [
+            StreamToken(
+                text=f"tok{i}",
+                token=i,
+                prompt_tokens=5,
+                generation_tokens=i + 1,
+                prompt_tps=100.0,
+                generation_tps=50.0,
+            )
+            for i in range(n_tokens)
+        ]
+        token_iter = iter(tokens)
+
+        async def anext_impl():
+            try:
+                return next(token_iter)
+            except StopIteration:
+                raise StopAsyncIteration
+
+        mock_stream.__aiter__ = lambda self: self
+        mock_stream.__anext__ = lambda self: anext_impl()
+        return mock_stream
+
+    @pytest.mark.asyncio
+    async def test_exclusive_path_emits_length_when_max_tokens_exhausted(
+        self, mock_manager
+    ):
+        """Exclusive path: stream terminates after exactly max_tokens tokens.
+        done_chunk must have done_reason=='length'."""
+        lm = mock_manager._loaded["qwen3:latest"]
+        lm.inference_timeout = None
+
+        mock_stream = self._make_stream(3)
+
+        with (
+            patch("olmlx.engine.inference.mx"),
+            patch("olmlx.engine.inference.settings") as mock_settings,
+            patch("olmlx.engine.inference.async_mlx_stream", return_value=mock_stream),
+        ):
+            mock_settings.inference_queue_timeout = None
+            mock_settings.inference_timeout = None
+            mock_settings.prompt_cache = False
+            mock_settings.memory_limit_fraction = 0.9
+            mock_settings.sync_mode = "full"
+            gen = await generate_completion(
+                mock_manager,
+                "qwen3",
+                "Hello",
+                max_tokens=3,
+                stream=True,
+            )
+            chunks = []
+            async for chunk in gen:
+                chunks.append(chunk)
+
+        done_chunk = chunks[-1]
+        assert done_chunk["done"] is True
+        assert done_chunk.get("done_reason") == "length"
+        text_chunks = [c for c in chunks if not c.get("done") and "text" in c]
+        assert len(text_chunks) == 3
+
+    @pytest.mark.asyncio
+    async def test_exclusive_path_no_length_on_eos_before_limit(self, mock_manager):
+        """Exclusive path: stream ends before max_tokens (EOS). done_reason must
+        not be 'length'."""
+        lm = mock_manager._loaded["qwen3:latest"]
+        lm.inference_timeout = None
+
+        mock_stream = self._make_stream(2)
+
+        with (
+            patch("olmlx.engine.inference.mx"),
+            patch("olmlx.engine.inference.settings") as mock_settings,
+            patch("olmlx.engine.inference.async_mlx_stream", return_value=mock_stream),
+        ):
+            mock_settings.inference_queue_timeout = None
+            mock_settings.inference_timeout = None
+            mock_settings.prompt_cache = False
+            mock_settings.memory_limit_fraction = 0.9
+            mock_settings.sync_mode = "full"
+            gen = await generate_completion(
+                mock_manager,
+                "qwen3",
+                "Hello",
+                max_tokens=10,
+                stream=True,
+            )
+            chunks = []
+            async for chunk in gen:
+                chunks.append(chunk)
+
+        done_chunk = chunks[-1]
+        assert done_chunk["done"] is True
+        assert done_chunk.get("done_reason") != "length"
+
+    @pytest.mark.asyncio
+    async def test_batched_path_propagates_length_reason(self, mock_manager):
+        """Batched path: a done event with reason='length' from the scheduler
+        must produce done_chunk['done_reason']=='length'."""
+        import asyncio
+
+        from olmlx.engine.inference import _stream_completion_batched
+        from olmlx.utils.timing import TimingStats
+
+        lm = mock_manager._loaded["qwen3:latest"]
+        lm.inference_timeout = None
+        lm.inference_queue_timeout = None
+
+        # Build a mock sequence whose out queue delivers:
+        # one token event then a done event with reason='length'
+        mock_seq = MagicMock()
+        mock_seq.note_consumed = MagicMock()
+        mock_seq.want_cache = True
+        out_queue: asyncio.Queue = asyncio.Queue()
+
+        async def _get():
+            return await out_queue.get()
+
+        mock_seq.out = MagicMock()
+        mock_seq.out.get = _get
+
+        # Detokenizer mock
+        lm.tokenizer.detokenizer = MagicMock()
+        lm.tokenizer.detokenizer.add_token = MagicMock()
+        lm.tokenizer.detokenizer.last_segment = "hi"
+        lm.tokenizer.detokenizer.finalize = MagicMock()
+
+        mock_scheduler = MagicMock()
+        mock_scheduler.submit = AsyncMock(return_value=mock_seq)
+        mock_scheduler.cancel = MagicMock()
+
+        # Populate the out queue: one token then done with length reason
+        await out_queue.put({"type": "token", "token": 42})
+        await out_queue.put({"type": "done", "reason": "length"})
+
+        with (
+            patch("olmlx.engine.inference.settings") as mock_settings,
+            patch(
+                "olmlx.engine.inference._get_batch_scheduler",
+                return_value=mock_scheduler,
+            ),
+            patch("olmlx.engine.inference._batched_kv_preflight"),
+            patch(
+                "olmlx.engine.inference.tokenize_for_cache",
+                return_value=[1, 2, 3],
+            ),
+        ):
+            mock_settings.inference_queue_timeout = None
+            mock_settings.inference_timeout = None
+            mock_settings.prompt_cache = False
+            mock_settings.memory_limit_fraction = 0.9
+            mock_settings.sync_mode = "full"
+
+            stats = TimingStats()
+            chunks = []
+            async for chunk in _stream_completion_batched(
+                lm,
+                "Hello",
+                max_tokens=5,
+                gen_kwargs={},
+                stats=stats,
+            ):
+                chunks.append(chunk)
+
+        done_chunk = chunks[-1]
+        assert done_chunk["done"] is True
+        assert done_chunk.get("done_reason") == "length"
