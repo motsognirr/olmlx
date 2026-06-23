@@ -592,6 +592,59 @@ class TestResolveModelDir:
         assert path == local_dir
         assert has_manifest is False
 
+    def test_resolve_hf_path_with_latest_tag_and_manifest(self, mock_store):
+        """_resolve_model_dir finds the stripped path when name carries :latest tag."""
+        # pull() strips the tag before writing to disk; dir is keyed on stripped path
+        stripped_dir = mock_store.local_path("mlx-community/Qwen3-4B-4bit")
+        stripped_dir.mkdir(parents=True)
+        (stripped_dir / "config.json").write_text("{}")
+        (stripped_dir / "manifest.json").write_text(
+            json.dumps(
+                {
+                    "name": "mlx-community/Qwen3-4B-4bit:latest",
+                    "hf_path": "mlx-community/Qwen3-4B-4bit",
+                }
+            )
+        )
+
+        result = mock_store._resolve_model_dir("mlx-community/Qwen3-4B-4bit:latest")
+        assert result is not None
+        path, has_manifest = result
+        assert path == stripped_dir
+        assert has_manifest is True
+
+    def test_resolve_hf_path_with_latest_tag_config_only(self, mock_store):
+        """_resolve_model_dir returns (path, False) for :latest-tagged HF paths with only config.json."""
+        stripped_dir = mock_store.local_path("mlx-community/Qwen3-4B-4bit")
+        stripped_dir.mkdir(parents=True)
+        (stripped_dir / "config.json").write_text("{}")
+
+        result = mock_store._resolve_model_dir("mlx-community/Qwen3-4B-4bit:latest")
+        assert result is not None
+        path, has_manifest = result
+        assert path == stripped_dir
+        assert has_manifest is False
+
+
+class TestShowHfPathWithTag:
+    def test_show_hf_path_with_latest_tag(self, mock_store):
+        """show() returns a ModelManifest for an HF-path name carrying :latest tag."""
+        stripped_dir = mock_store.local_path("mlx-community/Qwen3-4B-4bit")
+        stripped_dir.mkdir(parents=True)
+        (stripped_dir / "config.json").write_text(json.dumps({"model_type": "qwen2"}))
+        (stripped_dir / "manifest.json").write_text(
+            json.dumps(
+                {
+                    "name": "mlx-community/Qwen3-4B-4bit:latest",
+                    "hf_path": "mlx-community/Qwen3-4B-4bit",
+                }
+            )
+        )
+
+        result = mock_store.show("mlx-community/Qwen3-4B-4bit:latest")
+        assert result is not None
+        assert isinstance(result, ModelManifest)
+
 
 class TestListLocalWithoutManifest:
     def test_list_local_includes_dirs_without_manifest(self, mock_store, tmp_path):
