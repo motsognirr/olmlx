@@ -392,6 +392,18 @@ class Settings(BaseSettings):
     flash_speculative_draft_model: Annotated[str, Field(min_length=1)] | None = None
     flash_speculative_tokens: Annotated[int, Field(gt=0)] = 4
 
+    # AWQ / GPTQ auto-conversion on pull (issue #363).
+    # When detect_format() identifies a downloaded model as AWQ or GPTQ,
+    # olmlx re-quantizes it to MLX int4/int8 via mlx_lm.convert.  The
+    # converted artifact lands in a sibling directory; the original is deleted
+    # when awq_gptq_remove_source=True.
+    # Peak disk: ~2× model size during conversion (src + dst coexist).
+    # Peak RAM: BF16 weights in flight (~2 bytes/param) — large models OOM
+    # on 16-24 GB devices; see issue #363 risks.
+    awq_gptq_convert_bits: Annotated[int, Field(ge=1, le=8)] = 4
+    awq_gptq_convert_group_size: Annotated[int, Field(ge=32)] = 64
+    awq_gptq_remove_source: bool = True
+
     # Autonomous agent (engine/agent/, routers/agent.py — issue #445). The
     # orchestrator drives the existing ``ChatSession`` ReAct loop across many
     # turns toward a goal, with hard budgets, stall detection, SQLite-persisted

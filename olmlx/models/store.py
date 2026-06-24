@@ -2,12 +2,14 @@ import asyncio
 import json
 import logging
 import re
+import shutil
 import threading
 from collections.abc import AsyncGenerator
 from datetime import datetime, timezone
 from pathlib import Path
 
 from olmlx.config import settings
+from olmlx.engine.awq_gptq_converter import convert_to_mlx, detect_format
 from olmlx.engine.registry import ModelRegistry
 from olmlx.models.manifest import ModelManifest
 
@@ -72,6 +74,20 @@ def _extract_metadata(model_dir: Path) -> dict:
         if bits:
             meta["quantization_level"] = f"{bits}-bit"
     return meta
+
+
+def _converted_path(models_dir: Path, hf_path: str) -> Path:
+    """Return the canonical directory for the MLX-converted form of *hf_path*."""
+    return models_dir / _safe_dir_name(hf_path + "-mlx-converted")
+
+
+def _is_valid_mlx_dir(path: Path) -> bool:
+    """True when *path* is a complete, ready-to-load MLX model directory."""
+    return (
+        path.exists()
+        and (path / "config.json").exists()
+        and not (path / ".converting").exists()
+    )
 
 
 def _dir_size(path: Path) -> int:
@@ -177,10 +193,18 @@ class ModelStore:
     def ensure_downloaded(self, hf_path: str) -> Path:
         """Download a model if not already present. Returns the local directory.
 
+        Checks the converted directory first: if a prior pull already
+        converted this model to MLX format, return that immediately without
+        triggering a new download.
+
         Uses a .downloading marker to track incomplete downloads.
         Partial directories are kept on failure so snapshot_download can resume.
         Thread-safe: concurrent calls for the same hf_path are serialized.
         """
+        converted_dir = _converted_path(self.models_dir, hf_path)
+        if _is_valid_mlx_dir(converted_dir):
+            return converted_dir
+
         local_dir = self.local_path(hf_path)
         if self.is_downloaded(hf_path):
             return local_dir
@@ -220,7 +244,14 @@ class ModelStore:
             return local_dir
 
     async def pull(self, name: str) -> AsyncGenerator[dict, None]:
-        """Pull a model from HuggingFace, yielding progress dicts."""
+        """Pull a model from HuggingFace, yielding progress dicts.
+
+        If the downloaded model is detected as AWQ or GPTQ, it is
+        automatically re-quantised to MLX int4 (configurable via
+        OLMLX_AWQ_GPTQ_CONVERT_BITS / OLMLX_AWQ_GPTQ_CONVERT_GROUP_SIZE).
+        The converted artifact lands in a sibling directory and the original
+        is removed when OLMLX_AWQ_GPTQ_REMOVE_SOURCE=true (default).
+        """
         resolved = self.registry.resolve(name)
         hf_path = resolved.hf_path if resolved is not None else None
         if hf_path is None:
@@ -232,8 +263,10 @@ class ModelStore:
         # Strip Ollama-style tag before passing to HF.
         hf_path = _strip_ollama_tag(hf_path)
 
-        # Fast path: skip lock if already downloaded
-        if self.is_downloaded(hf_path):
+        converted_dir = _converted_path(self.models_dir, hf_path)
+
+        # Fast path: skip lock if already downloaded or already converted
+        if self.is_downloaded(hf_path) or _is_valid_mlx_dir(converted_dir):
             yield {"status": "pulling manifest"}
             yield {"status": "already downloaded"}
             yield {"status": "success"}
@@ -243,12 +276,12 @@ class ModelStore:
 
         async with self._pull_lock(hf_path):
             # Re-check after acquiring lock — another coroutine may have
-            # completed the download while we waited.
-            if self.is_downloaded(hf_path):
+            # completed the download (or conversion) while we waited.
+            converted_dir = _converted_path(self.models_dir, hf_path)
+            if self.is_downloaded(hf_path) or _is_valid_mlx_dir(converted_dir):
                 yield {"status": "pulling manifest"}
                 yield {"status": "already downloaded"}
                 yield {"status": "success"}
-                # Ensure registered
                 if "/" not in name:
                     self.registry.add_mapping(name, hf_path)
                 return
@@ -260,11 +293,27 @@ class ModelStore:
             # hf_path — that lock serializes the sync download path used by
             # ModelManager._load_model().  The asyncio lock here serializes the
             # async pull path (is_downloaded check → download → manifest write).
-            local_dir = await asyncio.to_thread(self.ensure_downloaded, hf_path)
+            raw_local_dir = await asyncio.to_thread(self.ensure_downloaded, hf_path)
+            local_dir = raw_local_dir
+
+            fmt = detect_format(raw_local_dir)
+            if fmt:
+                yield {"status": f"converting {fmt} → mlx"}
+                await asyncio.to_thread(
+                    convert_to_mlx,
+                    raw_local_dir,
+                    converted_dir,
+                    settings.awq_gptq_convert_bits,
+                    settings.awq_gptq_convert_group_size,
+                )
+                local_dir = converted_dir
+                if settings.awq_gptq_remove_source:
+                    await asyncio.to_thread(shutil.rmtree, raw_local_dir)
 
             yield {"status": "verifying"}
 
-            # Write manifest
+            # Write manifest — after conversion, local_dir is the MLX artifact
+            # and _extract_metadata reads its config.json for quant info.
             meta = _extract_metadata(local_dir)
             size = _dir_size(local_dir)
             normalized = self.registry.normalize_name(name)
