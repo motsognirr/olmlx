@@ -69,7 +69,7 @@ def convert_to_mlx(src: Path, dst: Path, bits: int, group_size: int) -> None:
 
     try:
         mlx_lm.convert(
-            model=str(src),
+            hf_path=str(src),
             mlx_path=str(dst),
             quantize=True,
             q_bits=bits,

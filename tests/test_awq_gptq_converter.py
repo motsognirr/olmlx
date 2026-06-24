@@ -26,7 +26,7 @@ def test_convert_calls_mlx_lm_convert_with_correct_args(tmp_path):
         convert_to_mlx(src, dst, bits=4, group_size=64)
 
     mock_convert.assert_called_once_with(
-        model=str(src),
+        hf_path=str(src),
         mlx_path=str(dst),
         quantize=True,
         q_bits=4,
@@ -65,7 +65,7 @@ def test_convert_sets_and_clears_converting_marker(tmp_path):
 
     marker_states: list[bool] = []
 
-    def capture_marker_state(model, mlx_path, **kwargs):
+    def capture_marker_state(hf_path, mlx_path, **kwargs):
         marker_states.append((Path(mlx_path) / ".converting").exists())
 
     with patch("mlx_lm.convert", side_effect=capture_marker_state):
