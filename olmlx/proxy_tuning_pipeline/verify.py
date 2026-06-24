@@ -139,7 +139,14 @@ def main(argv: list[str] | None = None) -> None:
         args.base_vocab,
         base_dir=args.base_dir,
     )
-    print("OK: M-/M+ share one tokenizer and match the base vocabulary.")
+    if args.base_dir is not None:
+        print("OK: base, M-, and M+ share one tokenizer and one vocabulary width.")
+    else:
+        print(
+            f"OK: M-/M+ share one tokenizer and match the base vocab width "
+            f"({args.base_vocab}). Base tokenizer NOT checked — pass --base-dir "
+            f"to verify the base shares the pair's token mapping."
+        )
 
 
 if __name__ == "__main__":
