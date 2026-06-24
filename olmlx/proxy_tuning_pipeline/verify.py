@@ -16,10 +16,13 @@ from olmlx.engine.proxy_tuning import check_vocab_identity
 
 
 def _load_tokenizer(path: str) -> Any:
-    from mlx_lm import load
+    from mlx_lm.utils import load_tokenizer
 
-    _model, tokenizer = load(path)  # pyright: ignore[reportAssignmentType]
-    return tokenizer
+    # Tokenizer-only load: fetches just the tokenizer/config files, never the
+    # multi-GB model weights (we only need get_vocab() for the identity check).
+    # Using load() here would fully materialize each model — and the base would
+    # then be loaded a second time by the eval pipeline's own loader.
+    return load_tokenizer(path, {"trust_remote_code": True})
 
 
 def _load_config_vocab_size(path: str) -> int:
