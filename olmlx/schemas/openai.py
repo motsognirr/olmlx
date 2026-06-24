@@ -26,6 +26,12 @@ class OpenAIChatMessage(BaseModel):
     tool_calls: list[dict[str, Any]] | None = None
     tool_call_id: str | None = None
 
+    @model_validator(mode="after")
+    def _content_required(self) -> "OpenAIChatMessage":
+        if self.role in ("user", "tool") and self.content is None:
+            raise ValueError(f"content is required for {self.role} messages")
+        return self
+
 
 class ResponseFormat(BaseModel):
     type: Literal["text", "json_object", "json_schema"] = "text"

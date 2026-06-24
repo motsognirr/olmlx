@@ -608,6 +608,33 @@ class TestOpenAISchemas:
         with pytest.raises(ValidationError, match="max_tokens"):
             OpenAICompletionRequest(model="test", prompt="hi", max_tokens=0)
 
+    def test_user_null_content_rejected(self):
+        with pytest.raises(ValidationError, match="content"):
+            OpenAIChatMessage(role="user", content=None)
+
+    def test_tool_null_content_rejected(self):
+        with pytest.raises(ValidationError, match="content"):
+            OpenAIChatMessage(role="tool", content=None)
+
+    def test_system_null_content_allowed(self):
+        msg = OpenAIChatMessage(role="system", content=None)
+        assert msg.content is None
+
+    def test_assistant_null_content_with_tool_calls_allowed(self):
+        msg = OpenAIChatMessage(
+            role="assistant",
+            content=None,
+            tool_calls=[
+                {
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "foo", "arguments": "{}"},
+                }
+            ],
+        )
+        assert msg.content is None
+        assert msg.tool_calls is not None
+
 
 class TestAnthropicSchemas:
     def test_tool_input_schema(self):
