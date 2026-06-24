@@ -771,6 +771,19 @@ class TestEmptyInputRejected:
         assert "prompt" in body
         assert "empty" in body
 
+    @pytest.mark.asyncio
+    async def test_user_null_content_returns_422(self, app_client):
+        resp = await app_client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "qwen3",
+                "messages": [{"role": "user", "content": None}],
+            },
+        )
+        assert resp.status_code == 422
+        body = resp.text.lower()
+        assert "content" in body
+
 
 class TestXCacheIDHeader:
     @pytest.mark.asyncio
