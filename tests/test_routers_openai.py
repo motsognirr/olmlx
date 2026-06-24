@@ -308,6 +308,23 @@ class TestOpenAIRouter:
         assert len(data["data"]) >= 2
 
     @pytest.mark.asyncio
+    async def test_list_models_includes_local_only(self, app_client):
+        from olmlx.models.manifest import ModelManifest
+
+        store = app_client._transport.app.state.model_store
+        model_dir = store.models_dir / "mlx-community_Qwen3-4B-4bit"
+        model_dir.mkdir(parents=True, exist_ok=True)
+        ModelManifest(
+            name="mlx-community/Qwen3-4B-4bit:latest",
+            hf_path="mlx-community/Qwen3-4B-4bit",
+        ).save(model_dir / "manifest.json")
+
+        resp = await app_client.get("/v1/models")
+        assert resp.status_code == 200
+        ids = [m["id"] for m in resp.json()["data"]]
+        assert "mlx-community/Qwen3-4B-4bit:latest" in ids
+
+    @pytest.mark.asyncio
     async def test_chat_completions_non_streaming(self, app_client):
         stats = TimingStats(prompt_eval_count=10, eval_count=20)
         mock_result = {"text": "Hello!", "done": True, "stats": stats}
