@@ -92,11 +92,18 @@ def assert_serveable_pair(
             other_label="expert (M+)",
         )
     # Each model's logits width must equal the steered base's, or the per-token
-    # logit arithmetic (base + alpha*(expert - anti-expert)) is misaligned.
-    for label, model_dir in (
+    # logit arithmetic (base + alpha*(expert - anti-expert)) is misaligned. When
+    # base_dir is supplied, width-check the base too: token-mapping identity does
+    # not pin the padded width (a same-mapping base can still declare a different
+    # config vocab_size), and base_vocab_size may come from a separate source
+    # than base_dir (e.g. the CLI's --base-vocab vs --base-dir).
+    width_checks = [
         ("anti-expert (M-)", anti_expert_dir),
         ("expert (M+)", expert_dir),
-    ):
+    ]
+    if base_dir is not None:
+        width_checks.append(("base (M)", base_dir))
+    for label, model_dir in width_checks:
         vocab_size = config_loader(model_dir)
         if vocab_size != base_vocab_size:
             raise ValueError(

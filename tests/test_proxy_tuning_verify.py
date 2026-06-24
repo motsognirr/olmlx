@@ -128,7 +128,7 @@ def test_assert_serveable_pair_passes_when_base_tokenizer_matches():
     loader = _loader_for(
         {"base": dict(vocab), "m_minus": dict(vocab), "m_plus": dict(vocab)}
     )
-    config_loader = _config_loader_for({"m_minus": 3, "m_plus": 3})
+    config_loader = _config_loader_for({"base": 3, "m_minus": 3, "m_plus": 3})
     assert_serveable_pair(
         "m_minus",
         "m_plus",
@@ -137,6 +137,28 @@ def test_assert_serveable_pair_passes_when_base_tokenizer_matches():
         loader=loader,
         config_loader=config_loader,
     )
+
+
+def test_assert_serveable_pair_raises_on_base_dir_width_mismatch():
+    # base_dir given, tokenizer matches, but the base's own config width differs
+    # from base_vocab_size (e.g. CLI --base-vocab disagrees with the base config).
+    # The base must be width-checked too, not just token-mapping-checked.
+    vocab = {"a": 0, "b": 1, "c": 2}
+    loader = _loader_for(
+        {"base": dict(vocab), "m_minus": dict(vocab), "m_plus": dict(vocab)}
+    )
+    config_loader = _config_loader_for(
+        {"base": 248320, "m_minus": 151936, "m_plus": 151936}
+    )
+    with pytest.raises(ValueError, match="base"):
+        assert_serveable_pair(
+            "m_minus",
+            "m_plus",
+            base_vocab_size=151936,
+            base_dir="base",
+            loader=loader,
+            config_loader=config_loader,
+        )
 
 
 def test_assert_serveable_pair_raises_on_base_tokenizer_mapping_diff():
