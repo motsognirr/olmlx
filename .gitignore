@@ -6,6 +6,7 @@ dist/
 build/
 .venv/
 .env
+*.key
 models.json
 aliases.json
 *.mlx

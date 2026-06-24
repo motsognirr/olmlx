@@ -101,11 +101,19 @@ def _default_decoder_factory(base, expert, anti, alpha):
     return ProxyTuningDecoder(base, expert, anti, alpha=alpha)
 
 
-def _default_preflight(antiexpert_dir: str, expert_dir: str) -> None:
-    from olmlx.proxy_tuning_pipeline.verify import assert_serveable_pair
+def _default_preflight(base_dir: str, antiexpert_dir: str, expert_dir: str) -> None:
+    from olmlx.proxy_tuning_pipeline.verify import (
+        _load_config_vocab_size,
+        assert_serveable_pair,
+    )
 
-    # Steered base config vocab_size (Qwen3 dense = 151936).
-    assert_serveable_pair(antiexpert_dir, expert_dir, 151936)
+    # Derive the steered base's logits width from its own config (Qwen3 dense =
+    # 151936, qwen3_5/qwen3_next = 248320) rather than assuming one family.
+    # Pass base_dir so the base tokenizer is checked for token-mapping identity
+    # against M-/M+ — a same-width base from another family is otherwise
+    # silently accepted and corrupts the per-token logit arithmetic.
+    base_vocab = _load_config_vocab_size(base_dir)
+    assert_serveable_pair(antiexpert_dir, expert_dir, base_vocab, base_dir=base_dir)
 
 
 def run_eval(
@@ -128,7 +136,7 @@ def run_eval(
     the same model objects (cheap — caches are per-decoder). Calls run on the
     default stream (decoder contract).
     """
-    preflight(antiexpert_dir, expert_dir)
+    preflight(base_dir, antiexpert_dir, expert_dir)
     base, expert, anti, tokenizer = loader(base_dir, expert_dir, antiexpert_dir)
 
     scores: list[EvalScore] = []
