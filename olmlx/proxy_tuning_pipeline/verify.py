@@ -54,6 +54,7 @@ def assert_serveable_pair(
     expert_dir: str,
     base_vocab_size: int,
     *,
+    base_dir: str | None = None,
     loader: Callable[[str], Any] = _load_tokenizer,
     config_loader: Callable[[str], int] = _load_config_vocab_size,
 ) -> None:
@@ -62,6 +63,12 @@ def assert_serveable_pair(
     ``base_vocab_size`` is the steered model's logits dimension — its
     ``config.json`` ``vocab_size`` (Qwen3 = 151936) — which must match the
     pair's so the combined logits align position-by-position.
+
+    When ``base_dir`` is given, the base's tokenizer is also checked for
+    token-mapping identity against the pair. A width match alone is too weak:
+    two model families can share a ``vocab_size`` yet map tokens differently, so
+    a same-width base from another family would otherwise be silently accepted
+    and corrupt the per-token logit arithmetic at generation time.
     """
     tok_anti = loader(anti_expert_dir)
     tok_expert = loader(expert_dir)
@@ -72,6 +79,15 @@ def assert_serveable_pair(
         reference_label="anti-expert (M-)",
         other_label="expert (M+)",
     )
+    # M <-> M+ token-mapping identity. M- and M+ are already proven identical
+    # above, so matching the base against M+ transitively covers all three.
+    if base_dir is not None:
+        check_vocab_identity(
+            loader(base_dir),
+            tok_expert,
+            reference_label="base (M)",
+            other_label="expert (M+)",
+        )
     # Each model's logits width must equal the steered base's, or the per-token
     # logit arithmetic (base + alpha*(expert - anti-expert)) is misaligned.
     for label, model_dir in (
@@ -100,8 +116,19 @@ def main(argv: list[str] | None = None) -> None:
         default=151936,
         help="steered base vocab size (Qwen3 dense = 151936)",
     )
+    ap.add_argument(
+        "--base-dir",
+        default=None,
+        help="steered base (M) model dir; when given, its tokenizer is also "
+        "checked for token-mapping identity against the M-/M+ pair",
+    )
     args = ap.parse_args(argv)
-    assert_serveable_pair(args.anti_expert, args.expert, args.base_vocab)
+    assert_serveable_pair(
+        args.anti_expert,
+        args.expert,
+        args.base_vocab,
+        base_dir=args.base_dir,
+    )
     print("OK: M-/M+ share one tokenizer and match the base vocabulary.")
 
 

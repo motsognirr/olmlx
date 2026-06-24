@@ -109,8 +109,11 @@ def _default_preflight(base_dir: str, antiexpert_dir: str, expert_dir: str) -> N
 
     # Derive the steered base's logits width from its own config (Qwen3 dense =
     # 151936, qwen3_5/qwen3_next = 248320) rather than assuming one family.
+    # Pass base_dir so the base tokenizer is checked for token-mapping identity
+    # against M-/M+ — a same-width base from another family is otherwise
+    # silently accepted and corrupts the per-token logit arithmetic.
     base_vocab = _load_config_vocab_size(base_dir)
-    assert_serveable_pair(antiexpert_dir, expert_dir, base_vocab)
+    assert_serveable_pair(antiexpert_dir, expert_dir, base_vocab, base_dir=base_dir)
 
 
 def run_eval(
