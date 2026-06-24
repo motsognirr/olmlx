@@ -58,6 +58,7 @@ jobs:
         run: uv sync --no-editable && uv run pytest -m "not real_model" --cov=olmlx --cov-report=xml --cov-report=term
       - name: Upload coverage report
         if: always()
+        continue-on-error: true
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: coverage-report

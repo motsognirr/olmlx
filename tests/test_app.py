@@ -469,6 +469,71 @@ class TestErrorHandlers:
         assert data["error"]["code"] == "calibration_missing"
 
     @pytest.mark.asyncio
+    async def test_file_not_found_error_handler_ollama_chat(self, app_client):
+        from unittest.mock import AsyncMock
+
+        with patch(
+            "olmlx.routers.chat.generate_chat", new_callable=AsyncMock
+        ) as mock_gen:
+            mock_gen.side_effect = FileNotFoundError(
+                "Config not found at nonexistent-org/nonexistent-model"
+            )
+            resp = await app_client.post(
+                "/api/chat",
+                json={
+                    "model": "nonexistent-org/nonexistent-model",
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "stream": False,
+                },
+            )
+        assert resp.status_code == 400
+        data = resp.json()
+        assert "error" in data
+
+    @pytest.mark.asyncio
+    async def test_file_not_found_error_handler_ollama_generate(self, app_client):
+        from unittest.mock import AsyncMock
+
+        with patch(
+            "olmlx.routers.generate.generate_completion", new_callable=AsyncMock
+        ) as mock_gen:
+            mock_gen.side_effect = FileNotFoundError(
+                "Config not found at nonexistent-org/nonexistent-model"
+            )
+            resp = await app_client.post(
+                "/api/generate",
+                json={
+                    "model": "nonexistent-org/nonexistent-model",
+                    "prompt": "hi",
+                    "stream": False,
+                },
+            )
+        assert resp.status_code == 400
+        data = resp.json()
+        assert "error" in data
+
+    @pytest.mark.asyncio
+    async def test_file_not_found_error_handler_ollama_embed(self, app_client):
+        from unittest.mock import AsyncMock
+
+        with patch(
+            "olmlx.routers.embed.generate_embeddings", new_callable=AsyncMock
+        ) as mock_gen:
+            mock_gen.side_effect = FileNotFoundError(
+                "Config not found at nonexistent-org/nonexistent-model"
+            )
+            resp = await app_client.post(
+                "/api/embed",
+                json={
+                    "model": "nonexistent-org/nonexistent-model",
+                    "input": "hi",
+                },
+            )
+        assert resp.status_code == 400
+        data = resp.json()
+        assert "error" in data
+
+    @pytest.mark.asyncio
     async def test_general_endpoints_exist(self, app_client):
         resp = await app_client.get("/")
         assert resp.status_code == 200

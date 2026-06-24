@@ -2246,7 +2246,14 @@ class ModelManager(SpeculativeLoaderMixin):
             logger.warning("mlx-lm failed for %s (%s), trying mlx-vlm", label, exc)
             import mlx_vlm
 
-            model, processor = mlx_vlm.load(load_path)
+            try:
+                model, processor = mlx_vlm.load(load_path)
+            except FileNotFoundError as vlm_exc:
+                raise ValueError(
+                    f"Model '{label}' not found at '{load_path}'. "
+                    f"Verify the model path is correct and the files are downloaded. "
+                    f"Use 'olmlx models pull {label}' or provide a valid HuggingFace path."
+                ) from vlm_exc
             tok = processor.tokenizer if hasattr(processor, "tokenizer") else processor
             self._load_chat_template(tok, load_path, label)
             caps = detect_caps(tok)

@@ -389,6 +389,19 @@ def create_app() -> FastAPI:
             "calibration_missing",
         )
 
+    @app.exception_handler(FileNotFoundError)
+    async def file_not_found_error_handler(request: Request, exc: FileNotFoundError):
+        msg = str(exc)
+        logger.warning("FileNotFoundError on %s: %s", request.url.path, msg)
+        return _make_error_response(
+            request.url.path,
+            400,
+            msg,
+            "invalid_request_error",
+            "invalid_request_error",
+            "model_not_found",
+        )
+
     @app.exception_handler(RuntimeError)
     async def runtime_error_handler(request: Request, exc: RuntimeError):
         msg = str(exc)

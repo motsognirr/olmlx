@@ -2740,6 +2740,27 @@ class TestTryLmThenVlmFallback:
             with pytest.raises(MemoryError):
                 manager._try_lm_then_vlm("test/path", "test")
 
+    def test_both_fail_with_file_not_found_raises_value_error(
+        self, registry, mock_store
+    ):
+        manager = self._make_manager(registry, mock_store)
+
+        mock_mlx_lm = MagicMock()
+        mock_mlx_lm.load.side_effect = ValueError("config.json not found")
+        mock_mlx_vlm = MagicMock()
+        mock_mlx_vlm.load.side_effect = FileNotFoundError(
+            "Config not found at nonexistent-org/nonexistent-model"
+        )
+
+        with patch.dict(
+            "sys.modules", {"mlx_lm": mock_mlx_lm, "mlx_vlm": mock_mlx_vlm}
+        ):
+            with pytest.raises(ValueError, match="not found"):
+                manager._try_lm_then_vlm(
+                    "nonexistent-org/nonexistent-model",
+                    "nonexistent-org/nonexistent-model",
+                )
+
 
 class _FakeTokenizerWrapper:
     """Minimal stand-in for mlx-lm's TokenizerWrapper for stop-token tests."""
