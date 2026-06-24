@@ -400,8 +400,10 @@ class Settings(BaseSettings):
     # Peak disk: ~2× model size during conversion (src + dst coexist).
     # Peak RAM: BF16 weights in flight (~2 bytes/param) — large models OOM
     # on 16-24 GB devices; see issue #363 risks.
-    awq_gptq_convert_bits: Annotated[int, Field(ge=1, le=8)] = 4
-    awq_gptq_convert_group_size: Annotated[int, Field(ge=32)] = 64
+    # Restricted to the values mlx's quantizer actually accepts — bits 1 and 7
+    # and group sizes like 16/256 pass a naive range check but crash conversion.
+    awq_gptq_convert_bits: Literal[2, 3, 4, 5, 6, 8] = 4
+    awq_gptq_convert_group_size: Literal[32, 64, 128] = 64
     awq_gptq_remove_source: bool = True
 
     # Autonomous agent (engine/agent/, routers/agent.py — issue #445). The

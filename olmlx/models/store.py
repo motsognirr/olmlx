@@ -9,7 +9,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from olmlx.config import settings
-from olmlx.engine.awq_gptq_converter import convert_to_mlx, detect_format
+from olmlx.engine.awq_gptq_converter import (
+    convert_to_mlx,
+    converting_marker,
+    detect_format,
+)
 from olmlx.engine.registry import ModelRegistry
 from olmlx.models.manifest import ModelManifest
 
@@ -77,8 +81,14 @@ def _extract_metadata(model_dir: Path) -> dict:
 
 
 def _converted_path(models_dir: Path, hf_path: str) -> Path:
-    """Return the canonical directory for the MLX-converted form of *hf_path*."""
-    return models_dir / _safe_dir_name(hf_path + "-mlx-converted")
+    """Return the canonical directory for the MLX-converted form of *hf_path*.
+
+    The ``@`` separator can never appear in a raw download directory name
+    (``_safe_dir_name`` maps it to ``_``), so this path cannot collide with the
+    download directory of any real HF repo — including one literally named
+    ``owner/model@mlx`` or ``owner/model-mlx-converted``.
+    """
+    return models_dir / (_safe_dir_name(hf_path) + "@mlx")
 
 
 def _is_valid_mlx_dir(path: Path) -> bool:
@@ -86,7 +96,7 @@ def _is_valid_mlx_dir(path: Path) -> bool:
     return (
         path.exists()
         and (path / "config.json").exists()
-        and not (path / ".converting").exists()
+        and not converting_marker(path).exists()
     )
 
 
@@ -164,6 +174,14 @@ class ModelStore:
         hf_path = resolved.hf_path if resolved is not None else None
         if hf_path is not None:
             hf_path = _strip_ollama_tag(hf_path)
+            # An AWQ/GPTQ model may have been converted to a sibling directory
+            # (and its raw download removed), so check the converted path before
+            # the raw one — otherwise delete()/show() can't find it by name.
+            converted = _converted_path(self.models_dir, hf_path)
+            if (converted / "manifest.json").exists():
+                return (converted, True)
+            if _is_valid_mlx_dir(converted):
+                return (converted, False)
             d = self.local_path(hf_path)
             if (d / "manifest.json").exists():
                 return (d, True)
@@ -178,6 +196,20 @@ class ModelStore:
             if (d / "config.json").exists():
                 return (d, False)
         return None
+
+    def _pull_complete(self, hf_path: str) -> bool:
+        """True when no (further) pull work is needed for *hf_path*.
+
+        Either a valid converted MLX artifact exists, or the model is already
+        downloaded AND needs no conversion. A downloaded-but-unconverted
+        AWQ/GPTQ model (e.g. a prior conversion failed) returns False so the
+        conversion is retried rather than reported as already complete.
+        """
+        if _is_valid_mlx_dir(_converted_path(self.models_dir, hf_path)):
+            return True
+        if self.is_downloaded(hf_path):
+            return detect_format(self.local_path(hf_path)) is None
+        return False
 
     def _pull_lock(self, hf_path: str) -> asyncio.Lock:
         """Return a per-path async lock, creating one if needed."""
@@ -265,8 +297,10 @@ class ModelStore:
 
         converted_dir = _converted_path(self.models_dir, hf_path)
 
-        # Fast path: skip lock if already downloaded or already converted
-        if self.is_downloaded(hf_path) or _is_valid_mlx_dir(converted_dir):
+        # Fast path: skip lock if the model is fully ready (downloaded with no
+        # conversion needed, or already converted). A downloaded-but-unconverted
+        # AWQ/GPTQ model is NOT complete — fall through so conversion is retried.
+        if self._pull_complete(hf_path):
             yield {"status": "pulling manifest"}
             yield {"status": "already downloaded"}
             yield {"status": "success"}
@@ -278,7 +312,7 @@ class ModelStore:
             # Re-check after acquiring lock — another coroutine may have
             # completed the download (or conversion) while we waited.
             converted_dir = _converted_path(self.models_dir, hf_path)
-            if self.is_downloaded(hf_path) or _is_valid_mlx_dir(converted_dir):
+            if self._pull_complete(hf_path):
                 yield {"status": "pulling manifest"}
                 yield {"status": "already downloaded"}
                 yield {"status": "success"}

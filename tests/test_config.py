@@ -570,3 +570,30 @@ def test_tracing_env_toggle(monkeypatch):
     from olmlx.config import Settings
 
     assert Settings().tracing is True
+
+
+def test_awq_gptq_convert_bits_rejects_unsupported(monkeypatch):
+    """mlx supports bits {2,3,4,5,6,8}; 1 and 7 must be rejected, not just range-checked."""
+    monkeypatch.setenv("OLMLX_AWQ_GPTQ_CONVERT_BITS", "7")
+    from olmlx.config import Settings
+
+    with pytest.raises(ValidationError):
+        Settings()
+
+
+def test_awq_gptq_convert_group_size_rejects_unsupported(monkeypatch):
+    monkeypatch.setenv("OLMLX_AWQ_GPTQ_CONVERT_GROUP_SIZE", "16")
+    from olmlx.config import Settings
+
+    with pytest.raises(ValidationError):
+        Settings()
+
+
+def test_awq_gptq_convert_defaults(monkeypatch):
+    for key in ("OLMLX_AWQ_GPTQ_CONVERT_BITS", "OLMLX_AWQ_GPTQ_CONVERT_GROUP_SIZE"):
+        monkeypatch.delenv(key, raising=False)
+    from olmlx.config import Settings
+
+    s = Settings()
+    assert s.awq_gptq_convert_bits == 4
+    assert s.awq_gptq_convert_group_size == 64

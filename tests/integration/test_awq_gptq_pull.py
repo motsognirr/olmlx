@@ -7,7 +7,7 @@ from unittest.mock import patch
 import pytest
 
 from olmlx.models.manifest import ModelManifest
-from olmlx.models.store import _converted_path
+from olmlx.models.store import _converted_path, _is_valid_mlx_dir
 
 
 # ---------------------------------------------------------------------------
@@ -245,3 +245,41 @@ async def test_pull_mlx_native_dir_not_re_converted(mock_store, monkeypatch):
             pass
 
     assert convert_called == []
+
+
+@pytest.mark.asyncio
+async def test_pull_retries_conversion_when_source_present_but_unconverted(mock_store):
+    """A downloaded-but-unconverted AWQ model must trigger conversion.
+
+    Regression: the fast path keyed on is_downloaded() reported a prior-failed
+    conversion as 'already downloaded' and never retried, leaving the raw
+    AWQ weights in place.
+    """
+    hf_path = "org/awq-needs-retry"
+    raw_dir = mock_store.local_path(hf_path)
+    _make_awq_dir(raw_dir, fmt="awq")  # downloaded earlier; conversion never finished
+
+    convert_calls: list[Path] = []
+
+    def tracking_convert(src, dst, bits, group_size):
+        convert_calls.append(dst)
+        _fake_convert_to_mlx(src, dst, bits, group_size)
+
+    with patch("olmlx.models.store.convert_to_mlx", side_effect=tracking_convert):
+        events = [e async for e in mock_store.pull(hf_path)]
+
+    assert len(convert_calls) == 1, "conversion must run even though raw source exists"
+    assert any(e["status"] == "success" for e in events)
+    assert _is_valid_mlx_dir(_converted_path(mock_store.models_dir, hf_path))
+
+
+@pytest.mark.asyncio
+async def test_delete_finds_converted_model(mock_store):
+    """delete() must locate a converted model whose raw source was removed."""
+    hf_path = "org/awq-del"
+    converted = _converted_path(mock_store.models_dir, hf_path)
+    _fake_convert_to_mlx(Path("/fake/src"), converted, bits=4, group_size=64)
+    assert _is_valid_mlx_dir(converted)
+
+    assert mock_store.delete(hf_path) is True
+    assert not converted.exists()
