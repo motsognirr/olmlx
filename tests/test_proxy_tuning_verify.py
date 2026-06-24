@@ -31,6 +31,16 @@ def test_load_config_vocab_size_missing_raises(tmp_path):
         _load_config_vocab_size(str(tmp_path))
 
 
+def test_load_config_vocab_size_null_text_config_raises(tmp_path):
+    # text_config present but null (or non-dict) must fall through to the clean
+    # ValueError, not crash with AttributeError on None.get(...).
+    (tmp_path / "config.json").write_text(
+        json.dumps({"model_type": "weird", "text_config": None})
+    )
+    with pytest.raises(ValueError, match="vocab_size"):
+        _load_config_vocab_size(str(tmp_path))
+
+
 class _FakeTokenizer:
     def __init__(self, vocab: dict[str, int]):
         self._vocab = vocab

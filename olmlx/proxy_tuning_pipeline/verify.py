@@ -38,7 +38,9 @@ def _load_config_vocab_size(path: str) -> int:
         config = json.load(f)
     vocab_size = config.get("vocab_size")
     if vocab_size is None:
-        vocab_size = config.get("text_config", {}).get("vocab_size")
+        text_config = config.get("text_config")
+        if isinstance(text_config, dict):
+            vocab_size = text_config.get("vocab_size")
     if vocab_size is None:
         raise ValueError(
             f"config.json at {path} has no vocab_size (checked top level and "
