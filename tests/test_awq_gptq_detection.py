@@ -14,6 +14,33 @@ def test_detect_awq_via_quantization_config_quant_type(tmp_path):
     assert detect_format(tmp_path) == "awq"
 
 
+def test_detect_awq_via_quantization_config_quant_method(tmp_path):
+    """Canonical HF AutoAWQ checkpoints carry quant_method, not quant_type."""
+    config = {
+        "model_type": "qwen2",
+        "quantization_config": {"quant_method": "awq", "bits": 4, "version": "gemm"},
+    }
+    (tmp_path / "config.json").write_text(json.dumps(config))
+    assert detect_format(tmp_path) == "awq"
+
+
+def test_detect_gptq_via_quantization_config_quant_method(tmp_path):
+    """Canonical HF GPTQ checkpoints carry quant_method, not quant_type."""
+    config = {
+        "model_type": "qwen2",
+        "quantization_config": {"quant_method": "gptq", "bits": 4, "group_size": 128},
+    }
+    (tmp_path / "config.json").write_text(json.dumps(config))
+    assert detect_format(tmp_path) == "gptq"
+
+
+def test_detect_case_insensitive_quant_method(tmp_path):
+    """quant_method is normalised to lowercase before comparison."""
+    config = {"quantization_config": {"quant_method": "GPTQ"}}
+    (tmp_path / "config.json").write_text(json.dumps(config))
+    assert detect_format(tmp_path) == "gptq"
+
+
 def test_detect_gptq_via_quantize_config_json(tmp_path):
     """quantize_config.json present (auto_gptq convention) → gptq."""
     (tmp_path / "config.json").write_text(json.dumps({"model_type": "qwen2"}))

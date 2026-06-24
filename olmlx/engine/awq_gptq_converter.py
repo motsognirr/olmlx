@@ -20,8 +20,9 @@ def detect_format(model_dir: Path) -> str | None:
     Returns ``"awq"``, ``"gptq"``, or ``None`` for MLX-native / plain FP16.
 
     Detection strategy (in priority order):
-    1. ``config.json`` → ``quantization_config.quant_type`` field (HF
-       standard, used by both AWQ and GPTQ transformers checkpoints).
+    1. ``config.json`` → ``quantization_config`` field. The canonical HF
+       discriminator is ``quant_method`` (written by AutoAWQ / auto_gptq /
+       transformers); ``quant_type`` is accepted as a fallback alias.
     2. Presence of ``quantize_config.json`` — the auto_gptq canonical GPTQ
        marker file.
 
@@ -36,10 +37,15 @@ def detect_format(model_dir: Path) -> str | None:
                 cfg = json.load(f)
             quant_config = cfg.get("quantization_config")
             if isinstance(quant_config, dict):
-                quant_type = quant_config.get("quant_type", "").lower()
-                if quant_type == "awq":
+                # quant_method is the canonical HF key; quant_type is a fallback alias.
+                marker = (
+                    quant_config.get("quant_method")
+                    or quant_config.get("quant_type")
+                    or ""
+                ).lower()
+                if marker == "awq":
                     return "awq"
-                if quant_type == "gptq":
+                if marker == "gptq":
                     return "gptq"
         except Exception:
             pass
