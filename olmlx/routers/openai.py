@@ -555,10 +555,20 @@ async def openai_completions(req: OpenAICompletionRequest, request: Request):
     response_model_exclude_none=True,
 )
 async def openai_list_models(request: Request):
+    store = request.app.state.model_store
     registry = request.app.state.registry
     created = int(time.time())
-    models = registry.list_models()
-    data = [OpenAIModel(id=name, created=created) for name in models]
+
+    local_models = store.list_local()
+    local_names = {m.name for m in local_models}
+    data = [OpenAIModel(id=m.name, created=created) for m in local_models]
+
+    # Add configured-but-not-yet-downloaded registry entries
+    for name in registry.list_models():
+        normalized = registry.normalize_name(name)
+        if normalized not in local_names:
+            data.append(OpenAIModel(id=normalized, created=created))
+
     # Synthetic panel models have no weights but are selectable by name, so
     # clients (opencode, etc.) need to see them in the model list.
     data += [OpenAIModel(id=name, created=created) for name in registry.list_panels()]
