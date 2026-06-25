@@ -3031,6 +3031,8 @@ class ModelManager(SpeculativeLoaderMixin):
             return self._load_mtp_decoder(model, spec_config)
         if strategy == "pld":
             return self._load_pld_decoder(model, spec_config, is_vlm=is_vlm)
+        if strategy == "lookahead":
+            return self._load_lookahead_decoder(model, spec_config, is_vlm=is_vlm)
         if strategy == "self_speculative":
             target = (
                 getattr(model, "language_model", model)

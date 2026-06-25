@@ -173,6 +173,7 @@ _STRATEGY_BY_CLASS = {
     "SpeculativeDecoder": "classic",
     "SpeculativeFlashDecoder": "classic",
     "PromptLookupDecoder": "pld",
+    "LookaheadDecoder": "lookahead",
     "DFlashDecoder": "dflash",
     "EagleDecoder": "eagle",
     "MTPDecoder": "mtp",
