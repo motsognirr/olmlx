@@ -750,8 +750,21 @@ class LoadedModel:
         if self.is_vlm and self.vlm_prompt_cache_store is None:
             from olmlx.engine.prompt_cache.vlm_state import VlmPromptCacheStore
 
+            vlm_disk_path = (
+                settings.vlm_prompt_cache_disk_path
+                if settings.vlm_prompt_cache_disk
+                else None
+            )
+            vlm_disk_max_bytes = (
+                int(settings.vlm_prompt_cache_disk_max_gb * 1024**3)
+                if settings.vlm_prompt_cache_disk
+                else None
+            )
             self.vlm_prompt_cache_store = VlmPromptCacheStore(
-                capacity=settings.vlm_prompt_cache_slots
+                capacity=settings.vlm_prompt_cache_slots,
+                disk_path=vlm_disk_path,
+                model_name=self.name,
+                disk_max_bytes=vlm_disk_max_bytes,
             )
 
     def acquire_ref(self) -> None:
