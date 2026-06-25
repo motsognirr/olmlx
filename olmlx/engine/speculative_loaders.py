@@ -879,6 +879,53 @@ class SpeculativeLoaderMixin:
             cache_slots=settings.speculative_cache_slots,
         )
 
+    def _load_lookahead_decoder(
+        self,
+        target_model: Any,
+        spec_config: SpeculativeConfig,
+        *,
+        is_vlm: bool = False,
+    ) -> Any:
+        """Construct a LookaheadDecoder (draft-free Jacobi; no draft model).
+
+        Like PLD, lookahead needs no draft model and runs on the unwrapped
+        language model for VLM targets. ``num_tokens`` is the Jacobi window
+        width (max draft per step); it defaults to 5 — a modest window keeps
+        the per-step target forward cheap while still amortising several tokens
+        on convergent text.
+        """
+        from olmlx.engine.lookahead_decoder import LookaheadDecoder
+
+        if not spec_config.enabled:
+            raise RuntimeError(
+                "_load_lookahead_decoder called with spec_config.enabled=False"
+            )
+        num_tokens = (
+            spec_config.num_tokens if spec_config.num_tokens is not None else 5
+        )
+        if spec_config.draft_model:
+            logger.warning(
+                "speculative_strategy='lookahead' ignores speculative_draft_model "
+                "(%s) — lookahead is draft-free.",
+                spec_config.draft_model,
+            )
+
+        if is_vlm:
+            la_target = getattr(target_model, "language_model", None)
+            if la_target is None:
+                raise ValueError(
+                    "VLM model does not expose .language_model; lookahead "
+                    "requires direct access to the text decoder"
+                )
+        else:
+            la_target = target_model
+
+        logger.info("Constructing lookahead decoder (window=%d)", num_tokens)
+        return LookaheadDecoder(
+            target_model=la_target,
+            num_speculative_tokens=num_tokens,
+        )
+
     def _load_self_speculative_decoder(
         self,
         target_model: Any,

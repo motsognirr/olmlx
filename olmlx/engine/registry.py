@@ -17,10 +17,26 @@ from olmlx.config import FlashMoeConfig, SyncMode, settings
 from olmlx.utils.loop_affinity import assert_loop_thread
 
 SpeculativeStrategy = Literal[
-    "classic", "dflash", "eagle", "pld", "self_speculative", "mtp", "proxy_tuning"
+    "classic",
+    "dflash",
+    "eagle",
+    "pld",
+    "lookahead",
+    "self_speculative",
+    "mtp",
+    "proxy_tuning",
 ]
 _VALID_SPECULATIVE_STRATEGIES: frozenset[str] = frozenset(
-    ("classic", "dflash", "eagle", "pld", "self_speculative", "mtp", "proxy_tuning")
+    (
+        "classic",
+        "dflash",
+        "eagle",
+        "pld",
+        "lookahead",
+        "self_speculative",
+        "mtp",
+        "proxy_tuning",
+    )
 )
 # Strategies that consume target hidden states / run a feature-conditioned
 # verify forward and therefore can't compose with flash_moe's per-token expert

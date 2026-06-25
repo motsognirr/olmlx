@@ -1044,9 +1044,10 @@ def _audit_speculative_config(
             continue
         # Strategies that legitimately run without a ``speculative_draft_model``:
         # ``self_speculative`` (target's own early layers), ``pld`` (n-gram
-        # prompt lookup), and ``proxy_tuning`` (steers via expert/anti-expert
-        # models configured under their own ``speculative_proxy_*`` knobs).
-        _draftless = {"self_speculative", "pld", "proxy_tuning"}
+        # prompt lookup), ``lookahead`` (draft-free Jacobi iteration), and
+        # ``proxy_tuning`` (steers via expert/anti-expert models configured
+        # under their own ``speculative_proxy_*`` knobs).
+        _draftless = {"self_speculative", "pld", "lookahead", "proxy_tuning"}
         if enabled and not draft and strategy not in _draftless:
             bad.append(name)
         elif not enabled and mc.speculative_draft_model:
@@ -3146,6 +3147,7 @@ def build_parser() -> argparse.ArgumentParser:
             "dflash",
             "eagle",
             "pld",
+            "lookahead",
             "self_speculative",
             "proxy_tuning",
         ),

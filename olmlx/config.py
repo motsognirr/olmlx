@@ -255,7 +255,13 @@ class Settings(BaseSettings):
     # the draft model's pre-trained ``block_size`` for DFlash and EAGLE.
     speculative: bool = False
     speculative_strategy: Literal[
-        "classic", "dflash", "eagle", "pld", "self_speculative", "proxy_tuning"
+        "classic",
+        "dflash",
+        "eagle",
+        "pld",
+        "lookahead",
+        "self_speculative",
+        "proxy_tuning",
     ] = "classic"
     speculative_draft_model: Annotated[str, Field(min_length=1)] | None = None
     speculative_tokens: Annotated[int, Field(gt=0)] | None = None
