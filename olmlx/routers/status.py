@@ -1,8 +1,9 @@
 import json
 from datetime import datetime, timezone
+from pathlib import Path
 
 from fastapi import APIRouter, Request
-from fastapi.responses import PlainTextResponse
+from fastapi.responses import FileResponse, PlainTextResponse
 
 from olmlx import __version__
 from olmlx.schemas.models import ModelDetails
@@ -10,9 +11,20 @@ from olmlx.schemas.status import PsResponse, RunningModel, VersionResponse
 
 router = APIRouter()
 
+_UI_INDEX = Path(__file__).resolve().parent.parent / "ui" / "index.html"
+
+
+def _wants_html(request: Request) -> bool:
+    """Browsers send ``Accept: text/html``; API/heartbeat clients (curl, the
+    Ollama Go client) send ``*/*`` or a JSON type. Only browsers get the UI so
+    existing ``/`` heartbeat integrations keep their plain-text response."""
+    return "text/html" in request.headers.get("accept", "") and _UI_INDEX.exists()
+
 
 @router.get("/")
-async def root():
+async def root(request: Request):
+    if _wants_html(request):
+        return FileResponse(_UI_INDEX, media_type="text/html")
     return PlainTextResponse("Ollama is running")
 
 

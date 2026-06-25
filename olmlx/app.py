@@ -4,9 +4,12 @@ import traceback
 import uuid
 from contextlib import asynccontextmanager
 
+from pathlib import Path
+
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from fastapi.staticfiles import StaticFiles
 from starlette.middleware.base import BaseHTTPMiddleware
 
 from olmlx.config import settings
@@ -446,6 +449,14 @@ def create_app() -> FastAPI:
     app.include_router(audio.router)
     app.include_router(anthropic.router)
     app.include_router(metrics_router.router)
+
+    # Operator web UI (#373): the single-page dashboard's static assets
+    # (app.js, style.css, index.html) are served from olmlx/ui/. The root "/"
+    # itself content-negotiates in status.router so heartbeat clients keep the
+    # plain-text response.
+    ui_dir = Path(__file__).resolve().parent / "ui"
+    if ui_dir.is_dir():
+        app.mount("/ui", StaticFiles(directory=ui_dir), name="ui")
 
     # Autonomous agent (#445): the HTTP surface and run registry only exist
     # when explicitly enabled. The service resolves the model manager lazily
