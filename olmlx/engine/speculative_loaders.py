@@ -900,9 +900,7 @@ class SpeculativeLoaderMixin:
             raise RuntimeError(
                 "_load_lookahead_decoder called with spec_config.enabled=False"
             )
-        num_tokens = (
-            spec_config.num_tokens if spec_config.num_tokens is not None else 5
-        )
+        num_tokens = spec_config.num_tokens if spec_config.num_tokens is not None else 5
         if spec_config.draft_model:
             logger.warning(
                 "speculative_strategy='lookahead' ignores speculative_draft_model "
