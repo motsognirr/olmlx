@@ -280,6 +280,7 @@ def _make_lm_for_radix(store: PromptCacheStore) -> MagicMock:
     lm.supports_cache_trim = True
     lm.is_vlm = False
     lm.kv_cache_quant = None
+    lm.kv_eviction = None
     lm.is_distributed = False
     return lm
 
