@@ -5,12 +5,66 @@ from pathlib import Path
 
 import pytest
 
+from olmlx.engine.registry import KnownDraft, ModelRegistry
 from olmlx.models.manifest import ModelManifest
 from olmlx.models.store import (
+    ModelStore,
     _dir_size,
     _extract_metadata,
     _safe_dir_name,
 )
+
+
+class TestRegisterSpeculativeDraft:
+    """ModelStore.register_speculative_draft persists curated draft config (#514)."""
+
+    def _store(self, tmp_path, monkeypatch, config):
+        config_path = tmp_path / "models.json"
+        config_path.write_text(json.dumps(config))
+        monkeypatch.setattr("olmlx.engine.registry.settings.models_config", config_path)
+        reg = ModelRegistry()
+        reg.load()
+        return ModelStore(reg), config_path
+
+    def test_writes_speculative_fields(self, tmp_path, monkeypatch):
+        store, config_path = self._store(
+            tmp_path, monkeypatch, {"qwen3:latest": "Qwen/Qwen3-32B-MLX"}
+        )
+        draft = KnownDraft(
+            draft_repo="org/Qwen3-32B-eagle", strategy="eagle", block_size=4
+        )
+        store.register_speculative_draft("qwen3:latest", "Qwen/Qwen3-32B-MLX", draft)
+
+        resolved = store.registry.resolve("qwen3:latest")
+        assert resolved.speculative is True
+        assert resolved.speculative_strategy == "eagle"
+        assert resolved.speculative_draft_model == "org/Qwen3-32B-eagle"
+        assert resolved.speculative_tokens == 4
+        # Persisted to disk.
+        assert "org/Qwen3-32B-eagle" in config_path.read_text()
+
+    def test_preserves_existing_per_model_config(self, tmp_path, monkeypatch):
+        store, _ = self._store(
+            tmp_path,
+            monkeypatch,
+            {"qwen3:latest": {"hf_path": "Qwen/Qwen3-32B-MLX", "keep_alive": "30m"}},
+        )
+        draft = KnownDraft(draft_repo="org/draft", strategy="dflash", block_size=8)
+        store.register_speculative_draft("qwen3:latest", "Qwen/Qwen3-32B-MLX", draft)
+        resolved = store.registry.resolve("qwen3:latest")
+        assert resolved.keep_alive == "30m"
+        assert resolved.speculative_draft_model == "org/draft"
+
+    def test_works_for_full_hf_path_target(self, tmp_path, monkeypatch):
+        store, _ = self._store(tmp_path, monkeypatch, {})
+        draft = KnownDraft(draft_repo="org/draft", strategy="classic", block_size=None)
+        store.register_speculative_draft(
+            "Qwen/Qwen3-32B-MLX", "Qwen/Qwen3-32B-MLX", draft
+        )
+        resolved = store.registry.resolve("Qwen/Qwen3-32B-MLX")
+        assert resolved.speculative is True
+        assert resolved.speculative_draft_model == "org/draft"
+        assert resolved.speculative_tokens is None
 
 
 class TestSafeDirName:

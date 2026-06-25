@@ -1886,6 +1886,36 @@ def cmd_models_pull(args):
         async for status in store.pull(args.model_name):
             if msg := status.get("status", ""):
                 print(msg, flush=True)
+        # ``is True`` (not just truthiness): argparse store_true yields a real
+        # bool, so this stays correct while ignoring the truthy MagicMock attrs
+        # bare-mock CLI tests pass for unrelated pull cases.
+        if getattr(args, "with_draft", False) is True:
+            await _pull_draft()
+
+    async def _pull_draft():
+        """Co-download the curated speculative draft for the target (#514)."""
+        from olmlx.engine.registry import lookup_known_draft
+
+        resolved = store.registry.resolve(args.model_name)
+        hf_path = resolved.hf_path if resolved is not None else None
+        draft = lookup_known_draft(hf_path) if hf_path else None
+        if draft is None:
+            print(
+                f"--with-draft: no known speculative draft for "
+                f"{hf_path or args.model_name}; skipping.",
+                flush=True,
+            )
+            return
+        print(f"pulling speculative draft {draft.draft_repo}", flush=True)
+        async for status in store.pull(draft.draft_repo):
+            if msg := status.get("status", ""):
+                print(msg, flush=True)
+        store.register_speculative_draft(args.model_name, hf_path, draft)
+        print(
+            f"wired speculative draft {draft.draft_repo} "
+            f"(strategy={draft.strategy}) into config",
+            flush=True,
+        )
 
     try:
         asyncio.run(_pull())
@@ -3219,6 +3249,12 @@ def build_parser() -> argparse.ArgumentParser:
     mdl_sub.add_parser("list", help="List locally downloaded models")
     pull_p = mdl_sub.add_parser("pull", help="Pull/download a model")
     pull_p.add_argument("model_name", help="Model name or HF path")
+    pull_p.add_argument(
+        "--with-draft",
+        action="store_true",
+        help="Also pull the matching speculative draft (if one is known for "
+        "this target) and wire it into the model's config",
+    )
     show_p = mdl_sub.add_parser("show", help="Show model details")
     show_p.add_argument("model_name", help="Model name or HF path")
     del_p = mdl_sub.add_parser("delete", help="Delete a local model")
