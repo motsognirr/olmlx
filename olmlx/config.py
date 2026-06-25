@@ -99,6 +99,9 @@ class Settings(BaseSettings):
     models_dir: Path = Path.home() / ".olmlx" / "models"
     models_config: Path = Path.home() / ".olmlx" / "models.json"
     default_keep_alive: str = "5m"
+    # Max models resident at once. A LoRA adapter (``base:adapter``, issue #362)
+    # pins its base, so serving a base plus N adapters concurrently needs this
+    # set to at least N+1 (the base and each adapter each occupy one slot).
     max_loaded_models: int = 1
     memory_limit_fraction: Annotated[float, Field(gt=0, le=1.0)] = 0.75
     # Fraction of system RAM reserved below ``memory_limit_fraction`` for the

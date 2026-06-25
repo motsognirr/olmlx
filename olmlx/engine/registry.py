@@ -1384,12 +1384,56 @@ class PanelConfig:
         return names
 
 
+@dataclass(frozen=True)
+class AdapterConfig:
+    """A LoRA adapter loaded on top of a shared base model (issue #362).
+
+    Addressed by the Ollama colon syntax ``base:adapter`` (e.g.
+    ``qwen3-8b:my-coder-lora``).  ``base`` names a regular model entry whose
+    weights are shared in RAM across every adapter loaded for it; ``hf_path``
+    is the HuggingFace repo holding the adapter's ``adapter_config.json`` /
+    ``adapters.safetensors``.
+    """
+
+    name: str
+    base: str
+    hf_path: str
+    keep_alive: str | None = None
+
+    @classmethod
+    def from_entry(cls, name: str, entry: Any) -> "AdapterConfig":
+        if not isinstance(entry, dict):
+            raise ValueError(f"adapter {name!r}: entry must be a JSON object")
+        base = entry.get("base")
+        hf_path = entry.get("hf_path")
+        if not base or not isinstance(base, str):
+            raise ValueError(f"adapter {name!r}: 'base' must be a non-empty model name")
+        if not hf_path or not isinstance(hf_path, str):
+            raise ValueError(
+                f"adapter {name!r}: 'hf_path' must be a non-empty HF repo path"
+            )
+        validate_hf_path(hf_path)
+        keep_alive = entry.get("keep_alive")
+        if keep_alive is not None:
+            if not isinstance(keep_alive, str):
+                raise ValueError(f"adapter {name!r}: 'keep_alive' must be a string")
+            _validate_keep_alive(keep_alive)
+        return cls(name=name, base=base, hf_path=hf_path, keep_alive=keep_alive)
+
+    def to_entry(self) -> dict:
+        entry: dict[str, Any] = {"base": self.base, "hf_path": self.hf_path}
+        if self.keep_alive is not None:
+            entry["keep_alive"] = self.keep_alive
+        return entry
+
+
 class ModelRegistry:
     """Resolves Ollama model names to HuggingFace paths via config file."""
 
     def __init__(self):
         self._mappings: dict[str, ModelConfig] = {}
         self._panels: dict[str, PanelConfig] = {}
+        self._adapters: dict[str, AdapterConfig] = {}
         self._raw_unrecognized: dict[str, Any] = {}
         self._dirty_keys: set[str] = set()
         self._removed_keys: set[str] = set()
@@ -1427,9 +1471,28 @@ class ModelRegistry:
                 )
             self._mappings = {}
             self._panels = {}
+            self._adapters = {}
             self._raw_unrecognized = {}
             self._dirty_keys = set()
             self._removed_keys = set()
+            # "adapters" is a reserved top-level section (issue #362), parsed
+            # separately so its colon-named children aren't treated as models.
+            adapters_raw = raw.pop("adapters", None)
+            if adapters_raw is not None:
+                if isinstance(adapters_raw, dict):
+                    for ak, av in adapters_raw.items():
+                        an = self.normalize_name(ak)
+                        try:
+                            self._adapters[an] = AdapterConfig.from_entry(an, av)
+                        except (ValueError, TypeError) as exc:
+                            logger.warning(
+                                "Skipping invalid adapter entry %r: %s", ak, exc
+                            )
+                else:
+                    logger.warning(
+                        "Ignoring 'adapters' section: expected an object, got %s",
+                        type(adapters_raw).__name__,
+                    )
             for k, v in raw.items():
                 normalized = self.normalize_name(k)
                 if isinstance(v, dict) and v.get("type") == "panel":
@@ -1512,6 +1575,18 @@ class ModelRegistry:
         the CLI) append these so panels are selectable by clients like opencode.
         """
         return dict(self._panels)
+
+    def is_adapter(self, name: str) -> bool:
+        """True if *name* resolves to a ``base:adapter`` entry (issue #362)."""
+        return self.normalize_name(name) in self._adapters
+
+    def resolve_adapter(self, name: str) -> "AdapterConfig | None":
+        """Resolve *name* to an AdapterConfig, or None if it is not an adapter."""
+        return self._adapters.get(self.normalize_name(name))
+
+    def list_adapters(self) -> dict[str, "AdapterConfig"]:
+        """Return all configured adapter name → AdapterConfig mappings."""
+        return dict(self._adapters)
 
     def _validate_panels(self) -> None:
         """Drop panels referencing unknown models; warn on judge-in-panel.
@@ -1635,6 +1710,68 @@ class ModelRegistry:
         self._removed_keys.discard(normalized)
         self._save_mappings()
 
+    def add_adapter_mapping(
+        self,
+        name: str,
+        *,
+        base: str,
+        hf_path: str,
+        keep_alive: str | None = None,
+    ):
+        """Register a ``base:adapter`` entry and persist it (issue #362).
+
+        Used by ``ModelStore.pull_adapter`` so a pulled adapter becomes
+        addressable across restarts.
+        """
+        # Lock-free read-modify-write of _adapters; loop-only (#463).
+        assert_loop_thread("ModelRegistry.add_adapter_mapping")
+        validate_model_name(name)
+        validate_model_name(base)
+        validate_hf_path(hf_path)
+        normalized = self.normalize_name(name)
+        cfg = AdapterConfig(
+            name=normalized, base=base, hf_path=hf_path, keep_alive=keep_alive
+        )
+        if self._adapters.get(normalized) == cfg:
+            return
+        self._adapters[normalized] = cfg
+        self._save_adapters()
+
+    def _save_adapters(self):
+        with self._save_lock:
+            disk_data = self._read_models_config_for_update()
+            if self._adapters:
+                disk_data["adapters"] = {
+                    cfg.name: cfg.to_entry() for cfg in self._adapters.values()
+                }
+            else:
+                disk_data.pop("adapters", None)
+            _atomic_write_json(disk_data, settings.models_config)
+
+    def _read_models_config_for_update(self) -> dict[str, Any]:
+        """Read models.json as a dict for a read-modify-write, or {} if absent.
+
+        Refuses (raises ``ModelsConfigError``) when the file exists but is
+        unreadable/non-object, mirroring ``_save_mappings_locked`` so an
+        adapter save never clobbers a user's config.
+        """
+        if not settings.models_config.exists():
+            return {}
+        try:
+            with open(settings.models_config) as f:
+                loaded = json.load(f)
+        except (json.JSONDecodeError, OSError) as exc:
+            raise ModelsConfigError(
+                f"Refusing to overwrite {settings.models_config}: existing "
+                f"file is unreadable ({exc}). Fix or remove the file and retry."
+            ) from exc
+        if not isinstance(loaded, dict):
+            raise ModelsConfigError(
+                f"Refusing to overwrite {settings.models_config}: existing "
+                f"file is not a JSON object (got {type(loaded).__name__})."
+            )
+        return loaded
+
     def _save_mappings(self):
         with self._save_lock:
             self._save_mappings_locked()
@@ -1726,11 +1863,14 @@ class ModelRegistry:
         self._removed_keys -= removed_snapshot
 
     def remove(self, name: str):
-        """Remove a model alias or mapping."""
-        # Lock-free pop-then-save of _aliases/_mappings; loop-only (#463).
+        """Remove a model alias, mapping, or adapter."""
+        # Lock-free pop-then-save of _aliases/_mappings/_adapters; loop-only (#463).
         assert_loop_thread("ModelRegistry.remove")
         validate_model_name(name)
         normalized = self.normalize_name(name)
+        if self._adapters.pop(normalized, None) is not None:
+            self._save_adapters()
+            return
         if self._aliases.pop(normalized, None) is not None:
             self._save_aliases()
         raw_removed = self._raw_unrecognized.pop(normalized, None)

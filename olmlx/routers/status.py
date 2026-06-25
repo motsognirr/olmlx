@@ -107,6 +107,7 @@ async def ps(request: Request):
                 active_refs=lm.active_refs,
                 cache_metrics=cache_metrics,
                 batch_metrics=batch_metrics,
+                adapter_base=getattr(lm, "adapter_base", None),
             )
         )
     return PsResponse(models=models)

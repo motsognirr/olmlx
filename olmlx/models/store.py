@@ -155,6 +155,23 @@ class ModelStore:
         """Return the local directory for a HF repo ID."""
         return self.models_dir / _safe_dir_name(hf_path)
 
+    def adapter_local_path(self, hf_path: str) -> Path:
+        """Return the local directory for a LoRA adapter repo ID (issue #362).
+
+        Adapters live under a dedicated ``adapters/`` subtree so they never
+        collide with a base model that happens to share the same repo id, and
+        so ``list_local`` (which scans ``models_dir`` top-level) doesn't treat
+        them as base models.
+        """
+        return self.models_dir / "adapters" / _safe_dir_name(hf_path)
+
+    def is_adapter_downloaded(self, hf_path: str) -> bool:
+        """True when the adapter's ``adapter_config.json`` is present locally."""
+        local = self.adapter_local_path(hf_path)
+        return (local / "adapter_config.json").exists() and not (
+            local / ".downloading"
+        ).exists()
+
     def is_downloaded(self, hf_path: str) -> bool:
         """Check if a model is already downloaded locally."""
         local = self.local_path(hf_path)
@@ -276,6 +293,71 @@ class ModelStore:
                 )
             return local_dir
 
+    def ensure_adapter_downloaded(self, hf_path: str) -> Path:
+        """Download a LoRA adapter if not present. Returns its local directory.
+
+        Mirrors :meth:`ensure_downloaded` but targets the ``adapters/`` subtree
+        and performs no AWQ/GPTQ conversion (adapters are small delta weights).
+        Thread-safe: concurrent calls for the same adapter are serialized.
+        """
+        local_dir = self.adapter_local_path(hf_path)
+        if self.is_adapter_downloaded(hf_path):
+            return local_dir
+
+        with self._download_lock("adapter:" + hf_path):
+            if self.is_adapter_downloaded(hf_path):
+                return local_dir
+
+            from huggingface_hub import snapshot_download
+
+            local_dir.mkdir(parents=True, exist_ok=True)
+            marker = local_dir / ".downloading"
+            marker.touch()
+            snapshot_download(repo_id=hf_path, local_dir=str(local_dir))
+            try:
+                marker.unlink(missing_ok=True)
+            except OSError:
+                try:
+                    marker.rename(marker.with_name(".downloading.failed"))
+                except OSError:
+                    pass
+                logger.error(
+                    "Failed to remove .downloading marker %s; renamed to "
+                    ".downloading.failed if possible — adapter may need manual cleanup",
+                    marker,
+                )
+            return local_dir
+
+    async def pull_adapter(self, name: str) -> AsyncGenerator[dict, None]:
+        """Pull a registered LoRA adapter, yielding progress dicts (issue #362).
+
+        The adapter must already be declared in the ``adapters`` section of
+        ``models.json`` (so its base and HF repo are known). Downloads the
+        adapter weights into the ``adapters/`` subtree.
+        """
+        cfg = self.registry.resolve_adapter(name)
+        if cfg is None:
+            raise ValueError(f"Adapter '{name}' not found in config")
+
+        hf_path = cfg.hf_path
+        if self.is_adapter_downloaded(hf_path):
+            yield {"status": "pulling manifest"}
+            yield {"status": "already downloaded"}
+            yield {"status": "success"}
+            return
+
+        async with self._pull_lock("adapter:" + hf_path):
+            if self.is_adapter_downloaded(hf_path):
+                yield {"status": "pulling manifest"}
+                yield {"status": "already downloaded"}
+                yield {"status": "success"}
+                return
+            yield {"status": "pulling manifest"}
+            yield {"status": f"downloading adapter {hf_path}"}
+            await asyncio.to_thread(self.ensure_adapter_downloaded, hf_path)
+            yield {"status": "verifying"}
+            yield {"status": "success"}
+
     async def pull(self, name: str) -> AsyncGenerator[dict, None]:
         """Pull a model from HuggingFace, yielding progress dicts.
 
@@ -284,7 +366,14 @@ class ModelStore:
         OLMLX_AWQ_GPTQ_CONVERT_BITS / OLMLX_AWQ_GPTQ_CONVERT_GROUP_SIZE).
         The converted artifact lands in a sibling directory and the original
         is removed when OLMLX_AWQ_GPTQ_REMOVE_SOURCE=true (default).
+
+        ``base:adapter`` names dispatch to :meth:`pull_adapter` (issue #362).
         """
+        if self.registry.is_adapter(name):
+            async for event in self.pull_adapter(name):
+                yield event
+            return
+
         resolved = self.registry.resolve(name)
         hf_path = resolved.hf_path if resolved is not None else None
         if hf_path is None:
@@ -455,6 +544,15 @@ class ModelStore:
 
     def delete(self, name: str) -> bool:
         import shutil
+
+        if self.registry.is_adapter(name):
+            cfg = self.registry.resolve_adapter(name)
+            if cfg is not None:
+                adapter_dir = self.adapter_local_path(cfg.hf_path)
+                if adapter_dir.exists():
+                    shutil.rmtree(adapter_dir)
+                    return True
+            return False
 
         resolved = self._resolve_model_dir(name)
         if resolved is not None:
