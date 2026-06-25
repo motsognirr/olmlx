@@ -1961,7 +1961,7 @@ async def _setup_via_checkpoint_path(
     )
 
 
-def _setup_vlm_prompt_cache(
+async def _setup_vlm_prompt_cache(
     lm: LoadedModel,
     prompt_tokens: list[int] | None,
     gen_kwargs: dict,
@@ -1993,7 +1993,7 @@ def _setup_vlm_prompt_cache(
         mx.clear_cache()
         _safe_sync()
 
-    state = store.get(cache_id)
+    state = await store.async_get(cache_id)
     if state is not None:
         read = state.find_prefix_length(prompt_tokens)
         # A full-prefix re-request reuses everything but the seed; clamp so we
@@ -2002,7 +2002,7 @@ def _setup_vlm_prompt_cache(
         store.note_hit(reused_tokens=read)
     else:
         state = PromptCacheState()
-        store.insert(cache_id, state)
+        await store.async_insert(cache_id, state)
         read = 0
         store.note_miss()
 
@@ -3263,7 +3263,7 @@ async def _stream_completion(
         if use_prompt_cache and lm.is_vlm:
             # VLM: attach an mlx_vlm PromptCacheState. ``prompt`` stays the full
             # str — mlx_vlm tokenizes it and reuses the KV prefix internally.
-            read, creation = _setup_vlm_prompt_cache(
+            read, creation = await _setup_vlm_prompt_cache(
                 lm, prompt_tokens, gen_kwargs, cache_id=cache_id
             )
             cs = _CacheSetupResult(
@@ -3794,7 +3794,10 @@ async def _full_completion(
                     # VLM: attach an mlx_vlm PromptCacheState. Leave ``prompt``
                     # as the full str — mlx_vlm tokenizes it and reuses the KV
                     # prefix internally (no suffix-only trimming on this path).
-                    cache_read_tokens, cache_creation_tokens = _setup_vlm_prompt_cache(
+                    (
+                        cache_read_tokens,
+                        cache_creation_tokens,
+                    ) = await _setup_vlm_prompt_cache(
                         lm, prompt_tokens, gen_kwargs, cache_id=cache_id
                     )
                     # Leave full_prompt_tokens None: the text-tokenizer count

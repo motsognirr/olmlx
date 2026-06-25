@@ -122,8 +122,15 @@ class Settings(BaseSettings):
     prompt_cache: bool = True
     # Number of per-cache_id VLM KV-cache slots retained for cross-turn image-prefix
     # reuse (mlx_vlm PromptCacheState). 0 disables VLM prompt caching entirely.
-    # In-memory only (no disk spill / radix / KV-quant); 2 slots bound the memory.
+    # 2 slots bound the in-memory tier; cold entries spill to disk when
+    # vlm_prompt_cache_disk is on (#491).
     vlm_prompt_cache_slots: int = 2
+    # Disk spill for the VLM prompt cache (#491): mirrors the text-path
+    # prompt_cache_disk_* knobs. Off by default — the common single-conversation
+    # case is fully covered by the in-memory slots.
+    vlm_prompt_cache_disk: bool = False
+    vlm_prompt_cache_disk_path: Path = Path.home() / ".olmlx" / "cache" / "vlm"
+    vlm_prompt_cache_disk_max_gb: Annotated[float, Field(gt=0)] = 10.0
     prompt_cache_max_tokens: Annotated[int, Field(gt=0)] | None = 32768
     prompt_cache_max_slots: Annotated[int, Field(gt=0)] = 4
     prompt_cache_disk: bool = False
