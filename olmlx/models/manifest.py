@@ -17,9 +17,6 @@ class ModelManifest:
     family: str = ""
     parameter_size: str = ""
     quantization_level: str = ""
-    #: Base model name when this manifest describes a LoRA adapter (issue #362);
-    #: empty for ordinary base models. Default preserves existing manifests.
-    adapter_base: str = ""
 
     def to_dict(self) -> dict:
         return asdict(self)
