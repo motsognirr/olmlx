@@ -13,11 +13,13 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import mlx.core as mx
+import mlx.nn as nn
 
 from olmlx.config import FlashMoeConfig, SyncMode, experimental as global_experimental
 from olmlx.config import resolve_experimental, settings
 from olmlx.engine.registry import (
     _FLASH_MOE_INCOMPATIBLE_STRATEGIES,
+    AdapterConfig,
     ModelRegistry,
     ResolvedFlashConfig,
     SpeculativeConfig,
@@ -637,6 +639,53 @@ class ActiveRequestsError(RuntimeError):
     """
 
 
+def structural_copy(module: "nn.Module") -> "nn.Module":
+    """Copy an ``nn.Module`` *tree* while sharing every weight by reference.
+
+    LoRA hot-swap (issue #362) needs one base model's weights resident once in
+    RAM with multiple adapters layered on top. ``mlx_lm.tuner.utils.load_adapters``
+    mutates the module tree in place (replacing ``nn.Linear`` with ``LoRALinear``),
+    so each adapter needs its *own* module objects — but the heavy ``mx.array``
+    weights must stay shared.
+
+    Neither ``copy.copy`` nor ``copy.deepcopy`` works:
+
+    * ``copy.copy`` is shallow — the ``layers`` list and every submodule are
+      shared by reference, so ``load_adapters`` would corrupt the base model.
+    * ``copy.deepcopy`` duplicates the ``mx.array`` weights (defeating sharing)
+      and crashes on quantized models — modules store an ``mx.Dtype`` attribute
+      and ``Dtype`` is not picklable.
+
+    So this walks the tree explicitly: fresh ``Module`` / list / dict / tuple
+    containers, with ``mx.array`` leaves and scalar attributes (``bits``,
+    ``group_size``, dtypes, …) shared by reference. Mutable per-module Python
+    state (the ``_no_grad`` / freeze-tracking sets) is copied so freezing one
+    instance can't affect another. ``nn.Module`` overrides ``__setattr__`` to
+    route into its backing dict, so attributes are copied by mutating
+    ``__dict__`` in place rather than reassigning it. Verified to share weights
+    (no extra Metal allocation) and isolate the base through a real
+    ``load_adapters`` call on a 4-bit-quantized model.
+    """
+
+    def _copy(obj: Any) -> Any:
+        if isinstance(obj, nn.Module):
+            new = obj.__class__.__new__(obj.__class__)
+            for k, v in obj.__dict__.items():
+                new.__dict__[k] = v.copy() if isinstance(v, (set, dict, list)) else v
+            for k, v in obj.items():
+                dict.__setitem__(new, k, _copy(v))
+            return new
+        if isinstance(obj, dict):
+            return {k: _copy(v) for k, v in obj.items()}
+        if isinstance(obj, list):
+            return [_copy(v) for v in obj]
+        if isinstance(obj, tuple):
+            return tuple(_copy(v) for v in obj)
+        return obj
+
+    return _copy(module)
+
+
 @dataclass
 class LoadedModel:
     name: str
@@ -652,6 +701,14 @@ class LoadedModel:
     is_reranker: bool = False
     speculative_decoder: Any = None
     weight_store: Any = None
+    # LoRA-adapter hot-swap (issue #362). On an adapter entry, ``adapter_base``
+    # names the base model's key in ``_loaded`` (whose weights this entry
+    # shares via a structural copy); None on ordinary base models.
+    # ``_adapter_child_refs`` counts adapters currently sharing THIS entry's
+    # weights — a base with refs > 0 is pinned against LRU eviction. Guarded by
+    # the manager's ``_lock`` (mutated only on the loop thread).
+    adapter_base: str | None = None
+    _adapter_child_refs: int = field(default=0, compare=False, repr=False)
     # Continuous-batching scheduler (engine/batching.py), created lazily on
     # the first batch-eligible request. None for ineligible/idle models.
     batch_scheduler: Any = None
@@ -936,7 +993,13 @@ class ModelManager(SpeculativeLoaderMixin):
         #
         # Whisper models (issue #366) return ``tokenizer=None``; guard the
         # grammar drop so it doesn't choke on the missing tokenizer.
-        if not (lm.is_whisper or lm.is_tts):
+        #
+        # Adapter entries (issue #362) SHARE the base model's tokenizer object,
+        # so they must NOT drop its grammar cache — the base (and any sibling
+        # adapters) still use it. The base's own close drops it once its last
+        # adapter is gone (``_adapter_child_refs`` keeps the base pinned until
+        # then). Skipping here mirrors the grammar-tokenizer-identity invariant.
+        if not (lm.is_whisper or lm.is_tts or lm.adapter_base):
             try:
                 from olmlx.engine import grammar as _grammar
 
@@ -1085,14 +1148,22 @@ class ModelManager(SpeculativeLoaderMixin):
         """
         evictees: list[LoadedModel] = []
         while len(self._loaded) >= settings.max_loaded_models:
-            evictable = {k: v for k, v in self._loaded.items() if v.active_refs == 0}
+            # A base with loaded adapters (``_adapter_child_refs > 0``) is
+            # pinned: its weights are shared by those adapters (issue #362).
+            evictable = {
+                k: v
+                for k, v in self._loaded.items()
+                if v.active_refs == 0 and v._adapter_child_refs == 0
+            }
             if not evictable:
                 raise RuntimeError(
                     "All loaded models are in use, cannot evict to load a new model"
                 )
             oldest_name = min(evictable, key=lambda k: evictable[k].loaded_at)
             logger.info("Evicting model %s", oldest_name)
-            evictees.append(self._loaded.pop(oldest_name))
+            victim = self._loaded.pop(oldest_name)
+            self._detach_adapter_locked(victim)
+            evictees.append(victim)
         return evictees
 
     def _pop_one_idle_lru(self, exclude: str | None = None) -> LoadedModel | None:
@@ -1114,12 +1185,175 @@ class ModelManager(SpeculativeLoaderMixin):
         (same pop / close split as ``_pop_lru_evictees`` — issue #315).
         """
         idle = {
-            k: v for k, v in self._loaded.items() if v.active_refs == 0 and k != exclude
+            k: v
+            for k, v in self._loaded.items()
+            if v.active_refs == 0 and v._adapter_child_refs == 0 and k != exclude
         }
         if not idle:
             return None
         oldest_name = min(idle, key=lambda k: idle[k].loaded_at)
-        return self._loaded.pop(oldest_name)
+        victim = self._loaded.pop(oldest_name)
+        self._detach_adapter_locked(victim)
+        return victim
+
+    def _detach_adapter_locked(self, lm: "LoadedModel") -> None:
+        """Decrement an adapter's base child-ref as the adapter leaves _loaded.
+
+        Mirrors the increment in :meth:`_load_adapter_model`. Must run on the
+        loop thread while holding ``self._lock`` (same affinity as every other
+        ``_loaded`` / child-ref mutation, issue #463 / #362).
+        """
+        base_name = lm.adapter_base
+        if not base_name:
+            return
+        base = self._loaded.get(base_name)
+        if base is not None and base._adapter_child_refs > 0:
+            base._adapter_child_refs -= 1
+
+    # Base architectures that LoRA hot-swap does not support (issue #362). Each
+    # has a structural reason: VLMs use a processor (not a bare tokenizer) and
+    # route through mlx-vlm; flash models carry an SSD weight store / prefetcher
+    # that a structural copy would alias unsafely; distributed models are
+    # sharded; speculative decoders own a separate lifecycle/stream; KV-quant
+    # caches deepcopy-share Metal-bound buffers; whisper/tts/reranker aren't
+    # chat LMs.
+    @staticmethod
+    def _reject_adapter_base(base_lm: "LoadedModel") -> None:
+        reason = None
+        if base_lm.is_vlm:
+            reason = "vision-language models"
+        elif base_lm.is_flash or base_lm.is_flash_moe:
+            reason = "flash / flash-MoE models"
+        elif base_lm.is_distributed:
+            reason = "distributed (sharded) models"
+        elif base_lm.is_whisper or base_lm.is_tts or base_lm.is_reranker:
+            reason = "whisper / tts / reranker models"
+        elif base_lm.speculative_decoder is not None:
+            reason = "speculative-decoding models"
+        elif base_lm.kv_cache_quant:
+            reason = "KV-cache-quantized models"
+        if reason is not None:
+            raise ValueError(
+                f"LoRA adapters are not supported on {reason} (base '{base_lm.name}')"
+            )
+
+    @staticmethod
+    def _build_adapter_model(base_model: Any, adapter_dir: str) -> Any:
+        """Structural-copy *base_model* and apply the adapter at *adapter_dir*.
+
+        Runs in a worker thread (like the base model load) — it shares the
+        base's weight arrays and only allocates the small LoRA deltas. The new
+        params are eagerly evaluated so no Metal-stream-bound lazy graph crosses
+        back to the loop thread (the snapshot-persistence invariant).
+        """
+        from mlx_lm.tuner.utils import load_adapters
+
+        adapter_model = structural_copy(base_model)
+        load_adapters(adapter_model, adapter_dir)
+        mx.eval(adapter_model.parameters())
+        return adapter_model
+
+    async def _load_adapter_model(
+        self, normalized: str, *, keep_alive: int | str | None, pin: bool
+    ) -> LoadedModel:
+        """Load a ``base:adapter`` entry, sharing the base's weights (issue #362).
+
+        The base is loaded (and pinned) through the normal ``ensure_loaded``
+        flow; the adapter is a structural copy of the base model with LoRA
+        layers applied. The base is pinned against eviction for as long as any
+        adapter is loaded via ``_adapter_child_refs``.
+        """
+        cfg: AdapterConfig | None = self.registry.resolve_adapter(normalized)
+        if cfg is None:  # pragma: no cover - guarded by caller's is_adapter
+            raise ValueError(f"Adapter '{normalized}' not found in config")
+
+        # Fast path: already loaded — refresh expiry and return.
+        async with self._lock:
+            if normalized in self._loaded:
+                lm = self._loaded[normalized]
+                ka = self._resolve_keep_alive(
+                    keep_alive if keep_alive is not None else cfg.keep_alive
+                )
+                lm.expires_at = time.time() + ka if ka is not None else None
+                if pin:
+                    lm.acquire_ref()
+                return lm
+
+        # Load + pin the base through the normal path (recurses, but the base is
+        # not an adapter so it won't re-enter here). The pin keeps the base
+        # resident across our awaits (download + off-thread build); once the
+        # adapter is registered, ``_adapter_child_refs`` takes over the pinning.
+        base_lm = await self.ensure_loaded(cfg.base, keep_alive=keep_alive, pin=True)
+        try:
+            self._reject_adapter_base(base_lm)
+
+            adapter_dir = await asyncio.to_thread(
+                self.store.ensure_adapter_downloaded, cfg.hf_path
+            )
+            adapter_model = await asyncio.to_thread(
+                self._build_adapter_model, base_lm.model, str(adapter_dir)
+            )
+
+            ka = self._resolve_keep_alive(
+                keep_alive if keep_alive is not None else cfg.keep_alive
+            )
+            expires = time.time() + ka if ka is not None else None
+
+            evictees: list[LoadedModel] = []
+            async with self._lock:
+                # Another coroutine may have loaded the same adapter during our
+                # awaits — discard our build and return theirs.
+                if normalized in self._loaded:
+                    lm = self._loaded[normalized]
+                    lm.expires_at = expires
+                    if pin:
+                        lm.acquire_ref()
+                    return lm
+
+                evictees = self._pop_lru_evictees()
+                lm = LoadedModel(
+                    name=normalized,
+                    hf_path=cfg.hf_path,
+                    model=adapter_model,
+                    tokenizer=base_lm.tokenizer,
+                    template_caps=base_lm.template_caps,
+                    expires_at=expires,
+                    size_bytes=0,  # weights shared with the base; marginal cost
+                    weight_quant=base_lm.weight_quant,
+                    default_options=dict(base_lm.default_options),
+                    inference_queue_timeout=base_lm.inference_queue_timeout,
+                    inference_timeout=base_lm.inference_timeout,
+                    sync_mode=base_lm.sync_mode,
+                    enable_thinking=base_lm.enable_thinking,
+                    reasoning_effort=base_lm.reasoning_effort,
+                    prompt_cache=base_lm.prompt_cache,
+                    batching=base_lm.batching,
+                    batch_completion_size=base_lm.batch_completion_size,
+                    batch_prefill_size=base_lm.batch_prefill_size,
+                    batch_prefill_step=base_lm.batch_prefill_step,
+                    batch_fairness_quantum=base_lm.batch_fairness_quantum,
+                    adapter_base=base_lm.name,
+                )
+                # The adapter shares the base's architecture and a freshly
+                # built prompt cache, so its cache capabilities are identical —
+                # copy them instead of re-running the (Metal-touching) probe.
+                lm.supports_cache_trim = base_lm.supports_cache_trim
+                lm.supports_cache_persistence = base_lm.supports_cache_persistence
+                lm.uses_checkpoint_persistence = base_lm.uses_checkpoint_persistence
+
+                self._loaded[normalized] = lm
+                # Pin the base against eviction while this adapter is loaded.
+                base_in_loaded = self._loaded.get(base_lm.name)
+                if base_in_loaded is not None:
+                    base_in_loaded._adapter_child_refs += 1
+                if pin:
+                    lm.acquire_ref()
+        finally:
+            # Release the temporary base pin; the child-ref now keeps it alive.
+            base_lm.release_ref()
+
+        await self._close_evictees(evictees)
+        return lm
 
     async def _close_evictees(self, evictees: list[LoadedModel]) -> None:
         """Close popped evictees off the event loop. MUST NOT hold ``self._lock``.
@@ -1219,6 +1453,14 @@ class ModelManager(SpeculativeLoaderMixin):
         normalized = self.registry.normalize_name(name)
         if normalized != name:
             logger.info("Normalized model name '%s' -> '%s'", name, normalized)
+
+        # LoRA adapters (issue #362) load via a separate path that shares the
+        # base model's weights. Handled here so the base loads through the
+        # normal flow below (this method recurses for the base).
+        if self.registry.is_adapter(name):
+            return await self._load_adapter_model(
+                normalized, keep_alive=keep_alive, pin=pin
+            )
 
         while True:
             # If a previous load timed out and the background thread is still
@@ -1850,7 +2092,15 @@ class ModelManager(SpeculativeLoaderMixin):
             raise ActiveRequestsError(
                 f"Model '{normalized}' has {lm.active_refs} active request(s)"
             )
+        if lm._adapter_child_refs > 0:
+            # A base whose weights are shared by loaded adapters cannot be torn
+            # down without breaking them (issue #362). Unload the adapters first.
+            raise ActiveRequestsError(
+                f"Model '{normalized}' has {lm._adapter_child_refs} loaded "
+                f"adapter(s); unload them first"
+            )
         lm = self._loaded.pop(normalized)
+        self._detach_adapter_locked(lm)
         try:
             await asyncio.to_thread(self._close_loaded_model, lm)
         except ExceptionGroup:
@@ -3515,8 +3765,14 @@ class ModelManager(SpeculativeLoaderMixin):
                     lm.expires_at is not None
                     and lm.expires_at <= now
                     and lm.active_refs == 0
+                    # A base pinned by loaded adapters must outlive them (#362).
+                    and lm._adapter_child_refs == 0
                 ):
                     logger.info("Unloading expired model %s", name)
+                    # Detach before popping and reuse the loop variable: a new
+                    # local here would outlive the loop and keep the model alive
+                    # past the gc.collect() below (TestExpiryChecker guards this).
+                    self._detach_adapter_locked(lm)
                     expired_lms.append(self._loaded.pop(name))
 
         # Close outside the lock AND off the event loop thread.
