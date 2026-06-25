@@ -84,6 +84,19 @@ class TestStructuralCopy:
         assert cp.a is cp.b
         assert cp.a is not shared
 
+    def test_shared_tuple_deduped(self):
+        shared = (nn.Linear(4, 4, bias=False),)
+
+        class TwinTuple(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.a = shared
+                self.b = shared
+
+        cp = structural_copy(TwinTuple())
+        assert cp.a is cp.b
+        assert cp.a is not shared
+
 
 # --------------------------------------------------------------------------- #
 # Manager: base-pinning + child-ref accounting

@@ -702,9 +702,14 @@ def structural_copy(module: "nn.Module") -> "nn.Module":
                 new_list.append(_copy(v))
             return new_list
         if isinstance(obj, tuple):
-            # Immutable: can't pre-register, but a tuple can't be on a cycle
-            # that reaches back to itself, so a direct build is safe.
-            return tuple(_copy(v) for v in obj)
+            # Immutable, so it can't be pre-registered before its contents are
+            # built — but any reference cycle reaching a tuple must pass through
+            # a mutable container (list/dict/Module), which IS pre-registered,
+            # so recursion still terminates. Register after building to dedupe a
+            # tuple shared from several places.
+            new_tuple = tuple(_copy(v) for v in obj)
+            memo[oid] = new_tuple
+            return new_tuple
         return obj
 
     return _copy(module)
