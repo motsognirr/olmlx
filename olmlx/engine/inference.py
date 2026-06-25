@@ -4607,8 +4607,12 @@ async def generate_embeddings(
     model_name: str,
     texts: list[str],
     keep_alive: int | str | None = None,
-) -> list[list[float]]:
-    """Generate embeddings using the model's hidden states or embed_tokens layer."""
+) -> tuple[list[list[float]], int]:
+    """Generate embeddings using the model's hidden states or embed_tokens layer.
+
+    Returns ``(embeddings, total_tokens)`` where ``total_tokens`` is the summed
+    token count across all inputs (for OpenAI ``usage.prompt_tokens``).
+    """
     lm = await manager.ensure_loaded(model_name, keep_alive, pin=True)
 
     try:
@@ -4625,6 +4629,7 @@ async def generate_embeddings(
                 _inference_ref(lm, keep_alive=keep_alive, adopt=True),
             ):
                 embeddings = []
+                total_tokens = 0
 
                 tokenizer = lm.text_tokenizer
 
@@ -4636,6 +4641,7 @@ async def generate_embeddings(
 
                 for text in texts:
                     tokens = tokenizer.encode(text)
+                    total_tokens += len(tokens)
                     input_ids = mx.array([tokens])
 
                     if embed_layer is not None:
@@ -4685,7 +4691,7 @@ async def generate_embeddings(
                         "embeddings post-compute sync failed — next inference will crash",
                         exc_info=True,
                     )
-                return embeddings
+                return embeddings, total_tokens
     finally:
         lm.release_ref()
 
