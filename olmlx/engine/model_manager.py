@@ -248,6 +248,42 @@ def _load_with_model_type_fallback(mlx_lm, load_path, **kwargs):
     return model, tokenizer
 
 
+def _quantize_language_tower(
+    model: Any, quant: dict, lang_weights: dict, prefix: str = "language_model."
+) -> None:
+    """Quantize a rebuilt ``gemma4_text`` language tower in place, honoring the
+    checkpoint's *per-layer* quantization overrides.
+
+    mlx-community ``gemma4_unified`` checkpoints carry mixed precision: a global
+    ``bits``/``group_size`` plus per-module overrides (e.g. MLP projections at
+    8-bit) keyed by the full ``language_model.*`` path.  A blanket
+    ``nn.quantize`` at the global bits builds QuantizedLinear params whose packed
+    shapes mismatch the stored 8-bit weights, so the strict load fails.  This
+    mirrors mlx-lm's own ``load_model`` predicate, mapping our stripped tower
+    paths (``model.layers.0.mlp.gate_proj``) back to the prefixed config keys.
+    """
+    import mlx.nn as nn
+
+    def class_predicate(path: str, module: Any) -> bool | dict:
+        # Per-layer override wins: config keys retain the language_model prefix.
+        override = quant.get(f"{prefix}{path}")
+        if isinstance(override, dict):
+            return override
+        if not hasattr(module, "to_quantized"):
+            return False
+        # Otherwise quantize at the global bits only if the checkpoint stored
+        # this module as quantized (a non-quantized module has no .scales).
+        return f"{path}.scales" in lang_weights
+
+    nn.quantize(
+        model,
+        group_size=quant.get("group_size", 64),
+        bits=quant.get("bits", 4),
+        mode=quant.get("mode", "affine"),
+        class_predicate=class_predicate,
+    )
+
+
 def _load_gemma4_unified_text(load_path: str, config: dict) -> tuple[Any, Any]:
     """Load only the *language tower* of a mlx-community ``gemma4_unified``
     checkpoint (e.g. ``gemma-4-12B-it-4bit``) via mlx-lm's ``gemma4_text``.
@@ -266,7 +302,6 @@ def _load_gemma4_unified_text(load_path: str, config: dict) -> tuple[Any, Any]:
     import glob
 
     import mlx.core as mx
-    import mlx.nn as nn
     import mlx_lm
     from mlx_lm.models import gemma4_text
 
@@ -276,14 +311,6 @@ def _load_gemma4_unified_text(load_path: str, config: dict) -> tuple[Any, Any]:
     text_cfg["model_type"] = "gemma4_text"
     args = gemma4_text.ModelArgs.from_dict(text_cfg)
     model = gemma4_text.Model(args)
-
-    quant = config.get("quantization") or config.get("quantization_config")
-    if quant:
-        nn.quantize(
-            model,
-            group_size=quant.get("group_size", 64),
-            bits=quant.get("bits", 4),
-        )
 
     weights: dict[str, Any] = {}
     for shard in sorted(glob.glob(str(Path(load_path) / "*.safetensors"))):
@@ -302,6 +329,15 @@ def _load_gemma4_unified_text(load_path: str, config: dict) -> tuple[Any, Any]:
             f"'{prefix}*' weights; cannot load the language tower."
         )
     lang_weights = model.sanitize(lang_weights)
+
+    # Quantize *before* loading so the packed param shapes match the stored
+    # weights.  These checkpoints carry mixed precision (a global bits plus
+    # per-module 8-bit overrides), so quantize from the per-layer config rather
+    # than a single blanket bits — sanitize first to mirror mlx-lm's order.
+    quant = config.get("quantization") or config.get("quantization_config")
+    if quant:
+        _quantize_language_tower(model, quant, lang_weights, prefix)
+
     model.load_weights(list(lang_weights.items()), strict=True)
     mx.eval(model.parameters())
 

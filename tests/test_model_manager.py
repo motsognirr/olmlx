@@ -1123,6 +1123,91 @@ class TestGemma4UnifiedTextLoader:
         assert called["cfg"]["model_type"] == "gemma4_unified"
 
 
+class TestQuantizeLanguageTower:
+    """The rebuilt language tower must honor the checkpoint's *per-layer*
+    quantization overrides.  mlx-community 'gemma4_unified' checkpoints carry
+    mixed precision (a global ``bits``/``group_size`` plus per-module overrides,
+    e.g. MLP projections at 8-bit) keyed by the full ``language_model.*`` path.
+    A blanket ``nn.quantize`` at the global bits builds QuantizedLinear params
+    whose packed shapes mismatch the stored 8-bit weights, so the strict load
+    raises ``Expected shape ... but received shape ...`` — the original failure.
+    """
+
+    def test_honors_per_layer_bit_overrides(self):
+        import mlx.core as mx
+        import mlx.nn as nn
+        from mlx.utils import tree_flatten
+
+        from olmlx.engine.model_manager import _quantize_language_tower
+
+        class Tower(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.layers = [nn.Linear(128, 256, bias=False) for _ in range(2)]
+
+        # Reference checkpoint: layer 0 at 8-bit, layer 1 at the global 4-bit.
+        ref = Tower()
+
+        def ref_predicate(path, module):
+            return {"group_size": 64, "bits": 8 if path == "layers.0" else 4}
+
+        nn.quantize(ref, group_size=64, bits=4, class_predicate=ref_predicate)
+        mx.eval(ref.parameters())
+        lang_weights = dict(tree_flatten(ref.parameters()))
+
+        # 4-bit packs in_features/8 columns, 8-bit packs in_features/4 — so the
+        # mixed precision yields differently shaped weights that only load if
+        # the target is quantized with matching per-layer bits.
+        assert lang_weights["layers.0.weight"].shape == (256, 32)  # 8-bit
+        assert lang_weights["layers.1.weight"].shape == (256, 16)  # 4-bit
+
+        quant = {
+            "group_size": 64,
+            "bits": 4,
+            "mode": "affine",
+            "language_model.layers.0": {"group_size": 64, "bits": 8},
+        }
+        target = Tower()
+        _quantize_language_tower(target, quant, lang_weights)
+
+        # Strict load proves every packed param shape matches the checkpoint.
+        target.load_weights(list(lang_weights.items()), strict=True)
+        assert target.layers[0].bits == 8
+        assert target.layers[1].bits == 4
+
+    def test_skips_unquantized_modules(self):
+        """A module absent from the quant dict and not stored as quantized
+        (no ``.scales``) must be left in full precision."""
+        import mlx.core as mx
+        import mlx.nn as nn
+        from mlx.utils import tree_flatten
+
+        from olmlx.engine.model_manager import _quantize_language_tower
+
+        class Tower(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.quantized = nn.Linear(128, 256, bias=False)
+                self.plain = nn.Linear(128, 256, bias=False)
+
+        ref = Tower()
+        nn.quantize(
+            ref,
+            group_size=64,
+            bits=4,
+            class_predicate=lambda p, m: p == "quantized",
+        )
+        mx.eval(ref.parameters())
+        lang_weights = dict(tree_flatten(ref.parameters()))
+
+        target = Tower()
+        _quantize_language_tower(target, {"group_size": 64, "bits": 4}, lang_weights)
+        target.load_weights(list(lang_weights.items()), strict=True)
+
+        assert hasattr(target.quantized, "bits")  # quantized
+        assert not hasattr(target.plain, "bits")  # left full precision
+
+
 class TestProbeCacheCapabilities:
     """Exercise _probe_cache_capabilities, including the probe-failure path
     promoted to WARNING + non-persistable default in issue #284."""
