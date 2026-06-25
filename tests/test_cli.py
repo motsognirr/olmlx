@@ -3126,3 +3126,28 @@ class TestPullWithDraft:
         assert "downloading qwen3:32b" in out
         assert "pulling speculative draft" not in out
         mock_store.register_speculative_draft.assert_not_called()
+
+    def test_with_draft_strips_tag_on_full_path_target(
+        self, capsys, mock_store, _patch_store, monkeypatch
+    ):
+        """A full-path pull with a tag (org/model:q4) resolves to the canonical
+        untagged key in the curated map."""
+        from olmlx.engine import registry
+        from olmlx.engine.registry import KnownDraft
+
+        entry = KnownDraft(draft_repo="org/draft", strategy="eagle", block_size=4)
+        monkeypatch.setitem(registry.KNOWN_DRAFTS, "org/Big-Model", entry)
+
+        mock_store.pull = self._fake_pull()
+        # resolve() passes a full path through verbatim, tag included.
+        mock_store.registry.resolve.return_value = MagicMock(hf_path="org/Big-Model:q4")
+        mock_store.register_speculative_draft = MagicMock()
+
+        args = MagicMock(model_name="org/Big-Model:q4", with_draft=True)
+        cmd_models_pull(args)
+
+        out = capsys.readouterr().out
+        assert "pulling speculative draft org/draft" in out
+        mock_store.register_speculative_draft.assert_called_once_with(
+            "org/Big-Model:q4", "org/Big-Model", entry
+        )

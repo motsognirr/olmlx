@@ -1895,9 +1895,15 @@ def cmd_models_pull(args):
     async def _pull_draft():
         """Co-download the curated speculative draft for the target (#514)."""
         from olmlx.engine.registry import lookup_known_draft
+        from olmlx.models.store import _strip_ollama_tag
 
         resolved = store.registry.resolve(args.model_name)
         hf_path = resolved.hf_path if resolved is not None else None
+        # The curated map is keyed by the canonical (untagged) hf_path, and a
+        # full-path pull like "org/model:q4" resolves with its tag — strip it
+        # so the lookup matches, mirroring store.pull().
+        if hf_path:
+            hf_path = _strip_ollama_tag(hf_path)
         draft = lookup_known_draft(hf_path) if hf_path else None
         if draft is None:
             print(
