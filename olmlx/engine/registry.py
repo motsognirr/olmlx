@@ -307,6 +307,52 @@ class SpeculativeConfig(NamedTuple):
     proxy_alpha: float = 1.0
 
 
+class KnownDraft(NamedTuple):
+    """A curated speculative draft for a known target model (#513).
+
+    ``block_size`` carries the validated token/block count for the draft
+    (``num_tokens`` for classic, the trained block length for dflash/eagle/mtp);
+    ``None`` defers to the strategy/draft default. ``quant`` records the draft's
+    validated quantization for the compatibility matrix (informational).
+    """
+
+    draft_repo: str
+    strategy: SpeculativeStrategy
+    block_size: int | None = None
+    quant: str | None = None
+
+
+# Curated "known drafts" map: target ``hf_path`` -> matching speculative draft.
+#
+# Consulted by ``ModelConfig.resolved_speculative()`` only when neither a
+# per-model nor a global draft is configured, so that
+# ``OLMLX_SPECULATIVE=true olmlx serve`` on a supported target "just works"
+# with no repo ids to memorise. Draft-model precedence is therefore:
+#
+#     explicit per-model > global env (Settings) > curated map > none
+#
+# Entries are validated draft repos — primarily the olmlx-trained dflash/eagle
+# drafts hosted under the project org (#512) — so this map is intentionally
+# empty until those repos land; it grows as drafts are validated. A worked
+# example of the shape:
+#
+#     "mlx-community/Qwen3-32B-4bit": KnownDraft(
+#         draft_repo="<org>/Qwen3-32B-eagle-draft",
+#         strategy="eagle",
+#         block_size=4,
+#         quant="4bit",
+#     ),
+#
+# Only external-draft strategies belong here (classic/dflash/eagle/mtp); the
+# draft-free strategies (pld, self_speculative) never consult the map.
+KNOWN_DRAFTS: dict[str, KnownDraft] = {}
+
+
+def lookup_known_draft(hf_path: str) -> KnownDraft | None:
+    """Return the curated draft for ``hf_path``, or ``None`` if unknown."""
+    return KNOWN_DRAFTS.get(hf_path)
+
+
 @dataclass
 class ModelConfig:
     """Per-model configuration resolved from models.json."""
@@ -716,6 +762,21 @@ class ModelConfig:
             if self.speculative_draft_model is not None
             else settings.speculative_draft_model
         )
+        # Curated "known drafts" map (#513): only when no explicit per-model or
+        # global draft is configured. The map entry describes a specific draft,
+        # so its strategy/block_size come along with it — but an explicit
+        # per-model strategy / token override still wins.
+        if draft is None:
+            curated = lookup_known_draft(self.hf_path)
+            if curated is not None:
+                draft = curated.draft_repo
+                if self.speculative_strategy is None:
+                    strategy = curated.strategy
+                if (
+                    self.speculative_tokens is None
+                    and settings.speculative_tokens is None
+                ):
+                    tokens = curated.block_size
         return SpeculativeConfig(
             enabled=True,
             draft_model=draft,
