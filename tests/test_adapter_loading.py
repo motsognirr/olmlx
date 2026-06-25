@@ -103,6 +103,10 @@ async def test_two_adapters_share_base_and_serve(manager):
     assert mgr._loaded["qwen:latest"]._adapter_child_refs == 2
     assert a.adapter_base == "qwen:latest"
     assert a.tokenizer is base.tokenizer
+    # size_bytes reports the LoRA-delta footprint, not 0 and not the full base.
+    assert 0 < a.size_bytes < base.size_bytes
+    # Adapters serve via the per-request path (batching not validated for them).
+    assert a.batching is False
 
     # Two full adapter models added far less than a second base (~250MB+);
     # the base weights are shared, not duplicated.

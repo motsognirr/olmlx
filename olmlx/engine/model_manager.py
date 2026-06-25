@@ -665,21 +665,45 @@ def structural_copy(module: "nn.Module") -> "nn.Module":
     ``__dict__`` in place rather than reassigning it. Verified to share weights
     (no extra Metal allocation) and isolate the base through a real
     ``load_adapters`` call on a 4-bit-quantized model.
+
+    A by-id memo makes the walk robust to module graphs that aren't strict
+    trees: a submodule instance shared across layers (e.g. one rotary-embedding
+    object) is copied once and re-shared, and any back-reference / cycle
+    resolves to the in-progress copy instead of recursing forever. ``id()`` is
+    stable here because the whole source tree stays referenced for the walk's
+    duration, so no object is collected and no address is recycled.
     """
 
+    memo: dict[int, Any] = {}
+
     def _copy(obj: Any) -> Any:
+        oid = id(obj)
+        cached = memo.get(oid)
+        if cached is not None:
+            return cached
         if isinstance(obj, nn.Module):
             new = obj.__class__.__new__(obj.__class__)
+            memo[oid] = new  # register before recursing so cycles terminate
             for k, v in obj.__dict__.items():
                 new.__dict__[k] = v.copy() if isinstance(v, (set, dict, list)) else v
             for k, v in obj.items():
                 dict.__setitem__(new, k, _copy(v))
             return new
         if isinstance(obj, dict):
-            return {k: _copy(v) for k, v in obj.items()}
+            new_dict: dict = {}
+            memo[oid] = new_dict
+            for k, v in obj.items():
+                new_dict[k] = _copy(v)
+            return new_dict
         if isinstance(obj, list):
-            return [_copy(v) for v in obj]
+            new_list: list = []
+            memo[oid] = new_list
+            for v in obj:
+                new_list.append(_copy(v))
+            return new_list
         if isinstance(obj, tuple):
+            # Immutable: can't pre-register, but a tuple can't be on a cycle
+            # that reaches back to itself, so a direct build is safe.
             return tuple(_copy(v) for v in obj)
         return obj
 
@@ -1293,6 +1317,16 @@ class ModelManager(SpeculativeLoaderMixin):
             adapter_model = await asyncio.to_thread(
                 self._build_adapter_model, base_lm.model, str(adapter_dir)
             )
+            # Marginal footprint = the LoRA deltas; the base weights are shared
+            # (and already counted in the base's size_bytes). Reporting this in
+            # /api/ps and memory accounting beats reporting 0.
+            from mlx.utils import tree_flatten
+
+            adapter_bytes = sum(
+                v.nbytes
+                for k, v in tree_flatten(adapter_model.parameters())
+                if "lora" in k.lower()
+            )
 
             ka = self._resolve_keep_alive(
                 keep_alive if keep_alive is not None else cfg.keep_alive
@@ -1318,7 +1352,7 @@ class ModelManager(SpeculativeLoaderMixin):
                     tokenizer=base_lm.tokenizer,
                     template_caps=base_lm.template_caps,
                     expires_at=expires,
-                    size_bytes=0,  # weights shared with the base; marginal cost
+                    size_bytes=adapter_bytes,  # LoRA deltas; base weights shared
                     weight_quant=base_lm.weight_quant,
                     default_options=dict(base_lm.default_options),
                     inference_queue_timeout=base_lm.inference_queue_timeout,
@@ -1327,11 +1361,10 @@ class ModelManager(SpeculativeLoaderMixin):
                     enable_thinking=base_lm.enable_thinking,
                     reasoning_effort=base_lm.reasoning_effort,
                     prompt_cache=base_lm.prompt_cache,
-                    batching=base_lm.batching,
-                    batch_completion_size=base_lm.batch_completion_size,
-                    batch_prefill_size=base_lm.batch_prefill_size,
-                    batch_prefill_step=base_lm.batch_prefill_step,
-                    batch_fairness_quantum=base_lm.batch_fairness_quantum,
+                    # Continuous batching is not validated for the structurally
+                    # modified (LoRALinear) adapter model, so adapters serve via
+                    # the per-request path. Out of scope for issue #362.
+                    batching=False,
                     adapter_base=base_lm.name,
                 )
                 # The adapter shares the base's architecture and a freshly

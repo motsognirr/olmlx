@@ -69,6 +69,21 @@ class TestStructuralCopy:
             is not (base.layers[0].__dict__["_no_grad"])
         )
 
+    def test_shared_submodule_copied_once(self):
+        # A module instance referenced from two places (not a strict tree) must
+        # be copied a single time and re-shared, not duplicated or recursed.
+        shared = nn.Linear(8, 8, bias=False)
+
+        class Twin(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.a = shared
+                self.b = shared
+
+        cp = structural_copy(Twin())
+        assert cp.a is cp.b
+        assert cp.a is not shared
+
 
 # --------------------------------------------------------------------------- #
 # Manager: base-pinning + child-ref accounting
