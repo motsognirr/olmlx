@@ -7,6 +7,16 @@ const POLL_MS = 3000;
 
 const $ = (id) => document.getElementById(id);
 
+// Append text cells safely — model names are untrusted (a model can be pulled
+// under an arbitrary name), so values go through textContent, never innerHTML.
+function addCells(tr, values) {
+  for (const v of values) {
+    const td = document.createElement("td");
+    td.textContent = v;
+    tr.appendChild(td);
+  }
+}
+
 function fmtBytes(n) {
   if (!n || n <= 0) return "–";
   const units = ["B", "KB", "MB", "GB", "TB"];
@@ -52,7 +62,11 @@ function parseMetrics(text) {
     const labels = {};
     if (br >= 0) {
       const inner = left.slice(br + 1, left.lastIndexOf("}"));
-      for (const m of inner.matchAll(/(\w+)="([^"]*)"/g)) labels[m[1]] = m[2];
+      // Label values are quoted with \\, \" and \n escapes per the Prometheus
+      // exposition format; match across escapes, then unescape.
+      for (const m of inner.matchAll(/(\w+)="((?:\\.|[^"\\])*)"/g)) {
+        labels[m[1]] = m[2].replace(/\\n/g, "\n").replace(/\\(["\\])/g, "$1");
+      }
     }
     (out[name] ||= []).push({ labels, value });
   }
@@ -129,9 +143,7 @@ function renderRunning(models) {
   for (const m of models) {
     const tr = document.createElement("tr");
     const quant = m.details?.quantization_level || "–";
-    tr.innerHTML =
-      `<td>${m.name}</td><td>${fmtBytes(m.size)}</td><td>${quant}</td>` +
-      `<td>${m.active_refs ?? 0}</td><td>${fmtExpires(m.expires_at)}</td>`;
+    addCells(tr, [m.name, fmtBytes(m.size), quant, m.active_refs ?? 0, fmtExpires(m.expires_at)]);
     const td = document.createElement("td");
     const btn = document.createElement("button");
     btn.textContent = "Unload";
@@ -153,7 +165,7 @@ function renderAvailable(models, runningNames) {
   }
   for (const m of models) {
     const tr = document.createElement("tr");
-    tr.innerHTML = `<td>${m.name}</td><td>${fmtBytes(m.size)}</td>`;
+    addCells(tr, [m.name, fmtBytes(m.size)]);
     const td = document.createElement("td");
     if (!runningNames.has(m.name)) {
       const btn = document.createElement("button");
@@ -225,6 +237,16 @@ async function pull(model) {
           log.textContent += `${line}\n`;
         }
         log.scrollTop = log.scrollHeight;
+      }
+    }
+    // Flush any trailing partial line the stream ended without a newline.
+    buf += decoder.decode();
+    if (buf.trim()) {
+      try {
+        const obj = JSON.parse(buf);
+        log.textContent += `${obj.status || JSON.stringify(obj)}\n`;
+      } catch {
+        log.textContent += `${buf}\n`;
       }
     }
     log.textContent += "done.\n";
