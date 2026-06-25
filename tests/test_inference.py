@@ -2922,7 +2922,7 @@ class TestGenerateEmbeddings:
         model.model = MagicMock()
         model.model.embed_tokens = MagicMock(return_value=mx.zeros((1, 3, 4)))
 
-        result = await generate_embeddings(mock_manager, "qwen3", ["hello"])
+        result, _ = await generate_embeddings(mock_manager, "qwen3", ["hello"])
         assert len(result) == 1
         assert len(result[0]) == 4
 
@@ -2936,7 +2936,7 @@ class TestGenerateEmbeddings:
         model.model = MagicMock(spec=[])  # no embed_tokens attribute
         model.return_value = mx.zeros((3, 4))
 
-        result = await generate_embeddings(mock_manager, "qwen3", ["hello"])
+        result, _ = await generate_embeddings(mock_manager, "qwen3", ["hello"])
         assert len(result) == 1
         assert len(result[0]) == 4
 
@@ -2950,7 +2950,7 @@ class TestGenerateEmbeddings:
         model.model = MagicMock()
         model.model.embed_tokens = MagicMock(return_value=mx.zeros((4,)))
 
-        result = await generate_embeddings(mock_manager, "qwen3", ["hello"])
+        result, _ = await generate_embeddings(mock_manager, "qwen3", ["hello"])
         assert len(result) == 1
         assert len(result[0]) == 4
 
@@ -2964,8 +2964,25 @@ class TestGenerateEmbeddings:
         model.model = MagicMock()
         model.model.embed_tokens = MagicMock(return_value=mx.zeros((1, 3, 4)))
 
-        result = await generate_embeddings(mock_manager, "qwen3", ["hello", "world"])
+        result, _ = await generate_embeddings(mock_manager, "qwen3", ["hello", "world"])
         assert len(result) == 2
+
+    @pytest.mark.asyncio
+    async def test_returns_correct_token_count(self, mock_manager):
+        import mlx.core as mx
+
+        # _setup_tokenizer stubs encode() to return a fixed 3-token list.
+        self._setup_tokenizer(mock_manager)
+
+        model = mock_manager._loaded["qwen3:latest"].model
+        model.model = MagicMock()
+        model.model.embed_tokens = MagicMock(return_value=mx.zeros((1, 3, 4)))
+
+        _result, total_tokens = await generate_embeddings(
+            mock_manager, "qwen3", ["hello", "world"]
+        )
+        # Two texts, each encoding to 3 tokens -> 6 total (accumulated sum).
+        assert total_tokens == 6
 
     @pytest.mark.asyncio
     async def test_sync_mode_none_still_syncs_metal(self, mock_manager):
@@ -2986,7 +3003,7 @@ class TestGenerateEmbeddings:
         model.model.embed_tokens = MagicMock(return_value=mx.zeros((1, 3, 4)))
 
         with patch.object(_inf_mod.mx, "synchronize") as mock_sync:
-            result = await generate_embeddings(mock_manager, "qwen3", ["hello"])
+            result, _ = await generate_embeddings(mock_manager, "qwen3", ["hello"])
         assert len(result) == 1
         # Under sync_mode="none" the lock-boundary _lock_boundary_sync() calls
         # are no-ops (they return before calling mx.synchronize), so any
@@ -3080,7 +3097,7 @@ class TestGenerateEmbeddingsAcquiresLock:
             order.append("lock_released")
 
         # Now it should complete
-        result = await task
+        result, _ = await task
         order.append("embeddings_done")
         assert order == ["lock_released", "embeddings_done"]
         assert len(result) == 1

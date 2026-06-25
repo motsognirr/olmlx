@@ -583,7 +583,7 @@ async def openai_list_models(request: Request):
 async def openai_embeddings(req: OpenAIEmbeddingRequest, request: Request):
     manager = request.app.state.model_manager
     texts = req.input if isinstance(req.input, list) else [req.input]
-    embeddings = await generate_embeddings(manager, req.model, texts)
+    embeddings, prompt_tokens = await generate_embeddings(manager, req.model, texts)
     if req.encoding_format == "base64":
         # OpenAI's base64 format packs each embedding as little-endian
         # float32 bytes, then base64-encodes the result into a string.
@@ -604,4 +604,5 @@ async def openai_embeddings(req: OpenAIEmbeddingRequest, request: Request):
     return OpenAIEmbeddingResponse(
         data=data,
         model=req.model,
+        usage=OpenAIUsage(prompt_tokens=prompt_tokens, total_tokens=prompt_tokens),
     )

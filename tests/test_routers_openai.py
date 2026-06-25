@@ -431,7 +431,7 @@ class TestOpenAIRouter:
         with patch(
             "olmlx.routers.openai.generate_embeddings", new_callable=AsyncMock
         ) as mock_emb:
-            mock_emb.return_value = [[0.1, 0.2, 0.3]]
+            mock_emb.return_value = ([[0.1, 0.2, 0.3]], 2)
             resp = await app_client.post(
                 "/v1/embeddings",
                 json={
@@ -447,11 +447,27 @@ class TestOpenAIRouter:
         assert data["data"][0]["embedding"] == [0.1, 0.2, 0.3]
 
     @pytest.mark.asyncio
+    async def test_embeddings_usage_reflects_token_count(self, app_client):
+        with patch(
+            "olmlx.routers.openai.generate_embeddings", new_callable=AsyncMock
+        ) as mock_emb:
+            mock_emb.return_value = ([[0.1, 0.2, 0.3]], 5)
+            resp = await app_client.post(
+                "/v1/embeddings",
+                json={"model": "qwen3", "input": "hello world"},
+            )
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["usage"]["prompt_tokens"] == 5
+        assert data["usage"]["total_tokens"] == 5
+        assert data["usage"]["completion_tokens"] == 0
+
+    @pytest.mark.asyncio
     async def test_embeddings_list_input(self, app_client):
         with patch(
             "olmlx.routers.openai.generate_embeddings", new_callable=AsyncMock
         ) as mock_emb:
-            mock_emb.return_value = [[0.1], [0.2]]
+            mock_emb.return_value = ([[0.1], [0.2]], 4)
             resp = await app_client.post(
                 "/v1/embeddings",
                 json={
@@ -472,7 +488,7 @@ class TestOpenAIRouter:
         with patch(
             "olmlx.routers.openai.generate_embeddings", new_callable=AsyncMock
         ) as mock_emb:
-            mock_emb.return_value = [[0.1, 0.2, 0.3]]
+            mock_emb.return_value = ([[0.1, 0.2, 0.3]], 2)
             resp = await app_client.post(
                 "/v1/embeddings",
                 json={
@@ -494,7 +510,7 @@ class TestOpenAIRouter:
         with patch(
             "olmlx.routers.openai.generate_embeddings", new_callable=AsyncMock
         ) as mock_emb:
-            mock_emb.return_value = [[0.1, 0.2, 0.3]]
+            mock_emb.return_value = ([[0.1, 0.2, 0.3]], 2)
             resp = await app_client.post(
                 "/v1/embeddings",
                 json={

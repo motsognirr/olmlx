@@ -18,7 +18,7 @@ async def embed(req: EmbedRequest, request: Request):
     texts = req.input if isinstance(req.input, list) else [req.input]
 
     with Timer() as t:
-        embeddings = await generate_embeddings(
+        embeddings, _ = await generate_embeddings(
             manager, req.model, texts, keep_alive=req.keep_alive
         )
 
@@ -33,7 +33,7 @@ async def embed(req: EmbedRequest, request: Request):
 async def embeddings(req: EmbeddingsRequest, request: Request):
     manager = request.app.state.model_manager
 
-    result = await generate_embeddings(
+    result, _ = await generate_embeddings(
         manager, req.model, [req.prompt], keep_alive=req.keep_alive
     )
 

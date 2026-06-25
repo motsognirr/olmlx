@@ -11,7 +11,7 @@ class TestEmbedRouter:
         with patch(
             "olmlx.routers.embed.generate_embeddings", new_callable=AsyncMock
         ) as mock_emb:
-            mock_emb.return_value = [[0.1, 0.2, 0.3]]
+            mock_emb.return_value = ([[0.1, 0.2, 0.3]], 1)
             resp = await app_client.post(
                 "/api/embed",
                 json={
@@ -31,7 +31,7 @@ class TestEmbedRouter:
         with patch(
             "olmlx.routers.embed.generate_embeddings", new_callable=AsyncMock
         ) as mock_emb:
-            mock_emb.return_value = [[0.1], [0.2]]
+            mock_emb.return_value = ([[0.1], [0.2]], 2)
             resp = await app_client.post(
                 "/api/embed",
                 json={
@@ -49,7 +49,7 @@ class TestEmbedRouter:
         with patch(
             "olmlx.routers.embed.generate_embeddings", new_callable=AsyncMock
         ) as mock_emb:
-            mock_emb.return_value = [[0.5, 0.6]]
+            mock_emb.return_value = ([[0.5, 0.6]], 1)
             resp = await app_client.post(
                 "/api/embeddings",
                 json={
