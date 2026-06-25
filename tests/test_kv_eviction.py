@@ -77,6 +77,22 @@ class TestResolvedKvEviction:
         with pytest.raises(ValueError, match="kv_eviction"):
             ModelConfig.from_entry({"hf_path": "org/m", "kv_eviction": "bad"})
 
+    def test_to_entry_round_trips(self):
+        """kv_eviction must survive serialization (no silent data loss on
+        models.json re-save)."""
+        from olmlx.engine.registry import ModelConfig
+
+        entry = ModelConfig(hf_path="org/m", kv_eviction="4:512").to_entry()
+        assert isinstance(entry, dict)
+        assert entry["kv_eviction"] == "4:512"
+        assert ModelConfig.from_entry(entry).kv_eviction == "4:512"
+
+    def test_to_entry_bare_string_when_only_hf_path(self):
+        """An entry with no overrides still collapses to a bare hf_path string."""
+        from olmlx.engine.registry import ModelConfig
+
+        assert ModelConfig(hf_path="org/m").to_entry() == "org/m"
+
 
 class TestParse:
     def test_parse(self):

@@ -1167,6 +1167,7 @@ class ModelConfig:
             and self.speculative_pld_lookup_window is None
             and self.speculative_layers_skip is None
             and self.kv_cache_quant is None
+            and self.kv_eviction is None
             and self.weight_quant is None
             and self.flash is None
             and self.flash_sparsity_threshold is None
@@ -1223,6 +1224,8 @@ class ModelConfig:
             result["speculative_layers_skip"] = self.speculative_layers_skip
         if self.kv_cache_quant is not None:
             result["kv_cache_quant"] = self.kv_cache_quant
+        if self.kv_eviction is not None:
+            result["kv_eviction"] = self.kv_eviction
         if self.weight_quant is not None:
             result["weight_quant"] = self.weight_quant
         if self.flash is not None:
