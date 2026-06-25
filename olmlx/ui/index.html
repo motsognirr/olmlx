@@ -1,0 +1,58 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>olmlx · dashboard</title>
+  <link rel="stylesheet" href="/ui/style.css" />
+</head>
+<body>
+  <header>
+    <h1>olmlx</h1>
+    <span id="version" class="muted"></span>
+    <span id="conn" class="badge"></span>
+  </header>
+
+  <main>
+    <section id="stats-section">
+      <h2>Live stats</h2>
+      <div class="cards" id="stat-cards">
+        <div class="card"><div class="card-label">Loaded models</div><div class="card-value" id="stat-loaded">–</div></div>
+        <div class="card"><div class="card-label">Decode tokens/sec</div><div class="card-value" id="stat-tps">–</div></div>
+        <div class="card"><div class="card-label">In-flight requests</div><div class="card-value" id="stat-inflight">–</div></div>
+        <div class="card"><div class="card-label">Prompt-cache hit ratio</div><div class="card-value" id="stat-cache">–</div></div>
+      </div>
+    </section>
+
+    <section id="running-section">
+      <h2>Running models</h2>
+      <table id="running-table">
+        <thead>
+          <tr><th>Name</th><th>Size</th><th>Quant</th><th>Refs</th><th>Expires</th><th></th></tr>
+        </thead>
+        <tbody id="running-body"><tr><td colspan="6" class="muted">loading…</td></tr></tbody>
+      </table>
+    </section>
+
+    <section id="pull-section">
+      <h2>Pull a model</h2>
+      <form id="pull-form">
+        <input type="text" id="pull-input" placeholder="e.g. mlx-community/Qwen3-4B-4bit" autocomplete="off" />
+        <button type="submit">Pull</button>
+      </form>
+      <pre id="pull-log" class="log" hidden></pre>
+    </section>
+
+    <section id="available-section">
+      <h2>Available models</h2>
+      <table id="available-table">
+        <thead><tr><th>Name</th><th>Size</th><th></th></tr></thead>
+        <tbody id="available-body"><tr><td colspan="3" class="muted">loading…</td></tr></tbody>
+      </table>
+    </section>
+  </main>
+
+  <footer class="muted">olmlx operator dashboard · polls every 3s</footer>
+  <script src="/ui/app.js"></script>
+</body>
+</html>
