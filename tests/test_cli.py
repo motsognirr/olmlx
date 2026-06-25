@@ -3049,3 +3049,105 @@ class TestFlashWithoutFlashGuards:
         with caplog.at_level(logging.WARNING, logger="olmlx.cli"):
             _apply_serve_overrides(args)
         assert "flash_prefetch is set but flash is not enabled globally" in caplog.text
+
+
+class TestPullWithDraft:
+    """`olmlx models pull --with-draft` co-downloads the curated draft (#514)."""
+
+    @staticmethod
+    def _fake_pull():
+        async def fake_pull(name):
+            yield {"status": f"downloading {name}"}
+            yield {"status": "success"}
+
+        return fake_pull
+
+    def test_with_draft_pulls_and_registers(
+        self, capsys, mock_store, _patch_store, monkeypatch
+    ):
+        from olmlx.engine import registry
+        from olmlx.engine.registry import KnownDraft
+
+        entry = KnownDraft(draft_repo="org/draft", strategy="eagle", block_size=4)
+        monkeypatch.setitem(registry.KNOWN_DRAFTS, "Qwen/Qwen3-32B-MLX", entry)
+
+        mock_store.pull = self._fake_pull()
+        mock_store.registry.resolve.return_value = MagicMock(
+            hf_path="Qwen/Qwen3-32B-MLX"
+        )
+        mock_store.register_speculative_draft = MagicMock()
+
+        args = MagicMock(model_name="qwen3:32b", with_draft=True)
+        cmd_models_pull(args)
+
+        out = capsys.readouterr().out
+        assert "downloading qwen3:32b" in out
+        assert "pulling speculative draft org/draft" in out
+        assert "downloading org/draft" in out
+        assert "wired speculative draft org/draft" in out
+        mock_store.register_speculative_draft.assert_called_once_with(
+            "qwen3:32b", "Qwen/Qwen3-32B-MLX", entry
+        )
+
+    def test_with_draft_no_known_draft_skips(self, capsys, mock_store, _patch_store):
+        mock_store.pull = self._fake_pull()
+        mock_store.registry.resolve.return_value = MagicMock(hf_path="unknown/model")
+        mock_store.register_speculative_draft = MagicMock()
+
+        args = MagicMock(model_name="unknown", with_draft=True)
+        cmd_models_pull(args)
+
+        out = capsys.readouterr().out
+        assert "no known speculative draft" in out
+        assert "pulling speculative draft" not in out
+        mock_store.register_speculative_draft.assert_not_called()
+
+    def test_without_flag_does_not_touch_draft(
+        self, capsys, mock_store, _patch_store, monkeypatch
+    ):
+        from olmlx.engine import registry
+        from olmlx.engine.registry import KnownDraft
+
+        monkeypatch.setitem(
+            registry.KNOWN_DRAFTS,
+            "Qwen/Qwen3-32B-MLX",
+            KnownDraft(draft_repo="org/draft", strategy="eagle", block_size=4),
+        )
+        mock_store.pull = self._fake_pull()
+        mock_store.registry.resolve.return_value = MagicMock(
+            hf_path="Qwen/Qwen3-32B-MLX"
+        )
+        mock_store.register_speculative_draft = MagicMock()
+
+        args = MagicMock(model_name="qwen3:32b", with_draft=False)
+        cmd_models_pull(args)
+
+        out = capsys.readouterr().out
+        assert "downloading qwen3:32b" in out
+        assert "pulling speculative draft" not in out
+        mock_store.register_speculative_draft.assert_not_called()
+
+    def test_with_draft_strips_tag_on_full_path_target(
+        self, capsys, mock_store, _patch_store, monkeypatch
+    ):
+        """A full-path pull with a tag (org/model:q4) resolves to the canonical
+        untagged key in the curated map."""
+        from olmlx.engine import registry
+        from olmlx.engine.registry import KnownDraft
+
+        entry = KnownDraft(draft_repo="org/draft", strategy="eagle", block_size=4)
+        monkeypatch.setitem(registry.KNOWN_DRAFTS, "org/Big-Model", entry)
+
+        mock_store.pull = self._fake_pull()
+        # resolve() passes a full path through verbatim, tag included.
+        mock_store.registry.resolve.return_value = MagicMock(hf_path="org/Big-Model:q4")
+        mock_store.register_speculative_draft = MagicMock()
+
+        args = MagicMock(model_name="org/Big-Model:q4", with_draft=True)
+        cmd_models_pull(args)
+
+        out = capsys.readouterr().out
+        assert "pulling speculative draft org/draft" in out
+        mock_store.register_speculative_draft.assert_called_once_with(
+            "org/Big-Model:q4", "org/Big-Model", entry
+        )

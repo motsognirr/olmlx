@@ -5,6 +5,7 @@ import re
 import shutil
 import threading
 from collections.abc import AsyncGenerator
+from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -14,7 +15,7 @@ from olmlx.engine.awq_gptq_converter import (
     converting_marker,
     detect_format,
 )
-from olmlx.engine.registry import ModelRegistry
+from olmlx.engine.registry import KnownDraft, ModelConfig, ModelRegistry
 from olmlx.models.manifest import ModelManifest
 
 logger = logging.getLogger(__name__)
@@ -369,6 +370,29 @@ class ModelStore:
                 self.registry.add_mapping(name, hf_path)
 
             yield {"status": "success"}
+
+    def register_speculative_draft(
+        self, name: str, hf_path: str, draft: KnownDraft
+    ) -> None:
+        """Persist a curated speculative draft onto the target's models.json
+        entry (#514).
+
+        Writes ``speculative=True`` plus the draft's strategy / repo / block
+        size, preserving any existing per-model config on the entry. Like the
+        auto-registration in :meth:`pull`, this mutates the registry and must
+        run on the event-loop thread.
+        """
+        existing = self.registry.resolve(name)
+        base = existing if existing is not None else ModelConfig(hf_path=hf_path)
+        mc = replace(
+            base,
+            hf_path=hf_path,
+            speculative=True,
+            speculative_strategy=draft.strategy,
+            speculative_draft_model=draft.draft_repo,
+            speculative_tokens=draft.block_size,
+        )
+        self.registry.add_mapping(name, hf_path, model_config=mc)
 
     def list_local(self) -> list[ModelManifest]:
         """List all locally stored models, deriving manifests for directories that lack one."""
