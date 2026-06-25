@@ -179,6 +179,10 @@ class VlmPromptCacheStore:
         """Eager-eval the KV state on the loop thread (so no lazy Metal-stream
         graph crosses into the worker thread, #284), then write it to disk in a
         worker thread."""
+        # The eager-eval below must run on the loop thread (the offloaded
+        # _save_to_disk then sees concrete arrays); guard for consistency with
+        # get/insert/_insert_capture.
+        assert_loop_thread("VlmPromptCacheStore._spill")
         if not self._disk_enabled:
             return
         cache = getattr(state, "cache", None)
