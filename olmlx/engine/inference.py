@@ -30,11 +30,18 @@ if TYPE_CHECKING:
     from olmlx.engine.prompt_cache.store import PromptCacheStore
 
 try:
-    from mlx_lm.models.cache import make_prompt_cache, trim_prompt_cache
+    from mlx_lm.models.cache import (
+        KVCache,
+        RotatingKVCache,
+        make_prompt_cache,
+        trim_prompt_cache,
+    )
     from mlx_lm.utils import common_prefix_len as _find_common_prefix
 except ImportError:  # pragma: no cover
     make_prompt_cache = None  # type: ignore[assignment]
     trim_prompt_cache = None  # type: ignore[assignment]
+    KVCache = None  # type: ignore[assignment]
+    RotatingKVCache = None  # type: ignore[assignment]
     _find_common_prefix = None  # type: ignore[assignment]
     logging.getLogger(__name__).warning(
         "mlx-lm prompt cache imports unavailable — prompt caching disabled"
@@ -1362,6 +1369,43 @@ def _parse_kv_cache_quant(spec: str) -> tuple[str, int]:
     return method, int(bits_str)
 
 
+def _parse_kv_eviction(spec: str) -> tuple[int, int]:
+    """Split an ``OLMLX_KV_EVICTION`` value like ``"4:512"`` into
+    ``(sink, window)``. Format is validated at config load time (#505)."""
+    sink_str, window_str = spec.split(":")
+    return int(sink_str), int(window_str)
+
+
+def _make_eviction_prompt_cache(model: Any, sink: int, window: int) -> list:
+    """Build a StreamingLLM sink+window eviction cache for *model* (#505).
+
+    ``RotatingKVCache(max_size=sink+window, keep=sink)`` keeps the first
+    ``sink`` (attention-sink) tokens plus a rotating recent ``window`` and
+    drops the middle — bounding KV count for long contexts. mlx-lm's
+    ``create_attention_mask`` delegates to ``RotatingKVCache.make_mask``, so a
+    full-attention model attends correctly to the retained keys with no custom
+    mask/rope work.
+
+    Eviction is applied **only to pure full-attention models** — those whose
+    default cache is all plain ``KVCache``. Hybrid/SWA/GDN models (any
+    ``RotatingKVCache`` already present, or ``ArraysCache`` recurrent state)
+    are left untouched: a single per-forward mask is built from ``cache[0]``,
+    so a mixed list would mis-mask, and recurrent layers can't be windowed.
+    """
+    default = make_prompt_cache(model)
+    if RotatingKVCache is None or KVCache is None:
+        return default
+    if not default or not all(type(layer) is KVCache for layer in default):
+        logger.warning(
+            "kv_eviction requested but model is not pure full-attention "
+            "(cache layers: %s); eviction skipped for this model.",
+            sorted({type(layer).__name__ for layer in default}),
+        )
+        return default
+    max_size = sink + window
+    return [RotatingKVCache(max_size=max_size, keep=sink) for _ in default]
+
+
 def _make_prompt_cache_for_lm(lm: LoadedModel) -> list:
     """Create a fresh prompt cache for `lm` using the configured factory
     (plain mlx-lm, TurboQuant, or SpectralQuant).  Single source of truth
@@ -1378,6 +1422,9 @@ def _make_prompt_cache_for_lm(lm: LoadedModel) -> list:
             )
         return _make_turboquant_prompt_cache(lm.model, bits, is_vlm=lm.is_vlm)
     cache_model = _get_model_for_cache(lm.model, lm.is_vlm)
+    if lm.kv_eviction is not None:
+        sink, window = _parse_kv_eviction(lm.kv_eviction)
+        return _make_eviction_prompt_cache(cache_model, sink, window)
     return make_prompt_cache(cache_model)
 
 

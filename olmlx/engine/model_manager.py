@@ -756,6 +756,8 @@ class LoadedModel:
     # image-prefix KV reuse. Only populated for VLMs (None otherwise). #429.
     vlm_prompt_cache_store: Any = None
     kv_cache_quant: str | None = None
+    #: StreamingLLM sink+window KV eviction "<sink>:<window>" (#505), or None.
+    kv_eviction: str | None = None
     #: Weight quantization string (e.g. "hqq:4") applied at load time.
     #: ``None`` means no weight quantization was applied.
     weight_quant: str | None = None
@@ -1591,12 +1593,18 @@ class ModelManager(SpeculativeLoaderMixin):
                 # ``model_exp``.
                 flash_config = model_config.resolved_flash()
                 kv_cache_quant = model_config.resolved_kv_cache_quant()
+                kv_eviction = model_config.resolved_kv_eviction()
                 weight_quant_str = model_config.resolved_weight_quant()
                 # Whisper models (issue #366) have no LLM KV cache — never
                 # apply KV-cache quantization / spectral calibration to them.
                 _model_kind = self._detect_model_kind(hf_path)
                 if _model_kind in ("whisper", "tts", "reranker"):
                     kv_cache_quant = None
+                    kv_eviction = None
+                # KV quant and eviction are mutually exclusive (quant bounds
+                # bytes-per-token, eviction bounds token count); quant wins.
+                if kv_cache_quant is not None:
+                    kv_eviction = None
                 flash_moe_config = model_config.resolved_flash_moe()
 
                 # Pop LRU evictees under the lock; close them outside the lock
@@ -1963,6 +1971,7 @@ class ModelManager(SpeculativeLoaderMixin):
                         expires_at=expires,
                         size_bytes=_model_size,
                         kv_cache_quant=kv_cache_quant,
+                        kv_eviction=kv_eviction,
                         weight_quant=weight_quant_str,
                         spectral_calibration_dir=_spectral_dir,
                         shard_calibration_dir=_shard_dir,

@@ -94,6 +94,7 @@ PROMOTED_EXPERIMENTAL_KEYS: dict[str, str] = {
     "speculative_draft_model": "speculative_draft_model",
     "speculative_tokens": "speculative_tokens",
     "kv_cache_quant": "kv_cache_quant",
+    "kv_eviction": "kv_eviction",
     # Flash primary knobs promoted to top-level in Settings/ModelConfig.
     "flash": "flash",
     "flash_sparsity_threshold": "flash_sparsity_threshold",
@@ -401,6 +402,9 @@ class ModelConfig:
     #: KV cache quantization method and bits (e.g. "turboquant:4").
     #: ``None`` means inherit the global ``Settings.kv_cache_quant`` value.
     kv_cache_quant: str | None = None
+    #: StreamingLLM sink+window KV eviction, "<sink>:<window>" (e.g. "4:512").
+    #: ``None`` means inherit the global ``Settings.kv_eviction`` value (#505).
+    kv_eviction: str | None = None
     #: Weight quantization method, bits, and optional group size
     #: (e.g. "hqq:4", "hqq:8:128").
     #: ``None`` means inherit the global ``Settings.weight_quant`` value.
@@ -813,6 +817,12 @@ class ModelConfig:
             return self.kv_cache_quant
         return settings.kv_cache_quant
 
+    def resolved_kv_eviction(self) -> str | None:
+        """Resolve KV eviction config: per-model overrides global settings (#505)."""
+        if self.kv_eviction is not None:
+            return self.kv_eviction
+        return settings.kv_eviction
+
     def resolved_weight_quant(self) -> str | None:
         """Resolve weight quant config: per-model overrides global settings."""
         if self.weight_quant is not None:
@@ -1063,6 +1073,21 @@ class ModelConfig:
 
                 kv_cache_quant_raw = validate_kv_cache_quant_format(kv_cache_quant_raw)
 
+            kv_eviction_raw = entry.get("kv_eviction")
+            if kv_eviction_raw is not None:
+                if not isinstance(kv_eviction_raw, str):
+                    raise ValueError(
+                        f"'kv_eviction' must be a string, got {kv_eviction_raw!r}"
+                    )
+                if not kv_eviction_raw.strip():
+                    raise ValueError(
+                        "'kv_eviction' must be a non-empty string; "
+                        "use ``null`` to inherit from the global setting."
+                    )
+                from olmlx.config import validate_kv_eviction_format
+
+                kv_eviction_raw = validate_kv_eviction_format(kv_eviction_raw)
+
             weight_quant_raw = entry.get("weight_quant")
             if weight_quant_raw is not None:
                 if not isinstance(weight_quant_raw, str):
@@ -1096,6 +1121,7 @@ class ModelConfig:
                 speculative_pld_lookup_window=speculative_pld_lookup_window,
                 speculative_layers_skip=speculative_layers_skip,
                 kv_cache_quant=kv_cache_quant_raw,
+                kv_eviction=kv_eviction_raw,
                 weight_quant=weight_quant_raw,
                 flash=flash,
                 flash_sparsity_threshold=flash_sparsity_threshold,
@@ -1141,6 +1167,7 @@ class ModelConfig:
             and self.speculative_pld_lookup_window is None
             and self.speculative_layers_skip is None
             and self.kv_cache_quant is None
+            and self.kv_eviction is None
             and self.weight_quant is None
             and self.flash is None
             and self.flash_sparsity_threshold is None
@@ -1197,6 +1224,8 @@ class ModelConfig:
             result["speculative_layers_skip"] = self.speculative_layers_skip
         if self.kv_cache_quant is not None:
             result["kv_cache_quant"] = self.kv_cache_quant
+        if self.kv_eviction is not None:
+            result["kv_eviction"] = self.kv_eviction
         if self.weight_quant is not None:
             result["weight_quant"] = self.weight_quant
         if self.flash is not None:

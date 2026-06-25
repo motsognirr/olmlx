@@ -4470,6 +4470,7 @@ class TestSetupPromptCache:
         lm = MagicMock()
         lm.is_vlm = False
         lm.kv_cache_quant = None
+        lm.kv_eviction = None
         lm.model = MagicMock()
         lm.prompt_cache_store = MagicMock()
         lm.prompt_cache_store.async_get = AsyncMock(return_value=None)
@@ -4628,6 +4629,7 @@ class TestKvCachePreflightCheckHelper:
         lm = MagicMock()
         lm.is_vlm = False
         lm.kv_cache_quant = None
+        lm.kv_eviction = None
         lm.model = MagicMock()
         lm.text_tokenizer = MagicMock()
         lm.prompt_cache_store = MagicMock()

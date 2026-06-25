@@ -80,6 +80,34 @@ def validate_kv_cache_quant_format(v: str | None) -> str | None:
     return v
 
 
+def validate_kv_eviction_format(v: str | None) -> str | None:
+    """Validate a ``kv_eviction`` value of the form ``'<sink>:<window>'`` (#505).
+
+    StreamingLLM-style eviction keeps the first ``sink`` tokens (attention
+    sinks) plus the last ``window`` tokens, dropping the middle. ``sink >= 0``,
+    ``window >= 1``. Validated for both the env var and ``models.json`` paths.
+    """
+    if v is None:
+        return v
+    parts = v.split(":", 1)
+    if len(parts) != 2:
+        raise ValueError(
+            f"Invalid kv_eviction={v!r}. Expected '<sink>:<window>' (e.g. '4:512')."
+        )
+    try:
+        sink, window = int(parts[0]), int(parts[1])
+    except ValueError:
+        raise ValueError(
+            f"Invalid kv_eviction={v!r}. Both sink and window must be integers "
+            f"(e.g. '4:512')."
+        ) from None
+    if sink < 0 or window < 1:
+        raise ValueError(
+            f"Invalid kv_eviction={v!r}. Require sink >= 0 and window >= 1."
+        )
+    return v
+
+
 class Settings(BaseSettings):
     # Note: ``validate_assignment=True`` applies to *all* fields, not just
     # the new speculative ones. Programmatic writes that previously
@@ -191,6 +219,14 @@ class Settings(BaseSettings):
     # bits ∈ {2, 4} for turboquant/spectral, {2, 4, 8} for shard. Per-model
     # overrides live on ``ModelConfig`` in ``olmlx.engine.registry``.
     kv_cache_quant: str | None = None
+
+    # StreamingLLM-style sink+window KV eviction (#505): '<sink>:<window>'
+    # keeps the first <sink> tokens + last <window> tokens and drops the middle,
+    # bounding KV *count* (per-step attention compute + memory) for long
+    # contexts. Lossy and opt-in; applied only to pure full-attention models
+    # (RotatingKVCache under the hood). Takes effect when kv_cache_quant is
+    # unset. Per-model overrides live on ``ModelConfig``.
+    kv_eviction: str | None = None
 
     # Fused Metal decode path for shard KV quant (#377 Tier 2): attention
     # over the compressed middle is computed from the packed form (no FP16
@@ -601,6 +637,11 @@ class Settings(BaseSettings):
     @classmethod
     def validate_kv_cache_quant(cls, v: str | None) -> str | None:
         return validate_kv_cache_quant_format(v)
+
+    @field_validator("kv_eviction")
+    @classmethod
+    def validate_kv_eviction(cls, v: str | None) -> str | None:
+        return validate_kv_eviction_format(v)
 
     @field_validator("weight_quant")
     @classmethod
