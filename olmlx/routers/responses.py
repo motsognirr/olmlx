@@ -16,6 +16,7 @@ from olmlx.engine.tool_parser import (
     resolve_tool_names,
 )
 from olmlx.routers.common import build_inference_options, resolve_openai_think
+from olmlx.routers.thinking_split import flush_split_thinking, split_thinking_parts
 from olmlx.schemas.responses import ResponsesRequest, ResponsesResponse
 from olmlx.utils.images import normalize_image_block
 
@@ -345,7 +346,16 @@ async def _stream_response(
     tools: list[dict] | None,
     conversation: list[dict],
 ):
-    """Buffer the engine output, parse once, replay full semantic events."""
+    """Emit Responses SSE events from the engine stream.
+
+    Routes by whether tools are requested.  The **text path**
+    (``_stream_text_response``) emits ``response.created`` immediately — before
+    consuming any token — and one ``response.output_text.delta`` per engine
+    chunk, so clients see real time-to-first-token (issue #547).  The **tools
+    path** (``_stream_tools_response``) must buffer the whole generation:
+    ``parse_model_output`` needs the full, brace-balanced output to detect tool
+    calls and assign upfront tool IDs, so streaming is impossible there.
+    """
     seq = 0
 
     def ev(event: str, data: dict) -> str:
@@ -361,7 +371,8 @@ async def _stream_response(
         obj["status"] = status
         return obj
 
-    try:
+    async def _stream_tools_response():
+        """Buffer the engine output, parse once, replay full semantic events."""
         full_text = ""
         raw_text = ""
         done_reason = None
@@ -370,14 +381,16 @@ async def _stream_response(
         async for chunk in result:
             if chunk.get("cache_info"):
                 continue
-            if "thinking_expected" in chunk:
-                thinking_expected = bool(chunk["thinking_expected"])
-                continue
+            # `done` is checked before `thinking_expected` so a terminal chunk
+            # that also carries the meta key can't have its stats dropped.
             if chunk.get("done"):
                 raw_text = chunk.get("raw_text", raw_text)
                 done_reason = chunk.get("done_reason")
                 stats = chunk.get("stats")
                 break
+            if "thinking_expected" in chunk:
+                thinking_expected = bool(chunk["thinking_expected"])
+                continue
             full_text += chunk.get("text", "")
 
         parse_text = raw_text or full_text
@@ -388,7 +401,7 @@ async def _stream_response(
         fill_missing_required_args(tool_uses, tools)
         output_items = _build_output_items(thinking, visible_text, tool_uses)
 
-        in_progress_resp = base_response("in_progress", [], stats, None)
+        in_progress_resp = base_response("in_progress", [], None, None)
         yield ev("response.created", {"response": in_progress_resp})
         yield ev("response.in_progress", {"response": in_progress_resp})
 
@@ -467,6 +480,231 @@ async def _stream_response(
         yield ev("response.completed", {"response": final})
 
         _store_response(req, response_id, conversation, output_items, final)
+
+    async def _stream_text_response():
+        """Real-time path (no tools): emit events as tokens arrive.
+
+        ``response.created``/``response.in_progress`` are emitted up front with
+        zero usage, then thinking and visible fragments — split by the shared
+        ``split_thinking_parts`` state machine — are routed to a reasoning item
+        and per-fragment ``response.output_text.delta`` events respectively.
+        """
+        reasoning_id = _make_reasoning_id()
+        message_id = _make_message_id()
+        split_state: dict = {}
+        stats = None
+        done_reason = None
+        thinking_text = ""
+        visible_text = ""
+        reasoning_open = False
+        reasoning_closed = False
+        message_open = False
+        reasoning_index: int | None = None
+        message_index: int | None = None
+
+        def reasoning_item() -> dict:
+            content = (
+                [{"type": "reasoning_text", "text": thinking_text}]
+                if thinking_text
+                else []
+            )
+            return {
+                "type": "reasoning",
+                "id": reasoning_id,
+                "summary": [],
+                "content": content,
+            }
+
+        def message_item(status: str) -> dict:
+            return {
+                "type": "message",
+                "id": message_id,
+                "status": status,
+                "role": "assistant",
+                "content": [
+                    {"type": "output_text", "text": visible_text, "annotations": []}
+                ],
+            }
+
+        def close_reasoning() -> list[str]:
+            """Close an open reasoning item: reasoning_text.done then item.done."""
+            nonlocal reasoning_closed
+            if not reasoning_open or reasoning_closed:
+                return []
+            reasoning_closed = True
+            return [
+                ev(
+                    "response.reasoning_text.done",
+                    {
+                        "item_id": reasoning_id,
+                        "output_index": reasoning_index,
+                        "content_index": 0,
+                        "text": thinking_text,
+                    },
+                ),
+                ev(
+                    "response.output_item.done",
+                    {"output_index": reasoning_index, "item": reasoning_item()},
+                ),
+            ]
+
+        def route(channel: str, fragment: str) -> list[str]:
+            """SSE events for *fragment*, opening/closing items as needed."""
+            nonlocal thinking_text, visible_text
+            nonlocal reasoning_open, message_open
+            nonlocal reasoning_index, message_index
+            if not fragment:
+                return []
+            events: list[str] = []
+            if channel == "thinking" and not message_open:
+                if not reasoning_open:
+                    reasoning_open = True
+                    reasoning_index = 0
+                    events.append(
+                        ev(
+                            "response.output_item.added",
+                            {"output_index": reasoning_index, "item": reasoning_item()},
+                        )
+                    )
+                thinking_text += fragment
+                events.append(
+                    ev(
+                        "response.reasoning_text.delta",
+                        {
+                            "item_id": reasoning_id,
+                            "output_index": reasoning_index,
+                            "content_index": 0,
+                            "delta": fragment,
+                        },
+                    )
+                )
+                return events
+            # Visible content (or stray thinking after the message opened): close
+            # the reasoning item, then stream the fragment as an output_text delta.
+            events.extend(close_reasoning())
+            if not message_open:
+                message_open = True
+                message_index = 1 if reasoning_index is not None else 0
+                events.append(
+                    ev(
+                        "response.output_item.added",
+                        {
+                            "output_index": message_index,
+                            "item": message_item("in_progress"),
+                        },
+                    )
+                )
+                events.append(
+                    ev(
+                        "response.content_part.added",
+                        {
+                            "item_id": message_id,
+                            "output_index": message_index,
+                            "content_index": 0,
+                            "part": {
+                                "type": "output_text",
+                                "text": "",
+                                "annotations": [],
+                            },
+                        },
+                    )
+                )
+            visible_text += fragment
+            events.append(
+                ev(
+                    "response.output_text.delta",
+                    {
+                        "item_id": message_id,
+                        "output_index": message_index,
+                        "content_index": 0,
+                        "delta": fragment,
+                        "logprobs": [],
+                    },
+                )
+            )
+            return events
+
+        initial = base_response("in_progress", [], None, None)
+        yield ev("response.created", {"response": initial})
+        yield ev("response.in_progress", {"response": initial})
+
+        async for chunk in result:
+            if chunk.get("cache_info"):
+                continue
+            # `done` is checked before `thinking_expected` so a terminal chunk
+            # that also carries the meta key can't have its stats dropped.
+            if chunk.get("done"):
+                done_reason = chunk.get("done_reason")
+                stats = chunk.get("stats")
+                break
+            if "thinking_expected" in chunk:
+                split_state["thinking_expected"] = bool(chunk["thinking_expected"])
+                continue
+            for channel, fragment in split_thinking_parts(
+                chunk.get("text", ""), split_state
+            ):
+                for event in route(channel, fragment):
+                    yield event
+
+        thinking_tail, content_tail = flush_split_thinking(split_state)
+        for channel, fragment in (
+            ("thinking", thinking_tail),
+            ("content", content_tail),
+        ):
+            for event in route(channel, fragment):
+                yield event
+
+        # Close any item left open: a pure/truncated-thinking response never
+        # opened a message, so its reasoning item must be closed here.
+        for event in close_reasoning():
+            yield event
+        if message_open:
+            yield ev(
+                "response.output_text.done",
+                {
+                    "item_id": message_id,
+                    "output_index": message_index,
+                    "content_index": 0,
+                    "text": visible_text,
+                    "logprobs": [],
+                },
+            )
+            yield ev(
+                "response.content_part.done",
+                {
+                    "item_id": message_id,
+                    "output_index": message_index,
+                    "content_index": 0,
+                    "part": {
+                        "type": "output_text",
+                        "text": visible_text,
+                        "annotations": [],
+                    },
+                },
+            )
+            yield ev(
+                "response.output_item.done",
+                {"output_index": message_index, "item": message_item("completed")},
+            )
+
+        output_items: list[dict] = []
+        if thinking_text:
+            output_items.append(reasoning_item())
+        if visible_text:
+            output_items.append(message_item("completed"))
+
+        final_status = (
+            "incomplete" if done_reason in ("timeout", "length") else "completed"
+        )
+        final = base_response(final_status, output_items, stats, done_reason)
+        yield ev("response.completed", {"response": final})
+
+        _store_response(req, response_id, conversation, output_items, final)
+
+    gen = _stream_tools_response() if tools else _stream_text_response()
+    try:
+        async for event in gen:
+            yield event
     except Exception as exc:
         logger.error("Error during Responses streaming: %s", exc, exc_info=True)
         yield ev(
