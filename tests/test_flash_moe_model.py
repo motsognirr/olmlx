@@ -457,6 +457,154 @@ class TestFlashMoeQwen3Next:
 
 
 # ---------------------------------------------------------------------------
+# Synthetic plain Qwen3-MoE model (e.g. Qwen3-235B-A22B): linear gate, NO
+# shared_expert_gate and NO e_score_correction_bias. Must NOT fall through to
+# the DeepSeek branch (whose _route expects a custom gate returning
+# (inds, scores)) — that produced "not enough values to unpack".
+# ---------------------------------------------------------------------------
+
+
+class _MockQwen3SparseMoeBlock(nn.Module):
+    """Mock Qwen3MoeSparseMoeBlock — plain nn.Linear gate, no shared experts."""
+
+    def __init__(
+        self, hidden_size, intermediate_size, num_experts, num_experts_per_tok
+    ):
+        super().__init__()
+        self.gate = nn.Linear(hidden_size, num_experts, bias=False)
+        self.switch_mlp = _MockSwitchGLU(hidden_size, intermediate_size, num_experts)
+        self.top_k = num_experts_per_tok
+        self.norm_topk_prob = True
+        self.sharding_group = None
+
+    def __call__(self, x):
+        gates = mx.softmax(self.gate(x), axis=-1, precise=True)
+        k = self.top_k
+        inds = mx.argpartition(gates, kth=-k, axis=-1)[..., -k:]  # noqa: F841
+        return x  # simplified — real expert dispatch is replaced by FlashMoE
+
+
+class _MockQwen3DecoderLayer(nn.Module):
+    def __init__(
+        self, hidden_size, intermediate_size, num_experts, num_experts_per_tok, is_moe
+    ):
+        super().__init__()
+        if is_moe:
+            self.mlp = _MockQwen3SparseMoeBlock(
+                hidden_size, intermediate_size, num_experts, num_experts_per_tok
+            )
+        else:
+            self.mlp = _MockMLP(hidden_size, intermediate_size)
+
+
+class _MockQwen3Model(nn.Module):
+    def __init__(
+        self,
+        hidden_size,
+        intermediate_size,
+        num_experts,
+        num_experts_per_tok,
+        num_dense,
+        num_moe,
+    ):
+        super().__init__()
+        layers = []
+        for _ in range(num_dense):
+            layers.append(
+                _MockQwen3DecoderLayer(
+                    hidden_size,
+                    intermediate_size,
+                    num_experts,
+                    num_experts_per_tok,
+                    is_moe=False,
+                )
+            )
+        for _ in range(num_moe):
+            layers.append(
+                _MockQwen3DecoderLayer(
+                    hidden_size,
+                    intermediate_size,
+                    num_experts,
+                    num_experts_per_tok,
+                    is_moe=True,
+                )
+            )
+        self.layers = layers
+
+    def __call__(self, x, cache=None):
+        for layer in self.layers:
+            x = layer.mlp(x)
+        return x
+
+
+class TestFlashMoeQwen3:
+    @pytest.fixture()
+    def model_and_store(self, tmp_path):
+        hidden, inter, experts = 64, 32, 8
+        num_dense, num_moe = 1, 2
+        num_experts_per_tok = 2
+
+        model_dir = _make_synthetic_moe_weights(
+            hidden, inter, experts, num_moe, num_dense, tmp_path
+        )
+        output_dir = tmp_path / "flash_moe"
+
+        from olmlx.engine.flash.moe_bundler import bundle_moe_experts
+
+        bundle_moe_experts(model_dir, output_dir)
+
+        from olmlx.engine.flash.moe_weight_store import FlashMoeWeightStore
+
+        store = FlashMoeWeightStore(
+            output_dir, num_io_threads=4, cache_budget_experts=16
+        )
+
+        model = _MockQwen3Model(
+            hidden, inter, experts, num_experts_per_tok, num_dense, num_moe
+        )
+        return model, store, hidden, inter, experts, num_experts_per_tok
+
+    def test_replaces_qwen3_moe_with_qwen3_class(self, model_and_store):
+        """Plain Qwen3-MoE layers must map to _FlashMoEQwen3, not _FlashMoEDeepSeek."""
+        model, store, hidden, inter, experts, num_experts_per_tok = model_and_store
+
+        from olmlx.engine.flash.flash_moe_model import (
+            FlashMoeModelWrapper,
+            _FlashMoEDeepSeek,
+            _FlashMoEQwen3,
+        )
+
+        moe_layer_indices = [1, 2]
+        wrapped = FlashMoeModelWrapper(
+            model, store, moe_layer_indices, hidden, inter, experts, num_experts_per_tok
+        )
+
+        assert isinstance(wrapped.layers[0].mlp, _MockMLP)
+        for i in [1, 2]:
+            mlp = wrapped.layers[i].mlp
+            assert isinstance(mlp, _FlashMoEQwen3)
+            assert not isinstance(mlp, _FlashMoEDeepSeek)
+
+    def test_qwen3_forward_pass(self, model_and_store):
+        """Forward through plain Qwen3 Flash-MoE wrapper must not raise on routing."""
+        model, store, hidden, inter, experts, num_experts_per_tok = model_and_store
+
+        from olmlx.engine.flash.flash_moe_model import FlashMoeModelWrapper
+
+        moe_layer_indices = [1, 2]
+        wrapped = FlashMoeModelWrapper(
+            model, store, moe_layer_indices, hidden, inter, experts, num_experts_per_tok
+        )
+
+        x = mx.random.normal((1, 4, hidden))
+        # This is the regression: a plain linear gate routed through the
+        # DeepSeek branch raised "not enough values to unpack (expected 2, got 1)".
+        result = wrapped.layers[1].mlp(x)
+        mx.eval(result)
+        assert result.shape == (1, 4, hidden)
+
+
+# ---------------------------------------------------------------------------
 # Synthetic MiniMax-like model (block_sparse_moe instead of mlp)
 # ---------------------------------------------------------------------------
 
