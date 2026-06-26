@@ -1283,8 +1283,46 @@ class TestToolCallParsing:
         assert tool_calls[0]["function"]["name"] == "get_weather"
         args = json.loads(tool_calls[0]["function"]["arguments"])
         assert args == {"city": "London"}
-        # Tool call text should be stripped from content
-        assert not choice["message"].get("content")
+        # Tool call text should be stripped from content, but the key must be
+        # present with value null (OpenAI spec) — not omitted.
+        assert "content" in choice["message"]
+        assert choice["message"]["content"] is None
+
+    @pytest.mark.asyncio
+    async def test_non_streaming_tool_call_content_key_present(self, app_client):
+        """OpenAI spec: content key must be present (as null) even for tool-only responses."""
+        mock_result = {
+            "text": self.QWEN_TOOL_CALL,
+            "done": True,
+            "stats": TimingStats(prompt_eval_count=10, eval_count=20),
+        }
+
+        with patch(
+            "olmlx.routers.openai.generate_chat", new_callable=AsyncMock
+        ) as mock_gen:
+            mock_gen.return_value = mock_result
+            resp = await app_client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "qwen3",
+                    "messages": [{"role": "user", "content": "weather?"}],
+                    "tools": [
+                        {
+                            "type": "function",
+                            "function": {
+                                "name": "get_weather",
+                                "parameters": {"type": "object"},
+                            },
+                        }
+                    ],
+                },
+            )
+
+        assert resp.status_code == 200
+        msg = resp.json()["choices"][0]["message"]
+        assert "content" in msg  # key must be present ...
+        assert msg["content"] is None  # ... with value null
+        assert msg["tool_calls"] is not None
 
     @pytest.mark.asyncio
     async def test_non_streaming_text_and_tool_call(self, app_client):
