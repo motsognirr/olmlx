@@ -1153,6 +1153,60 @@ class TestAnthropicEndpoint:
             )
 
     @pytest.mark.asyncio
+    async def test_streaming_no_think_whitespace_no_spurious_thinking_block(
+        self, app_client
+    ):
+        """Issue #557: with `/no_think`, Qwen3 emits leading whitespace (`\\n\\n`)
+        before an orphan `</think>`. The splitter classifies that whitespace as
+        thinking content; the streaming path must NOT surface it as a thinking
+        content block — the non-streaming path emits only a text block."""
+
+        async def mock_stream(*args, **kwargs):
+            async def gen():
+                yield {"thinking_expected": True}
+                yield {"text": "\n\n</think>", "done": False}
+                yield {"text": "Yes.", "done": False}
+                yield {"text": "", "done": True, "stats": TimingStats()}
+
+            return gen()
+
+        with patch("olmlx.routers.anthropic.generate_chat", side_effect=mock_stream):
+            resp = await app_client.post(
+                "/v1/messages",
+                json={
+                    "model": "qwen3",
+                    "messages": [{"role": "user", "content": "Say: yes. /no_think"}],
+                    "max_tokens": 20,
+                    "stream": True,
+                },
+            )
+
+        assert resp.status_code == 200
+        block_types: list[str] = []
+        thinking_text = ""
+        text_text = ""
+        for line in resp.text.splitlines():
+            if not line.startswith("data: "):
+                continue
+            try:
+                payload = json.loads(line[6:])
+            except json.JSONDecodeError:
+                continue
+            if payload.get("type") == "content_block_start":
+                block_types.append(payload["content_block"]["type"])
+            elif payload.get("type") == "content_block_delta":
+                delta = payload.get("delta", {})
+                if delta.get("type") == "thinking_delta":
+                    thinking_text += delta.get("thinking", "")
+                elif delta.get("type") == "text_delta":
+                    text_text += delta.get("text", "")
+        assert "thinking" not in block_types, (
+            f"spurious thinking block emitted: {block_types}"
+        )
+        assert thinking_text == ""
+        assert text_text == "Yes."
+
+    @pytest.mark.asyncio
     async def test_streaming_overflow_when_close_think_never_arrives(self, app_client):
         """When `thinking_expected=True` but no `</think>` arrives before the
         buffer crosses `INIT_ORPHAN_DETECT_LIMIT`, the state machine must

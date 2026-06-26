@@ -420,7 +420,9 @@ async def _stream_buffered_with_tools(
 
     block_idx = 0
 
-    if thinking:
+    if thinking and thinking.strip():
+        # Mirror the incremental path (issue #557): a whitespace-only thinking
+        # span must not produce a thinking content block.
         for event in _emit_content_block(
             block_idx,
             "thinking",
@@ -529,6 +531,15 @@ async def _stream_thinking_state_machine(result):
         """
         nonlocal current, text_block_emitted
         if not fragment:
+            return []
+        # A whitespace-only *thinking* fragment must not open a thinking block.
+        # With `/no_think`, Qwen3 emits leading whitespace before an orphan
+        # `</think>`, which the splitter classifies as a thinking fragment;
+        # opening a block for it produces a spurious thinking block the
+        # non-streaming path never emits (issue #557). Scoped to the thinking
+        # channel so leading whitespace in plain-text streams is preserved, and
+        # to block-opening so whitespace inside an open thinking block survives.
+        if channel == "thinking" and current is None and not fragment.strip():
             return []
         block_type = "thinking" if channel == "thinking" else "text"
         events = []
@@ -887,7 +898,9 @@ async def anthropic_messages(req: AnthropicMessagesRequest, request: Request):
 
         content_blocks = []
 
-        if thinking:
+        # Consistent with the streaming paths (issue #557): a whitespace-only
+        # thinking span must not produce a thinking content block.
+        if thinking and thinking.strip():
             content_blocks.append(
                 AnthropicContentBlock(type="thinking", thinking=thinking, signature="")
             )
