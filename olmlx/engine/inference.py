@@ -3954,6 +3954,11 @@ async def _full_completion(
         text, hit = truncate_at_stop(result_dict.get("text", ""), stop_sequences)
         if hit:
             result_dict["finish_reason"] = "stop"
+            # The stop sequence is applied post-hoc, so mlx-lm may have run on to
+            # max_tokens and set done_reason="length". A stop-sequence hit means
+            # the visible generation ended at the stop, so "stop" wins — drop the
+            # length marker that routers key on.
+            result_dict.pop("done_reason", None)
         result_dict["text"] = text
     return result_dict
 
