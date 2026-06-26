@@ -78,8 +78,14 @@ async def sdk_client(tmp_path, monkeypatch):
 
 
 async def test_text(sdk_client):
+    # Qwen3 is a thinking model; reasoning.effort="none" disables thinking so the
+    # 64-token budget produces visible prose rather than being spent entirely on an
+    # unclosed <think> block (which #555 correctly routes to reasoning, not content).
     resp = await sdk_client.responses.create(
-        model=MODEL, input="Say the single word: pong.", max_output_tokens=64
+        model=MODEL,
+        input="Say the single word: pong.",
+        max_output_tokens=64,
+        reasoning={"effort": "none"},
     )
     assert resp.status in ("completed", "incomplete")
     assert resp.output_text  # SDK convenience accessor concatenates output_text
@@ -88,7 +94,10 @@ async def test_text(sdk_client):
 async def test_streaming_text(sdk_client):
     chunks = []
     async with sdk_client.responses.stream(
-        model=MODEL, input="Count to three.", max_output_tokens=64
+        model=MODEL,
+        input="Count to three.",
+        max_output_tokens=64,
+        reasoning={"effort": "none"},
     ) as stream:
         async for event in stream:
             if event.type == "response.output_text.delta":
