@@ -97,6 +97,7 @@ async def _stream_openai_sse(
         return {k: v for k, v in choice.items() if v is not None}
 
     think_state: dict = {}
+    content_emitted = False
     try:
         async for chunk in result:
             if chunk.get("cache_info"):
@@ -124,6 +125,23 @@ async def _stream_openai_sse(
                             "choices": [_compact_choice(format_content(flushed))],
                         }
                         yield f"data: {json.dumps(data)}\n\n"
+                        content_emitted = True
+                # Issue #551: if thinking consumed the whole token budget, no
+                # content chunk ever fired and the client never saw a role
+                # announcement — the stream looks like an instant empty success.
+                # Emit a role/empty-content chunk so the assistant turn is
+                # detectable. Scoped to the chat path (format_content carries a
+                # role); the completions path uses a text-shaped formatter.
+                if strip_thinking and not content_emitted:
+                    data = {
+                        "id": response_id,
+                        "object": object_type,
+                        "created": created,
+                        "model": model,
+                        "choices": [_compact_choice(format_content(""))],
+                    }
+                    yield f"data: {json.dumps(data)}\n\n"
+                    content_emitted = True
                 done_reason = chunk.get("done_reason")
                 finish_reason = (
                     "length"
@@ -155,6 +173,7 @@ async def _stream_openai_sse(
                     "choices": [_compact_choice(format_content(text))],
                 }
                 yield f"data: {json.dumps(data)}\n\n"
+                content_emitted = True
     except Exception as exc:
         logger.error("Error during OpenAI streaming: %s", exc, exc_info=True)
         error_payload = json.dumps(

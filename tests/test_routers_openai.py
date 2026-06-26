@@ -1648,6 +1648,91 @@ class TestToolCallParsing:
         assert "The answer is 42." in full_content
 
     @pytest.mark.asyncio
+    async def test_streaming_thinking_exhausts_max_tokens_emits_role_chunk(
+        self, app_client
+    ):
+        """Issue #551: when thinking consumes the entire max_tokens budget, no
+        content chunk fires, so the stream must still announce the assistant
+        role (otherwise it is indistinguishable from an instant empty success)
+        and report finish_reason 'length'."""
+
+        async def mock_stream(*args, **kwargs):
+            async def gen():
+                yield {"thinking_expected": True}
+                yield {"text": "<think>", "done": False}
+                yield {"text": "Okay, 2+2 is...", "done": False}
+                yield {
+                    "text": "",
+                    "done": True,
+                    "done_reason": "length",
+                    "stats": TimingStats(),
+                }
+
+            return gen()
+
+        with patch("olmlx.routers.openai.generate_chat", side_effect=mock_stream):
+            resp = await app_client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "qwen3",
+                    "messages": [{"role": "user", "content": "2+2?"}],
+                    "stream": True,
+                    "max_tokens": 30,
+                },
+            )
+
+        assert resp.status_code == 200
+        events = [
+            json.loads(line[6:])
+            for line in resp.text.strip().split("\n")
+            if line.startswith("data: ") and line.strip() != "data: [DONE]"
+        ]
+        roles = [e["choices"][0]["delta"].get("role") for e in events]
+        assert "assistant" in roles, "no role announcement in all-thinking stream"
+        contents = "".join(
+            e["choices"][0]["delta"].get("content", "") or "" for e in events
+        )
+        # Neither the <think> marker nor the thinking text itself may leak into
+        # visible content — the whole budget was reasoning.
+        assert "<think>" not in contents
+        assert "Okay, 2+2 is" not in contents
+        assert contents.strip() == ""
+        done_events = [e for e in events if e["choices"][0].get("finish_reason")]
+        assert done_events[-1]["choices"][0]["finish_reason"] == "length"
+
+    @pytest.mark.asyncio
+    async def test_streaming_normal_response_role_announced_once(self, app_client):
+        """Regression guard for #551: a normal response must not gain an extra
+        empty role chunk — the role rides the (single) content chunk."""
+
+        async def mock_stream(*args, **kwargs):
+            async def gen():
+                yield {"text": "Hello!", "done": False}
+                yield {"text": "", "done": True, "stats": TimingStats()}
+
+            return gen()
+
+        with patch("olmlx.routers.openai.generate_chat", side_effect=mock_stream):
+            resp = await app_client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "any",
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "stream": True,
+                },
+            )
+
+        events = [
+            json.loads(line[6:])
+            for line in resp.text.strip().split("\n")
+            if line.startswith("data: ") and line.strip() != "data: [DONE]"
+        ]
+        role_chunks = [
+            e for e in events if e["choices"][0]["delta"].get("role") == "assistant"
+        ]
+        assert len(role_chunks) == 1
+
+    @pytest.mark.asyncio
     async def test_streaming_qwen35_long_orphaned_thinking(self, app_client):
         """Issue #307: Qwen3.5/3.6 stream their thinking without ``<think>``
         opener; the orphan ``</think>`` arrives only after several hundred
