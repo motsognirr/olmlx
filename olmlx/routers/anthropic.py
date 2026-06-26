@@ -420,7 +420,9 @@ async def _stream_buffered_with_tools(
 
     block_idx = 0
 
-    if thinking:
+    if thinking and thinking.strip():
+        # Mirror the incremental path (issue #557): a whitespace-only thinking
+        # span must not produce a thinking content block.
         for event in _emit_content_block(
             block_idx,
             "thinking",
@@ -529,6 +531,14 @@ async def _stream_thinking_state_machine(result):
         """
         nonlocal current, text_block_emitted
         if not fragment:
+            return []
+        # A whitespace-only fragment must not *open* a new block. With
+        # `/no_think`, Qwen3 emits leading whitespace before an orphan
+        # `</think>`, which the splitter classifies as a thinking fragment;
+        # opening a thinking block for it produces a spurious block the
+        # non-streaming path never emits (issue #557). Whitespace *inside* an
+        # already-open block is preserved.
+        if current is None and not fragment.strip():
             return []
         block_type = "thinking" if channel == "thinking" else "text"
         events = []
