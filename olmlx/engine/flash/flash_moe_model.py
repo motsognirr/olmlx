@@ -126,6 +126,31 @@ class _FlashMoEQwen3Next(_FlashMoEBase):
         return y + shared_y
 
 
+class _FlashMoEQwen3(_FlashMoEBase):
+    """Replacement MoE layer for plain Qwen3-MoE style models.
+
+    Covers Qwen3MoeSparseMoeBlock (e.g. Qwen3-235B-A22B): a plain nn.Linear
+    gate (returns logits, not (inds, scores)), no shared experts, and no
+    e_score_correction_bias. Routing mirrors mlx-lm's Qwen3MoeSparseMoeBlock:
+    softmax over all experts, top-k, optional norm_topk_prob renormalization.
+    """
+
+    def __init__(self, original_moe, flash_moe: FlashMoE):
+        super().__init__(original_moe, flash_moe)
+        self.gate = original_moe.gate
+        self.top_k = original_moe.top_k
+        self.norm_topk_prob = original_moe.norm_topk_prob
+
+    def _route(self, x):
+        gates = mx.softmax(self.gate(x), axis=-1, precise=True)  # pyright: ignore[reportCallIssue]
+        k = self.top_k
+        inds = mx.argpartition(gates, kth=-k, axis=-1)[..., -k:]
+        scores = mx.take_along_axis(gates, inds, axis=-1)
+        if self.norm_topk_prob:
+            scores = scores / mx.sum(scores, axis=-1, keepdims=True)
+        return inds, scores
+
+
 class _FlashMoEMiniMax(_FlashMoEBase):
     """Replacement MoE layer for MiniMax-style models.
 
@@ -326,6 +351,11 @@ def _replace_moe_layers(
             elif gate_is_linear and hasattr(moe_module, "e_score_correction_bias"):
                 # MiniMax style: linear gate with sigmoid scoring + correction bias
                 replacement = _FlashMoEMiniMax(moe_module, flash_moe)
+            elif gate_is_linear:
+                # Plain Qwen3-MoE style (e.g. Qwen3-235B-A22B): linear gate ->
+                # softmax -> top-k. Must come before the DeepSeek branch — a
+                # plain linear gate returns logits, never (inds, scores).
+                replacement = _FlashMoEQwen3(moe_module, flash_moe)
             elif gate is not None:
                 # DeepSeek-V3 / Kimi-K2.5 style: custom gate returns (inds, scores)
                 replacement = _FlashMoEDeepSeek(moe_module, flash_moe)
