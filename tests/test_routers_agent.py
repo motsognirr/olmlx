@@ -99,15 +99,15 @@ class TestCreateRun:
         resp = await client.post("/v1/agent/runs", json={"goal": "x"})
         assert resp.json()["model"] == "qwen3:latest"
 
-    async def test_create_empty_goal_422(self, agent_client):
+    async def test_create_empty_goal_400(self, agent_client):
         client, service = agent_client
         resp = await client.post("/v1/agent/runs", json={"goal": "   "})
-        assert resp.status_code == 422
+        assert resp.status_code == 400
 
-    async def test_create_missing_goal_422(self, agent_client):
+    async def test_create_missing_goal_400(self, agent_client):
         client, service = agent_client
         resp = await client.post("/v1/agent/runs", json={})
-        assert resp.status_code == 422
+        assert resp.status_code == 400
 
 
 class TestGetAndList:

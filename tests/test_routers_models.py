@@ -58,4 +58,4 @@ class TestModelsRouter:
     async def test_show_rejects_empty_body(self, app_client):
         # neither name nor model gives 422
         resp = await app_client.post("/api/show", json={})
-        assert resp.status_code == 422
+        assert resp.status_code == 400

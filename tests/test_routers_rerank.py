@@ -70,7 +70,7 @@ class TestRerankRouter:
             "/v1/rerank",
             json={"model": "m", "query": "q", "documents": []},
         )
-        assert resp.status_code == 422
+        assert resp.status_code == 400
 
     @pytest.mark.asyncio
     async def test_rerank_non_reranker_model_returns_400(self, app_client):

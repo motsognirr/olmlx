@@ -61,7 +61,7 @@ class TestZeroTokenGeneration:
                 "max_tokens": 0,
             },
         )
-        assert resp.status_code == 422
+        assert resp.status_code == 400
 
     async def test_openai_zero_max_completion_tokens_rejected(self, integration_ctx):
         """POST /v1/chat/completions with max_completion_tokens: 0 is rejected."""
@@ -73,7 +73,7 @@ class TestZeroTokenGeneration:
                 "max_completion_tokens": 0,
             },
         )
-        assert resp.status_code == 422
+        assert resp.status_code == 400
 
 
 # ---------------------------------------------------------------------------

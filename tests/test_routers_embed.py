@@ -68,7 +68,7 @@ class TestEmbedRouter:
             "/api/embed",
             json={"model": "qwen3", "input": ""},
         )
-        assert resp.status_code == 422
+        assert resp.status_code == 400
         assert "input" in resp.text.lower()
         assert "empty" in resp.text.lower()
 
@@ -78,7 +78,7 @@ class TestEmbedRouter:
             "/api/embed",
             json={"model": "qwen3", "input": []},
         )
-        assert resp.status_code == 422
+        assert resp.status_code == 400
         assert "input" in resp.text.lower()
         assert "empty" in resp.text.lower()
 
@@ -88,6 +88,6 @@ class TestEmbedRouter:
             "/api/embeddings",
             json={"model": "qwen3", "prompt": ""},
         )
-        assert resp.status_code == 422
+        assert resp.status_code == 400
         assert "prompt" in resp.text.lower()
         assert "empty" in resp.text.lower()

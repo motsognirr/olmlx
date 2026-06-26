@@ -5,6 +5,7 @@ from pydantic import ValidationError
 
 from olmlx.schemas.anthropic import (
     AnthropicContentBlock,
+    AnthropicCountTokensRequest,
     AnthropicMessage,
     AnthropicMessagesRequest,
     AnthropicMessagesResponse,
@@ -692,16 +693,34 @@ class TestAnthropicSchemas:
         req = AnthropicMessagesRequest(
             model="test",
             messages=[AnthropicMessage(role="user", content="hi")],
+            max_tokens=100,
         )
-        assert req.max_tokens == 4096
         assert req.stream is False
         assert req.tools is None
         assert req.system is None
+
+    def test_messages_request_max_tokens_required(self):
+        """max_tokens has no default — omitting it is a validation error."""
+        with pytest.raises(ValidationError, match="max_tokens"):
+            AnthropicMessagesRequest(
+                model="test",
+                messages=[AnthropicMessage(role="user", content="hi")],
+            )
+
+    def test_count_tokens_request_max_tokens_optional(self):
+        """count_tokens accepts requests without max_tokens (real Anthropic API
+        takes no such field there)."""
+        req = AnthropicCountTokensRequest(
+            model="test",
+            messages=[AnthropicMessage(role="user", content="hi")],
+        )
+        assert req.max_tokens == 1
 
     def test_messages_request_with_system(self):
         req = AnthropicMessagesRequest(
             model="test",
             messages=[AnthropicMessage(role="user", content="hi")],
+            max_tokens=100,
             system="You are helpful.",
         )
         assert req.system == "You are helpful."
@@ -741,6 +760,7 @@ class TestAnthropicSchemas:
         req = AnthropicMessagesRequest(
             model="test",
             messages=[AnthropicMessage(role="user", content="hi")],
+            max_tokens=100,
             temperature=1.0,
         )
         assert req.temperature == 1.0
@@ -750,6 +770,7 @@ class TestAnthropicSchemas:
             AnthropicMessagesRequest(
                 model="test",
                 messages=[AnthropicMessage(role="user", content="hi")],
+                max_tokens=100,
                 temperature=1.1,
             )
 
@@ -758,6 +779,7 @@ class TestAnthropicSchemas:
             AnthropicMessagesRequest(
                 model="test",
                 messages=[AnthropicMessage(role="user", content="hi")],
+                max_tokens=100,
                 temperature=-0.1,
             )
 
@@ -766,6 +788,7 @@ class TestAnthropicSchemas:
             AnthropicMessagesRequest(
                 model="test",
                 messages=[AnthropicMessage(role="user", content="hi")],
+                max_tokens=100,
                 top_p=1.1,
             )
 
@@ -774,6 +797,7 @@ class TestAnthropicSchemas:
             AnthropicMessagesRequest(
                 model="test",
                 messages=[AnthropicMessage(role="user", content="hi")],
+                max_tokens=100,
                 top_k=0,
             )
 
@@ -787,7 +811,7 @@ class TestAnthropicSchemas:
 
     def test_messages_request_rejects_empty_messages(self):
         with pytest.raises(ValidationError, match="messages"):
-            AnthropicMessagesRequest(model="test", messages=[])
+            AnthropicMessagesRequest(model="test", messages=[], max_tokens=100)
 
     def test_usage(self):
         u = AnthropicUsage()

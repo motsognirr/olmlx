@@ -7,6 +7,7 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import FastAPI, Request
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
@@ -320,6 +321,41 @@ def create_app() -> FastAPI:
     # Added last → runs outermost, so the per-request root span wraps every
     # other middleware and all downstream engine spans nest under it.
     app.add_middleware(RootSpanMiddleware)
+
+    @app.exception_handler(RequestValidationError)
+    async def request_validation_error_handler(
+        request: Request, exc: RequestValidationError
+    ):
+        # FastAPI's default handler returns a raw 422 {"detail": [...]} body.
+        # Provider SDKs expect provider-shaped error envelopes, so translate the
+        # Pydantic errors into a single 400 message dispatched by request path.
+        parts: list[str] = []
+        for err in exc.errors():
+            loc = err.get("loc") or ()
+            field = str(loc[-1]) if loc else "body"
+            msg = str(err.get("msg", "invalid value"))
+            if err.get("type") == "missing":
+                parts.append(f"{field}: field required")
+            elif msg.startswith("Value error, "):
+                # A custom field-validator already produced a descriptive
+                # message; surface it verbatim without a redundant field prefix.
+                parts.append(msg[len("Value error, ") :])
+            elif len(loc) > 1:
+                # Generic constraint/type error (e.g. "Input should be ...") —
+                # prefix the field name so the client knows what was invalid.
+                parts.append(f"{field}: {msg}")
+            else:
+                parts.append(msg)
+        message = "; ".join(parts) if parts else "invalid request"
+        logger.warning("Request validation error on %s: %s", request.url.path, message)
+        return _make_error_response(
+            request.url.path,
+            400,
+            message,
+            "invalid_request_error",
+            "invalid_request_error",
+            "invalid_value",
+        )
 
     @app.exception_handler(ValueError)
     async def value_error_handler(request: Request, exc: ValueError):

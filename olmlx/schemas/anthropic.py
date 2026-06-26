@@ -71,7 +71,10 @@ class AnthropicThinkingParam(BaseModel):
 class AnthropicMessagesRequest(BaseModel):
     model: ModelName
     messages: list[AnthropicMessage]
-    max_tokens: int = Field(4096, ge=1)
+    # Required per the Anthropic API spec — omitting it must yield a 400, not a
+    # silent default. count_tokens uses AnthropicCountTokensRequest, which makes
+    # this optional (the real count_tokens endpoint takes no max_tokens).
+    max_tokens: int = Field(..., ge=1)
     stream: bool = False
 
     @field_validator("max_tokens")
@@ -115,6 +118,18 @@ class AnthropicMessagesRequest(BaseModel):
     metadata: dict | None = None
 
     model_config = {"extra": "allow"}
+
+
+class AnthropicCountTokensRequest(AnthropicMessagesRequest):
+    """Request schema for /v1/messages/count_tokens.
+
+    The real Anthropic count_tokens endpoint takes no max_tokens field, so —
+    unlike /v1/messages — omitting it must not be an error. Re-declaring the
+    field with a default makes it optional while inheriting every other field
+    and validator from AnthropicMessagesRequest.
+    """
+
+    max_tokens: int = Field(1, ge=1)
 
 
 class AnthropicUsage(BaseModel):

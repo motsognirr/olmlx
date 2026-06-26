@@ -30,6 +30,7 @@ from olmlx.engine.tool_parser import (
 )
 from olmlx.schemas.anthropic import (
     AnthropicContentBlock,
+    AnthropicCountTokensRequest,
     AnthropicMessagesRequest,
     AnthropicMessagesResponse,
     AnthropicTokenCountResponse,
@@ -626,7 +627,7 @@ async def _stream_thinking_state_machine(result):
     response_model=AnthropicTokenCountResponse,
     response_model_exclude_none=True,
 )
-async def anthropic_count_tokens(req: AnthropicMessagesRequest, request: Request):
+async def anthropic_count_tokens(req: AnthropicCountTokensRequest, request: Request):
     logger.info(
         "Anthropic count_tokens: model=%s messages=%d tools=%d",
         req.model,
