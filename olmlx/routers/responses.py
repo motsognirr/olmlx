@@ -526,10 +526,32 @@ async def _stream_response(
                 ],
             }
 
+        def close_reasoning() -> list[str]:
+            """Close an open reasoning item: reasoning_text.done then item.done."""
+            nonlocal reasoning_closed
+            if not reasoning_open or reasoning_closed:
+                return []
+            reasoning_closed = True
+            return [
+                ev(
+                    "response.reasoning_text.done",
+                    {
+                        "item_id": reasoning_id,
+                        "output_index": reasoning_index,
+                        "content_index": 0,
+                        "text": thinking_text,
+                    },
+                ),
+                ev(
+                    "response.output_item.done",
+                    {"output_index": reasoning_index, "item": reasoning_item()},
+                ),
+            ]
+
         def route(channel: str, fragment: str) -> list[str]:
             """SSE events for *fragment*, opening/closing items as needed."""
             nonlocal thinking_text, visible_text
-            nonlocal reasoning_open, reasoning_closed, message_open
+            nonlocal reasoning_open, message_open
             nonlocal reasoning_index, message_index
             if not fragment:
                 return []
@@ -545,17 +567,21 @@ async def _stream_response(
                         )
                     )
                 thinking_text += fragment
+                events.append(
+                    ev(
+                        "response.reasoning_text.delta",
+                        {
+                            "item_id": reasoning_id,
+                            "output_index": reasoning_index,
+                            "content_index": 0,
+                            "delta": fragment,
+                        },
+                    )
+                )
                 return events
             # Visible content (or stray thinking after the message opened): close
             # the reasoning item, then stream the fragment as an output_text delta.
-            if reasoning_open and not reasoning_closed:
-                reasoning_closed = True
-                events.append(
-                    ev(
-                        "response.output_item.done",
-                        {"output_index": reasoning_index, "item": reasoning_item()},
-                    )
-                )
+            events.extend(close_reasoning())
             if not message_open:
                 message_open = True
                 message_index = 1 if reasoning_index is not None else 0
@@ -630,12 +656,8 @@ async def _stream_response(
 
         # Close any item left open: a pure/truncated-thinking response never
         # opened a message, so its reasoning item must be closed here.
-        if reasoning_open and not reasoning_closed:
-            reasoning_closed = True
-            yield ev(
-                "response.output_item.done",
-                {"output_index": reasoning_index, "item": reasoning_item()},
-            )
+        for event in close_reasoning():
+            yield event
         if message_open:
             yield ev(
                 "response.output_text.done",

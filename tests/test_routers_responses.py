@@ -736,6 +736,46 @@ class TestStreaming:
         assert final["usage"]["output_tokens"] == 5
 
     @pytest.mark.asyncio
+    async def test_reasoning_text_streams_as_deltas(self, app_client):
+        # Thinking tokens must stream as response.reasoning_text.delta events as
+        # they arrive (issue #547 "Expected"), with a reasoning_text.done
+        # carrying the full text, emitted before the message item opens.
+        async def mock_stream(*args, **kwargs):
+            async def gen():
+                yield {"thinking_expected": True}
+                yield {"text": "<think>The capital is ", "done": False}
+                yield {"text": "Paris.</think>Done", "done": False}
+                yield {"text": "", "done": True, "stats": TimingStats()}
+
+            return gen()
+
+        with patch("olmlx.routers.responses.generate_chat", side_effect=mock_stream):
+            resp = await app_client.post(
+                "/v1/responses",
+                json={
+                    "model": "qwen3",
+                    "input": "q",
+                    "stream": True,
+                    "reasoning": {"effort": "high"},
+                },
+            )
+        events = _parse_sse(resp.text)
+        deltas = [e for e in events if e["event"] == "response.reasoning_text.delta"]
+        assert len(deltas) >= 2
+        assert "".join(d["data"]["delta"] for d in deltas) == "The capital is Paris."
+        done = next(e for e in events if e["event"] == "response.reasoning_text.done")
+        assert done["data"]["text"] == "The capital is Paris."
+        # reasoning_text.done precedes the message item opening.
+        done_idx = events.index(done)
+        message_added = next(
+            i
+            for i, e in enumerate(events)
+            if e["event"] == "response.output_item.added"
+            and e["data"]["item"]["type"] == "message"
+        )
+        assert done_idx < message_added
+
+    @pytest.mark.asyncio
     async def test_truncated_thinking_flushes_reasoning_item(self, app_client):
         # A generation cut off mid-<think> (no close tag) must still close the
         # reasoning item before response.completed, with no empty message item.
