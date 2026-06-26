@@ -3959,6 +3959,13 @@ async def _full_completion(
             # the visible generation ended at the stop, so "stop" wins — drop the
             # length marker that routers key on.
             result_dict.pop("done_reason", None)
+            # mlx-lm generated (and counted) tokens past the stop sequence; the
+            # client only sees the truncated text, so report its token count as
+            # eval_count instead of the full max_tokens run. add_special_tokens
+            # avoids inflating the count with a BOS that was never generated.
+            stats.eval_count = len(
+                lm.text_tokenizer.encode(text, add_special_tokens=False)
+            )
         result_dict["text"] = text
     return result_dict
 
