@@ -381,14 +381,16 @@ async def _stream_response(
         async for chunk in result:
             if chunk.get("cache_info"):
                 continue
-            if "thinking_expected" in chunk:
-                thinking_expected = bool(chunk["thinking_expected"])
-                continue
+            # `done` is checked before `thinking_expected` so a terminal chunk
+            # that also carries the meta key can't have its stats dropped.
             if chunk.get("done"):
                 raw_text = chunk.get("raw_text", raw_text)
                 done_reason = chunk.get("done_reason")
                 stats = chunk.get("stats")
                 break
+            if "thinking_expected" in chunk:
+                thinking_expected = bool(chunk["thinking_expected"])
+                continue
             full_text += chunk.get("text", "")
 
         parse_text = raw_text or full_text
@@ -603,13 +605,15 @@ async def _stream_response(
         async for chunk in result:
             if chunk.get("cache_info"):
                 continue
-            if "thinking_expected" in chunk:
-                split_state["thinking_expected"] = bool(chunk["thinking_expected"])
-                continue
+            # `done` is checked before `thinking_expected` so a terminal chunk
+            # that also carries the meta key can't have its stats dropped.
             if chunk.get("done"):
                 done_reason = chunk.get("done_reason")
                 stats = chunk.get("stats")
                 break
+            if "thinking_expected" in chunk:
+                split_state["thinking_expected"] = bool(chunk["thinking_expected"])
+                continue
             for channel, fragment in split_thinking_parts(
                 chunk.get("text", ""), split_state
             ):

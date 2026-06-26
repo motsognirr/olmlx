@@ -711,6 +711,31 @@ class TestStreaming:
         assert reasoning_item["content"][0]["text"] == "step"
 
     @pytest.mark.asyncio
+    async def test_done_honored_when_combined_with_thinking_expected(self, app_client):
+        # A terminal chunk that also carries `thinking_expected` must still be
+        # treated as done — its stats/done_reason can't be dropped.
+        async def mock_stream(*args, **kwargs):
+            async def gen():
+                yield {"text": "hi", "done": False}
+                yield {
+                    "thinking_expected": True,
+                    "done": True,
+                    "stats": TimingStats(eval_count=5),
+                }
+
+            return gen()
+
+        with patch("olmlx.routers.responses.generate_chat", side_effect=mock_stream):
+            resp = await app_client.post(
+                "/v1/responses",
+                json={"model": "qwen3", "input": "hi", "stream": True},
+            )
+        events = _parse_sse(resp.text)
+        final = events[-1]["data"]["response"]
+        assert final["status"] == "completed"
+        assert final["usage"]["output_tokens"] == 5
+
+    @pytest.mark.asyncio
     async def test_truncated_thinking_flushes_reasoning_item(self, app_client):
         # A generation cut off mid-<think> (no close tag) must still close the
         # reasoning item before response.completed, with no empty message item.
