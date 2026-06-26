@@ -577,6 +577,64 @@ class TestStopSequenceHandling:
     @patch("olmlx.engine.inference._inference_locked")
     @patch("olmlx.engine.inference._inference_ref")
     @patch("olmlx.engine.inference._full_completion_inner")
+    async def test_stop_sequence_hit_overrides_length_done_reason(
+        self, mock_inner, mock_ref, mock_locked
+    ):
+        """A post-hoc stop-sequence hit means the user-visible generation ended
+        at the stop, so it must win over a mlx-lm done_reason='length' (max_tokens
+        reached after the stop sequence was already emitted). Otherwise routers
+        keyed on done_reason would report 'length' for a stop-truncated response."""
+        gen_kwargs = {"stop": ["D"]}
+        stats = MagicMock()
+        lm = MagicMock()
+        lm.inference_queue_timeout = 30.0
+        lm.sync_mode = None
+
+        mock_locked.return_value.__aenter__.return_value = None
+        mock_ref.return_value.__enter__.return_value = None
+        mock_inner.return_value = {
+            "text": "A B C D E F G",
+            "done": True,
+            "stats": stats,
+            "done_reason": "length",
+        }
+
+        result = await _full_completion(lm, "prompt", 50, gen_kwargs, stats)
+        assert result["text"] == "A B C "
+        assert result["finish_reason"] == "stop"
+        assert "done_reason" not in result
+
+    @patch("olmlx.engine.inference._inference_locked")
+    @patch("olmlx.engine.inference._inference_ref")
+    @patch("olmlx.engine.inference._full_completion_inner")
+    async def test_length_done_reason_preserved_without_stop_hit(
+        self, mock_inner, mock_ref, mock_locked
+    ):
+        """When a stop sequence is configured but not matched, a length
+        done_reason must survive (genuine max_tokens truncation)."""
+        gen_kwargs = {"stop": ["Z"]}
+        stats = MagicMock()
+        lm = MagicMock()
+        lm.inference_queue_timeout = 30.0
+        lm.sync_mode = None
+
+        mock_locked.return_value.__aenter__.return_value = None
+        mock_ref.return_value.__enter__.return_value = None
+        mock_inner.return_value = {
+            "text": "A B C",
+            "done": True,
+            "stats": stats,
+            "done_reason": "length",
+        }
+
+        result = await _full_completion(lm, "prompt", 50, gen_kwargs, stats)
+        assert result["text"] == "A B C"
+        assert result["done_reason"] == "length"
+        assert "finish_reason" not in result
+
+    @patch("olmlx.engine.inference._inference_locked")
+    @patch("olmlx.engine.inference._inference_ref")
+    @patch("olmlx.engine.inference._full_completion_inner")
     async def test_no_stop_match(self, mock_inner, mock_ref, mock_locked):
         """When no stop sequence matches, text remains unchanged."""
         gen_kwargs = {"stop": ["D"]}
@@ -2450,6 +2508,65 @@ class TestFullCompletionInner:
         assert stats.prompt_eval_duration > 0
         assert stats.eval_duration >= 0
         assert stats.prompt_eval_duration + stats.eval_duration <= stats.total_duration
+
+    @pytest.mark.asyncio
+    async def test_length_finish_reason_propagated(self, mock_manager):
+        """finish_reason='length' on the last GenerationResponse must be forwarded
+        as done_reason='length' so all non-streaming routers can report max_tokens."""
+        from olmlx.engine.inference import _full_completion_inner
+
+        lm = mock_manager._loaded["qwen3:latest"]
+        mock_result = MagicMock()
+        mock_result.text = "truncated"
+        mock_result.prompt_tokens = 5
+        mock_result.generation_tokens = 200
+        mock_result.prompt_tps = 100.0
+        mock_result.generation_tps = 50.0
+        mock_result.finish_reason = "length"
+        stats = TimingStats()
+        with patch(
+            "olmlx.engine.inference.asyncio.to_thread", new_callable=AsyncMock
+        ) as mt:
+            mt.return_value = (mock_result, "truncated")
+            result = await _full_completion_inner(lm, "prompt", 200, {}, stats)
+        assert result["done_reason"] == "length"
+
+    @pytest.mark.asyncio
+    async def test_stop_finish_reason_not_propagated(self, mock_manager):
+        """finish_reason='stop' should NOT add done_reason — routers already default to stop."""
+        from olmlx.engine.inference import _full_completion_inner
+
+        lm = mock_manager._loaded["qwen3:latest"]
+        mock_result = MagicMock()
+        mock_result.text = "complete"
+        mock_result.prompt_tokens = 5
+        mock_result.generation_tokens = 10
+        mock_result.prompt_tps = 100.0
+        mock_result.generation_tps = 50.0
+        mock_result.finish_reason = "stop"
+        stats = TimingStats()
+        with patch(
+            "olmlx.engine.inference.asyncio.to_thread", new_callable=AsyncMock
+        ) as mt:
+            mt.return_value = (mock_result, "complete")
+            result = await _full_completion_inner(lm, "prompt", 200, {}, stats)
+        assert "done_reason" not in result
+
+    @pytest.mark.asyncio
+    async def test_none_finish_reason_not_propagated(self, mock_manager):
+        """finish_reason=None (result object lacks the attribute) must not set done_reason."""
+        from olmlx.engine.inference import _full_completion_inner
+
+        lm = mock_manager._loaded["qwen3:latest"]
+        mock_result = MagicMock(spec=[])  # no attributes at all
+        mock_result.text = "some text"
+        stats = TimingStats()
+        with patch(
+            "olmlx.engine.inference.asyncio.to_thread", new_callable=AsyncMock
+        ) as mt:
+            mt.return_value = (mock_result, "some text")
+            result = await _full_completion_inner(lm, "prompt", 200, {}, stats)
+        assert "done_reason" not in result
 
     @pytest.mark.asyncio
     async def test_result_as_string(self, mock_manager):
