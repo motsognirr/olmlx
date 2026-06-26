@@ -654,6 +654,66 @@ class TestStopSequenceHandling:
     @patch("olmlx.engine.inference._inference_locked")
     @patch("olmlx.engine.inference._inference_ref")
     @patch("olmlx.engine.inference._full_completion_inner")
+    async def test_stop_sequence_updates_eval_count(
+        self, mock_inner, mock_ref, mock_locked
+    ):
+        """eval_count must be updated to the truncated token count, not max_tokens."""
+        from olmlx.utils.timing import TimingStats
+
+        gen_kwargs = {"stop": ["STOP"]}
+        stats = TimingStats()
+        stats.eval_count = 200  # mlx-lm generated full max_tokens
+        lm = MagicMock()
+        lm.inference_queue_timeout = 30.0
+        lm.sync_mode = None
+        lm.text_tokenizer.encode.return_value = [10, 20, 30]  # 3 tokens
+
+        mock_locked.return_value.__aenter__.return_value = None
+        mock_ref.return_value.__enter__.return_value = None
+        mock_inner.return_value = {
+            "text": "foo STOP bar",
+            "done": True,
+            "stats": stats,
+        }
+
+        result = await _full_completion(lm, "prompt", 200, gen_kwargs, stats)
+        assert result["text"] == "foo "
+        assert result["finish_reason"] == "stop"
+        assert stats.eval_count == 3
+        lm.text_tokenizer.encode.assert_called_once_with(
+            "foo ", add_special_tokens=False
+        )
+
+    @patch("olmlx.engine.inference._inference_locked")
+    @patch("olmlx.engine.inference._inference_ref")
+    @patch("olmlx.engine.inference._full_completion_inner")
+    async def test_no_stop_match_eval_count_unchanged(
+        self, mock_inner, mock_ref, mock_locked
+    ):
+        """eval_count is unchanged when no stop sequence fires."""
+        from olmlx.utils.timing import TimingStats
+
+        gen_kwargs = {"stop": ["STOP"]}
+        stats = TimingStats()
+        stats.eval_count = 50
+        lm = MagicMock()
+        lm.inference_queue_timeout = 30.0
+        lm.sync_mode = None
+
+        mock_locked.return_value.__aenter__.return_value = None
+        mock_ref.return_value.__enter__.return_value = None
+        mock_inner.return_value = {
+            "text": "hello world",
+            "done": True,
+            "stats": stats,
+        }
+
+        await _full_completion(lm, "prompt", 200, gen_kwargs, stats)
+        assert stats.eval_count == 50
+
+    @patch("olmlx.engine.inference._inference_locked")
+    @patch("olmlx.engine.inference._inference_ref")
+    @patch("olmlx.engine.inference._full_completion_inner")
     async def test_stop_not_in_kwargs_no_effect(
         self, mock_inner, mock_ref, mock_locked
     ):
