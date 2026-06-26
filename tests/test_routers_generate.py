@@ -352,7 +352,7 @@ class TestEmptyPromptRejected:
             "/api/generate",
             json={"model": "qwen3", "prompt": ""},
         )
-        assert resp.status_code == 422
+        assert resp.status_code == 400
         body = resp.text.lower()
         assert "prompt" in body
         assert "empty" in body
@@ -363,6 +363,6 @@ class TestEmptyPromptRejected:
             "/api/generate",
             json={"model": "qwen3"},
         )
-        assert resp.status_code == 422
+        assert resp.status_code == 400
         body = resp.text.lower()
         assert "prompt" in body

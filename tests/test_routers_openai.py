@@ -533,7 +533,7 @@ class TestOpenAIRouter:
                 "encoding_format": "bogus",
             },
         )
-        assert resp.status_code == 422
+        assert resp.status_code == 400
 
     @pytest.mark.asyncio
     async def test_completions_streaming(self, app_client):
@@ -755,7 +755,7 @@ class TestEmptyInputRejected:
             "/v1/chat/completions",
             json={"model": "qwen3", "messages": []},
         )
-        assert resp.status_code == 422
+        assert resp.status_code == 400
         body = resp.text.lower()
         assert "messages" in body
         assert "empty" in body
@@ -766,7 +766,7 @@ class TestEmptyInputRejected:
             "/v1/embeddings",
             json={"model": "qwen3", "input": ""},
         )
-        assert resp.status_code == 422
+        assert resp.status_code == 400
         body = resp.text.lower()
         assert "input" in body
         assert "empty" in body
@@ -777,7 +777,7 @@ class TestEmptyInputRejected:
             "/v1/embeddings",
             json={"model": "qwen3", "input": []},
         )
-        assert resp.status_code == 422
+        assert resp.status_code == 400
         body = resp.text.lower()
         assert "input" in body
         assert "empty" in body
@@ -788,7 +788,7 @@ class TestEmptyInputRejected:
             "/v1/completions",
             json={"model": "qwen3", "prompt": ""},
         )
-        assert resp.status_code == 422
+        assert resp.status_code == 400
         body = resp.text.lower()
         assert "prompt" in body
         assert "empty" in body
@@ -799,13 +799,13 @@ class TestEmptyInputRejected:
             "/v1/completions",
             json={"model": "qwen3", "prompt": []},
         )
-        assert resp.status_code == 422
+        assert resp.status_code == 400
         body = resp.text.lower()
         assert "prompt" in body
         assert "empty" in body
 
     @pytest.mark.asyncio
-    async def test_user_null_content_returns_422(self, app_client):
+    async def test_user_null_content_returns_400(self, app_client):
         resp = await app_client.post(
             "/v1/chat/completions",
             json={
@@ -813,7 +813,7 @@ class TestEmptyInputRejected:
                 "messages": [{"role": "user", "content": None}],
             },
         )
-        assert resp.status_code == 422
+        assert resp.status_code == 400
         body = resp.text.lower()
         assert "content" in body
 
@@ -998,7 +998,7 @@ class TestResponseFormat:
                 "response_format": {"type": "json_schema"},
             },
         )
-        assert resp.status_code == 422
+        assert resp.status_code == 400
 
     @pytest.mark.asyncio
     async def test_json_schema_requires_name(self, app_client):
@@ -1013,7 +1013,7 @@ class TestResponseFormat:
                 },
             },
         )
-        assert resp.status_code == 422
+        assert resp.status_code == 400
 
     @pytest.mark.asyncio
     async def test_json_schema_requires_schema_field(self, app_client):
@@ -1028,7 +1028,7 @@ class TestResponseFormat:
                 },
             },
         )
-        assert resp.status_code == 422
+        assert resp.status_code == 400
 
     @pytest.mark.asyncio
     async def test_json_schema_passes_grammar_spec_and_injects_system_message(
@@ -1205,7 +1205,7 @@ class TestResponseFormat:
                 },
             },
         )
-        assert resp.status_code == 422
+        assert resp.status_code == 400
 
     @pytest.mark.asyncio
     async def test_json_schema_sanitizes_name(self, app_client):

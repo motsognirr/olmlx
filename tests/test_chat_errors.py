@@ -375,10 +375,12 @@ class TestRouterErrorShapeConsistency:
             content="{}",
             headers={"Content-Type": "application/json"},
         )
-        # Returns validation error — fastapi sends 422 with {'detail': [...]}
-        assert resp.status_code == 422
+        # Body validation fails; the RequestValidationError handler maps it to a
+        # 400 in the Ollama error envelope ({"error": ...}), not the raw 422.
+        assert resp.status_code == 400
         body = resp.json()
-        assert "detail" in body
+        assert "detail" not in body
+        assert "error" in body
 
 
 # ---------------------------------------------------------------------------

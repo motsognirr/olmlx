@@ -32,6 +32,7 @@ MAP_PATCH = "olmlx.routers.anthropic._anthropic_model_map"
 class TestConvertTools:
     def test_no_tools(self):
         req = AnthropicMessagesRequest(
+            max_tokens=100,
             model="test",
             messages=[AnthropicMessage(role="user", content="hi")],
         )
@@ -39,6 +40,7 @@ class TestConvertTools:
 
     def test_with_tools(self):
         req = AnthropicMessagesRequest(
+            max_tokens=100,
             model="test",
             messages=[AnthropicMessage(role="user", content="hi")],
             tools=[
@@ -138,6 +140,7 @@ class TestStripBillingHeaders:
 class TestConvertMessages:
     def test_simple_user_message(self):
         req = AnthropicMessagesRequest(
+            max_tokens=100,
             model="test",
             messages=[AnthropicMessage(role="user", content="hello")],
         )
@@ -148,6 +151,7 @@ class TestConvertMessages:
 
     def test_system_string(self):
         req = AnthropicMessagesRequest(
+            max_tokens=100,
             model="test",
             messages=[AnthropicMessage(role="user", content="hi")],
             system="Be helpful.",
@@ -158,6 +162,7 @@ class TestConvertMessages:
 
     def test_system_blocks(self):
         req = AnthropicMessagesRequest(
+            max_tokens=100,
             model="test",
             messages=[AnthropicMessage(role="user", content="hi")],
             system=[
@@ -182,6 +187,7 @@ class TestConvertMessages:
         every ``/v1/messages`` request.  Regression for that failure.
         """
         req = AnthropicMessagesRequest(
+            max_tokens=100,
             model="test",
             system=[AnthropicContentBlock(type="text", text="Top-level system.")],
             messages=[
@@ -201,6 +207,7 @@ class TestConvertMessages:
         """A ``system``-role message in ``messages`` with no top-level system
         still becomes the single leading system message."""
         req = AnthropicMessagesRequest(
+            max_tokens=100,
             model="test",
             messages=[
                 AnthropicMessage(role="system", content="Inline only."),
@@ -214,6 +221,7 @@ class TestConvertMessages:
 
     def test_assistant_with_tool_use(self):
         req = AnthropicMessagesRequest(
+            max_tokens=100,
             model="test",
             messages=[
                 AnthropicMessage(
@@ -239,6 +247,7 @@ class TestConvertMessages:
 
     def test_user_with_tool_result(self):
         req = AnthropicMessagesRequest(
+            max_tokens=100,
             model="test",
             messages=[
                 AnthropicMessage(
@@ -264,6 +273,7 @@ class TestConvertMessages:
 
     def test_tool_result_list_content(self):
         req = AnthropicMessagesRequest(
+            max_tokens=100,
             model="test",
             messages=[
                 AnthropicMessage(
@@ -288,6 +298,7 @@ class TestConvertMessages:
 
     def test_thinking_blocks_skipped(self):
         req = AnthropicMessagesRequest(
+            max_tokens=100,
             model="test",
             messages=[
                 AnthropicMessage(
@@ -306,6 +317,7 @@ class TestConvertMessages:
     def test_system_blocks_billing_header_stripped(self):
         """Billing header block in system is stripped during convert_messages."""
         req = AnthropicMessagesRequest(
+            max_tokens=100,
             model="test",
             messages=[AnthropicMessage(role="user", content="hi")],
             system=[
@@ -324,6 +336,7 @@ class TestConvertMessages:
     def test_system_only_billing_header_no_system_message(self):
         """System with only billing header produces no system message."""
         req = AnthropicMessagesRequest(
+            max_tokens=100,
             model="test",
             messages=[AnthropicMessage(role="user", content="hi")],
             system=[
@@ -340,6 +353,7 @@ class TestConvertMessages:
 class TestBuildOptions:
     def test_empty(self):
         req = AnthropicMessagesRequest(
+            max_tokens=100,
             model="test",
             messages=[AnthropicMessage(role="user", content="hi")],
         )
@@ -348,6 +362,7 @@ class TestBuildOptions:
 
     def test_all_options(self):
         req = AnthropicMessagesRequest(
+            max_tokens=100,
             model="test",
             messages=[AnthropicMessage(role="user", content="hi")],
             temperature=0.5,
@@ -400,6 +415,34 @@ class TestAnthropicEndpoint:
         assert data["content"][0]["text"] == "Hello from MLX!"
         assert data["usage"]["input_tokens"] == 10
         assert data["usage"]["output_tokens"] == 20
+
+    @pytest.mark.asyncio
+    async def test_missing_max_tokens_returns_400(self, app_client):
+        """max_tokens is required per the Anthropic spec; omitting it must yield
+        a 400 in the Anthropic error envelope, not a silent default 200."""
+        resp = await app_client.post(
+            "/v1/messages",
+            json={"model": "qwen3", "messages": [{"role": "user", "content": "hi"}]},
+        )
+        assert resp.status_code == 400
+        data = resp.json()
+        assert data["type"] == "error"
+        assert data["error"]["type"] == "invalid_request_error"
+        assert "max_tokens" in data["error"]["message"]
+
+    @pytest.mark.asyncio
+    async def test_count_tokens_without_max_tokens_succeeds(
+        self, app_client, mock_loaded_model
+    ):
+        """The real Anthropic count_tokens endpoint takes no max_tokens field, so
+        omitting it must still succeed (unlike /v1/messages)."""
+        mock_loaded_model.tokenizer.apply_chat_template.return_value = [1, 2, 3]
+        resp = await app_client.post(
+            "/v1/messages/count_tokens",
+            json={"model": "qwen3", "messages": [{"role": "user", "content": "hi"}]},
+        )
+        assert resp.status_code == 200
+        assert resp.json()["input_tokens"] == 3
 
     @pytest.mark.asyncio
     async def test_non_streaming_literal_close_think_preserved_when_not_thinking(
@@ -1525,10 +1568,13 @@ class TestEmptyMessagesRejected:
             "/v1/messages",
             json={"model": "qwen3", "messages": [], "max_tokens": 100},
         )
-        assert resp.status_code == 422
-        body = resp.text.lower()
-        assert "messages" in body
-        assert "empty" in body
+        # The RequestValidationError handler maps Pydantic validation failures to
+        # a 400 in the provider error envelope (Anthropic format here).
+        assert resp.status_code == 400
+        data = resp.json()
+        assert data["type"] == "error"
+        assert data["error"]["type"] == "invalid_request_error"
+        assert "messages cannot be empty" in data["error"]["message"]
 
 
 class TestCountTokens:
@@ -2082,6 +2128,7 @@ class TestXCacheIDHeader:
 class TestThinkingParamSchema:
     def test_thinking_enabled(self):
         req = AnthropicMessagesRequest(
+            max_tokens=100,
             model="test",
             messages=[AnthropicMessage(role="user", content="hi")],
             thinking=AnthropicThinkingParam(type="enabled", budget_tokens=10000),
@@ -2092,6 +2139,7 @@ class TestThinkingParamSchema:
 
     def test_thinking_disabled(self):
         req = AnthropicMessagesRequest(
+            max_tokens=100,
             model="test",
             messages=[AnthropicMessage(role="user", content="hi")],
             thinking=AnthropicThinkingParam(type="disabled"),
@@ -2102,6 +2150,7 @@ class TestThinkingParamSchema:
 
     def test_thinking_missing(self):
         req = AnthropicMessagesRequest(
+            max_tokens=100,
             model="test",
             messages=[AnthropicMessage(role="user", content="hi")],
         )
@@ -2110,6 +2159,7 @@ class TestThinkingParamSchema:
     def test_thinking_from_dict(self):
         """Schema parses thinking from raw dict (as JSON would arrive)."""
         req = AnthropicMessagesRequest(
+            max_tokens=100,
             model="test",
             messages=[AnthropicMessage(role="user", content="hi")],
             thinking={"type": "enabled", "budget_tokens": 5000},
@@ -2120,6 +2170,7 @@ class TestThinkingParamSchema:
     def test_thinking_adaptive(self):
         """Schema accepts 'adaptive' type (used by Claude Code)."""
         req = AnthropicMessagesRequest(
+            max_tokens=100,
             model="test",
             messages=[AnthropicMessage(role="user", content="hi")],
             thinking={"type": "adaptive"},
@@ -2129,6 +2180,7 @@ class TestThinkingParamSchema:
     def test_thinking_unknown_type_accepted(self):
         """Schema accepts unknown types for forward compatibility."""
         req = AnthropicMessagesRequest(
+            max_tokens=100,
             model="test",
             messages=[AnthropicMessage(role="user", content="hi")],
             thinking={"type": "some_future_type"},
@@ -2138,6 +2190,7 @@ class TestThinkingParamSchema:
     def test_thinking_extra_fields_accepted(self):
         """Unknown fields in thinking param are accepted for forward compatibility."""
         req = AnthropicMessagesRequest(
+            max_tokens=100,
             model="test",
             messages=[AnthropicMessage(role="user", content="hi")],
             thinking={"type": "enabled", "budget_tokens": 5000, "new_field": "value"},

@@ -193,6 +193,34 @@ class TestErrorHandlers:
         assert data["error"]["type"] == "invalid_request_error"
 
     @pytest.mark.asyncio
+    async def test_validation_error_anthropic_format(self, app_client):
+        """A request-body validation failure on /v1/messages is mapped to a 400
+        Anthropic error envelope, not the raw Pydantic 422 detail."""
+        resp = await app_client.post(
+            "/v1/messages",
+            json={"model": "qwen3", "messages": [{"role": "user", "content": "hi"}]},
+        )
+        assert resp.status_code == 400
+        data = resp.json()
+        assert data["type"] == "error"
+        assert data["error"]["type"] == "invalid_request_error"
+        assert "max_tokens" in data["error"]["message"]
+
+    @pytest.mark.asyncio
+    async def test_validation_error_openai_format(self, app_client):
+        """A request-body validation failure on /v1/chat/completions is mapped to
+        a 400 OpenAI error envelope, not the raw Pydantic 422 detail."""
+        resp = await app_client.post(
+            "/v1/chat/completions",
+            json={"model": "qwen3", "messages": []},
+        )
+        assert resp.status_code == 400
+        data = resp.json()
+        assert "detail" not in data
+        assert data["error"]["type"] == "invalid_request_error"
+        assert data["error"]["code"] == "invalid_value"
+
+    @pytest.mark.asyncio
     async def test_runtime_error_handler(self, app_client):
         from unittest.mock import AsyncMock
 

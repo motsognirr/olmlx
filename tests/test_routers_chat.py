@@ -1140,7 +1140,7 @@ class TestEmptyMessagesRejected:
             "/api/chat",
             json={"model": "qwen3", "messages": []},
         )
-        assert resp.status_code == 422
+        assert resp.status_code == 400
         body = resp.text.lower()
         assert "messages" in body
         assert "empty" in body
