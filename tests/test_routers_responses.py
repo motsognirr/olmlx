@@ -618,6 +618,143 @@ class TestStreaming:
         assert final["status"] == "incomplete"
         assert final["incomplete_details"]["reason"] == "max_output_tokens"
 
+    @pytest.mark.asyncio
+    async def test_response_created_has_zero_output_tokens(self, app_client):
+        # response.created must emit BEFORE generation, so it cannot carry the
+        # final token count — usage.output_tokens must be 0.
+        async def mock_stream(*args, **kwargs):
+            async def gen():
+                yield {"text": "Hello", "done": False}
+                yield {"text": "", "done": True, "stats": TimingStats(eval_count=3)}
+
+            return gen()
+
+        with patch("olmlx.routers.responses.generate_chat", side_effect=mock_stream):
+            resp = await app_client.post(
+                "/v1/responses",
+                json={"model": "qwen3", "input": "hi", "stream": True},
+            )
+        events = _parse_sse(resp.text)
+        assert events[0]["event"] == "response.created"
+        assert events[0]["data"]["response"]["usage"]["output_tokens"] == 0
+        # The final event must still carry the real count.
+        assert events[-1]["data"]["response"]["usage"]["output_tokens"] == 3
+
+    @pytest.mark.asyncio
+    async def test_per_chunk_content_deltas(self, app_client):
+        # Visible content arriving across multiple engine chunks must produce
+        # one output_text.delta per chunk as it is generated — not a single
+        # combined delta after the whole generation is buffered. (A leading
+        # <think> block pushes the splitter past its detect phase so each
+        # following content chunk streams immediately.)
+        async def mock_stream(*args, **kwargs):
+            async def gen():
+                yield {"thinking_expected": True}
+                yield {"text": "<think>t</think>Hel", "done": False}
+                yield {"text": "lo", "done": False}
+                yield {"text": "", "done": True, "stats": TimingStats(eval_count=2)}
+
+            return gen()
+
+        with patch("olmlx.routers.responses.generate_chat", side_effect=mock_stream):
+            resp = await app_client.post(
+                "/v1/responses",
+                json={
+                    "model": "qwen3",
+                    "input": "hi",
+                    "stream": True,
+                    "reasoning": {"effort": "high"},
+                },
+            )
+        events = _parse_sse(resp.text)
+        deltas = [e for e in events if e["event"] == "response.output_text.delta"]
+        assert [d["data"]["delta"] for d in deltas] == ["Hel", "lo"]
+
+    @pytest.mark.asyncio
+    async def test_thinking_item_closes_before_message_opens(self, app_client):
+        # The reasoning item must be opened and closed before the message item
+        # is added, so a client renders thinking then the answer in order.
+        async def mock_stream(*args, **kwargs):
+            async def gen():
+                yield {"thinking_expected": True}
+                yield {"text": "<think>step</think>Answer", "done": False}
+                yield {"text": "", "done": True, "stats": TimingStats()}
+
+            return gen()
+
+        with patch("olmlx.routers.responses.generate_chat", side_effect=mock_stream):
+            resp = await app_client.post(
+                "/v1/responses",
+                json={
+                    "model": "qwen3",
+                    "input": "q",
+                    "stream": True,
+                    "reasoning": {"effort": "high"},
+                },
+            )
+        events = _parse_sse(resp.text)
+        reasoning_done = next(
+            i
+            for i, e in enumerate(events)
+            if e["event"] == "response.output_item.done"
+            and e["data"]["item"]["type"] == "reasoning"
+        )
+        message_added = next(
+            i
+            for i, e in enumerate(events)
+            if e["event"] == "response.output_item.added"
+            and e["data"]["item"]["type"] == "message"
+        )
+        assert reasoning_done < message_added
+        # The reasoning item carries the full thinking text.
+        reasoning_item = events[reasoning_done]["data"]["item"]
+        assert reasoning_item["content"][0]["text"] == "step"
+
+    @pytest.mark.asyncio
+    async def test_truncated_thinking_flushes_reasoning_item(self, app_client):
+        # A generation cut off mid-<think> (no close tag) must still close the
+        # reasoning item before response.completed, with no empty message item.
+        async def mock_stream(*args, **kwargs):
+            async def gen():
+                yield {"thinking_expected": True}
+                yield {"text": "<think>partial thought", "done": False}
+                yield {
+                    "text": "",
+                    "done": True,
+                    "done_reason": "length",
+                    "stats": TimingStats(),
+                }
+
+            return gen()
+
+        with patch("olmlx.routers.responses.generate_chat", side_effect=mock_stream):
+            resp = await app_client.post(
+                "/v1/responses",
+                json={
+                    "model": "qwen3",
+                    "input": "q",
+                    "stream": True,
+                    "reasoning": {"effort": "high"},
+                },
+            )
+        events = _parse_sse(resp.text)
+        types = [e["event"] for e in events]
+        assert types[-1] == "response.completed"
+        # A reasoning item was opened and closed.
+        assert any(
+            e["event"] == "response.output_item.done"
+            and e["data"]["item"]["type"] == "reasoning"
+            for e in events
+        )
+        # No message item, since there is no visible text.
+        assert not any(
+            e["event"] == "response.output_item.added"
+            and e["data"]["item"]["type"] == "message"
+            for e in events
+        )
+        final = events[-1]["data"]["response"]
+        assert final["status"] == "incomplete"
+
 
 class TestRetrieveDelete:
     @pytest.fixture(autouse=True)
