@@ -4213,6 +4213,11 @@ async def _full_completion_inner(
                 text = visible
 
         result_dict: dict = {"text": text, "done": True, "stats": stats}
+        # Propagate the stop reason from mlx-lm's final GenerationResponse so the
+        # non-streaming routers can report max_tokens truncation. getattr(..., None)
+        # is safe across all sub-paths (stream_generate / speculative / mlx_vlm).
+        if getattr(result, "finish_reason", None) == "length":
+            result_dict["done_reason"] = "length"
         if raw_text is not None:
             result_dict["raw_text"] = raw_text
         if tool_uses:

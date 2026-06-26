@@ -2452,6 +2452,65 @@ class TestFullCompletionInner:
         assert stats.prompt_eval_duration + stats.eval_duration <= stats.total_duration
 
     @pytest.mark.asyncio
+    async def test_length_finish_reason_propagated(self, mock_manager):
+        """finish_reason='length' on the last GenerationResponse must be forwarded
+        as done_reason='length' so all non-streaming routers can report max_tokens."""
+        from olmlx.engine.inference import _full_completion_inner
+
+        lm = mock_manager._loaded["qwen3:latest"]
+        mock_result = MagicMock()
+        mock_result.text = "truncated"
+        mock_result.prompt_tokens = 5
+        mock_result.generation_tokens = 200
+        mock_result.prompt_tps = 100.0
+        mock_result.generation_tps = 50.0
+        mock_result.finish_reason = "length"
+        stats = TimingStats()
+        with patch(
+            "olmlx.engine.inference.asyncio.to_thread", new_callable=AsyncMock
+        ) as mt:
+            mt.return_value = (mock_result, "truncated")
+            result = await _full_completion_inner(lm, "prompt", 200, {}, stats)
+        assert result["done_reason"] == "length"
+
+    @pytest.mark.asyncio
+    async def test_stop_finish_reason_not_propagated(self, mock_manager):
+        """finish_reason='stop' should NOT add done_reason — routers already default to stop."""
+        from olmlx.engine.inference import _full_completion_inner
+
+        lm = mock_manager._loaded["qwen3:latest"]
+        mock_result = MagicMock()
+        mock_result.text = "complete"
+        mock_result.prompt_tokens = 5
+        mock_result.generation_tokens = 10
+        mock_result.prompt_tps = 100.0
+        mock_result.generation_tps = 50.0
+        mock_result.finish_reason = "stop"
+        stats = TimingStats()
+        with patch(
+            "olmlx.engine.inference.asyncio.to_thread", new_callable=AsyncMock
+        ) as mt:
+            mt.return_value = (mock_result, "complete")
+            result = await _full_completion_inner(lm, "prompt", 200, {}, stats)
+        assert "done_reason" not in result
+
+    @pytest.mark.asyncio
+    async def test_none_finish_reason_not_propagated(self, mock_manager):
+        """finish_reason=None (result object lacks the attribute) must not set done_reason."""
+        from olmlx.engine.inference import _full_completion_inner
+
+        lm = mock_manager._loaded["qwen3:latest"]
+        mock_result = MagicMock(spec=[])  # no attributes at all
+        mock_result.text = "some text"
+        stats = TimingStats()
+        with patch(
+            "olmlx.engine.inference.asyncio.to_thread", new_callable=AsyncMock
+        ) as mt:
+            mt.return_value = (mock_result, "some text")
+            result = await _full_completion_inner(lm, "prompt", 200, {}, stats)
+        assert "done_reason" not in result
+
+    @pytest.mark.asyncio
     async def test_result_as_string(self, mock_manager):
         from olmlx.engine.inference import _full_completion_inner
 
