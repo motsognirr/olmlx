@@ -1692,7 +1692,11 @@ class TestToolCallParsing:
         contents = "".join(
             e["choices"][0]["delta"].get("content", "") or "" for e in events
         )
+        # Neither the <think> marker nor the thinking text itself may leak into
+        # visible content — the whole budget was reasoning.
         assert "<think>" not in contents
+        assert "Okay, 2+2 is" not in contents
+        assert contents.strip() == ""
         done_events = [e for e in events if e["choices"][0].get("finish_reason")]
         assert done_events[-1]["choices"][0]["finish_reason"] == "length"
 
