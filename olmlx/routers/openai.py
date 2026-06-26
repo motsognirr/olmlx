@@ -7,7 +7,7 @@ import time
 import uuid
 
 from fastapi import APIRouter, HTTPException, Request
-from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 
 from olmlx.config import settings
 from olmlx.engine.grammar import parse_response_format
@@ -468,7 +468,7 @@ async def openai_chat(req: OpenAIChatRequest, request: Request):
         if not content:
             content = None
 
-        return OpenAIChatResponse(
+        resp = OpenAIChatResponse(
             id=chat_id,
             created=created,
             model=req.model,
@@ -485,6 +485,15 @@ async def openai_chat(req: OpenAIChatRequest, request: Request):
             ],
             usage=usage,
         )
+        resp_dict = resp.model_dump(mode="json", exclude_none=True)
+        # OpenAI spec: assistant messages must always carry a content key
+        # (null if absent). FastAPI's response_model_exclude_none would strip
+        # it, so we serialize ourselves and return a JSONResponse.
+        for ch in resp_dict.get("choices", []):
+            msg = ch.get("message")
+            if msg and msg.get("role") == "assistant" and "content" not in msg:
+                msg["content"] = None
+        return JSONResponse(content=resp_dict)
 
 
 @router.post(
