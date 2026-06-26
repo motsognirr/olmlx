@@ -898,7 +898,9 @@ async def anthropic_messages(req: AnthropicMessagesRequest, request: Request):
 
         content_blocks = []
 
-        if thinking:
+        # Consistent with the streaming paths (issue #557): a whitespace-only
+        # thinking span must not produce a thinking content block.
+        if thinking and thinking.strip():
             content_blocks.append(
                 AnthropicContentBlock(type="thinking", thinking=thinking, signature="")
             )
