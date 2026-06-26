@@ -532,13 +532,14 @@ async def _stream_thinking_state_machine(result):
         nonlocal current, text_block_emitted
         if not fragment:
             return []
-        # A whitespace-only fragment must not *open* a new block. With
-        # `/no_think`, Qwen3 emits leading whitespace before an orphan
+        # A whitespace-only *thinking* fragment must not open a thinking block.
+        # With `/no_think`, Qwen3 emits leading whitespace before an orphan
         # `</think>`, which the splitter classifies as a thinking fragment;
-        # opening a thinking block for it produces a spurious block the
-        # non-streaming path never emits (issue #557). Whitespace *inside* an
-        # already-open block is preserved.
-        if current is None and not fragment.strip():
+        # opening a block for it produces a spurious thinking block the
+        # non-streaming path never emits (issue #557). Scoped to the thinking
+        # channel so leading whitespace in plain-text streams is preserved, and
+        # to block-opening so whitespace inside an open thinking block survives.
+        if channel == "thinking" and current is None and not fragment.strip():
             return []
         block_type = "thinking" if channel == "thinking" else "text"
         events = []
