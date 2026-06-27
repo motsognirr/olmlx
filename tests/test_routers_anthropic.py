@@ -29,6 +29,21 @@ from olmlx.utils.timing import TimingStats
 MAP_PATCH = "olmlx.routers.anthropic._anthropic_model_map"
 
 
+def _content_block_start_types(sse_text: str) -> list[str]:
+    """Ordered list of content_block types from `content_block_start` SSE events."""
+    types: list[str] = []
+    for line in sse_text.splitlines():
+        if not line.startswith("data:"):
+            continue
+        try:
+            payload = json.loads(line[5:])
+        except json.JSONDecodeError:
+            continue
+        if payload.get("type") == "content_block_start":
+            types.append(payload["content_block"]["type"])
+    return types
+
+
 class TestConvertTools:
     def test_no_tools(self):
         req = AnthropicMessagesRequest(
@@ -809,6 +824,128 @@ class TestAnthropicEndpoint:
         assert "tool_use" in text
         assert "input_json_delta" in text
         assert '"stop_reason": "tool_use"' in text
+        # Issue #589: no spurious empty text block before the tool block.
+        assert _content_block_start_types(text) == ["tool_use"]
+
+    @pytest.mark.asyncio
+    async def test_streaming_tool_only_no_spurious_text_block(self, app_client):
+        """Issue #589: a tool call with no visible text must not emit a leading
+        empty text content block — matching the non-streaming path."""
+
+        async def mock_stream(*args, **kwargs):
+            async def gen():
+                yield {
+                    "text": '<tool_call>{"name": "weather", "arguments": {"city": "NYC"}}</tool_call>',
+                    "done": False,
+                }
+                yield {"text": "", "done": True, "stats": TimingStats(eval_count=10)}
+
+            return gen()
+
+        with patch("olmlx.routers.anthropic.generate_chat", side_effect=mock_stream):
+            resp = await app_client.post(
+                "/v1/messages",
+                json={
+                    "model": "qwen3",
+                    "messages": [{"role": "user", "content": "Get weather NYC"}],
+                    "max_tokens": 300,
+                    "stream": True,
+                    "tools": [
+                        {
+                            "name": "weather",
+                            "description": "Get weather",
+                            "input_schema": {
+                                "type": "object",
+                                "properties": {"city": {"type": "string"}},
+                            },
+                        }
+                    ],
+                },
+            )
+
+        assert resp.status_code == 200
+        assert _content_block_start_types(resp.text) == ["tool_use"]
+
+    @pytest.mark.asyncio
+    async def test_streaming_tool_with_text_preamble_has_two_blocks(self, app_client):
+        """A visible text preamble before the tool call still emits a text block
+        first (index 0), then the tool block (index 1)."""
+
+        async def mock_stream(*args, **kwargs):
+            async def gen():
+                yield {
+                    "text": 'Here is the answer <tool_call>{"name": "weather", "arguments": {"city": "NYC"}}</tool_call>',
+                    "done": False,
+                }
+                yield {"text": "", "done": True, "stats": TimingStats(eval_count=10)}
+
+            return gen()
+
+        with patch("olmlx.routers.anthropic.generate_chat", side_effect=mock_stream):
+            resp = await app_client.post(
+                "/v1/messages",
+                json={
+                    "model": "qwen3",
+                    "messages": [{"role": "user", "content": "Get weather NYC"}],
+                    "max_tokens": 300,
+                    "stream": True,
+                    "tools": [
+                        {
+                            "name": "weather",
+                            "description": "Get weather",
+                            "input_schema": {
+                                "type": "object",
+                                "properties": {"city": {"type": "string"}},
+                            },
+                        }
+                    ],
+                },
+            )
+
+        assert resp.status_code == 200
+        assert _content_block_start_types(resp.text) == ["text", "tool_use"]
+        assert "input_json_delta" in resp.text
+
+    @pytest.mark.asyncio
+    async def test_streaming_thinking_tool_no_visible_text_no_text_block(
+        self, app_client
+    ):
+        """Thinking + tool call with no visible text: thinking then tool_use, no
+        spurious empty text block between them."""
+
+        async def mock_stream(*args, **kwargs):
+            async def gen():
+                yield {
+                    "text": '<think>reasoning</think><tool_call>{"name": "weather", "arguments": {"city": "NYC"}}</tool_call>',
+                    "done": False,
+                }
+                yield {"text": "", "done": True, "stats": TimingStats(eval_count=10)}
+
+            return gen()
+
+        with patch("olmlx.routers.anthropic.generate_chat", side_effect=mock_stream):
+            resp = await app_client.post(
+                "/v1/messages",
+                json={
+                    "model": "qwen3",
+                    "messages": [{"role": "user", "content": "Get weather NYC"}],
+                    "max_tokens": 300,
+                    "stream": True,
+                    "tools": [
+                        {
+                            "name": "weather",
+                            "description": "Get weather",
+                            "input_schema": {
+                                "type": "object",
+                                "properties": {"city": {"type": "string"}},
+                            },
+                        }
+                    ],
+                },
+            )
+
+        assert resp.status_code == 200
+        assert _content_block_start_types(resp.text) == ["thinking", "tool_use"]
 
     @pytest.mark.asyncio
     async def test_streaming_empty_output(self, app_client):

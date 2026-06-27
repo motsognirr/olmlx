@@ -435,11 +435,17 @@ async def _stream_buffered_with_tools(
             yield event
         block_idx += 1
 
-    for event in _emit_content_block(
-        block_idx, "text", "text_delta", "text", visible_text, TEXT_CHUNK_SIZE
-    ):
-        yield event
-    block_idx += 1
+    # Mirror the non-streaming guard (issue #589): emit the text block only when
+    # there is visible text, or — when there isn't — only as the sole fallback
+    # block (no tool calls and no thinking block). Without this, a tool call with
+    # no visible preamble emits a spurious empty text block at index 0.
+    has_thinking_block = bool(thinking and thinking.strip())
+    if visible_text or (not tool_uses and not has_thinking_block):
+        for event in _emit_content_block(
+            block_idx, "text", "text_delta", "text", visible_text, TEXT_CHUNK_SIZE
+        ):
+            yield event
+        block_idx += 1
 
     for tool_use in tool_uses:
         yield _sse(
