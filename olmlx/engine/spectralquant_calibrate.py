@@ -367,17 +367,21 @@ def _load_calibration_model(model_path: str):
                 processor.tokenizer if hasattr(processor, "tokenizer") else processor
             )
 
-    inner = _get_backbone(model)
-    num_layers = len(inner.layers)
-    cfg_holder = _resolve_config_holder(inner, model)
-    cfg_ns = _config_namespace(cfg_holder)
-    head_dim = _detect_head_dim(cfg_holder, layers_hint=inner)
-    logger.debug("calibration: resolved head_dim=%d", head_dim)
+    try:
+        inner = _get_backbone(model)
+        num_layers = len(inner.layers)
+        cfg_holder = _resolve_config_holder(inner, model)
+        cfg_ns = _config_namespace(cfg_holder)
+        head_dim = _detect_head_dim(cfg_holder, layers_hint=inner)
+        logger.debug("calibration: resolved head_dim=%d", head_dim)
 
-    n_kv_heads = getattr(cfg_ns, "num_key_value_heads", None)
-    if n_kv_heads is None:
-        n_kv_heads = getattr(cfg_ns, "num_attention_heads", 1)
-
+        n_kv_heads = getattr(cfg_ns, "num_key_value_heads", None)
+        if n_kv_heads is None:
+            n_kv_heads = getattr(cfg_ns, "num_attention_heads", 1)
+    except Exception:
+        if store is not None:
+            store.close()
+        raise
     return model, tokenizer, inner, head_dim, n_kv_heads, num_layers, store
 
 

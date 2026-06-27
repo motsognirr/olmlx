@@ -884,3 +884,27 @@ def test_calibrate_model_synthetic_dataset_branch(tmp_path):
     assert synthetic_called["hit"] is True
     cfg = __import__("json").loads((out / "spectral_config.json").read_text())
     assert cfg["meta"]["calibration_dataset"] == "synthetic"
+
+
+def test_load_calibration_model_closes_store_when_resolution_fails(tmp_path):
+    from unittest.mock import MagicMock, patch
+
+    fdir = tmp_path / "flash_moe"
+    fdir.mkdir()
+    (fdir / "flash_moe_layout.json").write_text("{}")
+
+    spy_store = MagicMock()
+    model = MagicMock()
+    with (
+        patch(
+            "olmlx.engine.flash.flash_moe_model.load_flash_moe_model",
+            return_value=(model, MagicMock(), spy_store),
+        ),
+        patch(
+            "olmlx.engine.flash.prepare._get_backbone",
+            side_effect=RuntimeError("boom"),
+        ),
+    ):
+        with pytest.raises(RuntimeError, match="boom"):
+            sc._load_calibration_model(str(tmp_path))
+    spy_store.close.assert_called_once()
