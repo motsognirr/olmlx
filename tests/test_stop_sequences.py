@@ -156,3 +156,31 @@ def test_thinking_pairs_in_sync_with_thinking_split():
     from olmlx.routers.thinking_split import _THINKING_PAIRS as SPLIT_PAIRS
 
     assert STOP_PAIRS == SPLIT_PAIRS
+
+
+class TestThinkingAwareMultipleBlocks:
+    """Issue #588 review: every thinking block is skipped, not just the first."""
+
+    def test_scanner_stop_in_second_think_block_skipped(self):
+        s = StopScanner(["three"], thinking_aware=True)
+        s.feed("<think>a</think>\nout1 <think>one two three</think>\n")
+        piece, hit = s.feed("out2 three end")
+        assert hit and piece == "out2 "
+
+    def test_scanner_no_stop_when_only_in_think_blocks(self):
+        s = StopScanner(["three"], thinking_aware=True)
+        s.feed("<think>three</think>\nout1 ")
+        piece, hit = s.feed("<think>three again</think>\nout2")
+        assert not hit and not s.stop_hit
+
+    def test_truncate_stop_in_second_think_block_skipped(self):
+        text = "<think>a</think>\nout1 <think>one two three</think>\nout2"
+        result, hit = truncate_at_stop(text, ["three"], thinking_aware=True)
+        assert not hit and result == text
+
+    def test_truncate_stop_after_second_think_fires(self):
+        text = "<think>a</think>\nout1 <think>b</think>\nthe answer is three!"
+        result, hit = truncate_at_stop(text, ["three"], thinking_aware=True)
+        assert (
+            hit and result == "<think>a</think>\nout1 <think>b</think>\nthe answer is "
+        )
