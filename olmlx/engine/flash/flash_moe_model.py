@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import gc
 import logging
+from pathlib import Path
 from typing import Any
 
 import mlx.core as mx
@@ -258,7 +259,7 @@ class FlashMoeModelWrapper(nn.Module):
 
 def load_flash_moe_model(
     load_path: str,
-    flash_moe_dir: "Path | str",  # noqa: F821
+    flash_moe_dir: Path | str,
     *,
     cache_budget_experts: int,
     io_threads: int,
@@ -272,9 +273,7 @@ def load_flash_moe_model(
     close it. Raises if the bundle is present but cannot be loaded.
     """
     import json
-    from pathlib import Path
 
-    from olmlx.engine.flash.moe_weight_store import FlashMoeWeightStore
     from olmlx.engine.flash.prepare import load_model_with_strict_fallback
 
     flash_moe_dir = Path(flash_moe_dir)
