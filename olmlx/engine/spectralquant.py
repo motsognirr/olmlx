@@ -98,11 +98,20 @@ class SpectralRotation:
         return x @ self.V
 
 
+#: Bit-widths the spectral KV cache can actually pack/unpack — these are the
+#: only cases ``turboquant.pack_indices`` / ``unpack_indices`` implement. A
+#: width outside this set (e.g. 5 or 1, which ``allocate_bits`` used to emit for
+#: low-``d_eff`` heads) crashes decode with ``ValueError: Unsupported bits=N``.
+_PACKABLE_BITS: tuple[int, ...] = (2, 4)
+
+
 def allocate_bits(d_eff: int, head_dim: int, avg_bits: int) -> tuple[int, int]:
     """Find (b_high, b_low) minimizing budget slack.
 
     Solves: d_eff * b_high + (head_dim - d_eff) * b_low ≈ head_dim * avg_bits
-    Subject to: b_high >= b_low >= 1, both in [1, 8].
+    Subject to: b_high >= b_low, both drawn from ``_PACKABLE_BITS`` ({2, 4}) —
+    the only widths the spectral KV cache can pack. Mixed widths outside this
+    set would otherwise crash at decode.
 
     Returns:
         (b_high, b_low): bits for semantic and tail regimes.
@@ -110,11 +119,11 @@ def allocate_bits(d_eff: int, head_dim: int, avg_bits: int) -> tuple[int, int]:
     budget = head_dim * avg_bits
     d_tail = head_dim - d_eff
 
-    best_pair = (avg_bits, avg_bits)  # fallback: uniform
+    best_pair = (avg_bits, avg_bits)  # fallback: uniform (avg_bits ∈ {2, 4})
     best_slack = float("inf")
 
-    for b_high in range(8, 0, -1):
-        for b_low in range(min(b_high, 8), 0, -1):
+    for b_high in sorted(_PACKABLE_BITS, reverse=True):
+        for b_low in sorted((b for b in _PACKABLE_BITS if b <= b_high), reverse=True):
             total = d_eff * b_high + d_tail * b_low
             slack = abs(total - budget)
             if slack < best_slack:
