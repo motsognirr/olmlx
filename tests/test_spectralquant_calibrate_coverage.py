@@ -751,6 +751,136 @@ def test_calibrate_model_vlm_fallback_on_value_error(tmp_path):
     assert (out / "calibration.safetensors").exists()
 
 
+def test_load_calibration_model_uses_flash_when_bundle_present(tmp_path):
+    from unittest.mock import MagicMock, patch
+
+    fdir = tmp_path / "flash_moe"
+    fdir.mkdir()
+    (fdir / "flash_moe_layout.json").write_text("{}")
+
+    sentinel_model = MagicMock()
+    sentinel_model._backbone = _FakeBackbone(2, 2, 8)
+    sentinel_tok = MagicMock()
+    sentinel_store = MagicMock()
+
+    with (
+        patch(
+            "olmlx.engine.flash.flash_moe_model.load_flash_moe_model",
+            return_value=(sentinel_model, sentinel_tok, sentinel_store),
+        ) as load_flash,
+        patch(
+            "olmlx.engine.flash.prepare._get_backbone",
+            return_value=sentinel_model._backbone,
+        ),
+        patch("olmlx.engine.turboquant_cache._detect_head_dim", return_value=8),
+    ):
+        result = sc._load_calibration_model(str(tmp_path))
+
+    load_flash.assert_called_once()
+    assert result[0] is sentinel_model
+    assert result[6] is sentinel_store
+
+
+def test_load_calibration_model_full_load_when_no_bundle(tmp_path):
+    from unittest.mock import MagicMock, patch
+
+    model = MagicMock()
+    backbone = _FakeBackbone(2, 2, 8)
+    tok = MagicMock()
+
+    with (
+        patch(
+            "olmlx.engine.flash.prepare.load_model_with_strict_fallback",
+            return_value=(model, tok),
+        ) as full_load,
+        patch("olmlx.engine.flash.prepare._get_backbone", return_value=backbone),
+        patch("olmlx.engine.turboquant_cache._detect_head_dim", return_value=8),
+    ):
+        result = sc._load_calibration_model(str(tmp_path))
+
+    full_load.assert_called_once_with(str(tmp_path), lazy=False)
+    assert result[6] is None
+
+
+def test_calibrate_model_closes_store(tmp_path):
+    from unittest.mock import MagicMock, patch
+
+    head_dim, num_layers, n_kv_heads = 8, 2, 2
+    backbone = _FakeBackbone(num_layers, n_kv_heads, head_dim)
+    model = _FakeModel(backbone, head_dim)
+    tokenizer = MagicMock()
+    texts = ["one two three four five six seven eight nine ten"] * 2
+    spy_store = MagicMock()
+
+    def cache_factory(_owner):
+        return [KVCache() for _ in range(num_layers)]
+
+    patches = _patch_helpers(model, tokenizer, head_dim, texts, cache_factory)
+    # Replace the loader so it returns our spy store as the 7th element.
+    patches.append(
+        patch.object(
+            sc,
+            "_load_calibration_model",
+            return_value=(
+                model,
+                tokenizer,
+                backbone,
+                head_dim,
+                n_kv_heads,
+                num_layers,
+                spy_store,
+            ),
+        )
+    )
+    for p in patches:
+        p.start()
+    try:
+        sc.calibrate_model(
+            "fake/model", output_dir=tmp_path / "spectral", num_samples=2
+        )
+    finally:
+        for p in patches:
+            p.stop()
+
+    spy_store.close.assert_called_once()
+
+
+def test_calibrate_model_closes_store_when_data_generation_fails(tmp_path):
+    """The store must close even if the c4 download raises before KV collection."""
+    from unittest.mock import MagicMock, patch
+
+    head_dim, num_layers, n_kv_heads = 8, 2, 2
+    backbone = _FakeBackbone(num_layers, n_kv_heads, head_dim)
+    model = _FakeModel(backbone, head_dim)
+    spy_store = MagicMock()
+
+    with (
+        patch.object(
+            sc,
+            "_load_calibration_model",
+            return_value=(
+                model,
+                MagicMock(),
+                backbone,
+                head_dim,
+                n_kv_heads,
+                num_layers,
+                spy_store,
+            ),
+        ),
+        patch(
+            "olmlx.engine.flash.prepare._get_c4_calibration_data",
+            side_effect=RuntimeError("network down"),
+        ),
+    ):
+        with pytest.raises(RuntimeError, match="network down"):
+            sc.calibrate_model(
+                "fake/model", output_dir=tmp_path / "spectral", num_samples=2
+            )
+
+    spy_store.close.assert_called_once()
+
+
 def test_calibrate_model_synthetic_dataset_branch(tmp_path):
     head_dim = 4
     num_layers = 1
@@ -790,3 +920,27 @@ def test_calibrate_model_synthetic_dataset_branch(tmp_path):
     assert synthetic_called["hit"] is True
     cfg = __import__("json").loads((out / "spectral_config.json").read_text())
     assert cfg["meta"]["calibration_dataset"] == "synthetic"
+
+
+def test_load_calibration_model_closes_store_when_resolution_fails(tmp_path):
+    from unittest.mock import MagicMock, patch
+
+    fdir = tmp_path / "flash_moe"
+    fdir.mkdir()
+    (fdir / "flash_moe_layout.json").write_text("{}")
+
+    spy_store = MagicMock()
+    model = MagicMock()
+    with (
+        patch(
+            "olmlx.engine.flash.flash_moe_model.load_flash_moe_model",
+            return_value=(model, MagicMock(), spy_store),
+        ),
+        patch(
+            "olmlx.engine.flash.prepare._get_backbone",
+            side_effect=RuntimeError("boom"),
+        ),
+    ):
+        with pytest.raises(RuntimeError, match="boom"):
+            sc._load_calibration_model(str(tmp_path))
+    spy_store.close.assert_called_once()
