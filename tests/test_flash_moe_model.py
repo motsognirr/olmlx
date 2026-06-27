@@ -1011,3 +1011,54 @@ class TestFlashMoEDeepSeekShareExpertSingular:
         y = replacement(x)
         # Routed output is zeros; share_expert doubles input → expect 2.0.
         assert mx.allclose(y, mx.full((1, 1, 4), 2.0))
+
+
+def test_load_flash_moe_model_builds_wrapper_and_returns_store(tmp_path):
+    import json
+    from unittest.mock import MagicMock, patch
+
+    from olmlx.engine.flash.moe_bundler import bundle_moe_experts
+    from olmlx.engine.flash.flash_moe_model import (
+        FlashMoeModelWrapper,
+        _FlashMoEBase,
+        load_flash_moe_model,
+    )
+
+    hidden, inter, experts = 64, 32, 8
+    num_dense, num_moe, ntok = 1, 2, 2
+    model_dir = _make_synthetic_moe_weights(
+        hidden, inter, experts, num_moe, num_dense, tmp_path
+    )
+    flash_dir = tmp_path / "flash_moe"
+    bundle_moe_experts(model_dir, flash_dir)
+
+    # Create the flash_moe_config.json file that the loader expects
+    moe_config = {
+        "hidden_size": hidden,
+        "intermediate_size": inter,
+        "num_experts": experts,
+        "num_experts_per_tok": 2,
+        "moe_layer_indices": [1, 2],
+    }
+    (flash_dir / "flash_moe_config.json").write_text(json.dumps(moe_config))
+
+    synth = _MockModel(hidden, inter, experts, ntok, num_dense, num_moe)
+    tok = MagicMock()
+
+    with patch(
+        "olmlx.engine.flash.prepare.load_model_with_strict_fallback",
+        return_value=(synth, tok),
+    ) as load_mock:
+        model, tokenizer, store = load_flash_moe_model(
+            str(model_dir), flash_dir, cache_budget_experts=4, io_threads=4
+        )
+    try:
+        # lazy load is mandatory so experts are never materialized
+        assert load_mock.call_args.kwargs["lazy"] is True
+        assert isinstance(model, FlashMoeModelWrapper)
+        assert tokenizer is tok
+        for i in (1, 2):
+            assert isinstance(model.layers[i].mlp, _FlashMoEBase)
+        assert hasattr(store, "close")
+    finally:
+        store.close()

@@ -256,6 +256,53 @@ class FlashMoeModelWrapper(nn.Module):
         return self._model.args
 
 
+def load_flash_moe_model(
+    load_path: str,
+    flash_moe_dir: "Path | str",  # noqa: F821
+    *,
+    cache_budget_experts: int,
+    io_threads: int,
+) -> tuple[Any, Any, Any]:
+    """Load a model in Flash-MoE mode for offline use (e.g. KV-quant calibration).
+
+    Mirrors ``model_manager._load_flash_moe_model``: lazy-load so routed expert
+    weights are never materialized, wrap with ``FlashMoeModelWrapper`` (experts
+    streamed from the SSD bundle), and eval only the non-expert params. Returns
+    ``(wrapped_model, tokenizer, store)``; the caller owns the store and must
+    close it. Raises if the bundle is present but cannot be loaded.
+    """
+    import json
+    from pathlib import Path
+
+    from olmlx.engine.flash.moe_weight_store import FlashMoeWeightStore
+    from olmlx.engine.flash.prepare import load_model_with_strict_fallback
+
+    flash_moe_dir = Path(flash_moe_dir)
+    model, tokenizer = load_model_with_strict_fallback(load_path, lazy=True)
+    moe_config = json.loads((flash_moe_dir / "flash_moe_config.json").read_text())
+
+    store = FlashMoeWeightStore(
+        flash_moe_dir,
+        num_io_threads=io_threads,
+        cache_budget_experts=cache_budget_experts,
+    )
+    try:
+        wrapped = FlashMoeModelWrapper(
+            model,
+            store,
+            moe_layer_indices=moe_config["moe_layer_indices"],
+            hidden_size=moe_config["hidden_size"],
+            intermediate_size=moe_config["intermediate_size"],
+            num_experts=moe_config["num_experts"],
+            num_experts_per_tok=moe_config["num_experts_per_tok"],
+        )
+        mx.eval(wrapped.parameters())
+    except Exception:
+        store.close()
+        raise
+    return wrapped, tokenizer, store
+
+
 def _find_moe_module(layer: nn.Module) -> tuple[str, nn.Module]:
     """Find the MoE module on a decoder layer.
 
