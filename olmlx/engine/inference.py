@@ -1633,6 +1633,7 @@ async def generate_completion(
                 keep_alive=keep_alive,
                 grammar_active=grammar_active,
                 adopt_pin=True,
+                thinking_expected=thinking_expected,
             )
             # Ownership of the pin transfers to the wrapper; its finally
             # releases on any generator exit. Mark the flag for the outer
@@ -1664,6 +1665,7 @@ async def generate_completion(
                         keep_alive=keep_alive,
                         grammar_active=grammar_active,
                         adopt_pin=True,
+                        thinking_expected=thinking_expected,
                     )
                 result["thinking_expected"] = thinking_expected
                 return result
@@ -2983,6 +2985,7 @@ async def _stream_completion_batched(
     prompt_tokens: list[int] | None = None,
     use_prompt_cache: bool = False,
     cache_id: str = "",
+    thinking_expected: bool = False,
 ) -> AsyncGenerator[dict, None]:
     """Batched counterpart of ``_stream_completion`` (plan §2/§4).
 
@@ -3036,7 +3039,7 @@ async def _stream_completion_batched(
         else settings.inference_timeout
     )
 
-    stop_scanner = StopScanner(stop_sequences)
+    stop_scanner = StopScanner(stop_sequences, thinking_aware=thinking_expected)
     stop_hit = False
     timed_out = False
     lagged = False
@@ -3257,6 +3260,7 @@ async def _stream_completion(
     messages: list[dict] | None = None,
     tokenizer: Any = None,
     template_kwargs: dict | None = None,
+    thinking_expected: bool = False,
 ) -> AsyncGenerator[dict, None]:
     # Continuous batching (docs/batching-plan.md): eligible requests join
     # the per-model batch instead of serializing on the inference lock.
@@ -3277,6 +3281,7 @@ async def _stream_completion(
             prompt_tokens=prompt_tokens,
             use_prompt_cache=use_prompt_cache,
             cache_id=cache_id,
+            thinking_expected=thinking_expected,
         ):
             yield chunk
         return
@@ -3512,7 +3517,9 @@ async def _stream_completion(
             with Timer() as eval_timer:
                 inf_start = time.monotonic()
                 token = None
-                stop_scanner = StopScanner(stop_sequences)
+                stop_scanner = StopScanner(
+                    stop_sequences, thinking_aware=thinking_expected
+                )
                 async for token in stream:
                     # Always accumulate for prompt cache (raw stream, not filtered)
                     stats.eval_count = token.generation_tokens
@@ -3730,6 +3737,7 @@ async def _full_completion_batched(
     prompt_tokens: list[int] | None = None,
     cache_id: str = "",
     keep_alive: str | None = None,
+    thinking_expected: bool = False,
 ) -> dict:
     """Non-streaming batched completion (plan §4 item 6).
 
@@ -3752,6 +3760,7 @@ async def _full_completion_batched(
         prompt_tokens=prompt_tokens,
         use_prompt_cache=use_prompt_cache,
         cache_id=cache_id,
+        thinking_expected=thinking_expected,
     ):
         if chunk.get("cache_info"):
             result["cache_read_tokens"] = chunk.get("cache_read_tokens", 0)
@@ -3789,6 +3798,7 @@ async def _full_completion(
     messages: list[dict] | None = None,
     tokenizer: Any = None,
     template_kwargs: dict | None = None,
+    thinking_expected: bool = False,
 ) -> dict:
     # Continuous batching (plan §4 item 6): eligible non-streaming
     # requests internally consume the batched stream and aggregate —
@@ -3810,6 +3820,7 @@ async def _full_completion(
             prompt_tokens=prompt_tokens,
             cache_id=cache_id,
             keep_alive=keep_alive,
+            thinking_expected=thinking_expected,
         )
 
     # inference_timeout is not enforced for non-streaming: the GPU thread
@@ -3951,7 +3962,11 @@ async def _full_completion(
                                 exc_info=True,
                             )
     if stop_sequences and result_dict:
-        text, hit = truncate_at_stop(result_dict.get("text", ""), stop_sequences)
+        text, hit = truncate_at_stop(
+            result_dict.get("text", ""),
+            stop_sequences,
+            thinking_aware=thinking_expected,
+        )
         if hit:
             result_dict["finish_reason"] = "stop"
             # The stop sequence is applied post-hoc, so mlx-lm may have run on to
@@ -4564,6 +4579,7 @@ async def generate_chat(
                 messages=messages,
                 tokenizer=lm.tokenizer,
                 template_kwargs=chat_template_kwargs,
+                thinking_expected=thinking_expected,
             )
             # Ownership of the pin transfers to the wrapper; its finally
             # releases on any generator exit. Mark the flag for the outer
@@ -4603,6 +4619,7 @@ async def generate_chat(
                         messages=messages,
                         tokenizer=lm.tokenizer,
                         template_kwargs=chat_template_kwargs,
+                        thinking_expected=thinking_expected,
                     )
                 # Mirror the streaming meta chunk so non-streaming routers
                 # can gate orphan `</think>` handling on the same signal

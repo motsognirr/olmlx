@@ -76,3 +76,83 @@ class TestTruncateAtStop:
 
     def test_empty_stop_ignored(self):
         assert truncate_at_stop("abc", [""]) == ("abc", False)
+
+
+class TestStopScannerThinkingAware:
+    """Issue #588: stop sequences must not fire inside a <think> block."""
+
+    def test_stop_inside_think_does_not_fire(self):
+        s = StopScanner(["three"], thinking_aware=True)
+        assert s.feed("<think>") == ("<think>", False)
+        assert s.feed("one two three four") == ("one two three four", False)
+        assert not s.stop_hit
+
+    def test_stop_in_visible_content_fires_after_think(self):
+        s = StopScanner(["three"], thinking_aware=True)
+        s.feed("<think>one two three</think>\n")
+        piece, hit = s.feed("one two three four five")
+        assert hit and piece == "one two "
+
+    def test_stop_before_think_fires_normally(self):
+        s = StopScanner(["stop"], thinking_aware=True)
+        piece, hit = s.feed("prestop<think>thinking</think>\ncontent")
+        assert hit and piece == "pre"
+
+    def test_no_think_block_identical_to_non_aware(self):
+        s = StopScanner(["STOP"], thinking_aware=True)
+        assert s.feed("abc") == ("abc", False)
+        piece, hit = s.feed("STOPdef")
+        assert hit and piece == ""
+
+    def test_stop_spanning_piece_boundary_after_think(self):
+        s = StopScanner(["STOP"], thinking_aware=True)
+        s.feed("<think>thinking</think>\nprefix")
+        assert s.feed("ST") == ("ST", False)
+        piece, hit = s.feed("OP")
+        assert hit and piece == ""
+
+    def test_gemma_channel_close_tag_respected(self):
+        s = StopScanner(["three"], thinking_aware=True)
+        s.feed("<|channel>thought\none two three<channel|>")
+        piece, hit = s.feed("one two three four")
+        assert hit and piece == "one two "
+
+    def test_think_open_and_close_in_one_piece(self):
+        s = StopScanner(["three"], thinking_aware=True)
+        # Open and close tag in the same fed piece, stop only inside think.
+        piece, hit = s.feed("<think>one two three</think>\nvisible")
+        assert not hit and piece == "<think>one two three</think>\nvisible"
+        piece, hit = s.feed("a three b")
+        assert hit and piece == "a "
+
+
+class TestTruncateAtStopThinkingAware:
+    """Issue #588: whole-text variant must skip the thinking block."""
+
+    def test_stop_inside_think_not_matched(self):
+        text = "<think>one two three four</think>\nvisible"
+        result, hit = truncate_at_stop(text, ["three"], thinking_aware=True)
+        assert not hit and result == text
+
+    def test_stop_in_visible_part_fires(self):
+        text = "<think>thinking</think>\none two three four"
+        result, hit = truncate_at_stop(text, ["three"], thinking_aware=True)
+        assert hit and result == "<think>thinking</think>\none two "
+
+    def test_thinking_aware_no_think_block_normal(self):
+        result, hit = truncate_at_stop("one two three", ["three"], thinking_aware=True)
+        assert hit and result == "one two "
+
+    def test_gemma_channel_thinking_skipped(self):
+        text = "<|channel>thought\none two three<channel|>one two three four"
+        result, hit = truncate_at_stop(text, ["three"], thinking_aware=True)
+        assert hit and result == "<|channel>thought\none two three<channel|>one two "
+
+
+def test_thinking_pairs_in_sync_with_thinking_split():
+    """Guard against drift: the stop-scanner's thinking tag pairs must match the
+    canonical set in routers/thinking_split.py (issue #588 risk note)."""
+    from olmlx.engine.stop_sequences import _THINKING_PAIRS as STOP_PAIRS
+    from olmlx.routers.thinking_split import _THINKING_PAIRS as SPLIT_PAIRS
+
+    assert STOP_PAIRS == SPLIT_PAIRS

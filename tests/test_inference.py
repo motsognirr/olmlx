@@ -714,6 +714,59 @@ class TestStopSequenceHandling:
     @patch("olmlx.engine.inference._inference_locked")
     @patch("olmlx.engine.inference._inference_ref")
     @patch("olmlx.engine.inference._full_completion_inner")
+    async def test_thinking_aware_stop_inside_think_not_truncated(
+        self, mock_inner, mock_ref, mock_locked
+    ):
+        """Issue #588: with thinking_expected, a stop string inside <think> must
+        not truncate — generation is reported as not stopped."""
+        gen_kwargs = {"stop": ["three"]}
+        stats = MagicMock()
+        lm = MagicMock()
+        lm.inference_queue_timeout = 30.0
+        lm.sync_mode = None
+
+        mock_locked.return_value.__aenter__.return_value = None
+        mock_ref.return_value.__enter__.return_value = None
+        raw = "<think>one two three four</think>\nThe visible answer"
+        mock_inner.return_value = {"text": raw, "done": True, "stats": stats}
+
+        result = await _full_completion(
+            lm, "prompt", 50, gen_kwargs, stats, thinking_expected=True
+        )
+        assert result["text"] == raw
+        assert "finish_reason" not in result
+
+    @patch("olmlx.engine.inference._inference_locked")
+    @patch("olmlx.engine.inference._inference_ref")
+    @patch("olmlx.engine.inference._full_completion_inner")
+    async def test_thinking_aware_stop_in_visible_still_fires(
+        self, mock_inner, mock_ref, mock_locked
+    ):
+        """Issue #588: a stop string in the visible region (after </think>) must
+        still truncate when thinking_expected is set."""
+        gen_kwargs = {"stop": ["three"]}
+        stats = MagicMock()
+        lm = MagicMock()
+        lm.inference_queue_timeout = 30.0
+        lm.sync_mode = None
+
+        mock_locked.return_value.__aenter__.return_value = None
+        mock_ref.return_value.__enter__.return_value = None
+        mock_inner.return_value = {
+            "text": "<think>reasoning</think>\nThe answer is three!",
+            "done": True,
+            "stats": stats,
+        }
+
+        result = await _full_completion(
+            lm, "prompt", 50, gen_kwargs, stats, thinking_expected=True
+        )
+        assert result["text"] == "<think>reasoning</think>\nThe answer is "
+        assert result["finish_reason"] == "stop"
+
+    @patch("olmlx.engine.inference._inference_locked")
+    @patch("olmlx.engine.inference._inference_ref")
+    @patch("olmlx.engine.inference._full_completion_inner")
     async def test_stop_not_in_kwargs_no_effect(
         self, mock_inner, mock_ref, mock_locked
     ):
