@@ -802,6 +802,49 @@ def test_load_calibration_model_full_load_when_no_bundle(tmp_path):
     assert result[6] is None
 
 
+def test_calibrate_model_closes_store(tmp_path):
+    from unittest.mock import MagicMock, patch
+
+    head_dim, num_layers, n_kv_heads = 8, 2, 2
+    backbone = _FakeBackbone(num_layers, n_kv_heads, head_dim)
+    model = _FakeModel(backbone, head_dim)
+    tokenizer = MagicMock()
+    texts = ["one two three four five six seven eight nine ten"] * 2
+    spy_store = MagicMock()
+
+    def cache_factory(_owner):
+        return [KVCache() for _ in range(num_layers)]
+
+    patches = _patch_helpers(model, tokenizer, head_dim, texts, cache_factory)
+    # Replace the loader so it returns our spy store as the 7th element.
+    patches.append(
+        patch.object(
+            sc,
+            "_load_calibration_model",
+            return_value=(
+                model,
+                tokenizer,
+                backbone,
+                head_dim,
+                n_kv_heads,
+                num_layers,
+                spy_store,
+            ),
+        )
+    )
+    for p in patches:
+        p.start()
+    try:
+        sc.calibrate_model(
+            "fake/model", output_dir=tmp_path / "spectral", num_samples=2
+        )
+    finally:
+        for p in patches:
+            p.stop()
+
+    spy_store.close.assert_called_once()
+
+
 def test_calibrate_model_synthetic_dataset_branch(tmp_path):
     head_dim = 4
     num_layers = 1
