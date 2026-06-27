@@ -751,6 +751,57 @@ def test_calibrate_model_vlm_fallback_on_value_error(tmp_path):
     assert (out / "calibration.safetensors").exists()
 
 
+def test_load_calibration_model_uses_flash_when_bundle_present(tmp_path):
+    from unittest.mock import MagicMock, patch
+
+    fdir = tmp_path / "flash_moe"
+    fdir.mkdir()
+    (fdir / "flash_moe_layout.json").write_text("{}")
+
+    sentinel_model = MagicMock()
+    sentinel_model._backbone = _FakeBackbone(2, 2, 8)
+    sentinel_tok = MagicMock()
+    sentinel_store = MagicMock()
+
+    with (
+        patch(
+            "olmlx.engine.flash.flash_moe_model.load_flash_moe_model",
+            return_value=(sentinel_model, sentinel_tok, sentinel_store),
+        ) as load_flash,
+        patch(
+            "olmlx.engine.flash.prepare._get_backbone",
+            return_value=sentinel_model._backbone,
+        ),
+        patch("olmlx.engine.turboquant_cache._detect_head_dim", return_value=8),
+    ):
+        result = sc._load_calibration_model(str(tmp_path))
+
+    load_flash.assert_called_once()
+    assert result[0] is sentinel_model
+    assert result[6] is sentinel_store
+
+
+def test_load_calibration_model_full_load_when_no_bundle(tmp_path):
+    from unittest.mock import MagicMock, patch
+
+    model = MagicMock()
+    backbone = _FakeBackbone(2, 2, 8)
+    tok = MagicMock()
+
+    with (
+        patch(
+            "olmlx.engine.flash.prepare.load_model_with_strict_fallback",
+            return_value=(model, tok),
+        ) as full_load,
+        patch("olmlx.engine.flash.prepare._get_backbone", return_value=backbone),
+        patch("olmlx.engine.turboquant_cache._detect_head_dim", return_value=8),
+    ):
+        result = sc._load_calibration_model(str(tmp_path))
+
+    full_load.assert_called_once_with(str(tmp_path), lazy=False)
+    assert result[6] is None
+
+
 def test_calibrate_model_synthetic_dataset_branch(tmp_path):
     head_dim = 4
     num_layers = 1

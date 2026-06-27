@@ -27,6 +27,13 @@ logger = logging.getLogger(__name__)
 _SPECTRAL_DEFAULT_MAX_TOKENS_PER_HEAD = 8192
 _SPECTRAL_DEFAULT_NUM_SAMPLES = 256
 
+#: Conservative expert LRU budget during calibration. Calibration is
+#: latency-tolerant and the budget only affects *which* experts are resident,
+#: never the K/V output, so we minimize footprint to leave room for the
+#: K/V-collection buffers. Bump if calibration is too slow.
+_CALIBRATION_CACHE_BUDGET_EXPERTS = 8
+_CALIBRATION_IO_THREADS = 32
+
 
 def _resolve_config_holder(inner: Any, model: Any) -> Any:
     # Some architectures (e.g. Qwen3Next) expose the config namespace only on
@@ -327,21 +334,38 @@ def _load_calibration_model(model_path: str):
     inside the function (call-time) so tests can patch the helpers on their
     home modules.
     """
+    from pathlib import Path
+
     from olmlx.engine.flash.prepare import (
         _get_backbone,
         load_model_with_strict_fallback,
     )
     from olmlx.engine.turboquant_cache import _detect_head_dim
 
-    try:
-        model, tokenizer = load_model_with_strict_fallback(model_path, lazy=False)
-    except ValueError:
-        import mlx_vlm
+    flash_moe_dir = Path(model_path) / "flash_moe"
+    store = None
+    if (flash_moe_dir / "flash_moe_layout.json").exists():
+        from olmlx.engine.flash.flash_moe_model import load_flash_moe_model
 
-        model, processor = mlx_vlm.load(model_path, lazy=False)
-        tokenizer = (
-            processor.tokenizer if hasattr(processor, "tokenizer") else processor
+        # Bundle present: commit to the Flash-MoE path. Do NOT fall back to a
+        # full load on failure — that would OOM on the large models this path
+        # exists to support.
+        model, tokenizer, store = load_flash_moe_model(
+            model_path,
+            flash_moe_dir,
+            cache_budget_experts=_CALIBRATION_CACHE_BUDGET_EXPERTS,
+            io_threads=_CALIBRATION_IO_THREADS,
         )
+    else:
+        try:
+            model, tokenizer = load_model_with_strict_fallback(model_path, lazy=False)
+        except ValueError:
+            import mlx_vlm
+
+            model, processor = mlx_vlm.load(model_path, lazy=False)
+            tokenizer = (
+                processor.tokenizer if hasattr(processor, "tokenizer") else processor
+            )
 
     inner = _get_backbone(model)
     num_layers = len(inner.layers)
@@ -354,7 +378,7 @@ def _load_calibration_model(model_path: str):
     if n_kv_heads is None:
         n_kv_heads = getattr(cfg_ns, "num_attention_heads", 1)
 
-    return model, tokenizer, inner, head_dim, n_kv_heads, num_layers
+    return model, tokenizer, inner, head_dim, n_kv_heads, num_layers, store
 
 
 def collect_kv_vectors(
@@ -510,8 +534,8 @@ def calibrate_model(
     if progress_callback:
         progress_callback("Loading model", 0.0)
 
-    model, tokenizer, inner, head_dim, n_kv_heads, num_layers = _load_calibration_model(
-        model_path
+    model, tokenizer, inner, head_dim, n_kv_heads, num_layers, _store = (
+        _load_calibration_model(model_path)
     )
 
     if progress_callback:
