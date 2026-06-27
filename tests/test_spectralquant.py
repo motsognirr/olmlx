@@ -148,6 +148,24 @@ class TestBitAllocation:
         # With most dimensions being semantic, difference should be small
         assert b_high - b_low <= 2
 
+    def test_only_emits_packable_bit_widths(self):
+        """allocate_bits must only return widths the cache can pack ({2, 4}).
+
+        Regression: d_eff=32 / avg_bits=2 used to return (5, 1); the spectral
+        KV cache packs indices via turboquant.pack_indices, which implements
+        only bits 2 and 4, so any other width crashes decode with
+        'Unsupported bits=N'. Sweep d_eff across the full range for both
+        supported avg_bits.
+        """
+        from olmlx.engine.spectralquant import allocate_bits
+
+        for avg_bits in (2, 4):
+            for d_eff in range(1, 128):
+                b_high, b_low = allocate_bits(d_eff, head_dim=128, avg_bits=avg_bits)
+                assert b_high in (2, 4), (avg_bits, d_eff, b_high, b_low)
+                assert b_low in (2, 4), (avg_bits, d_eff, b_high, b_low)
+                assert b_high >= b_low
+
 
 # ---------------------------------------------------------------------------
 # Lloyd-Max codebook fitting tests
