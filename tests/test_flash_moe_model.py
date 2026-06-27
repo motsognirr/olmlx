@@ -1062,3 +1062,49 @@ def test_load_flash_moe_model_builds_wrapper_and_returns_store(tmp_path):
         assert hasattr(store, "close")
     finally:
         store.close()
+
+
+def test_flash_moe_wrapper_forwards_cache_to_inner_model(tmp_path):
+    import json
+    from unittest.mock import MagicMock, patch
+
+    import mlx.core as mx
+
+    from olmlx.engine.flash.moe_bundler import bundle_moe_experts
+    from olmlx.engine.flash.flash_moe_model import load_flash_moe_model
+
+    hidden, inter, experts = 64, 32, 8
+    num_dense, num_moe, ntok = 1, 2, 2
+    model_dir = _make_synthetic_moe_weights(
+        hidden, inter, experts, num_moe, num_dense, tmp_path
+    )
+    flash_dir = tmp_path / "flash_moe"
+    bundle_moe_experts(model_dir, flash_dir)
+
+    # Create the flash_moe_config.json file that the loader expects
+    moe_config = {
+        "hidden_size": hidden,
+        "intermediate_size": inter,
+        "num_experts": experts,
+        "num_experts_per_tok": 2,
+        "moe_layer_indices": [1, 2],
+    }
+    (flash_dir / "flash_moe_config.json").write_text(json.dumps(moe_config))
+
+    synth = _MockModel(hidden, inter, experts, ntok, num_dense, num_moe)
+    with patch(
+        "olmlx.engine.flash.prepare.load_model_with_strict_fallback",
+        return_value=(synth, MagicMock()),
+    ):
+        wrapped, _, store = load_flash_moe_model(
+            str(model_dir), flash_dir, cache_budget_experts=4, io_threads=4
+        )
+    try:
+        spy = MagicMock(return_value=mx.zeros((1, ntok, hidden)))
+        wrapped._model = spy  # replace inner so we observe the forward call
+        sentinel_cache = [object(), object()]
+        wrapped(mx.zeros((1, ntok, hidden)), cache=sentinel_cache)
+        spy.assert_called_once()
+        assert spy.call_args.kwargs["cache"] is sentinel_cache
+    finally:
+        store.close()
