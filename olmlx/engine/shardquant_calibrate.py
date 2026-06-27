@@ -202,23 +202,26 @@ def calibrate_model_shard(
         store,
     ) = _load_calibration_model(model_path)
 
-    if progress_callback:
-        progress_callback("Generating calibration data", 0.05)
-
-    from olmlx.engine.flash.prepare import (
-        _get_c4_calibration_data,
-        _get_calibration_data,
-    )
-
-    if calibration_dataset == "synthetic":
-        texts = _get_calibration_data(num_samples)
-    else:
-        texts = _get_c4_calibration_data(num_samples)
-
-    if progress_callback:
-        progress_callback("Collecting KV vectors", 0.1)
-
+    # Everything from here through KV collection runs under the store's
+    # lifetime — including the c4 download in _get_c4_calibration_data, which
+    # can raise on a network error — so the Flash-MoE store is always closed.
     try:
+        if progress_callback:
+            progress_callback("Generating calibration data", 0.05)
+
+        from olmlx.engine.flash.prepare import (
+            _get_c4_calibration_data,
+            _get_calibration_data,
+        )
+
+        if calibration_dataset == "synthetic":
+            texts = _get_calibration_data(num_samples)
+        else:
+            texts = _get_c4_calibration_data(num_samples)
+
+        if progress_callback:
+            progress_callback("Collecting KV vectors", 0.1)
+
         kv_collectors = collect_kv_vectors(
             model,
             tokenizer,

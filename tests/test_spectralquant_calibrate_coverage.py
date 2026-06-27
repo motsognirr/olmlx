@@ -845,6 +845,42 @@ def test_calibrate_model_closes_store(tmp_path):
     spy_store.close.assert_called_once()
 
 
+def test_calibrate_model_closes_store_when_data_generation_fails(tmp_path):
+    """The store must close even if the c4 download raises before KV collection."""
+    from unittest.mock import MagicMock, patch
+
+    head_dim, num_layers, n_kv_heads = 8, 2, 2
+    backbone = _FakeBackbone(num_layers, n_kv_heads, head_dim)
+    model = _FakeModel(backbone, head_dim)
+    spy_store = MagicMock()
+
+    with (
+        patch.object(
+            sc,
+            "_load_calibration_model",
+            return_value=(
+                model,
+                MagicMock(),
+                backbone,
+                head_dim,
+                n_kv_heads,
+                num_layers,
+                spy_store,
+            ),
+        ),
+        patch(
+            "olmlx.engine.flash.prepare._get_c4_calibration_data",
+            side_effect=RuntimeError("network down"),
+        ),
+    ):
+        with pytest.raises(RuntimeError, match="network down"):
+            sc.calibrate_model(
+                "fake/model", output_dir=tmp_path / "spectral", num_samples=2
+            )
+
+    spy_store.close.assert_called_once()
+
+
 def test_calibrate_model_synthetic_dataset_branch(tmp_path):
     head_dim = 4
     num_layers = 1
