@@ -2961,25 +2961,16 @@ class TestLegacyFlashPrefetchSpeculativeForwarding:
         assert settings.flash_moe is False
 
     def test_cmd_flash_prepare_calls_legacy_shim(self, monkeypatch):
-        """cmd_flash_prepare must surface legacy env vars before reading settings.
-
-        Regression test for the fix that adds _surface_legacy_flash_env() and
-        _surface_legacy_flash_prefetch_speculative_env() at the top of
-        cmd_flash_prepare — without this, OLMLX_EXPERIMENTAL_FLASH_PREFETCH=true
-        was silently ignored and no LookaheadBank was trained.
-        """
+        """cmd_flash_prepare must surface the legacy-flash warning before
+        reading settings, so a stale OLMLX_EXPERIMENTAL_FLASH* is reported."""
         import inspect
+
         import olmlx.cli as cli_mod
 
         src = inspect.getsource(cli_mod.cmd_flash_prepare)
-        assert "_surface_legacy_flash_prefetch_speculative_env" in src, (
-            "cmd_flash_prepare must call _surface_legacy_flash_prefetch_speculative_env() "
-            "so that OLMLX_EXPERIMENTAL_FLASH_PREFETCH=true reaches settings.flash_prefetch "
-            "before _cmd_flash_dense_prepare reads train_lookahead=settings.flash_prefetch."
-        )
-        assert "_surface_legacy_flash_env" in src, (
-            "cmd_flash_prepare must also call _surface_legacy_flash_env() "
-            "for consistency with other commands that surface both shims."
+        assert "_warn_legacy_flash_env" in src, (
+            "cmd_flash_prepare must call _warn_legacy_flash_env() so a stale "
+            "OLMLX_EXPERIMENTAL_FLASH* var is surfaced before settings are read."
         )
 
 

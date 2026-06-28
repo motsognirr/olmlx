@@ -183,22 +183,15 @@ def worker_main() -> None:
     # coordinator on ring collectives.
     from olmlx.config import (
         settings as _settings_early,
-        surface_legacy_flash_env,
-        surface_legacy_flash_moe_env,
-        surface_legacy_flash_prefetch_speculative_env,
+        warn_legacy_flash_env,
     )
 
-    # Honour the one-release deprecation window for ``OLMLX_EXPERIMENTAL_FLASH*``
-    # and ``OLMLX_EXPERIMENTAL_FLASH_MOE*`` on the direct-worker path. The
-    # coordinator runs the same shims in its own startup and forwards resolved
-    # ``OLMLX_FLASH*``/``OLMLX_FLASH_MOE*`` values to workers it launches via
-    # SSH, so these matter only when ``python -m olmlx.engine.distributed_worker``
-    # is invoked directly with legacy env vars set. Both helpers live in
-    # ``olmlx.config`` so the worker does not need to import ``olmlx.cli``
-    # (and its argparse/uvicorn baggage).
-    surface_legacy_flash_env()
-    surface_legacy_flash_moe_env()
-    surface_legacy_flash_prefetch_speculative_env()
+    # Warn (don't forward) if a stale ``OLMLX_EXPERIMENTAL_FLASH*`` var is set
+    # on the direct-worker path. These knobs were promoted to ``OLMLX_FLASH*``
+    # several releases ago; the value is no longer honored. Lives in
+    # ``olmlx.config`` so the worker need not import ``olmlx.cli`` (argparse/
+    # uvicorn baggage).
+    warn_legacy_flash_env()
 
     if _settings_early.flash_moe:
         logger.error(

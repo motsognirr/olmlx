@@ -20,9 +20,7 @@ if TYPE_CHECKING:
 
 from olmlx.config import (
     settings,
-    surface_legacy_flash_env as _surface_legacy_flash_env,
-    surface_legacy_flash_moe_env as _surface_legacy_flash_moe_env,
-    surface_legacy_flash_prefetch_speculative_env as _surface_legacy_flash_prefetch_speculative_env,
+    warn_legacy_flash_env as _warn_legacy_flash_env,
 )
 
 logger = logging.getLogger(__name__)
@@ -597,9 +595,7 @@ def _apply_serve_overrides(args) -> None:
 
     _surface_legacy_speculative_env()
     _surface_legacy_dflash_env()
-    _surface_legacy_flash_env()
-    _surface_legacy_flash_moe_env()
-    _surface_legacy_flash_prefetch_speculative_env()
+    _warn_legacy_flash_env()
 
     # ``getattr`` defends programmatic callers that hand a bare
     # ``argparse.Namespace`` (e.g. tests) without populating these
@@ -1542,7 +1538,7 @@ def _launch_distributed_workers() -> tuple[list[str], str, list[int] | None]:
             env["OLMLX_FLASH"] = "true"
             # Forward the *resolved* primary knobs (from ``settings``)
             # rather than relying on os.environ passthrough. The worker
-            # process does not run ``_surface_legacy_flash_env``, so a
+            # process does not run ``_warn_legacy_flash_env``, so a
             # user with only legacy env vars set (e.g.
             # ``OLMLX_EXPERIMENTAL_FLASH_SPARSITY_THRESHOLD``) would
             # otherwise see the worker fall back to schema defaults for
@@ -2051,9 +2047,7 @@ def cmd_chat(args):
     # ``serve`` handles it correctly.
     _surface_legacy_speculative_env()
     _surface_legacy_kv_cache_quant_env()
-    _surface_legacy_flash_env()
-    _surface_legacy_flash_moe_env()
-    _surface_legacy_flash_prefetch_speculative_env()
+    _warn_legacy_flash_env()
     _warn_kv_cache_quant_incompatibilities()
 
     model_name = args.model_name
@@ -2448,9 +2442,7 @@ def cmd_config_show(_args):
     """Show current configuration."""
     _surface_legacy_kv_cache_quant_env()
     _surface_legacy_distributed_env()
-    _surface_legacy_flash_env()
-    _surface_legacy_flash_moe_env()
-    _surface_legacy_flash_prefetch_speculative_env()
+    _warn_legacy_flash_env()
 
     print(f"Host:                   {settings.host}")
     print(f"Port:                   {settings.port}")
@@ -2485,9 +2477,7 @@ def cmd_config_show(_args):
 def cmd_bench_run(args):
     """Run benchmark scenarios."""
     _configure_logging()
-    _surface_legacy_flash_env()
-    _surface_legacy_flash_moe_env()
-    _surface_legacy_flash_prefetch_speculative_env()
+    _warn_legacy_flash_env()
     _surface_legacy_speculative_env()
     _surface_legacy_dflash_env()
     _surface_legacy_kv_cache_quant_env()
@@ -2687,9 +2677,7 @@ def cmd_flash_prepare(args):
     # Forward legacy env vars so OLMLX_EXPERIMENTAL_FLASH_PREFETCH=true
     # reaches settings.flash_prefetch before _cmd_flash_dense_prepare reads it
     # via train_lookahead=settings.flash_prefetch.
-    _surface_legacy_flash_env()
-    _surface_legacy_flash_moe_env()
-    _surface_legacy_flash_prefetch_speculative_env()
+    _warn_legacy_flash_env()
 
     store = _create_store()
     _resolved = store.registry.resolve(args.model)
@@ -3039,9 +3027,7 @@ def cmd_flash_info(args):
     # ``olmlx flash info`` reflects the same effective Flash settings
     # an operator would see from ``olmlx config show`` / ``olmlx serve``
     # when they've only renamed the new env vars in some shells.
-    _surface_legacy_flash_env()
-    _surface_legacy_flash_moe_env()
-    _surface_legacy_flash_prefetch_speculative_env()
+    _warn_legacy_flash_env()
     store = _create_store()
     _resolved = store.registry.resolve(args.model)
     hf_path = _resolved.hf_path if _resolved is not None else args.model
