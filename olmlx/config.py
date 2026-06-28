@@ -731,6 +731,61 @@ experimental = ExperimentalSettings()
 
 PRE_SHARDED_DIR_ENV = "OLMLX_DISTRIBUTED_PRE_SHARDED_DIR"
 
+#: Promoted flash env vars: legacy ``OLMLX_EXPERIMENTAL_FLASH*`` name -> the
+#: bare ``OLMLX_FLASH*`` name that replaced it (PRs #327/#329/#336). These are
+#: no longer honored; ``warn_legacy_flash_env`` detects and warns but does NOT
+#: forward them. Only PROMOTED names belong here — the still-valid experimental
+#: *tuning* knobs (``OLMLX_EXPERIMENTAL_FLASH_WINDOW_SIZE``, ``..._PREDICTOR_*``,
+#: ``..._PREFETCH_CONFIDENCE_THRESHOLD``, ``..._IO_THREADS``, ...) stay valid
+#: and are intentionally absent.
+PROMOTED_FLASH_ENV_RENAMES: dict[str, str] = {
+    "OLMLX_EXPERIMENTAL_FLASH": "OLMLX_FLASH",
+    "OLMLX_EXPERIMENTAL_FLASH_SPARSITY_THRESHOLD": "OLMLX_FLASH_SPARSITY_THRESHOLD",
+    "OLMLX_EXPERIMENTAL_FLASH_MIN_ACTIVE_NEURONS": "OLMLX_FLASH_MIN_ACTIVE_NEURONS",
+    "OLMLX_EXPERIMENTAL_FLASH_MAX_ACTIVE_NEURONS": "OLMLX_FLASH_MAX_ACTIVE_NEURONS",
+    "OLMLX_EXPERIMENTAL_FLASH_MEMORY_BUDGET_FRACTION": "OLMLX_FLASH_MEMORY_BUDGET_FRACTION",
+    "OLMLX_EXPERIMENTAL_FLASH_MOE": "OLMLX_FLASH_MOE",
+    "OLMLX_EXPERIMENTAL_FLASH_MOE_CACHE_BUDGET_EXPERTS": "OLMLX_FLASH_MOE_CACHE_BUDGET_EXPERTS",
+    "OLMLX_EXPERIMENTAL_FLASH_MOE_IO_THREADS": "OLMLX_FLASH_MOE_IO_THREADS",
+    "OLMLX_EXPERIMENTAL_FLASH_PREFETCH": "OLMLX_FLASH_PREFETCH",
+    "OLMLX_EXPERIMENTAL_FLASH_SPECULATIVE": "OLMLX_FLASH_SPECULATIVE",
+    "OLMLX_EXPERIMENTAL_FLASH_SPECULATIVE_DRAFT_MODEL": "OLMLX_FLASH_SPECULATIVE_DRAFT_MODEL",
+    "OLMLX_EXPERIMENTAL_FLASH_SPECULATIVE_TOKENS": "OLMLX_FLASH_SPECULATIVE_TOKENS",
+}
+
+
+def warn_legacy_flash_env() -> None:
+    """Warn that promoted ``OLMLX_EXPERIMENTAL_FLASH*`` env vars are no longer
+    honored, naming the new ``OLMLX_FLASH*`` replacement for each.
+
+    Detects names set in the shell environment OR the project ``.env``. Does
+    NOT forward the value: these knobs were promoted out of the experimental
+    prefix several releases ago (PRs #327/#329/#336) and the one-release
+    deprecation window has long closed. Warns on *presence* of the name
+    regardless of its value, since the name itself is dead.
+
+    Lives in ``olmlx.config`` so the distributed-worker entry point can reuse
+    it without importing ``olmlx.cli`` (and its argparse/uvicorn baggage).
+    """
+    dotenv_keys = _legacy_values_in_dotenv(tuple(PROMOTED_FLASH_ENV_RENAMES))
+    detected = sorted(
+        old
+        for old in PROMOTED_FLASH_ENV_RENAMES
+        if old in os.environ or old in dotenv_keys
+    )
+    if not detected:
+        return
+    renames = "; ".join(
+        f"{old} -> {PROMOTED_FLASH_ENV_RENAMES[old]}" for old in detected
+    )
+    logger.warning(
+        "Unsupported env vars detected and IGNORED: %s. These were renamed out "
+        "of the experimental prefix and are no longer honored: %s. Update your "
+        "shell environment / .env to the new names.",
+        ", ".join(detected),
+        renames,
+    )
+
 
 #: Legacy ``OLMLX_EXPERIMENTAL_FLASH*`` env vars and their parsers.
 #: Lives here rather than in ``olmlx.cli`` so the distributed-worker
