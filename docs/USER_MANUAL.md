@@ -1353,16 +1353,16 @@ All settings are configured via `OLMLX_`-prefixed environment variables. You can
 
 | Variable | Type | Default | Description |
 |---|---|---|---|
-| `OLMLX_EXPERIMENTAL_FLASH` | bool | `false` | Enable LLM in a Flash inference |
-| `OLMLX_EXPERIMENTAL_FLASH_SPARSITY_THRESHOLD` | float | `0.5` | Activation sparsity threshold (0-1] |
-| `OLMLX_EXPERIMENTAL_FLASH_MIN_ACTIVE_NEURONS` | int | `128` | Minimum active neurons per layer |
-| `OLMLX_EXPERIMENTAL_FLASH_MAX_ACTIVE_NEURONS` | int/None | `None` | Maximum active neurons per layer (None = unlimited) |
+| `OLMLX_FLASH` | bool | `false` | Enable LLM in a Flash inference |
+| `OLMLX_FLASH_SPARSITY_THRESHOLD` | float | `0.5` | Activation sparsity threshold (0-1] |
+| `OLMLX_FLASH_MIN_ACTIVE_NEURONS` | int | `128` | Minimum active neurons per layer |
+| `OLMLX_FLASH_MAX_ACTIVE_NEURONS` | int/None | `None` | Maximum active neurons per layer (None = unlimited) |
 | `OLMLX_EXPERIMENTAL_FLASH_WINDOW_SIZE` | int | `5` | SSD window size for activation prediction |
 | `OLMLX_EXPERIMENTAL_FLASH_IO_THREADS` | int | `32` | I/O threads for SSD weight loading |
 | `OLMLX_EXPERIMENTAL_FLASH_CACHE_BUDGET_NEURONS` | int | `1024` | Budget for cached neurons in memory |
 | `OLMLX_EXPERIMENTAL_FLASH_BYPASS_OS_CACHE` | bool | `false` | Bypass OS page cache for direct SSD I/O |
 | `OLMLX_EXPERIMENTAL_FLASH_PREALLOCATED_BUFFER` | bool | `false` | Preallocate I/O buffer for weight loading |
-| `OLMLX_EXPERIMENTAL_FLASH_MEMORY_BUDGET_FRACTION` | float/None | `None` | Memory budget as fraction of system RAM |
+| `OLMLX_FLASH_MEMORY_BUDGET_FRACTION` | float/None | `None` | Memory budget as fraction of system RAM |
 | `OLMLX_FLASH_PREFETCH` | bool | `false` | Enable speculative neuron prefetching (also `--flash-prefetch` on `olmlx serve`) |
 | `OLMLX_EXPERIMENTAL_FLASH_PREFETCH_CONFIDENCE_THRESHOLD` | float | `0.3` | Minimum predictor confidence for prefetching |
 | `OLMLX_EXPERIMENTAL_FLASH_PREFETCH_MIN_NEURONS` | int | `64` | Minimum neurons per prefetch batch |
@@ -1403,7 +1403,7 @@ All settings are configured via `OLMLX_`-prefixed environment variables. You can
 | `OLMLX_FLASH_MOE_CACHE_BUDGET_EXPERTS` | int | `48` | LRU cache budget per layer (number of experts kept in RAM) |
 | `OLMLX_FLASH_MOE_IO_THREADS` | int | `32` | Parallel I/O threads for expert loading from SSD |
 
-The legacy names `OLMLX_EXPERIMENTAL_FLASH_MOE*` are still honoured for a deprecation window.
+The legacy names `OLMLX_EXPERIMENTAL_FLASH_MOE*` are no longer honored — the server emits a warning and ignores them. Use the `OLMLX_FLASH_MOE*` names above.
 
 ### Configuration Precedence
 
@@ -1693,17 +1693,17 @@ Shows:
 Once a model is prepared, enable flash inference for the server:
 
 ```bash
-OLMLX_EXPERIMENTAL_FLASH=true olmlx serve
+OLMLX_FLASH=true olmlx serve
 ```
 
 Or in your `.env` file:
 
 ```bash
-OLMLX_EXPERIMENTAL_FLASH=true
-OLMLX_EXPERIMENTAL_FLASH_SPARSITY_THRESHOLD=0.5
+OLMLX_FLASH=true
+OLMLX_FLASH_SPARSITY_THRESHOLD=0.5
 OLMLX_EXPERIMENTAL_FLASH_IO_THREADS=32
 OLMLX_EXPERIMENTAL_FLASH_WINDOW_SIZE=5
-OLMLX_EXPERIMENTAL_FLASH_MIN_ACTIVE_NEURONS=128
+OLMLX_FLASH_MIN_ACTIVE_NEURONS=128
 OLMLX_EXPERIMENTAL_FLASH_CACHE_BUDGET_NEURONS=1024
 ```
 
@@ -1759,7 +1759,7 @@ OLMLX_FLASH_PREFETCH=true
 OLMLX_EXPERIMENTAL_FLASH_PREFETCH_CONFIDENCE_THRESHOLD=0.3
 ```
 
-The legacy names `OLMLX_EXPERIMENTAL_FLASH_PREFETCH` and `OLMLX_EXPERIMENTAL_FLASH_SPECULATIVE*` are still honoured for one release with a deprecation warning. The four prefetch tuning knobs (`CONFIDENCE_THRESHOLD`, `MIN_NEURONS`, `MAX_NEURONS`, `IO_THREADS`) keep the `OLMLX_EXPERIMENTAL_FLASH_PREFETCH_*` prefix.
+The legacy names `OLMLX_EXPERIMENTAL_FLASH_PREFETCH` and `OLMLX_EXPERIMENTAL_FLASH_SPECULATIVE*` are **no longer honored** — the server emits a warning and ignores them. Use `OLMLX_FLASH_PREFETCH` and `OLMLX_FLASH_SPECULATIVE*` instead. The four prefetch tuning knobs (`CONFIDENCE_THRESHOLD`, `MIN_NEURONS`, `MAX_NEURONS`, `IO_THREADS`) keep the `OLMLX_EXPERIMENTAL_FLASH_PREFETCH_*` prefix.
 
 ### Combining with Distributed Inference
 
@@ -1775,7 +1775,7 @@ olmlx flash prepare <model>
 Then enable both features on the coordinator:
 
 ```bash
-OLMLX_EXPERIMENTAL_FLASH=true
+OLMLX_FLASH=true
 OLMLX_DISTRIBUTED=true
 ```
 
@@ -2206,7 +2206,7 @@ If you still experience issues:
 
 1. **Use a smaller model** — try 4-bit quantized models instead of 8-bit or 16-bit
 2. **Increase the limit** — `OLMLX_MEMORY_LIMIT_FRACTION=0.85` if you have headroom
-3. **Try flash inference** — enable LLM in a Flash for models that barely exceed memory (`OLMLX_EXPERIMENTAL_FLASH=true`)
+3. **Try flash inference** — enable LLM in a Flash for models that barely exceed memory (`OLMLX_FLASH=true`)
 4. **Free memory** — close other GPU-heavy applications
 5. **Check logs** — `~/.olmlx/olmlx.log` if running as a service
 
@@ -2292,8 +2292,8 @@ Run `olmlx flash prepare <model>` before enabling flash inference.
 - Ensure you're using an NVMe SSD, not a SATA drive
 
 **Inaccurate outputs with flash:**
-- Lower `OLMLX_EXPERIMENTAL_FLASH_SPARSITY_THRESHOLD` to load more neurons per layer
-- Increase `OLMLX_EXPERIMENTAL_FLASH_MIN_ACTIVE_NEURONS`
+- Lower `OLMLX_FLASH_SPARSITY_THRESHOLD` to load more neurons per layer
+- Increase `OLMLX_FLASH_MIN_ACTIVE_NEURONS`
 - Re-prepare the model with `--rank 256 --samples 512` for better predictors
 
 ---

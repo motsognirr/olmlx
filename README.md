@@ -369,7 +369,7 @@ Advanced tuning (rarely needed; left under the experimental prefix):
 | `OLMLX_FLASH_MOE_CACHE_BUDGET_EXPERTS` | `48` | Experts cached per layer (LRU eviction) |
 | `OLMLX_FLASH_MOE_IO_THREADS` | `32` | I/O threads for expert loading |
 
-The legacy names `OLMLX_EXPERIMENTAL_FLASH_MOE*` are still honoured for a deprecation window.
+The legacy names `OLMLX_EXPERIMENTAL_FLASH_MOE*` are no longer honored — the server emits a warning and ignores them. Use the `OLMLX_FLASH_MOE*` names above.
 
 ### Distributed inference settings (experimental)
 
@@ -551,7 +551,7 @@ Flash inference's primary knobs have been promoted out of `experimental`. Rename
 | `OLMLX_EXPERIMENTAL_FLASH_SPECULATIVE_DRAFT_MODEL` | `OLMLX_FLASH_SPECULATIVE_DRAFT_MODEL` |
 | `OLMLX_EXPERIMENTAL_FLASH_SPECULATIVE_TOKENS` | `OLMLX_FLASH_SPECULATIVE_TOKENS` |
 
-The legacy names for all nine fields above are still honoured for one release with a deprecation warning. Per-model `models.json` entries that previously placed these keys under `"experimental": {...}` now go at the top level — loading an old config raises a clear migration error pointing at the new location. Advanced tuning fields (`OLMLX_EXPERIMENTAL_FLASH_WINDOW_SIZE`, `..._IO_THREADS`, `..._CACHE_BUDGET_NEURONS`, `..._BYPASS_OS_CACHE`, `..._PREALLOCATED_BUFFER`, `..._PREFETCH_CONFIDENCE_THRESHOLD`, `..._PREFETCH_MIN_NEURONS`, `..._PREFETCH_MAX_NEURONS`, `..._PREFETCH_IO_THREADS`) and the Flash-MoE knobs (`OLMLX_EXPERIMENTAL_FLASH_MOE*`) remain under the experimental prefix.
+The legacy names for all nine fields above are **no longer honored** — the server emits a warning and ignores them. Use the new `OLMLX_FLASH*` names listed in the table above. Per-model `models.json` entries that previously placed these keys under `"experimental": {...}` now go at the top level — loading an old config raises a clear migration error pointing at the new location. Advanced tuning fields (`OLMLX_EXPERIMENTAL_FLASH_WINDOW_SIZE`, `..._IO_THREADS`, `..._CACHE_BUDGET_NEURONS`, `..._BYPASS_OS_CACHE`, `..._PREALLOCATED_BUFFER`, `..._PREFETCH_CONFIDENCE_THRESHOLD`, `..._PREFETCH_MIN_NEURONS`, `..._PREFETCH_MAX_NEURONS`, `..._PREFETCH_IO_THREADS`) and the Flash-MoE knobs (`OLMLX_EXPERIMENTAL_FLASH_MOE*`) remain under the experimental prefix.
 
 ### Flash-MoE
 
