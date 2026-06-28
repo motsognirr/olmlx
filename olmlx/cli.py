@@ -2674,9 +2674,8 @@ def cmd_shard_prepare(args):
 def cmd_flash_prepare(args):
     """Prepare a model for flash inference (auto-detects MoE vs dense)."""
     _configure_logging()
-    # Forward legacy env vars so OLMLX_EXPERIMENTAL_FLASH_PREFETCH=true
-    # reaches settings.flash_prefetch before _cmd_flash_dense_prepare reads it
-    # via train_lookahead=settings.flash_prefetch.
+    # Warn about stale OLMLX_EXPERIMENTAL_FLASH* env vars (warn-only;
+    # does not forward values).
     _warn_legacy_flash_env()
 
     store = _create_store()
@@ -3023,10 +3022,8 @@ def cmd_eagle_prepare(args):
 
 def cmd_flash_info(args):
     """Show flash preparation info for a model."""
-    # Honour the legacy ``OLMLX_EXPERIMENTAL_FLASH*`` shim so that
-    # ``olmlx flash info`` reflects the same effective Flash settings
-    # an operator would see from ``olmlx config show`` / ``olmlx serve``
-    # when they've only renamed the new env vars in some shells.
+    # Warn about stale ``OLMLX_EXPERIMENTAL_FLASH*`` env vars (warn-only;
+    # does not forward values).
     _warn_legacy_flash_env()
     store = _create_store()
     _resolved = store.registry.resolve(args.model)
