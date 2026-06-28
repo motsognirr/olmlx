@@ -1564,13 +1564,14 @@ def _launch_distributed_workers() -> tuple[list[str], str, list[int] | None]:
             #     experimental prefix (window_size, io_threads,
             #     cache_budget_neurons, predictor_*, prefetch_*,
             #     bypass_os_cache, preallocated_buffer);
-            #   - the five *promoted* legacy primary knobs (e.g.
+            #   - the *promoted* legacy primary knobs (e.g.
             #     OLMLX_EXPERIMENTAL_FLASH_SPARSITY_THRESHOLD) when
-            #     the user hasn't renamed them yet. Each worker also
-            #     runs ``surface_legacy_flash_env``, which prefers
-            #     the new-name vars already added above — so the
-            #     legacy copies are harmless redundancy during the
-            #     one-release deprecation window.
+            #     the user hasn't renamed them yet. These are no
+            #     longer honoured: the effective values are already
+            #     forwarded under their new OLMLX_FLASH_* names above,
+            #     and each worker runs ``warn_legacy_flash_env``, which
+            #     only warns about the stale legacy copies — so they
+            #     are harmless noise, not a second source of config.
             # ``OLMLX_EXPERIMENTAL_FLASH_MOE`` also matches this
             # prefix but is safe: the flash_moe guard above already
             # exited if it was true.
