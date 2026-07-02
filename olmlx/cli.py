@@ -19,10 +19,9 @@ if TYPE_CHECKING:
     from olmlx.engine.registry import ModelRegistry
 
 from olmlx.config import (
+    PROMOTED_FLASH_ENV_RENAMES,
     settings,
-    surface_legacy_flash_env as _surface_legacy_flash_env,
-    surface_legacy_flash_moe_env as _surface_legacy_flash_moe_env,
-    surface_legacy_flash_prefetch_speculative_env as _surface_legacy_flash_prefetch_speculative_env,
+    warn_legacy_flash_env as _warn_legacy_flash_env,
 )
 
 logger = logging.getLogger(__name__)
@@ -597,9 +596,7 @@ def _apply_serve_overrides(args) -> None:
 
     _surface_legacy_speculative_env()
     _surface_legacy_dflash_env()
-    _surface_legacy_flash_env()
-    _surface_legacy_flash_moe_env()
-    _surface_legacy_flash_prefetch_speculative_env()
+    _warn_legacy_flash_env()
 
     # ``getattr`` defends programmatic callers that hand a bare
     # ``argparse.Namespace`` (e.g. tests) without populating these
@@ -1541,13 +1538,13 @@ def _launch_distributed_workers() -> tuple[list[str], str, list[int] | None]:
         if settings.flash:
             env["OLMLX_FLASH"] = "true"
             # Forward the *resolved* primary knobs (from ``settings``)
-            # rather than relying on os.environ passthrough. The worker
-            # process does not run ``_surface_legacy_flash_env``, so a
-            # user with only legacy env vars set (e.g.
-            # ``OLMLX_EXPERIMENTAL_FLASH_SPARSITY_THRESHOLD``) would
-            # otherwise see the worker fall back to schema defaults for
-            # the numeric knobs. Sourcing from ``settings`` mirrors
-            # whatever the coordinator's legacy shim already applied.
+            # rather than relying on os.environ passthrough, so the worker
+            # gets the coordinator's effective config under the canonical
+            # ``OLMLX_FLASH_*`` names. ``settings`` honors only the new
+            # names; a stale legacy ``OLMLX_EXPERIMENTAL_FLASH_*`` knob is
+            # no longer applied (warn-only), so its value does not flow
+            # here — the worker sees the schema default for that knob,
+            # matching the coordinator.
             env["OLMLX_FLASH_SPARSITY_THRESHOLD"] = str(
                 settings.flash_sparsity_threshold
             )
@@ -1562,24 +1559,19 @@ def _launch_distributed_workers() -> tuple[list[str], str, list[int] | None]:
                 env["OLMLX_FLASH_MEMORY_BUDGET_FRACTION"] = str(
                     settings.flash_memory_budget_fraction
                 )
-            # Forward all OLMLX_EXPERIMENTAL_FLASH_* vars verbatim.
-            # This intentionally includes:
-            #   - the advanced tuning knobs that still live under the
-            #     experimental prefix (window_size, io_threads,
-            #     cache_budget_neurons, predictor_*, prefetch_*,
-            #     bypass_os_cache, preallocated_buffer);
-            #   - the five *promoted* legacy primary knobs (e.g.
-            #     OLMLX_EXPERIMENTAL_FLASH_SPARSITY_THRESHOLD) when
-            #     the user hasn't renamed them yet. Each worker also
-            #     runs ``surface_legacy_flash_env``, which prefers
-            #     the new-name vars already added above — so the
-            #     legacy copies are harmless redundancy during the
-            #     one-release deprecation window.
-            # ``OLMLX_EXPERIMENTAL_FLASH_MOE`` also matches this
-            # prefix but is safe: the flash_moe guard above already
-            # exited if it was true.
+            # Forward the advanced tuning knobs that still live under the
+            # experimental prefix (window_size, io_threads,
+            # cache_budget_neurons, predictor_*, prefetch_*,
+            # bypass_os_cache, preallocated_buffer) verbatim. The
+            # *promoted* legacy names (in ``PROMOTED_FLASH_ENV_RENAMES``,
+            # e.g. OLMLX_EXPERIMENTAL_FLASH_SPARSITY_THRESHOLD,
+            # OLMLX_EXPERIMENTAL_FLASH_MOE*) are skipped: they are no
+            # longer honoured and their effective values already flow
+            # under the new OLMLX_FLASH_* names above — forwarding them
+            # would only make each worker warn about a name the operator
+            # set on the *coordinator*.
             for key, val in os.environ.items():
-                if key in env:
+                if key in env or key in PROMOTED_FLASH_ENV_RENAMES:
                     continue
                 if key.startswith("OLMLX_EXPERIMENTAL_FLASH_"):
                     env[key] = val
@@ -2051,9 +2043,7 @@ def cmd_chat(args):
     # ``serve`` handles it correctly.
     _surface_legacy_speculative_env()
     _surface_legacy_kv_cache_quant_env()
-    _surface_legacy_flash_env()
-    _surface_legacy_flash_moe_env()
-    _surface_legacy_flash_prefetch_speculative_env()
+    _warn_legacy_flash_env()
     _warn_kv_cache_quant_incompatibilities()
 
     model_name = args.model_name
@@ -2448,9 +2438,7 @@ def cmd_config_show(_args):
     """Show current configuration."""
     _surface_legacy_kv_cache_quant_env()
     _surface_legacy_distributed_env()
-    _surface_legacy_flash_env()
-    _surface_legacy_flash_moe_env()
-    _surface_legacy_flash_prefetch_speculative_env()
+    _warn_legacy_flash_env()
 
     print(f"Host:                   {settings.host}")
     print(f"Port:                   {settings.port}")
@@ -2485,9 +2473,7 @@ def cmd_config_show(_args):
 def cmd_bench_run(args):
     """Run benchmark scenarios."""
     _configure_logging()
-    _surface_legacy_flash_env()
-    _surface_legacy_flash_moe_env()
-    _surface_legacy_flash_prefetch_speculative_env()
+    _warn_legacy_flash_env()
     _surface_legacy_speculative_env()
     _surface_legacy_dflash_env()
     _surface_legacy_kv_cache_quant_env()
@@ -2684,12 +2670,9 @@ def cmd_shard_prepare(args):
 def cmd_flash_prepare(args):
     """Prepare a model for flash inference (auto-detects MoE vs dense)."""
     _configure_logging()
-    # Forward legacy env vars so OLMLX_EXPERIMENTAL_FLASH_PREFETCH=true
-    # reaches settings.flash_prefetch before _cmd_flash_dense_prepare reads it
-    # via train_lookahead=settings.flash_prefetch.
-    _surface_legacy_flash_env()
-    _surface_legacy_flash_moe_env()
-    _surface_legacy_flash_prefetch_speculative_env()
+    # Warn about stale OLMLX_EXPERIMENTAL_FLASH* env vars (warn-only;
+    # does not forward values).
+    _warn_legacy_flash_env()
 
     store = _create_store()
     _resolved = store.registry.resolve(args.model)
@@ -3035,13 +3018,9 @@ def cmd_eagle_prepare(args):
 
 def cmd_flash_info(args):
     """Show flash preparation info for a model."""
-    # Honour the legacy ``OLMLX_EXPERIMENTAL_FLASH*`` shim so that
-    # ``olmlx flash info`` reflects the same effective Flash settings
-    # an operator would see from ``olmlx config show`` / ``olmlx serve``
-    # when they've only renamed the new env vars in some shells.
-    _surface_legacy_flash_env()
-    _surface_legacy_flash_moe_env()
-    _surface_legacy_flash_prefetch_speculative_env()
+    # Warn about stale ``OLMLX_EXPERIMENTAL_FLASH*`` env vars (warn-only;
+    # does not forward values).
+    _warn_legacy_flash_env()
     store = _create_store()
     _resolved = store.registry.resolve(args.model)
     hf_path = _resolved.hf_path if _resolved is not None else args.model

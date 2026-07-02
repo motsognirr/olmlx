@@ -597,3 +597,114 @@ def test_awq_gptq_convert_defaults(monkeypatch):
     s = Settings()
     assert s.awq_gptq_convert_bits == 4
     assert s.awq_gptq_convert_group_size == 64
+
+
+class TestWarnLegacyFlashEnv:
+    """warn_legacy_flash_env() detects promoted OLMLX_EXPERIMENTAL_FLASH*
+    names (shell or .env) and warns WITHOUT forwarding the value."""
+
+    def _clear_all(self, monkeypatch):
+        from olmlx.config import PROMOTED_FLASH_ENV_RENAMES
+
+        for old, new in PROMOTED_FLASH_ENV_RENAMES.items():
+            monkeypatch.delenv(old, raising=False)
+            monkeypatch.delenv(new, raising=False)
+
+    def test_warns_on_shell_var_and_does_not_apply(self, monkeypatch, tmp_path, caplog):
+        import logging
+
+        from olmlx.config import settings, warn_legacy_flash_env
+
+        monkeypatch.chdir(tmp_path)  # avoid the dev's real .env
+        self._clear_all(monkeypatch)
+        monkeypatch.setattr(settings, "flash", False, raising=False)
+        monkeypatch.setenv("OLMLX_EXPERIMENTAL_FLASH", "true")
+
+        with caplog.at_level(logging.WARNING, logger="olmlx.config"):
+            warn_legacy_flash_env()
+
+        # Value is NOT forwarded.
+        assert settings.flash is False
+        # Warning names the legacy var and its replacement.
+        assert "OLMLX_EXPERIMENTAL_FLASH" in caplog.text
+        assert "OLMLX_FLASH" in caplog.text
+
+    def test_warns_on_dotenv_var(self, monkeypatch, tmp_path, caplog):
+        import logging
+
+        from olmlx.config import settings, warn_legacy_flash_env
+
+        monkeypatch.chdir(tmp_path)
+        self._clear_all(monkeypatch)
+        (tmp_path / ".env").write_text("OLMLX_EXPERIMENTAL_FLASH_PREFETCH=true\n")
+        monkeypatch.setattr(settings, "flash_prefetch", False, raising=False)
+
+        with caplog.at_level(logging.WARNING, logger="olmlx.config"):
+            warn_legacy_flash_env()
+
+        assert settings.flash_prefetch is False
+        assert "OLMLX_EXPERIMENTAL_FLASH_PREFETCH" in caplog.text
+
+    def test_no_warn_when_unset(self, monkeypatch, tmp_path, caplog):
+        import logging
+
+        from olmlx.config import warn_legacy_flash_env
+
+        monkeypatch.chdir(tmp_path)
+        self._clear_all(monkeypatch)
+
+        with caplog.at_level(logging.WARNING, logger="olmlx.config"):
+            warn_legacy_flash_env()
+
+        assert not any(r.levelno >= logging.WARNING for r in caplog.records), (
+            "Expected no warnings but got: " + caplog.text
+        )
+
+    def test_warns_for_each_family(self, monkeypatch, tmp_path, caplog):
+        import logging
+
+        from olmlx.config import warn_legacy_flash_env
+
+        monkeypatch.chdir(tmp_path)
+        self._clear_all(monkeypatch)
+        monkeypatch.setenv("OLMLX_EXPERIMENTAL_FLASH", "true")
+        monkeypatch.setenv("OLMLX_EXPERIMENTAL_FLASH_MOE", "true")
+        monkeypatch.setenv("OLMLX_EXPERIMENTAL_FLASH_SPECULATIVE", "true")
+
+        with caplog.at_level(logging.WARNING, logger="olmlx.config"):
+            warn_legacy_flash_env()
+
+        assert "OLMLX_EXPERIMENTAL_FLASH_MOE" in caplog.text
+        assert "OLMLX_EXPERIMENTAL_FLASH_SPECULATIVE" in caplog.text
+
+    def test_presence_warns_even_for_false_value(self, monkeypatch, tmp_path, caplog):
+        import logging
+
+        from olmlx.config import warn_legacy_flash_env
+
+        monkeypatch.chdir(tmp_path)
+        self._clear_all(monkeypatch)
+        # A dead name is dead regardless of value — warn on presence.
+        monkeypatch.setenv("OLMLX_EXPERIMENTAL_FLASH", "false")
+
+        with caplog.at_level(logging.WARNING, logger="olmlx.config"):
+            warn_legacy_flash_env()
+
+        assert "OLMLX_EXPERIMENTAL_FLASH" in caplog.text
+
+    def test_valid_experimental_tuning_knob_not_warned(
+        self, monkeypatch, tmp_path, caplog
+    ):
+        import logging
+
+        from olmlx.config import warn_legacy_flash_env
+
+        monkeypatch.chdir(tmp_path)
+        self._clear_all(monkeypatch)
+        # Still-valid experimental tuning knob — must NOT be in the table.
+        monkeypatch.setenv("OLMLX_EXPERIMENTAL_FLASH_WINDOW_SIZE", "8")
+
+        with caplog.at_level(logging.WARNING, logger="olmlx.config"):
+            warn_legacy_flash_env()
+
+        assert not any(r.levelno >= logging.WARNING for r in caplog.records)
