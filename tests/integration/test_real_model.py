@@ -1,10 +1,21 @@
 """Real-model smoke tests — load an actual MLX model and run inference.
 
-These tests require a GPU and download ~300MB on first run.
+These tests require a GPU and download ~300MB once per machine (into the
+HF cache, unless the model is already in the operator's olmlx store).
 Skipped in CI via: pytest -m "not real_model"
+
+The model is provisioned ONCE per pytest session (`real_model_files`) and
+seeded into each test's isolated models_dir with hardlinks. Tests
+themselves never touch the network: the nightly smoke runs used to flake
+with `assert 500 == 200` whenever the per-test `snapshot_download` hit a
+connection reset mid-test.
 """
 
 import json
+import os
+import shutil
+import time
+from pathlib import Path
 
 import pytest
 
@@ -15,8 +26,68 @@ REAL_MODEL = "mlx-community/Qwen2.5-0.5B-Instruct-4bit"
 pytestmark = pytest.mark.real_model
 
 
+@pytest.fixture(scope="session")
+def real_model_files() -> Path:
+    """Provision REAL_MODEL once per session, outside any test body.
+
+    Prefers a copy already in the operator's store (the smoke runner
+    pre-pulls it via scripts/real_model_smoke.sh); otherwise downloads
+    into the shared HF cache with retries, so a transient network error
+    surfaces here — clearly labeled as provisioning — instead of as a
+    500 from an endpoint under test.
+    """
+    from olmlx.config import settings
+    from olmlx.models.store import _safe_dir_name
+
+    operator_copy = settings.models_dir / _safe_dir_name(REAL_MODEL)
+    if (operator_copy / "config.json").exists() and not (
+        operator_copy / ".downloading"
+    ).exists():
+        return operator_copy
+
+    from huggingface_hub import snapshot_download
+
+    last_err: Exception | None = None
+    for attempt in range(3):
+        if attempt:
+            time.sleep(5 * attempt)
+        try:
+            return Path(snapshot_download(repo_id=REAL_MODEL))
+        except Exception as exc:  # noqa: BLE001 — retry any transport error
+            last_err = exc
+    raise RuntimeError(
+        f"could not provision {REAL_MODEL} after 3 attempts"
+    ) from last_err
+
+
+def _seed_model(models_dir: Path, src: Path) -> None:
+    """Copy the provisioned model into a test's models_dir.
+
+    Weights are hardlinked (cheap, read-only usage); everything else is a
+    real copy so in-place writes (e.g. manifest.json) can't reach through
+    a shared inode into the HF cache or the operator's store.
+    """
+    from olmlx.models.store import _safe_dir_name
+
+    def link_weights(s: str, d: str) -> None:
+        if s.endswith(".safetensors"):
+            try:
+                os.link(s, d)
+                return
+            except OSError:
+                pass  # cross-filesystem tmp dir — fall through to a real copy
+        shutil.copy2(s, d)
+
+    shutil.copytree(
+        src,
+        models_dir / _safe_dir_name(REAL_MODEL),
+        copy_function=link_weights,
+        ignore=shutil.ignore_patterns(".cache", ".downloading*"),
+    )
+
+
 @pytest.fixture
-async def real_ctx(tmp_path, monkeypatch):
+async def real_ctx(tmp_path, monkeypatch, real_model_files):
     """Integration context with NO MLX mocks — uses a real model."""
     models_config = tmp_path / "models.json"
     models_config.write_text(json.dumps({}))
@@ -25,6 +96,7 @@ async def real_ctx(tmp_path, monkeypatch):
 
     models_dir = tmp_path / "models"
     models_dir.mkdir()
+    _seed_model(models_dir, real_model_files)
 
     monkeypatch.setattr("olmlx.config.settings.models_dir", models_dir)
     monkeypatch.setattr("olmlx.config.settings.models_config", models_config)

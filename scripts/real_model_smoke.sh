@@ -33,16 +33,32 @@ fi
 # test, which the summary below (correctly) treats as a failed smoke run, not a
 # green one. Pre-pull them so the run exercises real coverage. Pull reuses the
 # HF blob cache, so this is cheap once the runner has downloaded them once
-# (test_real_model.py and test_mtp_loader.py self-provision and are omitted).
+# (test_mtp_loader.py self-provisions and is omitted). Qwen2.5-0.5B is pulled
+# for test_real_model.py: its session fixture prefers the operator store, so
+# with the pull done here the tests themselves run with zero network I/O.
 # Only for the default subset — explicit file args manage their own models.
 DEFAULT_MODELS=(
+  "mlx-community/Qwen2.5-0.5B-Instruct-4bit"
   "mlx-community/Qwen3-4B-4bit"
   "mlx-community/gemma-4-26B-A4B-it-4bit"
 )
+
+# Retry pulls: the runner's early-morning network drops connections often
+# enough that single-shot pulls were a recurring cause of red smoke runs.
+pull_with_retries() {
+  local m="$1" attempt
+  for attempt in 1 2 3; do
+    uv run olmlx models pull "$m" && return 0
+    echo "pull attempt ${attempt}/3 failed for ${m}"
+    [ "$attempt" -lt 3 ] && sleep $((attempt * 30))
+  done
+  return 1
+}
+
 if [ "$DEFAULT_RUN" -eq 1 ]; then
   for m in "${DEFAULT_MODELS[@]}"; do
     echo "::group::pull ${m}"
-    uv run olmlx models pull "$m" || echo "warning: pull failed for ${m} (its test will skip)"
+    pull_with_retries "$m" || echo "warning: pull failed for ${m} (its test will skip)"
     echo "::endgroup::"
   done
 fi
