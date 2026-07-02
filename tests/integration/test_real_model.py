@@ -71,9 +71,12 @@ def _seed_model(models_dir: Path, src: Path) -> None:
 
     def link_weights(s: str, d: str) -> None:
         if s.endswith(".safetensors"):
-            os.link(s, d)
-        else:
-            shutil.copy2(s, d)
+            try:
+                os.link(s, d)
+                return
+            except OSError:
+                pass  # cross-filesystem tmp dir — fall through to a real copy
+        shutil.copy2(s, d)
 
     shutil.copytree(
         src,
