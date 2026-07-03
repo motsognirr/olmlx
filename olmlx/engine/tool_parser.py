@@ -50,6 +50,10 @@ _GPT_OSS_DETECT = "<|channel|>"
 _GEMMA4_TOOL_CALL_RE = re.compile(r"<\|tool_call>(.*?)<tool_call\|>", re.DOTALL)
 _TOOL_CALL_RE = re.compile(r"<tool_call>\s*(.*?)\s*</tool_call>", re.DOTALL)
 _FUNC_TAG_RE = re.compile(r"<function=([^>]+)>(.*?)</function>", re.DOTALL)
+# GLM-4.5/4.6 arg pairs inside <tool_call>: <arg_key>k</arg_key><arg_value>v</arg_value>
+_GLM_ARG_RE = re.compile(
+    r"<arg_key>\s*(.*?)\s*</arg_key>\s*<arg_value>(.*?)</arg_value>", re.DOTALL
+)
 _PARAM_TAG_RE = re.compile(r"<parameter=([^>]+)>(.*?)</parameter>", re.DOTALL)
 
 # Mistral: [TOOL_CALLS] followed by a JSON array
@@ -139,8 +143,33 @@ def _parse_func_tag(func_match: re.Match) -> dict | None:
     }
 
 
+def _parse_glm_tool_call(inner: str) -> dict | None:
+    """Parse a GLM-4.5/4.6 tool call body.
+
+    Format: ``name\\n<arg_key>k</arg_key>\\n<arg_value>v</arg_value>...``.
+    Values follow the GLM chat template (strings raw, non-strings
+    ``tojson``-encoded), so ``_extract_params`` (JSON-with-raw-fallback) parses
+    them the same way it does for the Mistral/MiniMax paths. Returns None if no
+    function name precedes the arg pairs.
+    """
+    arg_start = inner.find("<arg_key>")
+    name = (inner[:arg_start] if arg_start != -1 else inner).strip()
+    if not name:
+        return None
+    return {
+        "type": "tool_use",
+        "id": _make_tool_use_id(),
+        "name": name,
+        "input": _extract_params(inner, _GLM_ARG_RE),
+    }
+
+
 def _try_qwen(text: str) -> tuple[list[dict], str]:
-    """Parse Qwen-style <tool_call>...</tool_call> blocks."""
+    """Parse Qwen-style <tool_call>...</tool_call> blocks.
+
+    Also handles the GLM-4.5/4.6 body inside the same wrapper:
+    ``name\\n<arg_key>k</arg_key><arg_value>v</arg_value>...``.
+    """
     tool_uses = []
     for match in _TOOL_CALL_RE.finditer(text):
         span = (match.start(), match.end())
@@ -167,6 +196,20 @@ def _try_qwen(text: str) -> tuple[list[dict], str]:
                     logger.warning(
                         "Skipping <function> tag with empty name inside <tool_call>"
                     )
+        elif "<arg_key>" in inner and "<arg_value>" in inner:
+            # GLM-4.5/4.6 style: name\n<arg_key>k</arg_key><arg_value>v</arg_value>.
+            # Require both tag types so a stray "</arg_value>" in prose can't
+            # hijack the block. A bare-identifier body (no arg tags) is left to
+            # the existing "unparseable block" path — indistinguishable from
+            # garbage.
+            result = _parse_glm_tool_call(inner)
+            if result:
+                result["_span"] = span
+                tool_uses.append(result)
+            else:
+                logger.warning(
+                    "Failed to parse GLM <tool_call> block (no name): %r", inner[:500]
+                )
         else:
             logger.warning("Failed to parse <tool_call> block: %r", inner[:500])
 
