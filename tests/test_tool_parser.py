@@ -383,6 +383,83 @@ class TestTryMinimax:
         assert "<minimax:tool_call>" not in visible
 
 
+class TestGlmToolCall:
+    """GLM-4.5/4.6 native format: <tool_call>name\\n<arg_key>k</arg_key><arg_value>v</arg_value>."""
+
+    def test_glm_string_args_via_try_qwen(self):
+        text = (
+            "<tool_call>task\n"
+            "<arg_key>description</arg_key>\n"
+            "<arg_value>Explore repository structure</arg_value>\n"
+            "<arg_key>subagent_type</arg_key>\n"
+            "<arg_value>explore</arg_value>\n"
+            "</tool_call>"
+        )
+        tool_uses, _ = _try_qwen(text)
+        assert len(tool_uses) == 1
+        assert tool_uses[0]["name"] == "task"
+        assert tool_uses[0]["input"] == {
+            "description": "Explore repository structure",
+            "subagent_type": "explore",
+        }
+        assert "_span" in tool_uses[0]
+
+    def test_glm_non_string_values_json_coerced(self):
+        # Per GLM template: string values are raw, non-string values are tojson-encoded.
+        text = (
+            "<tool_call>search\n"
+            "<arg_key>query</arg_key>\n"
+            "<arg_value>find files</arg_value>\n"
+            "<arg_key>limit</arg_key>\n"
+            "<arg_value>10</arg_value>\n"
+            "<arg_key>recursive</arg_key>\n"
+            "<arg_value>true</arg_value>\n"
+            "<arg_key>tags</arg_key>\n"
+            '<arg_value>["a", "b"]</arg_value>\n'
+            "</tool_call>"
+        )
+        tool_uses, _ = _try_qwen(text)
+        assert len(tool_uses) == 1
+        assert tool_uses[0]["input"] == {
+            "query": "find files",
+            "limit": 10,
+            "recursive": True,
+            "tags": ["a", "b"],
+        }
+
+    def test_glm_stray_close_tag_not_hijacked(self):
+        # A block containing a stray "</arg_value>" but no real arg pairs must
+        # NOT be parsed as a GLM call (detection requires both tag types), so it
+        # falls through to the "unparseable block" path instead of producing a
+        # tool with a garbage name that halts the parser chain.
+        text = "<tool_call>Status: </arg_value> done</tool_call>"
+        tool_uses, _ = _try_qwen(text)
+        assert tool_uses == []
+
+    def test_glm_bare_name_body_not_parsed(self):
+        # A bare-identifier body (no arg tags) is indistinguishable from an
+        # unparseable/garbage block, so it is intentionally NOT parsed as a
+        # tool (preserves the existing <tool_call>GARBAGE</tool_call> contract).
+        text = "<tool_call>list_models</tool_call>"
+        tool_uses, _ = _try_qwen(text)
+        assert tool_uses == []
+
+    def test_glm_via_parse_model_output(self):
+        text = (
+            "I'll explore the repo.\n"
+            "<tool_call>task\n"
+            "<arg_key>description</arg_key>\n"
+            "<arg_value>Explore repo</arg_value>\n"
+            "</tool_call>"
+        )
+        _, visible, tools = parse_model_output(text, has_tools=True)
+        assert len(tools) == 1
+        assert tools[0]["name"] == "task"
+        assert tools[0]["input"] == {"description": "Explore repo"}
+        assert "<tool_call>" not in visible
+        assert "_span" not in tools[0]
+
+
 class TestTryXmlFunc:
     def test_single_tool_call(self):
         text = "<function=get_weather><parameter=city>NYC</parameter></function>"

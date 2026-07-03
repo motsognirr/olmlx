@@ -28,7 +28,7 @@ olmlx/
 │   ├── proxy_tuning.py # Decode-time logit arithmetic (base + α·(expert−antiexpert))
 │   ├── grammar.py      # xgrammar JSON-mode / JSON-Schema logits processor
 │   ├── chat_templating.py
-│   ├── tool_parser.py  # Qwen/Mistral/Llama/DeepSeek/MiniMax/bare-JSON
+│   ├── tool_parser.py  # Qwen/GLM/Mistral/Llama/DeepSeek/MiniMax/bare-JSON
 │   ├── template_caps.py
 │   ├── prompt_cache/   # cache_id LRU + radix prefix index + disk spill
 │   ├── turboquant*.py / spectralquant*.py / shardquant*.py
