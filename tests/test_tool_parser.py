@@ -436,11 +436,30 @@ class TestGlmToolCall:
         tool_uses, _ = _try_qwen(text)
         assert tool_uses == []
 
-    def test_glm_bare_name_body_not_parsed(self):
-        # A bare-identifier body (no arg tags) is indistinguishable from an
-        # unparseable/garbage block, so it is intentionally NOT parsed as a
-        # tool (preserves the existing <tool_call>GARBAGE</tool_call> contract).
+    def test_glm_zero_arg_call(self):
+        # GLM renders a no-argument call as just the bare name, e.g.
+        # "<tool_call>ls\n</tool_call>". It must parse as a zero-arg tool call
+        # rather than being dropped.
+        text = "<tool_call>ls\n</tool_call>"
+        tool_uses, _ = _try_qwen(text)
+        assert len(tool_uses) == 1
+        assert tool_uses[0]["name"] == "ls"
+        assert tool_uses[0]["input"] == {}
+        assert "_span" in tool_uses[0]
+
+    def test_glm_bare_identifier_body_parsed(self):
+        # A bare single-identifier body is a valid GLM zero-arg call.
         text = "<tool_call>list_models</tool_call>"
+        tool_uses, _ = _try_qwen(text)
+        assert len(tool_uses) == 1
+        assert tool_uses[0]["name"] == "list_models"
+        assert tool_uses[0]["input"] == {}
+
+    def test_glm_prose_body_not_parsed(self):
+        # A non-identifier body (contains spaces) is prose, not a tool name, and
+        # must NOT be parsed — preserves the <tool_call>GARBAGE</tool_call>
+        # contract for anything that isn't a bare identifier.
+        text = "<tool_call>Let me check the files</tool_call>"
         tool_uses, _ = _try_qwen(text)
         assert tool_uses == []
 
@@ -557,12 +576,13 @@ class TestParseModelOutputXmlFunc:
         Verified via parse_model_output because parsers no longer strip text —
         they annotate spans for parse_model_output to handle.
         """
-        text = "<tool_call>GARBAGE</tool_call><function=my_tool><parameter=x>1</parameter></function>"
+        # Body has spaces, so it is not a bare identifier / zero-arg call.
+        text = "<tool_call>not a tool</tool_call><function=my_tool><parameter=x>1</parameter></function>"
         _, visible, tools = parse_model_output(text, has_tools=True)
         assert len(tools) == 1
         assert tools[0]["name"] == "my_tool"
         # The orphaned <tool_call> skeleton must remain in visible text
-        assert "<tool_call>GARBAGE</tool_call>" in visible
+        assert "<tool_call>not a tool</tool_call>" in visible
         # The <function> tag must be stripped
         assert "<function=" not in visible
 

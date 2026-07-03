@@ -55,6 +55,9 @@ _GLM_ARG_RE = re.compile(
     r"<arg_key>\s*(.*?)\s*</arg_key>\s*<arg_value>(.*?)</arg_value>", re.DOTALL
 )
 _PARAM_TAG_RE = re.compile(r"<parameter=([^>]+)>(.*?)</parameter>", re.DOTALL)
+# GLM zero-argument call: the body is just the bare function name (no arg tags).
+# A strict single-identifier match distinguishes a real tool name from prose.
+_GLM_BARE_NAME_RE = re.compile(r"[A-Za-z_][\w.-]*")
 
 # Mistral: [TOOL_CALLS] followed by a JSON array
 _MISTRAL_TOOL_RE = re.compile(r"\[TOOL_CALLS\]\s*(\[.*?\])", re.DOTALL)
@@ -210,6 +213,20 @@ def _try_qwen(text: str) -> tuple[list[dict], str]:
                 logger.warning(
                     "Failed to parse GLM <tool_call> block (no name): %r", inner[:500]
                 )
+        elif _GLM_BARE_NAME_RE.fullmatch(inner.strip()):
+            # GLM renders a no-argument call as just the bare function name
+            # ("<tool_call>ls\n</tool_call>"). Require a strict single identifier
+            # so prose (which contains spaces/punctuation) still falls through to
+            # the "unparseable block" path below.
+            tool_uses.append(
+                {
+                    "type": "tool_use",
+                    "id": _make_tool_use_id(),
+                    "name": inner.strip(),
+                    "input": {},
+                    "_span": span,
+                }
+            )
         else:
             logger.warning("Failed to parse <tool_call> block: %r", inner[:500])
 
