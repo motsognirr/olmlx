@@ -58,6 +58,9 @@ _PARAM_TAG_RE = re.compile(r"<parameter=([^>]+)>(.*?)</parameter>", re.DOTALL)
 # GLM zero-argument call: the body is just the bare function name (no arg tags).
 # A strict single-identifier match distinguishes a real tool name from prose.
 _GLM_BARE_NAME_RE = re.compile(r"[A-Za-z_][\w.-]*")
+# JSON literals match the identifier pattern but are never tool names — a bare
+# "true"/"false"/"null" block is noise, not a zero-arg call.
+_JSON_LITERALS = frozenset({"true", "false", "null"})
 
 # Mistral: [TOOL_CALLS] followed by a JSON array
 _MISTRAL_TOOL_RE = re.compile(r"\[TOOL_CALLS\]\s*(\[.*?\])", re.DOTALL)
@@ -213,7 +216,10 @@ def _try_qwen(text: str) -> tuple[list[dict], str]:
                 logger.warning(
                     "Failed to parse GLM <tool_call> block (no name): %r", inner[:500]
                 )
-        elif _GLM_BARE_NAME_RE.fullmatch(inner.strip()):
+        elif (
+            _GLM_BARE_NAME_RE.fullmatch(inner.strip())
+            and inner.strip() not in _JSON_LITERALS
+        ):
             # GLM renders a no-argument call as just the bare function name
             # ("<tool_call>ls\n</tool_call>"). Require a strict single identifier
             # so prose (which contains spaces/punctuation) still falls through to

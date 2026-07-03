@@ -455,6 +455,14 @@ class TestGlmToolCall:
         assert tool_uses[0]["name"] == "list_models"
         assert tool_uses[0]["input"] == {}
 
+    def test_glm_json_literal_body_not_parsed(self):
+        # A JSON literal (true/false/null) matches the identifier pattern but is
+        # not a real tool name — it must not become a zero-arg call.
+        for literal in ("true", "false", "null"):
+            text = f"<tool_call>{literal}</tool_call>"
+            tool_uses, _ = _try_qwen(text)
+            assert tool_uses == [], literal
+
     def test_glm_prose_body_not_parsed(self):
         # A non-identifier body (contains spaces) is prose, not a tool name, and
         # must NOT be parsed — preserves the <tool_call>GARBAGE</tool_call>
