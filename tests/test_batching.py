@@ -103,9 +103,10 @@ class TestRopefix:
                 raise RuntimeError("boom")
         assert mx.fast.rope is orig
 
-    @pytest.mark.skipif(
-        not mx.metal.is_available(), reason="Metal-kernel bug; CPU path is fine"
-    )
+    # metal_default_device skips without Metal and forces the GPU default
+    # device: the corruption is Metal-only, so under OLMLX_TESTS_CPU_DEVICE=1
+    # the unforced CPU kernel is correct and this gate would fail spuriously.
+    @pytest.mark.usefixtures("metal_default_device")
     def test_rope_bug_still_present_remove_patch_when_this_fails(self):
         """Removal gate for safe_rope_patch (#499).
 

@@ -55,6 +55,14 @@ jobs:
         # (exit 138). These tests are developer-run; CI covers the logic via
         # mocked unit tests. (The marker's intent was already documented in
         # tests/live/test_tts_speech.py.)
+        #
+        # OLMLX_TESTS_CPU_DEVICE moves MLX unit-test compute to the CPU
+        # backend (tests/__init__.py): the two runners share one Mac with
+        # real-inference jobs, and concurrent Metal pressure starved runner
+        # heartbeats ("runner lost communication" kills). Metal-kernel tests
+        # opt back into the GPU via the metal_default_device fixture.
+        env:
+          OLMLX_TESTS_CPU_DEVICE: "1"
         run: uv sync --no-editable && uv run pytest -m "not real_model" --cov=olmlx --cov-report=xml --cov-report=term
       - name: Upload coverage report
         if: always()

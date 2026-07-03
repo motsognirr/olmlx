@@ -9,7 +9,10 @@ import pytest
 
 from tests.test_shardquant_cache import _feed, _make_cache
 
-pytestmark = pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal")
+# metal_default_device skips when Metal is unavailable and forces the GPU
+# default device, so kernels_supported() takes the kernel path even when the
+# suite runs under OLMLX_TESTS_CPU_DEVICE=1 (tests/__init__.py).
+pytestmark = pytest.mark.usefixtures("metal_default_device")
 
 
 def _decode_step(cache, D, H, seed=11):
