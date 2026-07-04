@@ -15,7 +15,7 @@ Single-user, localhost-only inference server:
 olmlx/
 ├── app.py              # FastAPI app factory, middleware, router registration
 ├── config.py           # Settings (pydantic-settings, OLMLX_ env prefix)
-├── cli.py              # CLI subcommands (serve, chat, service, models, config, dflash, eagle, flash, spectral, shard)
+├── cli.py              # CLI subcommands (serve, chat, service, models, config, dflash, eagle, flash, spectral, shard, bench)
 ├── chat/               # In-process terminal chat + MCP agent loop
 │   └── voice/          # Push-to-talk STT (Whisper) + Kokoro TTS
 ├── engine/
