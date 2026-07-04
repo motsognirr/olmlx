@@ -269,7 +269,7 @@ Add VLM mappings to `~/.olmlx/models.json`:
 }
 ```
 
-VLMs are automatically detected by inspecting `config.json` for vision-related keys (`vision_config`, `vision_tower`, etc.) and loaded via mlx-vlm instead of mlx-lm.
+VLMs are automatically detected by inspecting `config.json` for vision-related keys (`vision_config`, `vision_tower`, `vision_model`, `mm_vision_tower`, etc.) and loaded via mlx-vlm instead of mlx-lm. Beyond LLaVA, this covers current mlx-vlm architectures such as Gemma 4 (which also supports tools alongside images) and Qwen-VL. One exception: hybrid Qwen 3.5 text towers whose `text_config.layer_types` include `linear_attention` are routed through mlx-lm — the mlx-vlm path crashes with a Metal stream error on that architecture.
 
 ## API Endpoints
 
@@ -298,8 +298,13 @@ VLMs are automatically detected by inspecting `config.json` for vision-related k
 |---|---|---|
 | `/v1/chat/completions` | POST | Chat completion (SSE streaming supported) |
 | `/v1/completions` | POST | Text completion |
+| `/v1/responses` | POST | Responses API (SSE streaming supported) |
+| `/v1/responses/:id` | GET/DELETE | Retrieve or delete a stored response |
 | `/v1/models` | GET | List models |
 | `/v1/embeddings` | POST | Generate embeddings |
+| `/v1/rerank` | POST | Rerank documents against a query (cross-encoder) |
+| `/v1/audio/transcriptions` | POST | Speech-to-text (Whisper) |
+| `/v1/audio/speech` | POST | Text-to-speech (Kokoro) |
 
 ### Anthropic Messages API
 
@@ -309,6 +314,12 @@ VLMs are automatically detected by inspecting `config.json` for vision-related k
 | `/v1/messages/count_tokens` | POST | Count tokens for a messages request |
 
 This endpoint allows using the server as a backend for tools that speak the Anthropic API, such as Claude Code. It supports thinking blocks, tool use, streaming, and prompt caching (KV cache reuse across requests).
+
+### Observability
+
+| Endpoint | Method | Description |
+|---|---|---|
+| `/metrics` | GET | Prometheus metrics (request counts, token throughput, latency) |
 
 ## Configuration
 
@@ -555,7 +566,7 @@ The legacy names for all nine fields above are **no longer honored** — the ser
 
 ### Flash-MoE
 
-For Mixture-of-Experts models (DeepSeek-V3, Kimi-K2.5, Qwen3-Next MoE, MiniMax, gpt-oss), Flash-MoE keeps only the router in RAM and loads routed experts from SSD on demand:
+For Mixture-of-Experts models (DeepSeek-V3, Kimi-K2.5, Qwen3-MoE incl. Qwen3-235B-A22B, Qwen3-Next MoE, MiniMax, gpt-oss), Flash-MoE keeps only the router in RAM and loads routed experts from SSD on demand:
 
 ```bash
 OLMLX_FLASH_MOE=true olmlx serve
@@ -755,12 +766,23 @@ If the template doesn't support tools, olmlx falls back to injecting tool descri
 
 | Model Family | Chat | Tools | Thinking | Vision |
 |---|---|---|---|---|
-| Qwen 2.5/3/3.5 | ✓ | ✓ | ✓ (Qwen 3+) | ✗ |
+| Qwen 2.5 | ✓ | ✓ | ✗ | ✗ |
+| Qwen 3 / 3.5 / 3.6 | ✓ | ✓ | ✓ | ✓ (3.5 VLM) |
 | Llama 3.1/3.2 | ✓ | ✓ | ✗ | ✗ |
-| Mistral/Nemo | ✓ | ✓ | ✗ | ✗ |
-| DeepSeek | ✓ | ✓ | ✗ | ✗ |
-| Gemma 2 | ✓ | ✗ | ✗ | ✗ |
+| Mistral / Nemo | ✓ | ✓ | ✗ | ✗ |
+| DeepSeek (V3 / V3.2) | ✓ | ✓ | ✗ | ✗ |
+| GLM-4.5 / 4.6 | ✓ | ✓ | ✗ | ✗ |
+| MiniMax | ✓ | ✓ | ✗ | ✗ |
+| gpt-oss (Harmony) | ✓ | ✓ | ✓ | ✗ |
+| Gemma 2 / 3 | ✓ | ✗ | ✗ | ✗ |
+| Gemma 4 | ✓ | ✓ | ✓ | ✓ |
+| Step-3.5 | ✓ | ✓ | ✗ | ✗ |
 | Phi 3 | ✓ | ✗ | ✗ | ✗ |
-| LLava-based | ✓ | ✗ | ✗ | ✓ |
+| LLaVA / other mlx-vlm VLMs | ✓ | ✗ | ✗ | ✓ |
+
+Notes:
+- **Tools** cover the native tool-call formats parsed by `engine/tool_parser.py` — Qwen `<tool_call>`/XML, Mistral `[TOOL_CALLS]`, Llama `<|python_tag|>`, DeepSeek block, MiniMax `<invoke>`, GLM `<arg_key>/<arg_value>`, gpt-oss Harmony `commentary` channel, and Gemma 4 — plus a bare-JSON fallback. Whether a given checkpoint emits them still depends on its chat template.
+- **Thinking** is exposed for templates with a `<think>` channel (Qwen 3+), the gpt-oss Harmony `analysis` channel, and Gemma 4's `<|channel>thought` state machine.
+- **Vision** is auto-detected from `config.json` (`vision_config`, `vision_tower`, …) and routed through mlx-vlm. Gemma 4 (VLM + tools + images) and LLaVA are verified end-to-end; other mlx-vlm architectures load through the same path. Qwen 3.5 text towers with `linear_attention` deliberately route through mlx-lm instead (the mlx-vlm path crashes on that hybrid).
 
 Check a model's chat template on HuggingFace to verify feature support.
