@@ -99,6 +99,29 @@ class TurboQuantKVCache(_BaseCache):
                 f"across update_and_fetch calls."
             )
 
+        # Resumed from a released (dequant-shed) state: rebuild the
+        # full-precision side buffers from the packed indices+norms before any
+        # path below touches them. Both the resize truncation/concat
+        # (which assert the buffer is live) and the ``[prev:offset]`` splice
+        # write into an existing buffer of matching capacity, so the rebuild
+        # must happen first. ``_dequant_dtype`` was preserved by
+        # ``release_dequant_buffers``, so the rebuilt dtype matches the lock.
+        if self._key_indices is not None and self._key_dequant is None:
+            self._key_dequant = turboquant_dequantize(
+                self._key_indices,
+                self._key_norms,
+                self.rotation_key,
+                self._bits,
+                dtype=self._dequant_dtype,
+            )
+            self._value_dequant = turboquant_dequantize(
+                self._value_indices,
+                self._value_norms,
+                self.rotation_value,
+                self._bits,
+                dtype=self._dequant_dtype,
+            )
+
         # Quantize incoming tokens (returns bit-packed indices)
         k_idx, k_nrm = turboquant_quantize(keys, self.rotation_key, self._bits)
         v_idx, v_nrm = turboquant_quantize(values, self.rotation_value, self._bits)
@@ -231,6 +254,23 @@ class TurboQuantKVCache(_BaseCache):
             "Disable disk cache offload when using TurboQuant."
         )
 
+    def release_dequant_buffers(self) -> None:
+        """Drop the dequantized side buffers, keeping the packed state.
+
+        The side buffers (``_key_dequant`` / ``_value_dequant``) are
+        recoverable from the packed indices+norms — the next
+        ``update_and_fetch`` rebuilds them lazily. Shedding them when a cache
+        goes idle in the prompt-cache store frees the full-precision copy
+        (~4-8x the packed footprint at 4-bit) from RAM without losing any
+        committed tokens, so the RAM-budget accounting reflects the packed
+        (persistable) size rather than the transient acceleration buffer.
+
+        ``_dequant_dtype`` is deliberately retained so the rebuild reuses the
+        locked dtype (a resumed prompt continues in the same dtype).
+        """
+        self._key_dequant = None
+        self._value_dequant = None
+
     def is_trimmable(self):
         return True
 
@@ -255,8 +295,12 @@ class TurboQuantKVCache(_BaseCache):
                 self._key_norms = self._key_norms[..., :new_capacity, :]
                 self._value_indices = self._value_indices[..., :new_capacity, :]
                 self._value_norms = self._value_norms[..., :new_capacity, :]
-                self._key_dequant = self._key_dequant[..., :new_capacity, :]
-                self._value_dequant = self._value_dequant[..., :new_capacity, :]
+                # The dequant side buffers may be absent (shed for storage via
+                # release_dequant_buffers); the next update_and_fetch rebuilds
+                # them from the packed indices+norms, so skip when None.
+                if self._key_dequant is not None:
+                    self._key_dequant = self._key_dequant[..., :new_capacity, :]
+                    self._value_dequant = self._value_dequant[..., :new_capacity, :]
         return n
 
     def make_mask(self, *args, **kwargs):
