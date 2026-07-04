@@ -2423,6 +2423,28 @@ async def _kv_cache_preflight_check(
     return result
 
 
+def _shed_transient_cache_buffers(prompt_cache: list[Any] | None) -> None:
+    """Free recoverable, transient side buffers before a cache goes idle in
+    the store.
+
+    TurboQuant KV caches hold a full-precision dequantised side buffer
+    (~4-8x the packed footprint at 4-bit) that is recoverable from the packed
+    indices+norms and rebuilt lazily on the next ``update_and_fetch``.  Left
+    resident, it makes the RAM-budget accounting (``_estimate_state_bytes``)
+    see a quantised cache at ~8x its persistable size, so a single long
+    conversation trips the soft-eviction guard and is silently dropped around
+    ~30k tokens — forcing a full re-prefill every subsequent turn.  Shedding
+    it here keeps the stored footprint honest (packed size only).  Duck-typed:
+    only caches exposing ``release_dequant_buffers`` are affected.
+    """
+    if prompt_cache is None:
+        return
+    for layer in prompt_cache:
+        release = getattr(layer, "release_dequant_buffers", None)
+        if callable(release):
+            release()
+
+
 async def _store_prompt_cache_after_generation(
     lm: LoadedModel,
     gen_kwargs: dict,
@@ -2583,6 +2605,7 @@ async def _store_prompt_cache_after_generation(
             # next request's pre-generation path will sync before
             # its own allocation.
         else:
+            _shed_transient_cache_buffers(prompt_cache)
             evicted = await lm.prompt_cache_store.async_set(
                 cache_id,
                 CachedPromptState(tokens=stored_tokens, cache=prompt_cache),
@@ -2599,6 +2622,7 @@ async def _store_prompt_cache_after_generation(
                 max_cache_tokens,
             )
     else:
+        _shed_transient_cache_buffers(prompt_cache)
         evicted = await lm.prompt_cache_store.async_set(
             cache_id,
             CachedPromptState(

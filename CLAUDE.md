@@ -59,6 +59,8 @@ olmlx/
 
 **TurboQuant deepcopy** — `TurboQuantKVCache.__deepcopy__` shares `mx.Dtype` by reference (pickle rejects it) and eager-evals private dequant side buffers — they're not exposed by `flatten_cache_state` and would leave a Metal-stream-bound lazy graph that crashes on cross-thread reuse.
 
+**TurboQuant dequant-buffer shed-on-store** — `TurboQuantKVCache` holds a full-precision dequant side buffer (`_key_dequant`/`_value_dequant`, ~4–8x the packed footprint at 4-bit). `_estimate_state_bytes` walks `__dict__` and counts it, so an unshed cache trips the `prompt_cache_ram_budget_gb` soft-eviction at only ~30k tokens — and with disk spill off (default) the entry is silently dropped, forcing a full re-prefill every turn after. `_shed_transient_cache_buffers` (inference.py) calls `release_dequant_buffers()` right before `async_set` in `_store_prompt_cache_after_generation`; `update_and_fetch` rebuilds the buffers lazily from packed indices+norms on resume (so the rebuild must run *before* the resize/splice paths), and `trim`'s buffer-shrink branch guards against the shed (`None`) buffers. Only TurboQuant is affected — Spectral dequantizes to locals, Shard dequantizes on read.
+
 **Hybrid VLM routing** — VLMs whose `text_config.layer_types` contains `"linear_attention"` (Qwen3.5, Qwen3_5_moe) route through mlx-lm, not mlx-vlm. The mlx-vlm path crashes with a Metal stream error on text inference.
 
 **Distributed: eval before first forward** — After `model.shard()`, must `mx.eval(model.parameters())` on every rank before any forward pass. The combined lazy materialization + `all_sum` Metal command buffer times out (~10s GPU timeout) on 32B+ models.

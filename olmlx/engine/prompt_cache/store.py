@@ -52,14 +52,18 @@ def _estimate_state_bytes(state: CachedPromptState) -> int:
     importantly ``ArraysCache`` (used by Qwen3.5 / Nemotron-H / Jamba
     hybrid layers), which would otherwise report 0 bytes and let the RAM
     budget overrun silently for the model families the checkpoint path
-    primarily targets, and ``TurboQuantKVCache`` / ``SpectralQuantKVCache``,
-    which hold full-precision dequantisation side buffers
-    (``_key_dequant`` / ``_value_dequant``) that ``.state`` deliberately
-    excludes (they are recoverable from the packed indices + norms) — a
-    state-only walk would undercount their snapshot RAM by ~8x at 4-bit
-    and ~16x at 2-bit, defeating the ``ram_budget_bytes`` soft-eviction
-    guard. Walking ``__dict__`` plus the ``.state`` view (deduped by
-    ``id``) covers both surfaces.
+    primarily targets. Walking ``__dict__`` plus the ``.state`` view
+    (deduped by ``id``) covers both surfaces.
+
+    ``TurboQuantKVCache`` holds a full-precision dequantisation side buffer
+    (``_key_dequant`` / ``_value_dequant``, ~4-8x the packed footprint at
+    4-bit) that ``.state`` deliberately excludes. It is shed via
+    ``release_dequant_buffers`` before the cache is stored (see
+    ``_shed_transient_cache_buffers`` in inference.py), so a stored entry
+    walks to its packed size here and the ``ram_budget_bytes`` soft-eviction
+    guard reflects the persistable footprint rather than the transient
+    buffer. A live cache that still carries the buffer is counted honestly
+    by the ``__dict__`` walk regardless.
 
     Unknown layer types still contribute 0, but a layer whose class
     matches *none* of the sizing strategies (no ``.keys``/``.values``
