@@ -43,6 +43,30 @@ _UNSIZED_LAYER_CLASSES: set[type] = set()
 _MISSING: Any = object()
 
 
+def _shed_transient_buffers(state: CachedPromptState) -> None:
+    """Free recoverable, transient side buffers before a cache is stored.
+
+    Called from ``_set_in_memory`` — the single insertion chokepoint for every
+    store path (``set`` / ``async_set`` / ``insert_checkpoint`` / disk restore
+    / ``takeover``), so the "stored caches carry no transient buffer" invariant
+    holds universally rather than at individual call sites.
+
+    Only ``TurboQuantKVCache`` is affected: it holds a full-precision dequant
+    side buffer (~4-8x the packed footprint at 4-bit) that is recoverable from
+    the packed indices+norms and rebuilt lazily on the next
+    ``update_and_fetch``. Left resident, it makes ``_estimate_state_bytes`` see
+    a quantised cache at ~8x its persistable size, so a single long
+    conversation trips the ``ram_budget_bytes`` soft-eviction and is silently
+    dropped around ~30k tokens — forcing a full re-prefill every turn after.
+    Duck-typed: layers without ``release_dequant_buffers`` (plain KVCache,
+    Spectral, Shard, ArraysCache, non-cache placeholders) are skipped.
+    """
+    for layer in state.cache or ():
+        release = getattr(layer, "release_dequant_buffers", None)
+        if callable(release):
+            release()
+
+
 def _estimate_state_bytes(state: CachedPromptState) -> int:
     """Best-effort byte estimate of a cached state.
 
@@ -58,12 +82,12 @@ def _estimate_state_bytes(state: CachedPromptState) -> int:
     ``TurboQuantKVCache`` holds a full-precision dequantisation side buffer
     (``_key_dequant`` / ``_value_dequant``, ~4-8x the packed footprint at
     4-bit) that ``.state`` deliberately excludes. It is shed via
-    ``release_dequant_buffers`` before the cache is stored (see
-    ``_shed_transient_cache_buffers`` in inference.py), so a stored entry
-    walks to its packed size here and the ``ram_budget_bytes`` soft-eviction
-    guard reflects the persistable footprint rather than the transient
-    buffer. A live cache that still carries the buffer is counted honestly
-    by the ``__dict__`` walk regardless.
+    ``release_dequant_buffers`` at the store insertion chokepoint (see
+    ``_shed_transient_buffers``, called from ``_set_in_memory``), so a stored
+    entry walks to its packed size here and the ``ram_budget_bytes``
+    soft-eviction guard reflects the persistable footprint rather than the
+    transient buffer. A live cache that still carries the buffer is counted
+    honestly by the ``__dict__`` walk regardless.
 
     Unknown layer types still contribute 0, but a layer whose class
     matches *none* of the sizing strategies (no ``.keys``/``.values``
@@ -434,6 +458,7 @@ class PromptCacheStore:
         # future caller that bypasses the public surface still trips the
         # contract here (#463).
         assert_loop_thread("PromptCacheStore._set_in_memory")
+        _shed_transient_buffers(state)
         if cache_id in self._entries:
             self._entries.move_to_end(cache_id)
             old = self._entries[cache_id]

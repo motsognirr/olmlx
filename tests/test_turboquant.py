@@ -352,29 +352,31 @@ class TestTurboQuantKVCache:
         assert mx.allclose(got_k, ref_k, atol=1e-5)
         assert mx.allclose(got_v, ref_v, atol=1e-5)
 
-    def test_shed_transient_buffers_drops_estimated_bytes(self):
-        """After the store-side shed, a TurboQuant cache's RAM-budget estimate
-        falls to its packed footprint (the dequant side buffer is gone)."""
-        from olmlx.engine.inference import _shed_transient_cache_buffers
-        from olmlx.engine.model_manager import CachedPromptState
+    def test_store_insert_sheds_dequant_buffers(self):
+        """Storing a TurboQuant cache sheds its dequant buffers at the store
+        chokepoint, so its RAM-budget footprint reflects the packed size —
+        for EVERY store path, not just the post-generation one."""
+        from olmlx.engine.model_manager import CachedPromptState, PromptCacheStore
         from olmlx.engine.prompt_cache.store import _estimate_state_bytes
 
         cache = self._make_cache(bits=4, head_dim=128)
         cache.update_and_fetch(
             mx.random.normal((1, 8, 512, 128)), mx.random.normal((1, 8, 512, 128))
         )
-        state = CachedPromptState(tokens=list(range(512)), cache=[cache])
-        before = _estimate_state_bytes(state)
+        before = _estimate_state_bytes(CachedPromptState(tokens=[], cache=[cache]))
 
-        _shed_transient_cache_buffers([cache])
-        after = _estimate_state_bytes(state)
+        store = PromptCacheStore(max_slots=4)
+        store.set("x", CachedPromptState(tokens=list(range(512)), cache=[cache]))
 
+        # Shed on insert: the full-precision side buffer is gone...
         assert cache._key_dequant is None
-        # The full-precision side buffer dominates at 4-bit, so shedding it must
-        # cut the estimate substantially (well under half).
-        assert after < before * 0.5
-        # ...and the cache remains usable (rebuilds on the next update).
-        k_out, _ = cache.update_and_fetch(
+        assert cache._value_dequant is None
+        # ...the store's byte accounting reflects the packed size (well under
+        # half the unshed estimate, which the dequant buffer dominated)...
+        assert store.metrics.bytes_in_ram < before * 0.5
+        # ...and the retrieved cache still generates (rebuilds on next update).
+        got = store.get("x")
+        k_out, _ = got.cache[0].update_and_fetch(
             mx.random.normal((1, 8, 1, 128)), mx.random.normal((1, 8, 1, 128))
         )
         assert k_out.shape == (1, 8, 513, 128)
