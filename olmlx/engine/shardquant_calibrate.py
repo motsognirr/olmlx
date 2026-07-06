@@ -36,8 +36,7 @@ from olmlx.engine.shardquant import (
 )
 from olmlx.engine.spectralquant import fit_codebook
 from olmlx.engine.spectralquant_calibrate import (
-    _load_calibration_model,
-    collect_kv_vectors,
+    _load_and_collect_kv,
     compute_covariance,
     eigendecompose,
 )
@@ -189,9 +188,6 @@ def calibrate_model_shard(
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    if progress_callback:
-        progress_callback("Loading model", 0.0)
-
     (
         model,
         tokenizer,
@@ -199,43 +195,14 @@ def calibrate_model_shard(
         head_dim,
         n_kv_heads,
         num_layers,
-        store,
-    ) = _load_calibration_model(model_path)
-
-    # Everything from here through KV collection runs under the store's
-    # lifetime — including the c4 download in _get_c4_calibration_data, which
-    # can raise on a network error — so the Flash-MoE store is always closed.
-    try:
-        if progress_callback:
-            progress_callback("Generating calibration data", 0.05)
-
-        from olmlx.engine.flash.prepare import (
-            _get_c4_calibration_data,
-            _get_calibration_data,
-        )
-
-        if calibration_dataset == "synthetic":
-            texts = _get_calibration_data(num_samples)
-        else:
-            texts = _get_c4_calibration_data(num_samples)
-
-        if progress_callback:
-            progress_callback("Collecting KV vectors", 0.1)
-
-        kv_collectors = collect_kv_vectors(
-            model,
-            tokenizer,
-            inner,
-            num_layers=num_layers,
-            n_kv_heads=n_kv_heads,
-            head_dim=head_dim,
-            texts=texts,
-            max_tokens_per_head=max_tokens_per_head,
-            progress_callback=progress_callback,
-        )
-    finally:
-        if store is not None:
-            store.close()
+        kv_collectors,
+    ) = _load_and_collect_kv(
+        model_path,
+        num_samples=num_samples,
+        calibration_dataset=calibration_dataset,
+        max_tokens_per_head=max_tokens_per_head,
+        progress_callback=progress_callback,
+    )
 
     if progress_callback:
         progress_callback("Analyzing", 0.5)

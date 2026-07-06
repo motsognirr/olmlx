@@ -767,7 +767,7 @@ def warn_legacy_flash_env() -> None:
     Lives in ``olmlx.config`` so the distributed-worker entry point can reuse
     it without importing ``olmlx.cli`` (and its argparse/uvicorn baggage).
     """
-    dotenv_keys = _legacy_values_in_dotenv(tuple(PROMOTED_FLASH_ENV_RENAMES))
+    dotenv_keys = _legacy_names_in_dotenv(tuple(PROMOTED_FLASH_ENV_RENAMES))
     detected = sorted(
         old
         for old in PROMOTED_FLASH_ENV_RENAMES
@@ -787,41 +787,28 @@ def warn_legacy_flash_env() -> None:
     )
 
 
-def _legacy_values_in_dotenv(names: tuple[str, ...]) -> dict[str, str]:
-    """Return ``{name: value}`` for any *names* found in the project ``.env`` file."""
+def _legacy_names_in_dotenv(names: tuple[str, ...]) -> set[str]:
+    """Return the subset of *names* present as keys in the project ``.env``.
+
+    Key membership only — ``warn_legacy_flash_env`` warns on presence
+    regardless of value, so values are never parsed.
+    """
     dotenv_path = Path(".env")
     try:
         text = dotenv_path.read_text()
     except (FileNotFoundError, OSError):
-        return {}
-    found: dict[str, str] = {}
+        return set()
+    found: set[str] = set()
     legacy = set(names)
     for raw_line in text.splitlines():
         line = raw_line.strip()
-        if not line or line.startswith("#"):
+        if not line or line.startswith("#") or "=" not in line:
             continue
-        if "=" not in line:
-            continue
-        key, _, value = line.partition("=")
-        key = key.strip()
+        key = line.partition("=")[0].strip()
         if key.startswith("export "):
             key = key[len("export ") :].strip()
-        value = value.strip()
-        # Quoted values keep ``#`` literal; unquoted values strip trailing
-        # inline comments. Match opening and closing quote characters to
-        # avoid treating ``'foo"`` (mismatched) as quoted.
-        is_paired_quoted = len(value) >= 2 and (
-            (value.startswith('"') and value.endswith('"'))
-            or (value.startswith("'") and value.endswith("'"))
-        )
-        if not is_paired_quoted:
-            comment_idx = value.find("#")
-            if comment_idx != -1:
-                value = value[:comment_idx].rstrip()
-        if is_paired_quoted:
-            value = value[1:-1]
-        if key in legacy and key not in found:
-            found[key] = value
+        if key in legacy:
+            found.add(key)
     return found
 
 

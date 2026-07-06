@@ -3232,12 +3232,11 @@ class ModelManager(SpeculativeLoaderMixin):
         """Load a model in Flash-MoE mode.
 
         1. Load model with lazy=True to avoid materializing expert weights
-        2. Create FlashMoeWeightStore
-        3. Wrap model with FlashMoeModelWrapper (replaces SwitchGLU)
-        4. Eval only non-expert params
+        2. Wrap via the shared ``wrap_flash_moe`` kernel (weight store +
+           FlashMoeModelWrapper replacing SwitchGLU + eval of only the
+           non-expert params)
         """
-        from olmlx.engine.flash.flash_moe_model import FlashMoeModelWrapper
-        from olmlx.engine.flash.moe_weight_store import FlashMoeWeightStore
+        from olmlx.engine.flash.flash_moe_model import wrap_flash_moe
 
         import mlx_lm
 
@@ -3255,30 +3254,14 @@ class ModelManager(SpeculativeLoaderMixin):
             is_vlm = True
         caps = detect_caps(tokenizer)
 
-        # Read flash_moe_config for architecture info
-        moe_config = json.loads((flash_moe_dir / "flash_moe_config.json").read_text())
-
-        store = FlashMoeWeightStore(
+        # The store is not returned: unload recovers it from the wrapper's
+        # `_weight_store` attribute.
+        wrapped, _ = wrap_flash_moe(
+            model,
             flash_moe_dir,
-            num_io_threads=flash_moe_config.io_threads,
+            io_threads=flash_moe_config.io_threads,
             cache_budget_experts=flash_moe_config.cache_budget_experts,
         )
-
-        try:
-            wrapped = FlashMoeModelWrapper(
-                model,
-                store,
-                moe_layer_indices=moe_config["moe_layer_indices"],
-                hidden_size=moe_config["hidden_size"],
-                intermediate_size=moe_config["intermediate_size"],
-                num_experts=moe_config["num_experts"],
-                num_experts_per_tok=moe_config["num_experts_per_tok"],
-            )
-            # Materialize only non-expert weights
-            mx.eval(wrapped.parameters())
-        except Exception:
-            store.close()
-            raise
 
         return wrapped, tokenizer, is_vlm, caps
 

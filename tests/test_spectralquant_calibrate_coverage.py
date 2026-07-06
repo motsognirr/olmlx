@@ -497,6 +497,48 @@ def test_calibrate_model_end_to_end(tmp_path):
     assert progress[-1] == ("Done", 1.0)
 
 
+def test_collect_kv_vectors_stops_once_no_head_advances():
+    """Once every head hit max_tokens_per_head, further forwards append
+    nothing — on the Flash-MoE calibration path each one re-streams experts
+    from SSD, so the loop must stop instead of running all samples.
+
+    With 10-token texts and max_tokens_per_head=20, heads saturate after 2
+    samples; the 3rd forward advances no counter and the loop exits.
+    """
+    head_dim, num_layers, n_kv_heads = 8, 2, 2
+    backbone = _FakeBackbone(num_layers, n_kv_heads, head_dim)
+    model = _FakeModel(backbone, head_dim)
+    tokenizer = MagicMock()
+    texts = ["one two three four five six seven eight nine ten"] * 10
+
+    def cache_factory(_owner):
+        return [KVCache() for _ in range(num_layers)]
+
+    with (
+        patch(
+            "olmlx.engine.flash.prepare._encode_tokens",
+            side_effect=lambda tok, text: list(range(len(text.split()))),
+        ),
+        patch("mlx_lm.models.cache.make_prompt_cache", side_effect=cache_factory),
+    ):
+        collectors = sc.collect_kv_vectors(
+            model,
+            tokenizer,
+            backbone,
+            num_layers=num_layers,
+            n_kv_heads=n_kv_heads,
+            head_dim=head_dim,
+            texts=texts,
+            max_tokens_per_head=20,
+        )
+
+    # 2 collecting forwards + 1 that observes saturation — not all 10.
+    assert model.calls == 3
+    # The cap was still honored exactly.
+    total = sum(chunk.shape[0] for chunk in collectors[0][0]["key"])
+    assert total == 20
+
+
 def test_calibrate_model_raises_when_nothing_collected(tmp_path):
     head_dim = 8
     num_layers = 1
@@ -757,6 +799,7 @@ def test_load_calibration_model_uses_flash_when_bundle_present(tmp_path):
     fdir = tmp_path / "flash_moe"
     fdir.mkdir()
     (fdir / "flash_moe_layout.json").write_text("{}")
+    (fdir / "flash_moe_config.json").write_text("{}")
 
     sentinel_model = MagicMock()
     sentinel_model._backbone = _FakeBackbone(2, 2, 8)
@@ -779,6 +822,20 @@ def test_load_calibration_model_uses_flash_when_bundle_present(tmp_path):
     load_flash.assert_called_once()
     assert result[0] is sentinel_model
     assert result[6] is sentinel_store
+
+
+def test_load_calibration_model_incomplete_bundle_raises_clear_error(tmp_path):
+    """layout.json without config.json is an interrupted `olmlx flash prepare`
+    (the bundler writes the layout last, the config afterwards). Committing to
+    the flash path would die with a bare FileNotFoundError inside
+    load_flash_moe_model; falling back to a full load could OOM. Raise an
+    actionable error instead."""
+    fdir = tmp_path / "flash_moe"
+    fdir.mkdir()
+    (fdir / "flash_moe_layout.json").write_text("{}")
+
+    with pytest.raises(ValueError, match="flash prepare"):
+        sc._load_calibration_model(str(tmp_path))
 
 
 def test_load_calibration_model_full_load_when_no_bundle(tmp_path):
@@ -845,29 +902,14 @@ def test_calibrate_model_closes_store(tmp_path):
     spy_store.close.assert_called_once()
 
 
-def test_calibrate_model_closes_store_when_data_generation_fails(tmp_path):
-    """The store must close even if the c4 download raises before KV collection."""
+def test_calibrate_model_skips_load_when_data_generation_fails(tmp_path):
+    """Texts are fetched BEFORE the model load: they need nothing from the
+    model, and fetching first means a failing c4 download can never waste a
+    multi-GB load (nor open a Flash-MoE store it then has to unwind)."""
     from unittest.mock import MagicMock, patch
 
-    head_dim, num_layers, n_kv_heads = 8, 2, 2
-    backbone = _FakeBackbone(num_layers, n_kv_heads, head_dim)
-    model = _FakeModel(backbone, head_dim)
-    spy_store = MagicMock()
-
     with (
-        patch.object(
-            sc,
-            "_load_calibration_model",
-            return_value=(
-                model,
-                MagicMock(),
-                backbone,
-                head_dim,
-                n_kv_heads,
-                num_layers,
-                spy_store,
-            ),
-        ),
+        patch.object(sc, "_load_calibration_model", MagicMock()) as loader,
         patch(
             "olmlx.engine.flash.prepare._get_c4_calibration_data",
             side_effect=RuntimeError("network down"),
@@ -878,7 +920,51 @@ def test_calibrate_model_closes_store_when_data_generation_fails(tmp_path):
                 "fake/model", output_dir=tmp_path / "spectral", num_samples=2
             )
 
-    spy_store.close.assert_called_once()
+    loader.assert_not_called()
+
+
+def test_calibrate_model_fetches_texts_before_loading_model(tmp_path):
+    """Ordering contract: dataset fetch (network-bound, model-independent)
+    precedes the expensive model/store load in both calibrators."""
+    from unittest.mock import MagicMock, patch
+
+    head_dim, num_layers, n_kv_heads = 8, 2, 2
+    backbone = _FakeBackbone(num_layers, n_kv_heads, head_dim)
+    model = _FakeModel(backbone, head_dim)
+    tokenizer = MagicMock()
+    texts = ["one two three four five six seven eight nine ten"] * 2
+    order = []
+
+    def cache_factory(_owner):
+        return [KVCache() for _ in range(num_layers)]
+
+    def fake_texts(num_samples):
+        order.append("texts")
+        return texts
+
+    def fake_load(model_path):
+        order.append("load")
+        return (model, tokenizer, backbone, head_dim, n_kv_heads, num_layers, None)
+
+    patches = _patch_helpers(model, tokenizer, head_dim, texts, cache_factory)
+    patches.append(
+        patch(
+            "olmlx.engine.flash.prepare._get_c4_calibration_data",
+            side_effect=fake_texts,
+        )
+    )
+    patches.append(patch.object(sc, "_load_calibration_model", side_effect=fake_load))
+    for p in patches:
+        p.start()
+    try:
+        sc.calibrate_model(
+            "fake/model", output_dir=tmp_path / "spectral", num_samples=2
+        )
+    finally:
+        for p in patches:
+            p.stop()
+
+    assert order == ["texts", "load"]
 
 
 def test_calibrate_model_synthetic_dataset_branch(tmp_path):
@@ -928,6 +1014,7 @@ def test_load_calibration_model_closes_store_when_resolution_fails(tmp_path):
     fdir = tmp_path / "flash_moe"
     fdir.mkdir()
     (fdir / "flash_moe_layout.json").write_text("{}")
+    (fdir / "flash_moe_config.json").write_text("{}")
 
     spy_store = MagicMock()
     model = MagicMock()

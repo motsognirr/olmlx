@@ -257,27 +257,28 @@ class FlashMoeModelWrapper(nn.Module):
         return self._model.args
 
 
-def load_flash_moe_model(
-    load_path: str,
+def wrap_flash_moe(
+    model: Any,
     flash_moe_dir: Path | str,
     *,
-    cache_budget_experts: int,
     io_threads: int,
-) -> tuple[Any, Any, Any]:
-    """Load a model in Flash-MoE mode for offline use (e.g. KV-quant calibration).
+    cache_budget_experts: int,
+) -> tuple[Any, Any]:
+    """Wrap a lazily-loaded MoE model with SSD-streamed experts.
 
-    Mirrors ``model_manager._load_flash_moe_model``: lazy-load so routed expert
-    weights are never materialized, wrap with ``FlashMoeModelWrapper`` (experts
-    streamed from the SSD bundle), and eval only the non-expert params. Returns
-    ``(wrapped_model, tokenizer, store)``; the caller owns the store and must
-    close it. Raises if the bundle is present but cannot be loaded.
+    The kernel shared by the serving loader
+    (``ModelManager._load_flash_moe_model``) and the offline calibration
+    loader (``load_flash_moe_model``): read the bundle config, open the
+    weight store, replace MoE layers with streaming replacements, and eval
+    only the non-expert params. Closes the store and re-raises if wrapping
+    fails. Returns ``(wrapped_model, store)``; the caller owns the store.
     """
     import json
 
-    from olmlx.engine.flash.prepare import load_model_with_strict_fallback
+    # Call-time import so tests can patch the store on its home module.
+    from olmlx.engine.flash.moe_weight_store import FlashMoeWeightStore
 
     flash_moe_dir = Path(flash_moe_dir)
-    model, tokenizer = load_model_with_strict_fallback(load_path, lazy=True)
     moe_config = json.loads((flash_moe_dir / "flash_moe_config.json").read_text())
 
     store = FlashMoeWeightStore(
@@ -295,10 +296,48 @@ def load_flash_moe_model(
             num_experts=moe_config["num_experts"],
             num_experts_per_tok=moe_config["num_experts_per_tok"],
         )
+        # Materialize only non-expert weights.
         mx.eval(wrapped.parameters())
     except Exception:
         store.close()
         raise
+    return wrapped, store
+
+
+def load_flash_moe_model(
+    load_path: str,
+    flash_moe_dir: Path | str,
+    *,
+    cache_budget_experts: int,
+    io_threads: int,
+) -> tuple[Any, Any, Any]:
+    """Load a model in Flash-MoE mode for offline use (e.g. KV-quant calibration).
+
+    Lazy-load so routed expert weights are never materialized, then
+    ``wrap_flash_moe`` — the same kernel the serving loader uses. Returns
+    ``(wrapped_model, tokenizer, store)``; the caller owns the store and must
+    close it. Raises if the bundle is present but cannot be loaded.
+    """
+    from olmlx.engine.flash.prepare import load_model_with_strict_fallback
+
+    try:
+        model, tokenizer = load_model_with_strict_fallback(load_path, lazy=True)
+    except ValueError:
+        # VLM-shaped architectures mlx-lm rejects (Gemma4-class, Kimi-K2.5)
+        # are served via the same fallback in the manager's Flash-MoE loader;
+        # without it here, bundle-bearing VLMs could not be calibrated.
+        import mlx_vlm
+
+        model, processor = mlx_vlm.load(load_path, lazy=True)
+        tokenizer = (
+            processor.tokenizer if hasattr(processor, "tokenizer") else processor
+        )
+    wrapped, store = wrap_flash_moe(
+        model,
+        flash_moe_dir,
+        io_threads=io_threads,
+        cache_budget_experts=cache_budget_experts,
+    )
     return wrapped, tokenizer, store
 
 

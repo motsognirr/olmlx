@@ -98,20 +98,23 @@ class SpectralRotation:
         return x @ self.V
 
 
-#: Bit-widths the spectral KV cache can actually pack/unpack — these are the
-#: only cases ``turboquant.pack_indices`` / ``unpack_indices`` implement. A
-#: width outside this set (e.g. 5 or 1, which ``allocate_bits`` used to emit for
-#: low-``d_eff`` heads) crashes decode with ``ValueError: Unsupported bits=N``.
-_PACKABLE_BITS: tuple[int, ...] = (2, 4)
+#: Bit-widths the spectral KV cache can actually pack/unpack — the cases this
+#: module's own ``pack_indices`` / ``unpack_indices`` implement (turboquant's
+#: {2, 4} plus the 1- and 8-bit extensions above). A width outside this set
+#: (e.g. 5, which ``allocate_bits`` used to emit for low-``d_eff`` heads)
+#: crashes decode with ``ValueError: Unsupported bits=N``.
+_PACKABLE_BITS: tuple[int, ...] = (1, 2, 4, 8)
 
 
 def allocate_bits(d_eff: int, head_dim: int, avg_bits: int) -> tuple[int, int]:
     """Find (b_high, b_low) minimizing budget slack.
 
     Solves: d_eff * b_high + (head_dim - d_eff) * b_low ≈ head_dim * avg_bits
-    Subject to: b_high >= b_low, both drawn from ``_PACKABLE_BITS`` ({2, 4}) —
-    the only widths the spectral KV cache can pack. Mixed widths outside this
-    set would otherwise crash at decode.
+    Subject to: b_high >= b_low, both drawn from ``_PACKABLE_BITS``
+    ({1, 2, 4, 8}) — the only widths the spectral KV cache can pack. Widths
+    outside this set would crash at decode. Ties on slack go to the pair
+    found first, i.e. the largest ``b_high``, so a slack-0 non-uniform split
+    beats the always-slack-0 uniform pair when the budget allows it.
 
     Returns:
         (b_high, b_low): bits for semantic and tail regimes.

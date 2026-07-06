@@ -2633,3 +2633,55 @@ class TestPullWithDraft:
         mock_store.register_speculative_draft.assert_called_once_with(
             "org/Big-Model:q4", "org/Big-Model", entry
         )
+
+
+class TestFlashMoeActivationInstruction:
+    """The activation command printed by flash prepare / flash info must use
+    the honored env name.
+
+    Regression: after the legacy OLMLX_EXPERIMENTAL_FLASH* removal, both
+    sites still printed the dead OLMLX_EXPERIMENTAL_FLASH_MOE name —
+    following the printed command starts serve with flash_moe disabled and
+    full-loads the model.
+    """
+
+    def _write_bundle(self, tmp_path):
+        flash_moe_dir = tmp_path / "flash_moe"
+        flash_moe_dir.mkdir()
+        (flash_moe_dir / "flash_moe_config.json").write_text(
+            json.dumps(
+                {
+                    "hidden_size": 8,
+                    "intermediate_size": 16,
+                    "num_experts": 4,
+                    "num_experts_per_tok": 2,
+                    "num_moe_layers": 1,
+                    "prepared_at": "2026-01-01",
+                }
+            )
+        )
+        return flash_moe_dir
+
+    def test_flash_moe_info_prints_honored_env_name(self, tmp_path, capsys):
+        from olmlx.cli import _show_flash_moe_info
+
+        _show_flash_moe_info("some-model", self._write_bundle(tmp_path))
+
+        out = capsys.readouterr().out
+        assert "OLMLX_FLASH_MOE=true olmlx serve" in out
+        assert "OLMLX_EXPERIMENTAL_FLASH_MOE" not in out
+
+    def test_flash_moe_prepare_prints_honored_env_name(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        from olmlx.cli import _cmd_flash_moe_prepare
+
+        monkeypatch.setattr(
+            "olmlx.engine.flash.moe_prepare.prepare_moe_for_flash",
+            lambda model_path, progress_callback: tmp_path / "flash_moe",
+        )
+        _cmd_flash_moe_prepare(MagicMock(), str(tmp_path))
+
+        out = capsys.readouterr().out
+        assert "OLMLX_FLASH_MOE=true olmlx serve" in out
+        assert "OLMLX_EXPERIMENTAL_FLASH_MOE" not in out
