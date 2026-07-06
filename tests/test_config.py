@@ -708,3 +708,34 @@ class TestWarnLegacyFlashEnv:
             warn_legacy_flash_env()
 
         assert not any(r.levelno >= logging.WARNING for r in caplog.records)
+
+
+class TestLegacyNamesInDotenv:
+    """_legacy_names_in_dotenv returns the set of legacy names present in
+    .env — key membership only. warn_legacy_flash_env never reads values
+    (it warns on presence regardless of value), so the helper does not
+    parse them."""
+
+    def test_returns_set_of_present_names(self, monkeypatch, tmp_path):
+        from olmlx.config import _legacy_names_in_dotenv
+
+        monkeypatch.chdir(tmp_path)
+        (tmp_path / ".env").write_text(
+            "# comment\n"
+            "\n"
+            "OLMLX_EXPERIMENTAL_FLASH=true\n"
+            "export OLMLX_EXPERIMENTAL_FLASH_MOE=false  # inline comment\n"
+            "not-an-assignment\n"
+            "OLMLX_FLASH_PREFETCH=true\n"
+        )
+
+        names = _legacy_names_in_dotenv(
+            ("OLMLX_EXPERIMENTAL_FLASH", "OLMLX_EXPERIMENTAL_FLASH_MOE")
+        )
+        assert names == {"OLMLX_EXPERIMENTAL_FLASH", "OLMLX_EXPERIMENTAL_FLASH_MOE"}
+
+    def test_empty_when_no_dotenv(self, monkeypatch, tmp_path):
+        from olmlx.config import _legacy_names_in_dotenv
+
+        monkeypatch.chdir(tmp_path)
+        assert _legacy_names_in_dotenv(("OLMLX_EXPERIMENTAL_FLASH",)) == set()
