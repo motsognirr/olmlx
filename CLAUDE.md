@@ -15,7 +15,7 @@ Single-user, localhost-only inference server:
 olmlx/
 ├── app.py              # FastAPI app factory, middleware, router registration
 ├── config.py           # Settings (pydantic-settings, OLMLX_ env prefix)
-├── cli.py              # CLI subcommands (serve, chat, service, models, config, dflash, eagle, flash, spectral, shard)
+├── cli.py              # CLI subcommands (serve, chat, service, models, config, dflash, eagle, flash, spectral, shard, bench)
 ├── chat/               # In-process terminal chat + MCP agent loop
 │   └── voice/          # Push-to-talk STT (Whisper) + Kokoro TTS
 ├── engine/
@@ -28,7 +28,7 @@ olmlx/
 │   ├── proxy_tuning.py # Decode-time logit arithmetic (base + α·(expert−antiexpert))
 │   ├── grammar.py      # xgrammar JSON-mode / JSON-Schema logits processor
 │   ├── chat_templating.py
-│   ├── tool_parser.py  # Qwen/Mistral/Llama/DeepSeek/MiniMax/bare-JSON
+│   ├── tool_parser.py  # Qwen/GLM/Mistral/Llama/DeepSeek/MiniMax/bare-JSON
 │   ├── template_caps.py
 │   ├── prompt_cache/   # cache_id LRU + radix prefix index + disk spill
 │   ├── turboquant*.py / spectralquant*.py / shardquant*.py
@@ -58,6 +58,8 @@ olmlx/
 **Grammar tokenizer identity** — CPython recycles `id()` addresses; each grammar cache entry carries a `weakref` to its tokenizer and validates referent identity before serving. A stale entry with a recycled id would serve a wrong-vocabulary grammar. `drop_for_tokenizer` in `_close_loaded_model` runs **first** so no other close-step failure can skip it.
 
 **TurboQuant deepcopy** — `TurboQuantKVCache.__deepcopy__` shares `mx.Dtype` by reference (pickle rejects it) and eager-evals private dequant side buffers — they're not exposed by `flatten_cache_state` and would leave a Metal-stream-bound lazy graph that crashes on cross-thread reuse.
+
+**TurboQuant dequant-buffer shed-on-store** — `TurboQuantKVCache` holds a full-precision dequant side buffer (`_key_dequant`/`_value_dequant`, ~4–8x the packed footprint at 4-bit). `_estimate_state_bytes` walks `__dict__` and counts it, so an unshed cache trips the `prompt_cache_ram_budget_gb` soft-eviction at only ~30k tokens — and with disk spill off (default) the entry is silently dropped, forcing a full re-prefill every turn after. `_shed_transient_buffers` (store.py) calls `release_dequant_buffers()` from `_set_in_memory` — the single insertion chokepoint for **every** store path (`async_set`/`insert_checkpoint`/disk-restore/`takeover`/preflight), so the shed can't be missed at an individual call site. `update_and_fetch` rebuilds the buffers lazily from packed indices+norms on resume (so the rebuild must run *before* the resize/splice paths), and `trim`'s buffer-shrink branch guards against the shed (`None`) buffers. Only TurboQuant is affected — Spectral dequantizes to locals, Shard dequantizes on read.
 
 **Hybrid VLM routing** — VLMs whose `text_config.layer_types` contains `"linear_attention"` (Qwen3.5, Qwen3_5_moe) route through mlx-lm, not mlx-vlm. The mlx-vlm path crashes with a Metal stream error on text inference.
 

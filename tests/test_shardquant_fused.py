@@ -303,7 +303,7 @@ class TestConfig:
 
 class TestEndToEndDecodeParity:
     @pytest.mark.parametrize("backend", ["ref", "auto"])
-    def test_multi_step_decode_matches_tier1(self, backend):
+    def test_multi_step_decode_matches_tier1(self, backend, request):
         """Drive 24 decode steps on forked caches; fused output must track
         the Tier-1 materialized path at every step (middle grows each step,
         so capacity growth, rope positions, and handle reuse are all
@@ -311,8 +311,11 @@ class TestEndToEndDecodeParity:
         from olmlx.engine.shardquant_cache import ShardFusedKV
         from olmlx.engine.shardquant_fused import fused_sdpa_decode
 
-        if backend == "auto" and not mx.metal.is_available():
-            pytest.skip("auto backend needs Metal for the kernel path")
+        if backend == "auto":
+            # Forces the GPU default device (skips without Metal) so
+            # kernels_supported() actually takes the kernel path under
+            # OLMLX_TESTS_CPU_DEVICE=1 (tests/__init__.py).
+            request.getfixturevalue("metal_default_device")
 
         D, H, nq = 64, 2, 4
         scale = D**-0.5

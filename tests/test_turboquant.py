@@ -309,6 +309,99 @@ class TestTurboQuantKVCache:
         assert v_out.shape == (1, 4, 8, 64)
         assert cache.offset == 8
 
+    def test_release_dequant_buffers_frees_side_buffer(self):
+        """release_dequant_buffers() drops the side buffers but keeps the
+        packed state (indices/norms) and offset intact."""
+        cache = self._make_cache(bits=4, head_dim=64)
+        cache.update_and_fetch(
+            mx.random.normal((1, 4, 16, 64)), mx.random.normal((1, 4, 16, 64))
+        )
+        assert cache._key_dequant is not None
+        assert cache._value_dequant is not None
+
+        cache.release_dequant_buffers()
+
+        assert cache._key_dequant is None
+        assert cache._value_dequant is None
+        # Packed state and offset survive — the cache is still usable.
+        assert cache.offset == 16
+        assert cache._key_indices is not None
+        assert len(cache.state) == 4
+
+    def test_update_after_release_matches_never_released(self):
+        """A cache resumed after release_dequant_buffers() must produce output
+        identical to a cache that was never released (lazy rebuild is exact)."""
+        head_dim = 64
+        chunk1_k = mx.random.normal((1, 4, 16, head_dim))
+        chunk1_v = mx.random.normal((1, 4, 16, head_dim))
+        chunk2_k = mx.random.normal((1, 4, 1, head_dim))
+        chunk2_v = mx.random.normal((1, 4, 1, head_dim))
+
+        # Reference: never released.
+        ref = self._make_cache(bits=4, head_dim=head_dim)
+        ref.update_and_fetch(chunk1_k, chunk1_v)
+        ref_k, ref_v = ref.update_and_fetch(chunk2_k, chunk2_v)
+
+        # Released between the two updates, then resumed.
+        released = self._make_cache(bits=4, head_dim=head_dim)
+        released.update_and_fetch(chunk1_k, chunk1_v)
+        released.release_dequant_buffers()
+        got_k, got_v = released.update_and_fetch(chunk2_k, chunk2_v)
+
+        assert got_k.shape == ref_k.shape == (1, 4, 17, head_dim)
+        assert mx.allclose(got_k, ref_k, atol=1e-5)
+        assert mx.allclose(got_v, ref_v, atol=1e-5)
+
+    def test_store_insert_sheds_dequant_buffers(self):
+        """Storing a TurboQuant cache sheds its dequant buffers at the store
+        chokepoint, so its RAM-budget footprint reflects the packed size —
+        for EVERY store path, not just the post-generation one."""
+        from olmlx.engine.model_manager import CachedPromptState, PromptCacheStore
+        from olmlx.engine.prompt_cache.store import _estimate_state_bytes
+
+        cache = self._make_cache(bits=4, head_dim=128)
+        cache.update_and_fetch(
+            mx.random.normal((1, 8, 512, 128)), mx.random.normal((1, 8, 512, 128))
+        )
+        before = _estimate_state_bytes(CachedPromptState(tokens=[], cache=[cache]))
+
+        store = PromptCacheStore(max_slots=4)
+        store.set("x", CachedPromptState(tokens=list(range(512)), cache=[cache]))
+
+        # Shed on insert: the full-precision side buffer is gone...
+        assert cache._key_dequant is None
+        assert cache._value_dequant is None
+        # ...the store's byte accounting reflects the packed size (well under
+        # half the unshed estimate, which the dequant buffer dominated)...
+        assert store.metrics.bytes_in_ram < before * 0.5
+        # ...and the retrieved cache still generates (rebuilds on next update).
+        got = store.get("x")
+        k_out, _ = got.cache[0].update_and_fetch(
+            mx.random.normal((1, 8, 1, 128)), mx.random.normal((1, 8, 1, 128))
+        )
+        assert k_out.shape == (1, 8, 513, 128)
+
+    def test_trim_after_release_does_not_crash(self):
+        """A shed cache is trimmed to the common prefix before it resumes
+        (the cross-request reuse path). ``trim``'s buffer-shrink branch must
+        tolerate absent dequant buffers rather than indexing ``None``."""
+        cache = self._make_cache(bits=4, head_dim=64)
+        # 512 tokens → capacity 512; trimming to 112 (< capacity//2) triggers
+        # the buffer-shrink branch that touches the dequant side buffers.
+        cache.update_and_fetch(
+            mx.random.normal((1, 4, 512, 64)), mx.random.normal((1, 4, 512, 64))
+        )
+        cache.release_dequant_buffers()
+
+        cache.trim(400)  # must not raise
+
+        assert cache.offset == 112
+        # Resumes correctly afterwards (rebuild on next update).
+        k_out, _ = cache.update_and_fetch(
+            mx.random.normal((1, 4, 1, 64)), mx.random.normal((1, 4, 1, 64))
+        )
+        assert k_out.shape == (1, 4, 113, 64)
+
     def test_sequential_updates(self):
         """Multiple updates should accumulate tokens."""
         cache = self._make_cache(bits=4, head_dim=64)
