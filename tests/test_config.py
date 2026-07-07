@@ -22,7 +22,7 @@ class TestSettings:
         ):
             monkeypatch.delenv(key, raising=False)
         s = Settings()
-        assert s.host == "0.0.0.0"
+        assert s.host == "127.0.0.1"
         assert s.port == 11434
         assert s.default_keep_alive == "5m"
         assert s.max_loaded_models == 1

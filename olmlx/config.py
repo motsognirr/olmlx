@@ -122,7 +122,7 @@ class Settings(BaseSettings):
         "validate_assignment": True,
     }
 
-    host: str = "0.0.0.0"
+    host: str = "127.0.0.1"
     port: Annotated[int, Field(ge=1, le=65535)] = 11434
     models_dir: Path = Path.home() / ".olmlx" / "models"
     models_config: Path = Path.home() / ".olmlx" / "models.json"

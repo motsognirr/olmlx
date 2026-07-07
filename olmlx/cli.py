@@ -2207,10 +2207,16 @@ def cmd_chat(args):
                     "type to send text.[/dim]"
                 )
 
+            _pending_answer: str | None = None
+
             while True:
-                user_input = tui.get_user_input()
-                if user_input is None:
-                    break
+                if _pending_answer is not None:
+                    user_input = _pending_answer
+                    _pending_answer = None
+                else:
+                    user_input = tui.get_user_input()
+                    if user_input is None:
+                        break
 
                 # Empty line in voice mode => push-to-talk.
                 if voice_io is not None and not user_input.strip():
@@ -2371,7 +2377,7 @@ def cmd_chat(args):
                                     multiple=event.get("multiple", False),
                                 )
                                 if answer is not None:
-                                    user_input = answer
+                                    _pending_answer = answer
                                     break
                 finally:
                     active_stream_ctx = None
