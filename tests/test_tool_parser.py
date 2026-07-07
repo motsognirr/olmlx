@@ -3,6 +3,7 @@
 import json
 
 from olmlx.engine.tool_parser import (
+    _extract_think_blocks,
     _parse_json_call,
     _try_bare_json,
     _try_deepseek,
@@ -858,6 +859,15 @@ class TestParseModelOutput:
         assert "End" in visible
         assert "<think>" not in visible
 
+    def test_thinking_inner_near_miss_close_tag(self):
+        """The linear scan must match the close tag literally: a near-miss like
+        </thinkable> inside the block (plus '<' and newlines) must not be
+        mistaken for the real </think> closer."""
+        text = "<think>note: </thinkable> and x < y\nz < w</think>Result."
+        thinking, visible, tools = parse_model_output(text, has_tools=False)
+        assert thinking == "note: </thinkable> and x < y\nz < w"
+        assert visible == "Result."
+
     def test_tool_call_with_thinking(self):
         text = (
             "<think>I need to search</think>"
@@ -1178,3 +1188,49 @@ class TestGptOssCommentaryChannel:
         assert len(tools) == 1
         assert tools[0]["name"] == "my.tool-name"
         assert tools[0]["input"] == {"x": 1}
+
+
+class TestExtractThinkBlocks:
+    """Issue #621 / CodeQL py/polynomial-redos: the <think> extractor is a
+    linear, non-backtracking index scan (no regex)."""
+
+    def test_single_block_with_less_than_and_newlines(self):
+        text = "<think>x < y\nif a <b then</think>Result."
+        cleaned, blocks = _extract_think_blocks(text)
+        assert blocks == ["x < y\nif a <b then"]
+        assert cleaned == "Result."
+
+    def test_multiple_blocks_split_linearly(self):
+        text = "<think>a < b</think>mid<think>c < d</think>end"
+        cleaned, blocks = _extract_think_blocks(text)
+        assert blocks == ["a < b", "c < d"]
+        assert cleaned == "midend"
+
+    def test_near_miss_close_tag_not_matched(self):
+        text = "<think>see </thinkable> here</think>tail"
+        cleaned, blocks = _extract_think_blocks(text)
+        assert blocks == ["see </thinkable> here"]
+        assert cleaned == "tail"
+
+    def test_unclosed_opener_text_preserved(self):
+        """No matching </think>: the remainder (including <think>) is left
+        untouched — the old regex simply didn't match, so downstream orphan/
+        truncated handlers still see it."""
+        text = "before <think>partial with < and\nnewline, no close"
+        cleaned, blocks = _extract_think_blocks(text)
+        assert cleaned == text
+        assert blocks == []
+
+    def test_no_think_tag_passthrough(self):
+        text = "just a plain answer with < and > chars"
+        cleaned, blocks = _extract_think_blocks(text)
+        assert cleaned == text
+        assert blocks == []
+
+    def test_complete_block_before_unclosed_opener(self):
+        """A complete block is extracted; a trailing unclosed opener and its
+        text are preserved for the downstream truncated-thinking handler."""
+        text = "<think>done</think>visible <think>partial no close"
+        cleaned, blocks = _extract_think_blocks(text)
+        assert blocks == ["done"]
+        assert cleaned == "visible <think>partial no close"

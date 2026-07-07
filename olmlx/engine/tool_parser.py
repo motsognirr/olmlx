@@ -25,11 +25,6 @@ def _make_tool_use_id() -> str:
 
 # --- Regex patterns ---
 
-# Non-greedy DOTALL so thinking may contain '<' (code, comparisons, HTML) and
-# newlines without the extraction breaking, while multiple <think> blocks still
-# split correctly (issue #621).
-_THINK_RE = re.compile(r"<think>(.*?)</think>", re.DOTALL)
-
 # gpt-oss channel format (harmony):
 # <|start|>assistant<|channel|>analysis<|message|>thinking<|end|>
 # <|start|>assistant<|channel|>final<|message|>visible<|return|>  (or end-of-string — mlx-lm strips EOS)
@@ -89,12 +84,14 @@ _LLAMA_EOM = "<|eom_id|>"
 # and the V3.1 ``name<sep>args`` rendering (issue #621).
 _DEEPSEEK_BAR_TRANS = str.maketrans({"｜": "|", "▁": "_"})
 _DEEPSEEK_SEP = "<|tool_sep|>"
-_DEEPSEEK_TOOL_RE = re.compile(
-    r"<\|tool_calls_begin\|>(.*?)<\|tool_calls_end\|>", re.DOTALL
-)
-_DEEPSEEK_CALL_RE = re.compile(
-    r"<\|tool_call_begin\|>(.*?)<\|tool_call_end\|>", re.DOTALL
-)
+# Delimiters are matched with literal ``str.find`` scans (see ``_try_deepseek``)
+# rather than ``<begin>(.*?)<end>`` search/finditer regexes — the latter is a
+# multi-start-position non-greedy match, i.e. a polynomial-ReDoS shape.
+_DEEPSEEK_CALLS_BEGIN = "<|tool_calls_begin|>"
+_DEEPSEEK_CALLS_END = "<|tool_calls_end|>"
+_DEEPSEEK_CALL_BEGIN = "<|tool_call_begin|>"
+_DEEPSEEK_CALL_END = "<|tool_call_end|>"
+# Anchored ``.match`` (single start position) is linear, not a ReDoS.
 _DEEPSEEK_FENCE_RE = re.compile(r"```(?:json)?\s*(.*?)\s*```", re.DOTALL)
 
 # MiniMax: <minimax:tool_call><invoke name="Name"><parameter name="key">value</parameter></invoke></minimax:tool_call>
@@ -380,12 +377,26 @@ def _try_deepseek(text: str) -> tuple[list[dict], str]:
     """
     tool_uses: list[dict] = []
     norm = text.translate(_DEEPSEEK_BAR_TRANS)
-    ds_match = _DEEPSEEK_TOOL_RE.search(norm)
-    if not ds_match:
+    begin = norm.find(_DEEPSEEK_CALLS_BEGIN)
+    if begin == -1:
         return [], text
-    span = (ds_match.start(), ds_match.end())
-    for call_match in _DEEPSEEK_CALL_RE.finditer(ds_match.group(1)):
-        name, arguments = _parse_deepseek_call(call_match.group(1))
+    inner_start = begin + len(_DEEPSEEK_CALLS_BEGIN)
+    end = norm.find(_DEEPSEEK_CALLS_END, inner_start)
+    if end == -1:
+        return [], text
+    span = (begin, end + len(_DEEPSEEK_CALLS_END))
+    inner = norm[inner_start:end]
+    pos = 0
+    while True:
+        cb = inner.find(_DEEPSEEK_CALL_BEGIN, pos)
+        if cb == -1:
+            break
+        body_start = cb + len(_DEEPSEEK_CALL_BEGIN)
+        ce = inner.find(_DEEPSEEK_CALL_END, body_start)
+        if ce == -1:
+            break
+        name, arguments = _parse_deepseek_call(inner[body_start:ce])
+        pos = ce + len(_DEEPSEEK_CALL_END)
         if not name:
             continue
         tool_uses.append(
@@ -736,6 +747,51 @@ def _extract_gemma4_blocks(text: str) -> tuple[str, list[str]]:
     return "".join(out_parts), blocks
 
 
+def _extract_think_blocks(text: str) -> tuple[str, list[str]]:
+    """Extract ``<think>...</think>`` blocks with a linear, non-backtracking scan.
+
+    Replaces the ``<think>(.*?)</think>`` regex (``re.DOTALL``): a non-greedy
+    ``.*?`` followed by a literal is a polynomial-ReDoS pattern (O(n^2) on a
+    long unclosed ``<think>``), and the older ``[^<]*`` variant was linear but
+    silently broke whenever thinking contained ``<`` (issue #621).
+
+    An index scan is O(n) and exactly reproduces the old
+    ``findall`` / ``sub("")`` pair:
+
+    - returns ``(cleaned_text, inner_strings)`` where *cleaned_text* has every
+      complete block removed and *inner_strings* are the raw (unstripped) inner
+      captures, matching ``_THINK_RE.findall`` (the caller strips);
+    - a ``<think>`` with no matching ``</think>`` is left untouched — the
+      regex simply didn't match it, so the downstream orphan/truncated
+      handlers keep processing it;
+    - the close tag is matched literally, so a near-miss like ``</thinkable>``
+      inside the block is not mistaken for the closer, and multiple blocks
+      still split correctly.
+    """
+    open_tag = "<think>"
+    close_tag = "</think>"
+    blocks: list[str] = []
+    out_parts: list[str] = []
+    pos = 0
+
+    while True:
+        start = text.find(open_tag, pos)
+        if start == -1:
+            out_parts.append(text[pos:])
+            break
+        inner_start = start + len(open_tag)
+        end = text.find(close_tag, inner_start)
+        if end == -1:
+            # Unclosed opener: leave the remainder (including <think>) intact.
+            out_parts.append(text[pos:])
+            break
+        out_parts.append(text[pos:start])
+        blocks.append(text[inner_start:end])
+        pos = end + len(close_tag)
+
+    return "".join(out_parts), blocks
+
+
 def parse_model_output(
     text: str,
     has_tools: bool,
@@ -768,11 +824,10 @@ def parse_model_output(
     if gemma4_blocks:
         thinking = "\n".join(gemma4_blocks)
 
-    think_matches = _THINK_RE.findall(text)
-    if think_matches:
-        think_text = "\n".join(m.strip() for m in think_matches)
+    text, think_blocks = _extract_think_blocks(text)
+    if think_blocks:
+        think_text = "\n".join(m.strip() for m in think_blocks)
         thinking = f"{thinking}\n{think_text}".strip() if thinking else think_text
-        text = _THINK_RE.sub("", text)
 
     # Handle orphaned </think> — the chat template may open <think> in the
     # prompt so the generated text starts mid-think with only a closing tag.
