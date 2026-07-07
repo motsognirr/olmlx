@@ -174,11 +174,21 @@ class SpectralQuantKVCache(_BaseCache):
         self._v_tail[..., prev : self.offset, :] = v_tail
         self._v_norms[..., prev : self.offset, :] = v_nrm
 
-        # Dequantize full cache
-        k_out = spectral_dequantize(
-            self._k_sem[..., : self.offset, :],
-            self._k_tail[..., : self.offset, :],
-            self._k_norms[..., : self.offset, :],
+        # Dequantize the FULL capacity-aligned buffers, then slice to
+        # ``offset`` — mirrors ShardKVCache (shardquant_cache.py). Slicing to
+        # ``[..., :offset, :]`` *before* dequant would make the traced index
+        # shape grow by one token every decode step, so
+        # ``_compiled_spectral_dequant_core`` (lru_cache-keyed on index shape)
+        # would miss and re-JIT-compile a fresh kernel per token (#612). The
+        # buffer's seq axis is capacity-aligned to ``step`` and changes only
+        # when the cache grows, so the compiled trace is reused within a
+        # bucket. Dequant is position-wise (per-token rotate + rescale), so
+        # dequant-then-slice is numerically identical to slice-then-dequant;
+        # padding/stale slots beyond ``offset`` are dropped by the final slice.
+        k_full = spectral_dequantize(
+            self._k_sem,
+            self._k_tail,
+            self._k_norms,
             self.rotation_key,
             self.codebook_sem_key,
             self.codebook_tail_key,
@@ -187,10 +197,10 @@ class SpectralQuantKVCache(_BaseCache):
             self.bits_low,
             dtype=input_dtype,
         )
-        v_out = spectral_dequantize(
-            self._v_sem[..., : self.offset, :],
-            self._v_tail[..., : self.offset, :],
-            self._v_norms[..., : self.offset, :],
+        v_full = spectral_dequantize(
+            self._v_sem,
+            self._v_tail,
+            self._v_norms,
             self.rotation_value,
             self.codebook_sem_value,
             self.codebook_tail_value,
@@ -199,7 +209,7 @@ class SpectralQuantKVCache(_BaseCache):
             self.bits_low,
             dtype=input_dtype,
         )
-        return k_out, v_out
+        return k_full[..., : self.offset, :], v_full[..., : self.offset, :]
 
     @property
     def state(self):

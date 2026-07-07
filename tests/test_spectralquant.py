@@ -705,6 +705,148 @@ class TestSpectralQuantKVCache:
         )
         assert float(mx.mean(cos)) > 0.7  # Compressed, so lower bar
 
+    def test_decode_steps_reuse_compiled_dequant_kernel(self, cache_setup):
+        """Decode must not re-trace the dequant kernel every step (#612).
+
+        ``_compiled_spectral_dequant_core`` is lru_cache-keyed on the index
+        shapes. Dequantizing ``[..., :offset, :]`` slices makes that key grow
+        by one every decode step — a cache miss (fresh trace + JIT compile)
+        per token. Capacity-aligned dequant keeps the traced shape stable
+        within a 256-token bucket, so simulated decode steps after prefill
+        must add zero new misses.
+        """
+        from olmlx.engine import spectralquant
+
+        cache, hd = cache_setup
+        spectralquant._compiled_spectral_dequant_core.cache_clear()
+
+        # Prefill
+        cache.update_and_fetch(
+            mx.random.normal((1, 2, 8, hd)), mx.random.normal((1, 2, 8, hd))
+        )
+        prefill_misses = spectralquant._compiled_spectral_dequant_core.cache_info().misses
+
+        # 16 single-token decode steps, all within the first capacity bucket
+        for _ in range(16):
+            cache.update_and_fetch(
+                mx.random.normal((1, 2, 1, hd)), mx.random.normal((1, 2, 1, hd))
+            )
+
+        new_misses = (
+            spectralquant._compiled_spectral_dequant_core.cache_info().misses
+            - prefill_misses
+        )
+        assert new_misses == 0, (
+            f"dequant kernel re-traced {new_misses} times across 16 decode steps; "
+            "the compiled trace must be reused while capacity is unchanged"
+        )
+
+    def test_decode_output_matches_exact_slice_dequant(self, cache_setup):
+        """Capacity-aligned dequant + slice must match dequant of the exact
+        ``[..., :offset, :]`` packed slices (numerical equivalence guard)."""
+        from olmlx.engine.spectralquant import spectral_dequantize
+
+        cache, hd = cache_setup
+        mx.random.seed(7)
+        cache.update_and_fetch(
+            mx.random.normal((1, 2, 5, hd)), mx.random.normal((1, 2, 5, hd))
+        )
+        k_out = v_out = None
+        for _ in range(3):
+            k_out, v_out = cache.update_and_fetch(
+                mx.random.normal((1, 2, 1, hd)), mx.random.normal((1, 2, 1, hd))
+            )
+        assert k_out is not None and v_out is not None
+        assert k_out.shape == (1, 2, 8, hd)
+
+        k_ref = spectral_dequantize(
+            cache._k_sem[..., : cache.offset, :],
+            cache._k_tail[..., : cache.offset, :],
+            cache._k_norms[..., : cache.offset, :],
+            cache.rotation_key,
+            cache.codebook_sem_key,
+            cache.codebook_tail_key,
+            cache.d_eff,
+            cache.bits_high,
+            cache.bits_low,
+            dtype=k_out.dtype,
+        )
+        v_ref = spectral_dequantize(
+            cache._v_sem[..., : cache.offset, :],
+            cache._v_tail[..., : cache.offset, :],
+            cache._v_norms[..., : cache.offset, :],
+            cache.rotation_value,
+            cache.codebook_sem_value,
+            cache.codebook_tail_value,
+            cache.d_eff,
+            cache.bits_high,
+            cache.bits_low,
+            dtype=v_out.dtype,
+        )
+        assert k_ref.shape == k_out.shape
+        assert mx.allclose(k_out, k_ref, atol=1e-6, rtol=1e-6)
+        assert mx.allclose(v_out, v_ref, atol=1e-6, rtol=1e-6)
+
+    def test_dequant_correct_after_trim_leaves_stale_padding(self, cache_setup):
+        """Stale packed slots beyond ``offset`` (left by trim) must never leak
+        into the returned history."""
+        from olmlx.engine.spectralquant import spectral_dequantize
+
+        cache, hd = cache_setup
+        mx.random.seed(11)
+        cache.update_and_fetch(
+            mx.random.normal((1, 2, 10, hd)), mx.random.normal((1, 2, 10, hd))
+        )
+        cache.trim(3)  # positions [7:10] now stale in the packed buffers
+        k_out, v_out = cache.update_and_fetch(
+            mx.random.normal((1, 2, 2, hd)), mx.random.normal((1, 2, 2, hd))
+        )
+        assert cache.offset == 9
+        assert k_out.shape == (1, 2, 9, hd)
+        assert v_out.shape == (1, 2, 9, hd)
+
+        k_ref = spectral_dequantize(
+            cache._k_sem[..., : cache.offset, :],
+            cache._k_tail[..., : cache.offset, :],
+            cache._k_norms[..., : cache.offset, :],
+            cache.rotation_key,
+            cache.codebook_sem_key,
+            cache.codebook_tail_key,
+            cache.d_eff,
+            cache.bits_high,
+            cache.bits_low,
+            dtype=k_out.dtype,
+        )
+        assert mx.allclose(k_out, k_ref, atol=1e-6, rtol=1e-6)
+
+    def test_capacity_growth_retraces_at_most_once(self, cache_setup):
+        """Crossing a capacity boundary may compile one new trace, but decode
+        within the new bucket must keep reusing it."""
+        from olmlx.engine import spectralquant
+
+        cache, hd = cache_setup
+        spectralquant._compiled_spectral_dequant_core.cache_clear()
+
+        # Fill right up to the first capacity bucket (step == 256)
+        cache.update_and_fetch(
+            mx.random.normal((1, 2, 256, hd)), mx.random.normal((1, 2, 256, hd))
+        )
+        base_misses = spectralquant._compiled_spectral_dequant_core.cache_info().misses
+
+        # Cross the boundary, then decode within the second bucket
+        for _ in range(8):
+            cache.update_and_fetch(
+                mx.random.normal((1, 2, 1, hd)), mx.random.normal((1, 2, 1, hd))
+            )
+
+        new_misses = (
+            spectralquant._compiled_spectral_dequant_core.cache_info().misses
+            - base_misses
+        )
+        assert new_misses <= 1, (
+            f"expected at most one new trace when capacity grows, got {new_misses}"
+        )
+
 
 # ---------------------------------------------------------------------------
 # Config validation tests
