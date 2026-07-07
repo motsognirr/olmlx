@@ -152,6 +152,47 @@ class TestTryMistral:
         tool_uses, remaining = _try_mistral(text)
         assert len(tool_uses) == 0
 
+    def test_array_valued_arguments(self):
+        """Issue #607: array-valued arguments must not truncate at the first ']'."""
+        text = '[TOOL_CALLS] [{"name": "search", "arguments": {"tags": ["a", "b"]}}]'
+        tool_uses, remaining = _try_mistral(text)
+        assert len(tool_uses) == 1
+        assert tool_uses[0]["name"] == "search"
+        assert tool_uses[0]["input"] == {"tags": ["a", "b"]}
+
+    def test_bracket_inside_string_value(self):
+        """Issue #607: a ']' inside a string value must not end the array."""
+        text = '[TOOL_CALLS] [{"name": "bash", "arguments": {"cmd": "echo ]"}}]'
+        tool_uses, remaining = _try_mistral(text)
+        assert len(tool_uses) == 1
+        assert tool_uses[0]["input"] == {"cmd": "echo ]"}
+
+    def test_nested_arrays(self):
+        text = '[TOOL_CALLS] [{"name": "plot", "arguments": {"points": [[1, 2], [3, 4]]}}]'
+        tool_uses, remaining = _try_mistral(text)
+        assert len(tool_uses) == 1
+        assert tool_uses[0]["input"] == {"points": [[1, 2], [3, 4]]}
+
+    def test_trailing_text_after_array(self):
+        text = '[TOOL_CALLS] [{"name": "a", "arguments": {"x": [1, 2]}}] Done.'
+        tool_uses, remaining = _try_mistral(text)
+        assert len(tool_uses) == 1
+        assert tool_uses[0]["input"] == {"x": [1, 2]}
+
+    def test_unclosed_array(self):
+        text = '[TOOL_CALLS] [{"name": "a", "arguments": {"x": [1, 2]}}'
+        tool_uses, remaining = _try_mistral(text)
+        assert len(tool_uses) == 0
+
+    def test_array_args_via_parse_model_output(self):
+        """Issue #607: the raw [TOOL_CALLS] markup must not leak into content."""
+        text = '[TOOL_CALLS] [{"name": "search", "arguments": {"tags": ["a", "b"]}}]'
+        thinking, visible, tools = parse_model_output(text, has_tools=True)
+        assert len(tools) == 1
+        assert tools[0]["name"] == "search"
+        assert tools[0]["input"] == {"tags": ["a", "b"]}
+        assert "[TOOL_CALLS]" not in visible
+
 
 class TestTryLlama:
     def test_single_call(self):
@@ -169,6 +210,35 @@ class TestTryLlama:
     def test_no_match(self):
         tool_uses, remaining = _try_llama("normal text")
         assert len(tool_uses) == 0
+
+    def test_call_followed_by_prose(self):
+        """Issue #621: the JSON is not always terminal — trailing prose must
+        not drop the call."""
+        text = (
+            '<|python_tag|>{"name": "f", "parameters": {"a": 1}}\n'
+            "Let me know if you need anything else."
+        )
+        tool_uses, remaining = _try_llama(text)
+        assert len(tool_uses) == 1
+        assert tool_uses[0]["name"] == "f"
+        assert tool_uses[0]["input"] == {"a": 1}
+
+    def test_brace_in_string_value_with_trailing_prose(self):
+        text = '<|python_tag|>{"name": "echo", "parameters": {"msg": "a } b"}} And done.'
+        tool_uses, remaining = _try_llama(text)
+        assert len(tool_uses) == 1
+        assert tool_uses[0]["input"] == {"msg": "a } b"}
+
+    def test_prose_stripped_via_parse_model_output(self):
+        text = (
+            '<|python_tag|>{"name": "f", "parameters": {"a": 1}}<|eom_id|>\n'
+            "Checking the result now."
+        )
+        _, visible, tools = parse_model_output(text, has_tools=True)
+        assert len(tools) == 1
+        assert "<|python_tag|>" not in visible
+        assert "<|eom_id|>" not in visible
+        assert "Checking the result now." in visible
 
 
 class TestTryDeepseek:
@@ -199,6 +269,73 @@ class TestTryDeepseek:
         tool_uses, remaining = _try_deepseek(text)
         assert len(tool_uses) == 1
         assert tool_uses[0]["input"] == {}
+
+    def test_official_v3_rendering(self):
+        """Issue #621: the official DeepSeek V3/R1 template emits fullwidth-bar
+        markers (U+FF5C / U+2581), a <tool_sep> between type and name, and
+        arguments inside a ```json fence."""
+        text = (
+            "<｜tool▁calls▁begin｜>"
+            "<｜tool▁call▁begin｜>function<｜tool▁sep｜>get_weather\n"
+            "```json\n"
+            '{"city": "Tokyo"}\n'
+            "```<｜tool▁call▁end｜>"
+            "<｜tool▁calls▁end｜>"
+        )
+        tool_uses, remaining = _try_deepseek(text)
+        assert len(tool_uses) == 1
+        assert tool_uses[0]["name"] == "get_weather"
+        assert tool_uses[0]["input"] == {"city": "Tokyo"}
+
+    def test_official_v3_rendering_multiple_calls(self):
+        text = (
+            "<｜tool▁calls▁begin｜>"
+            "<｜tool▁call▁begin｜>function<｜tool▁sep｜>search\n"
+            "```json\n"
+            '{"q": "cats"}\n'
+            "```<｜tool▁call▁end｜>\n"
+            "<｜tool▁call▁begin｜>function<｜tool▁sep｜>fetch\n"
+            "```json\n"
+            '{"url": "http://x"}\n'
+            "```<｜tool▁call▁end｜>"
+            "<｜tool▁calls▁end｜>"
+        )
+        tool_uses, remaining = _try_deepseek(text)
+        assert len(tool_uses) == 2
+        assert tool_uses[0]["name"] == "search"
+        assert tool_uses[0]["input"] == {"q": "cats"}
+        assert tool_uses[1]["name"] == "fetch"
+        assert tool_uses[1]["input"] == {"url": "http://x"}
+
+    def test_v31_rendering_name_sep_args(self):
+        """DeepSeek V3.1 renders name<tool_sep>args with no fence."""
+        text = (
+            "<｜tool▁calls▁begin｜>"
+            '<｜tool▁call▁begin｜>get_weather<｜tool▁sep｜>{"city": "Berlin"}'
+            "<｜tool▁call▁end｜>"
+            "<｜tool▁calls▁end｜>"
+        )
+        tool_uses, remaining = _try_deepseek(text)
+        assert len(tool_uses) == 1
+        assert tool_uses[0]["name"] == "get_weather"
+        assert tool_uses[0]["input"] == {"city": "Berlin"}
+
+    def test_official_rendering_via_parse_model_output(self):
+        text = (
+            "Let me check.\n"
+            "<｜tool▁calls▁begin｜>"
+            "<｜tool▁call▁begin｜>function<｜tool▁sep｜>get_weather\n"
+            "```json\n"
+            '{"city": "Oslo"}\n'
+            "```<｜tool▁call▁end｜>"
+            "<｜tool▁calls▁end｜>"
+        )
+        _, visible, tools = parse_model_output(text, has_tools=True)
+        assert len(tools) == 1
+        assert tools[0]["name"] == "get_weather"
+        assert tools[0]["input"] == {"city": "Oslo"}
+        assert "tool▁calls" not in visible
+        assert "Let me check." in visible
 
 
 class TestTryBareJson:

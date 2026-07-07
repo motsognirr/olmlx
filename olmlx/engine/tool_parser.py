@@ -62,22 +62,35 @@ _GLM_BARE_NAME_RE = re.compile(r"[A-Za-z_][\w.-]*")
 # "true"/"false"/"null" block is noise, not a zero-arg call.
 _JSON_LITERALS = frozenset({"true", "false", "null"})
 
-# Mistral: [TOOL_CALLS] followed by a JSON array
-_MISTRAL_TOOL_RE = re.compile(r"\[TOOL_CALLS\]\s*(\[.*?\])", re.DOTALL)
+# Mistral: [TOOL_CALLS] followed by a JSON array. The array is extracted with a
+# bracket-counting scan (``_extract_json_array``) rather than a non-greedy regex,
+# so array-valued arguments and ``]`` inside string values don't truncate it
+# (issue #607).
+_MISTRAL_MARKER_RE = re.compile(r"\[TOOL_CALLS\]")
 
-# Llama 3.x: <|python_tag|> followed by JSON
-_LLAMA_TOOL_RE = re.compile(
-    r"<\|python_tag\|>\s*(\{.*?\})\s*(?:<\|eom_id\|>|$)", re.DOTALL
-)
+# Llama 3.x: <|python_tag|> followed by JSON. The object is extracted with
+# ``_extract_json_object`` (brace-counting) so a call followed by prose — the
+# JSON is not always terminal — isn't dropped (issue #621).
+_LLAMA_MARKER_RE = re.compile(r"<\|python_tag\|>")
+_LLAMA_EOM = "<|eom_id|>"
 
-# DeepSeek: <|tool_calls_begin|>...<|tool_calls_end|>
+# DeepSeek: <|tool_calls_begin|>...<|tool_calls_end|>.
+# The official V3/R1 chat template emits fullwidth-bar markers (U+FF5C ``｜``)
+# with a U+2581 ``▁`` word-joiner (``<｜tool▁calls▁begin｜>``), a
+# ``<｜tool▁sep｜>`` between the ``function`` type and the name, and arguments
+# inside a ```` ```json ```` fence.  We normalize those two codepoints to their
+# ASCII equivalents (a 1:1, length-preserving translation, so spans stay valid)
+# and then match a single ASCII grammar that also covers the legacy ASCII form
+# and the V3.1 ``name<sep>args`` rendering (issue #621).
+_DEEPSEEK_BAR_TRANS = str.maketrans({"｜": "|", "▁": "_"})
+_DEEPSEEK_SEP = "<|tool_sep|>"
 _DEEPSEEK_TOOL_RE = re.compile(
     r"<\|tool_calls_begin\|>(.*?)<\|tool_calls_end\|>", re.DOTALL
 )
 _DEEPSEEK_CALL_RE = re.compile(
-    r"<\|tool_call_begin\|>\s*(?:function)?\s*\n?\s*(\w+)\s*\n(.*?)<\|tool_call_end\|>",
-    re.DOTALL,
+    r"<\|tool_call_begin\|>(.*?)<\|tool_call_end\|>", re.DOTALL
 )
+_DEEPSEEK_FENCE_RE = re.compile(r"```(?:json)?\s*(.*?)\s*```", re.DOTALL)
 
 # MiniMax: <minimax:tool_call><invoke name="Name"><parameter name="key">value</parameter></invoke></minimax:tool_call>
 _MINIMAX_TOOL_RE = re.compile(
@@ -240,14 +253,26 @@ def _try_qwen(text: str) -> tuple[list[dict], str]:
 
 
 def _try_mistral(text: str) -> tuple[list[dict], str]:
-    """Parse Mistral-style [TOOL_CALLS] blocks."""
-    tool_uses = []
-    match = _MISTRAL_TOOL_RE.search(text)
-    if not match:
+    """Parse Mistral-style [TOOL_CALLS] blocks.
+
+    The JSON array is extracted with a bracket-counting scan rather than a
+    non-greedy regex, so a tool call whose arguments contain a nested array (or
+    a ``]`` inside a string value) is not truncated at the first ``]`` and
+    silently dropped (issue #607).
+    """
+    tool_uses: list[dict] = []
+    marker = _MISTRAL_MARKER_RE.search(text)
+    if not marker:
         return [], text
-    span = (match.start(), match.end())
+    arr_start = text.find("[", marker.end())
+    if arr_start == -1 or text[marker.end() : arr_start].strip():
+        return [], text
+    arr_str = _extract_json_array(text, arr_start)
+    if arr_str is None:
+        return [], text
+    span = (marker.start(), arr_start + len(arr_str))
     try:
-        calls = json.loads(match.group(1))
+        calls = json.loads(arr_str)
         for call in calls:
             result = _parse_json_call(call)
             if result:
@@ -259,37 +284,105 @@ def _try_mistral(text: str) -> tuple[list[dict], str]:
 
 
 def _try_llama(text: str) -> tuple[list[dict], str]:
-    """Parse Llama 3.x <|python_tag|> blocks."""
-    tool_uses = []
-    for match in _LLAMA_TOOL_RE.finditer(text):
+    """Parse Llama 3.x <|python_tag|> blocks.
+
+    The JSON object is extracted with a brace-counting scan (respecting string
+    literals) rather than a non-greedy regex anchored to end-of-string, so a
+    call followed by trailing prose — the JSON is not always terminal — is not
+    dropped, and a ``}`` inside a string value does not truncate it (issue
+    #621).
+    """
+    tool_uses: list[dict] = []
+    for match in _LLAMA_MARKER_RE.finditer(text):
+        brace = text.find("{", match.end())
+        if brace == -1 or text[match.end() : brace].strip():
+            continue
+        obj_str = _extract_json_object(text, brace)
+        if obj_str is None:
+            continue
         try:
-            call = json.loads(match.group(1))
-            result = _parse_json_call(call)
-            if result:
-                result["_span"] = (match.start(), match.end())
-                tool_uses.append(result)
-        except (json.JSONDecodeError, AttributeError):
-            logger.warning(
-                "Failed to parse <|python_tag|> block: %r", match.group(1)[:500]
-            )
+            call = json.loads(obj_str)
+        except json.JSONDecodeError:
+            logger.warning("Failed to parse <|python_tag|> block: %r", obj_str[:500])
+            continue
+        result = _parse_json_call(call)
+        if not result:
+            continue
+        end = brace + len(obj_str)
+        # Consume a trailing <|eom_id|> terminator into the span so it doesn't
+        # leak into visible text; any prose after it is preserved.
+        tail = text[end:]
+        stripped = tail.lstrip()
+        if stripped.startswith(_LLAMA_EOM):
+            end += len(tail) - len(stripped) + len(_LLAMA_EOM)
+        result["_span"] = (match.start(), end)
+        tool_uses.append(result)
     return tool_uses, text
 
 
+def _extract_deepseek_args(args_str: str) -> dict:
+    """Parse a DeepSeek call's argument text, stripping a ```json fence if any."""
+    args_str = args_str.strip()
+    fence = _DEEPSEEK_FENCE_RE.match(args_str)
+    if fence:
+        args_str = fence.group(1).strip()
+    if not args_str:
+        return {}
+    try:
+        parsed = json.loads(args_str)
+    except json.JSONDecodeError:
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def _parse_deepseek_call(inner: str) -> tuple[str, dict]:
+    """Parse the body of one <|tool_call_begin|>...<|tool_call_end|> block.
+
+    Handles three renderings that all normalize to ASCII markers here:
+    - legacy ASCII: ``function\\nname\\n{args}``
+    - official V3/R1: ``function<|tool_sep|>name\\n```json\\n{args}```
+    - V3.1: ``name<|tool_sep|>{args}``
+    """
+    inner = inner.strip()
+    if _DEEPSEEK_SEP in inner:
+        before, after = inner.split(_DEEPSEEK_SEP, 1)
+        before = before.strip()
+        if before and before != "function":
+            # V3.1: name<sep>args
+            return before, _extract_deepseek_args(after)
+        # official V3/R1: [function]<sep>name\n<fenced args>
+        after = after.strip()
+        newline = after.find("\n")
+        if newline == -1:
+            return after.strip(), {}
+        return after[:newline].strip(), _extract_deepseek_args(after[newline + 1 :])
+    # legacy ASCII: optional "function" type line, then name line, then args
+    lines = inner.split("\n")
+    if lines and lines[0].strip() == "function":
+        lines = lines[1:]
+    if not lines or not lines[0].strip():
+        return "", {}
+    return lines[0].strip(), _extract_deepseek_args("\n".join(lines[1:]))
+
+
 def _try_deepseek(text: str) -> tuple[list[dict], str]:
-    """Parse DeepSeek <|tool_calls_begin|>...<|tool_calls_end|> blocks."""
-    tool_uses = []
-    ds_match = _DEEPSEEK_TOOL_RE.search(text)
+    """Parse DeepSeek <|tool_calls_begin|>...<|tool_calls_end|> blocks.
+
+    The official V3/R1 template emits fullwidth-bar markers (U+FF5C / U+2581);
+    they are normalized to ASCII (a 1:1, length-preserving translation, so the
+    match spans stay valid against the original text) before matching (issue
+    #621).
+    """
+    tool_uses: list[dict] = []
+    norm = text.translate(_DEEPSEEK_BAR_TRANS)
+    ds_match = _DEEPSEEK_TOOL_RE.search(norm)
     if not ds_match:
         return [], text
     span = (ds_match.start(), ds_match.end())
-    inner = ds_match.group(1)
-    for call_match in _DEEPSEEK_CALL_RE.finditer(inner):
-        name = call_match.group(1).strip()
-        args_str = call_match.group(2).strip()
-        try:
-            arguments = json.loads(args_str) if args_str else {}
-        except json.JSONDecodeError:
-            arguments = {}
+    for call_match in _DEEPSEEK_CALL_RE.finditer(ds_match.group(1)):
+        name, arguments = _parse_deepseek_call(call_match.group(1))
+        if not name:
+            continue
         tool_uses.append(
             {
                 "type": "tool_use",
@@ -347,6 +440,35 @@ def _extract_json_object(text: str, start: int) -> str | None:
             if ch == "{":
                 depth += 1
             elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    return text[start : i + 1]
+        i += 1
+    return None
+
+
+def _extract_json_array(text: str, start: int) -> str | None:
+    """Extract a JSON array from text starting at a '[', counting brackets.
+
+    Respects string literals so brackets inside quoted strings are ignored.
+    Returns the substring from start to the matching ']', or None if unbalanced.
+    """
+    depth = 0
+    in_string = False
+    escape = False
+    i = start
+    while i < len(text):
+        ch = text[i]
+        if escape:
+            escape = False
+        elif ch == "\\" and in_string:
+            escape = True
+        elif ch == '"':
+            in_string = not in_string
+        elif not in_string:
+            if ch == "[":
+                depth += 1
+            elif ch == "]":
                 depth -= 1
                 if depth == 0:
                     return text[start : i + 1]
