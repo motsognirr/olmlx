@@ -187,6 +187,29 @@ class TestSkipChecks:
         assert reason is not None
         assert "OLMLX_FLASH_SPECULATIVE_DRAFT_MODEL" in reason
 
+    def test_flash_and_spec_skips_with_only_legacy_draft_env(
+        self, tmp_path, monkeypatch
+    ):
+        """Legacy OLMLX_EXPERIMENTAL_FLASH_SPECULATIVE_DRAFT_MODEL is dead
+        (warn-only, never forwarded into settings), so it must NOT satisfy
+        the gate — otherwise the scenario runs against an unconfigured
+        speculative pipeline and errors instead of skipping."""
+        from olmlx.config import settings
+
+        flash_dir = tmp_path / "flash"
+        flash_dir.mkdir()
+        (flash_dir / "flash_layout.json").write_text("{}")
+        monkeypatch.delenv("OLMLX_FLASH_SPECULATIVE_DRAFT_MODEL", raising=False)
+        monkeypatch.setenv(
+            "OLMLX_EXPERIMENTAL_FLASH_SPECULATIVE_DRAFT_MODEL", "some/draft-model"
+        )
+        monkeypatch.setattr(
+            settings, "flash_speculative_draft_model", None, raising=True
+        )
+        reason = _requires_flash_and_speculative_draft(tmp_path)
+        assert reason is not None
+        assert "OLMLX_FLASH_SPECULATIVE_DRAFT_MODEL" in reason
+
     def test_flash_and_spec_runs_with_layout_and_draft_model(
         self, tmp_path, monkeypatch
     ):

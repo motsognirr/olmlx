@@ -1108,3 +1108,131 @@ def test_flash_moe_wrapper_forwards_cache_to_inner_model(tmp_path):
         assert spy.call_args.kwargs["cache"] is sentinel_cache
     finally:
         store.close()
+
+
+def test_load_flash_moe_model_falls_back_to_vlm_loader(tmp_path):
+    """VLM-shaped MoE architectures that mlx-lm rejects load via mlx_vlm on
+    the serving path (``ModelManager._load_flash_moe_model`` →
+    ``_vlm_fallback_load``); the calibration loader needs the same escape
+    hatch or bundle-bearing VLMs (Gemma4-class, Kimi-K2.5) cannot be
+    calibrated at all."""
+    import json
+    from unittest.mock import MagicMock, patch
+
+    from olmlx.engine.flash.moe_bundler import bundle_moe_experts
+    from olmlx.engine.flash.flash_moe_model import (
+        FlashMoeModelWrapper,
+        load_flash_moe_model,
+    )
+
+    hidden, inter, experts = 64, 32, 8
+    num_dense, num_moe, ntok = 1, 2, 2
+    model_dir = _make_synthetic_moe_weights(
+        hidden, inter, experts, num_moe, num_dense, tmp_path
+    )
+    flash_dir = tmp_path / "flash_moe"
+    bundle_moe_experts(model_dir, flash_dir)
+    (flash_dir / "flash_moe_config.json").write_text(
+        json.dumps(
+            {
+                "hidden_size": hidden,
+                "intermediate_size": inter,
+                "num_experts": experts,
+                "num_experts_per_tok": 2,
+                "moe_layer_indices": [1, 2],
+            }
+        )
+    )
+
+    synth = _MockModel(hidden, inter, experts, ntok, num_dense, num_moe)
+    tok = MagicMock()
+    processor = MagicMock()
+    processor.tokenizer = tok
+    fake_vlm = MagicMock()
+    fake_vlm.load.return_value = (synth, processor)
+
+    with (
+        patch(
+            "olmlx.engine.flash.prepare.load_model_with_strict_fallback",
+            side_effect=ValueError("Model type gemma4 not supported"),
+        ),
+        patch.dict("sys.modules", {"mlx_vlm": fake_vlm}),
+    ):
+        model, tokenizer, store = load_flash_moe_model(
+            str(model_dir), flash_dir, cache_budget_experts=4, io_threads=4
+        )
+    try:
+        fake_vlm.load.assert_called_once()
+        assert fake_vlm.load.call_args.kwargs["lazy"] is True
+        assert tokenizer is tok
+        assert isinstance(model, FlashMoeModelWrapper)
+    finally:
+        store.close()
+
+
+class TestWrapFlashMoe:
+    """wrap_flash_moe is the shared store/wrap/eval/close kernel used by both
+    the serving loader (ModelManager._load_flash_moe_model) and the offline
+    calibration loader (load_flash_moe_model)."""
+
+    def _bundle(self, tmp_path, hidden=64, inter=32, experts=8):
+        import json
+
+        from olmlx.engine.flash.moe_bundler import bundle_moe_experts
+
+        model_dir = _make_synthetic_moe_weights(hidden, inter, experts, 2, 1, tmp_path)
+        flash_dir = tmp_path / "flash_moe"
+        bundle_moe_experts(model_dir, flash_dir)
+        (flash_dir / "flash_moe_config.json").write_text(
+            json.dumps(
+                {
+                    "hidden_size": hidden,
+                    "intermediate_size": inter,
+                    "num_experts": experts,
+                    "num_experts_per_tok": 2,
+                    "moe_layer_indices": [1, 2],
+                }
+            )
+        )
+        return flash_dir
+
+    def test_wraps_model_and_returns_store(self, tmp_path):
+        from olmlx.engine.flash.flash_moe_model import (
+            FlashMoeModelWrapper,
+            _FlashMoEBase,
+            wrap_flash_moe,
+        )
+
+        flash_dir = self._bundle(tmp_path)
+        synth = _MockModel(64, 32, 8, 2, 1, 2)
+
+        wrapped, store = wrap_flash_moe(
+            synth, flash_dir, io_threads=4, cache_budget_experts=4
+        )
+        try:
+            assert isinstance(wrapped, FlashMoeModelWrapper)
+            for i in (1, 2):
+                assert isinstance(wrapped.layers[i].mlp, _FlashMoEBase)
+        finally:
+            store.close()
+
+    def test_closes_store_when_wrapping_fails(self, tmp_path):
+        from unittest.mock import MagicMock, patch
+
+        from olmlx.engine.flash import flash_moe_model as fmm
+
+        flash_dir = self._bundle(tmp_path)
+        spy_store = MagicMock()
+
+        with (
+            patch(
+                "olmlx.engine.flash.moe_weight_store.FlashMoeWeightStore",
+                return_value=spy_store,
+            ),
+            patch.object(fmm, "FlashMoeModelWrapper", side_effect=RuntimeError("boom")),
+            pytest.raises(RuntimeError, match="boom"),
+        ):
+            fmm.wrap_flash_moe(
+                MagicMock(), flash_dir, io_threads=4, cache_budget_experts=4
+            )
+        spy_store.close.assert_called_once()

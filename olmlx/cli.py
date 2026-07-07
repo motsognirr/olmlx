@@ -2705,7 +2705,7 @@ def _cmd_flash_moe_prepare(args, model_path):
     print("\nFlash-MoE preparation complete!")
     print(f"  Output: {output_dir}")
     print("\nTo use Flash-MoE inference:")
-    print("  OLMLX_EXPERIMENTAL_FLASH_MOE=true olmlx serve")
+    print("  OLMLX_FLASH_MOE=true olmlx serve")
 
 
 def _cmd_flash_dense_prepare(args, model_path):
@@ -3063,7 +3063,7 @@ def _show_flash_moe_info(model_name, flash_moe_dir):
         print(f"  Total size:         {total_bytes / (1024**2):.1f} MB")
 
     print("\nTo use Flash-MoE inference:")
-    print("  OLMLX_EXPERIMENTAL_FLASH_MOE=true olmlx serve")
+    print("  OLMLX_FLASH_MOE=true olmlx serve")
 
 
 def _show_flash_dense_info(model_name, flash_dir):

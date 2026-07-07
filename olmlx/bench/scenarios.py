@@ -85,17 +85,18 @@ def _requires_flash_moe(model_path: Path) -> str | None:
 def _requires_flash_and_speculative_draft(model_path: Path) -> str | None:
     """Skip flash+spec unless Flash is prepared AND a draft model is set.
 
-    Accepts any of: the promoted env var ``OLMLX_FLASH_SPECULATIVE_DRAFT_MODEL``,
-    the legacy ``OLMLX_EXPERIMENTAL_FLASH_SPECULATIVE_DRAFT_MODEL`` (honoured
-    during the deprecation window), or ``settings.flash_speculative_draft_model``
-    set via a per-model ``models.json`` entry.
+    Accepts the env var ``OLMLX_FLASH_SPECULATIVE_DRAFT_MODEL`` or
+    ``settings.flash_speculative_draft_model`` set via a per-model
+    ``models.json`` entry. The legacy ``OLMLX_EXPERIMENTAL_FLASH_*`` name is
+    deliberately NOT accepted: it is warn-only and never reaches settings, so
+    honoring it would un-skip a scenario whose worker then fails at model
+    load with an unset draft model.
     """
     reason = _requires_flash(model_path)
     if reason is not None:
         return reason
     if (
         os.environ.get("OLMLX_FLASH_SPECULATIVE_DRAFT_MODEL")
-        or os.environ.get("OLMLX_EXPERIMENTAL_FLASH_SPECULATIVE_DRAFT_MODEL")
         or settings.flash_speculative_draft_model
     ):
         return None

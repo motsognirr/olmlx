@@ -345,6 +345,17 @@ def _load_calibration_model(model_path: str):
     flash_moe_dir = Path(model_path) / "flash_moe"
     store = None
     if (flash_moe_dir / "flash_moe_layout.json").exists():
+        if not (flash_moe_dir / "flash_moe_config.json").exists():
+            # The bundler writes the layout as its last act and the config
+            # afterwards, so layout-without-config means an interrupted
+            # `olmlx flash prepare`. Committing to the flash path would die
+            # with a bare FileNotFoundError; a full load could OOM.
+            raise ValueError(
+                f"Incomplete Flash-MoE bundle at {flash_moe_dir}: "
+                "flash_moe_layout.json exists but flash_moe_config.json is "
+                "missing (interrupted preparation?). Re-run `olmlx flash "
+                "prepare` to rebuild the bundle."
+            )
         from olmlx.engine.flash.flash_moe_model import load_flash_moe_model
 
         # Bundle present: commit to the Flash-MoE path. Do NOT fall back to a
@@ -383,6 +394,74 @@ def _load_calibration_model(model_path: str):
             store.close()
         raise
     return model, tokenizer, inner, head_dim, n_kv_heads, num_layers, store
+
+
+def _load_and_collect_kv(
+    model_path: str,
+    *,
+    num_samples: int,
+    calibration_dataset: str | None,
+    max_tokens_per_head: int,
+    progress_callback: Any | None,
+) -> tuple[Any, Any, Any, int, int, int, dict]:
+    """Fetch calibration texts, load the model, and collect K/V vectors.
+
+    The shared front half of ``calibrate_model`` (spectral) and
+    ``calibrate_model_shard``. Texts are fetched BEFORE the model load: they
+    need nothing from the model, and fetching first means a failing or slow
+    dataset download never wastes a multi-GB load nor runs under an open
+    Flash-MoE store. The store (if any) is open only for the collection
+    forwards and is always closed.
+
+    Returns ``(model, tokenizer, inner, head_dim, n_kv_heads, num_layers,
+    kv_collectors)``.
+    """
+    if progress_callback:
+        progress_callback("Generating calibration data", 0.0)
+
+    from olmlx.engine.flash.prepare import (
+        _get_c4_calibration_data,
+        _get_calibration_data,
+    )
+
+    if calibration_dataset == "synthetic":
+        texts = _get_calibration_data(num_samples)
+    else:
+        texts = _get_c4_calibration_data(num_samples)
+
+    if progress_callback:
+        progress_callback("Loading model", 0.05)
+
+    (
+        model,
+        tokenizer,
+        inner,
+        head_dim,
+        n_kv_heads,
+        num_layers,
+        store,
+    ) = _load_calibration_model(model_path)
+
+    try:
+        if progress_callback:
+            progress_callback("Collecting KV vectors", 0.1)
+
+        kv_collectors = collect_kv_vectors(
+            model,
+            tokenizer,
+            inner,
+            num_layers=num_layers,
+            n_kv_heads=n_kv_heads,
+            head_dim=head_dim,
+            texts=texts,
+            max_tokens_per_head=max_tokens_per_head,
+            progress_callback=progress_callback,
+        )
+    finally:
+        if store is not None:
+            store.close()
+
+    return model, tokenizer, inner, head_dim, n_kv_heads, num_layers, kv_collectors
 
 
 def collect_kv_vectors(
@@ -456,6 +535,7 @@ def collect_kv_vectors(
         mx.eval([c.state for c in prompt_cache if hasattr(c, "state")])
 
         # Extract K/V from each layer's cache
+        advanced = False
         for layer_idx in range(min(num_layers, len(prompt_cache))):
             cache_entry = prompt_cache[layer_idx]
             # Combined type + shape filter. Rejects SSM cache types (ArraysCache,
@@ -477,6 +557,7 @@ def collect_kv_vectors(
                     k_h = k_h[:remaining]
                     kv_collectors[layer_idx][h]["key"].append(k_h)
                     tokens_collected[(layer_idx, h, "key")] += k_h.shape[0]
+                    advanced = True
 
                 if tokens_collected[(layer_idx, h, "value")] < max_tokens_per_head:
                     v_h = cached_values[0, h, :, :]  # (seq, head_dim)
@@ -486,8 +567,20 @@ def collect_kv_vectors(
                     v_h = v_h[:remaining]
                     kv_collectors[layer_idx][h]["value"].append(v_h)
                     tokens_collected[(layer_idx, h, "value")] += v_h.shape[0]
+                    advanced = True
 
         del prompt_cache
+        if not advanced:
+            # Every collectable head is at max_tokens_per_head (heads on
+            # filtered layers never advance and never will), so further
+            # forwards contribute nothing. On the Flash-MoE path each one
+            # re-streams routed experts from SSD — stop here.
+            logger.info(
+                "KV collection saturated after %d/%d samples; stopping early",
+                sample_idx + 1,
+                len(texts),
+            )
+            break
         if progress_callback:
             frac = progress_lo + (sample_idx + 1) / len(texts) * (
                 progress_hi - progress_lo
@@ -535,9 +628,6 @@ def calibrate_model(
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    if progress_callback:
-        progress_callback("Loading model", 0.0)
-
     (
         model,
         tokenizer,
@@ -545,44 +635,14 @@ def calibrate_model(
         head_dim,
         n_kv_heads,
         num_layers,
-        store,
-    ) = _load_calibration_model(model_path)
-
-    # Everything from here through KV collection runs under the store's
-    # lifetime — including the c4 download in _get_c4_calibration_data, which
-    # can raise on a network error — so the Flash-MoE store is always closed.
-    try:
-        if progress_callback:
-            progress_callback("Generating calibration data", 0.05)
-
-        from olmlx.engine.flash.prepare import (
-            _get_c4_calibration_data,
-            _get_calibration_data,
-        )
-
-        # Generate calibration data
-        if calibration_dataset == "synthetic":
-            texts = _get_calibration_data(num_samples)
-        else:
-            texts = _get_c4_calibration_data(num_samples)
-
-        if progress_callback:
-            progress_callback("Collecting KV vectors", 0.1)
-
-        kv_collectors = collect_kv_vectors(
-            model,
-            tokenizer,
-            inner,
-            num_layers=num_layers,
-            n_kv_heads=n_kv_heads,
-            head_dim=head_dim,
-            texts=texts,
-            max_tokens_per_head=max_tokens_per_head,
-            progress_callback=progress_callback,
-        )
-    finally:
-        if store is not None:
-            store.close()
+        kv_collectors,
+    ) = _load_and_collect_kv(
+        model_path,
+        num_samples=num_samples,
+        calibration_dataset=calibration_dataset,
+        max_tokens_per_head=max_tokens_per_head,
+        progress_callback=progress_callback,
+    )
 
     if progress_callback:
         progress_callback("Running eigenspectral analysis", 0.5)

@@ -149,22 +149,38 @@ class TestBitAllocation:
         assert b_high - b_low <= 2
 
     def test_only_emits_packable_bit_widths(self):
-        """allocate_bits must only return widths the cache can pack ({2, 4}).
+        """allocate_bits must only return widths the cache can pack.
 
-        Regression: d_eff=32 / avg_bits=2 used to return (5, 1); the spectral
-        KV cache packs indices via turboquant.pack_indices, which implements
-        only bits 2 and 4, so any other width crashes decode with
-        'Unsupported bits=N'. Sweep d_eff across the full range for both
-        supported avg_bits.
+        Regression (#593): d_eff=32 / avg_bits=2 used to return (5, 1); the
+        spectral KV cache packs indices via spectralquant's own
+        pack_indices/unpack_indices, which implement bits 1, 2, 4, and 8 —
+        any other width crashes decode with 'Unsupported bits=N'. Sweep
+        d_eff across the full range for both supported avg_bits and two
+        head_dims.
         """
         from olmlx.engine.spectralquant import allocate_bits
 
         for avg_bits in (2, 4):
-            for d_eff in range(1, 128):
-                b_high, b_low = allocate_bits(d_eff, head_dim=128, avg_bits=avg_bits)
-                assert b_high in (2, 4), (avg_bits, d_eff, b_high, b_low)
-                assert b_low in (2, 4), (avg_bits, d_eff, b_high, b_low)
-                assert b_high >= b_low
+            for head_dim in (128, 192):
+                for d_eff in range(1, head_dim):
+                    b_high, b_low = allocate_bits(d_eff, head_dim, avg_bits)
+                    assert b_high in (1, 2, 4, 8), (avg_bits, d_eff, b_high, b_low)
+                    assert b_low in (1, 2, 4, 8), (avg_bits, d_eff, b_high, b_low)
+                    assert b_high >= b_low
+
+    def test_nonuniform_allocation_when_budget_allows(self):
+        """Non-uniform allocation must survive the packable-width restriction.
+
+        Regression: clamping _PACKABLE_BITS to (2, 4) made the uniform pair
+        (slack 0) unbeatable for every reachable avg_bits, silently killing
+        the module's semantic/tail split. With widths {1, 2, 4, 8}, a
+        slack-0 non-uniform pair found earlier in the search must win:
+        d_eff=64, head_dim=192, avg_bits=4 -> 64*8 + 128*2 = 768 = 192*4,
+        giving the semantic regime double precision at the same budget.
+        """
+        from olmlx.engine.spectralquant import allocate_bits
+
+        assert allocate_bits(d_eff=64, head_dim=192, avg_bits=4) == (8, 2)
 
 
 # ---------------------------------------------------------------------------
