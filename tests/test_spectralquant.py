@@ -724,7 +724,9 @@ class TestSpectralQuantKVCache:
         cache.update_and_fetch(
             mx.random.normal((1, 2, 8, hd)), mx.random.normal((1, 2, 8, hd))
         )
-        prefill_misses = spectralquant._compiled_spectral_dequant_core.cache_info().misses
+        prefill_misses = (
+            spectralquant._compiled_spectral_dequant_core.cache_info().misses
+        )
 
         # 16 single-token decode steps, all within the first capacity bucket
         for _ in range(16):
