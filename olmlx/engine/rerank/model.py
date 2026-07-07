@@ -99,10 +99,14 @@ class XLMRobertaSelfAttention(nn.Module):
             .reshape(b, s, self.num_heads, self.head_dim)
             .transpose(0, 2, 1, 3)
         )
-        scores = (q @ k.transpose(0, 1, 3, 2)) * self.scale
-        scores = scores + additive_mask  # [b, 1, 1, s] broadcast
-        weights = mx.softmax(scores, axis=-1)
-        out = weights @ v  # [b, heads, s, head_dim]
+        # Fused SDPA computes softmax(q @ kᵀ * scale + mask) @ v without ever
+        # materializing the [b, heads, s, s] float32 score tensor that OOMs Metal
+        # on long padded rerank batches (issue #625). The additive mask is
+        # [b, 1, 1, s] and broadcasts over heads and query positions, matching the
+        # unfused reference math exactly (bidirectional encoder — no causal mask).
+        out = mx.fast.scaled_dot_product_attention(
+            q, k, v, scale=self.scale, mask=additive_mask
+        )
         return out.transpose(0, 2, 1, 3).reshape(b, s, -1)
 
 
