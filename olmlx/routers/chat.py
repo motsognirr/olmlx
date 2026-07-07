@@ -10,13 +10,8 @@ from olmlx.config import settings
 from olmlx.engine.grammar import parse_response_format
 from olmlx.engine.inference import generate_chat
 from olmlx.engine.panel import panel_generate_chat
-from olmlx.engine.tool_parser import (
-    fill_missing_required_args,
-    parse_model_output,
-    resolve_tool_names,
-)
 from olmlx.routers.common import format_error, resolve_think_flag
-from olmlx.routers.streaming_common import collect_stream
+from olmlx.routers.streaming_common import collect_stream, parse_model_output_post
 from olmlx.routers.thinking_split import (
     flush_split_thinking,
     split_thinking_streaming,
@@ -43,11 +38,12 @@ def _build_tool_calls(
     and the Gemma 4 channel format) are still stripped unconditionally
     because that handling runs above the ``has_tools`` gate.
     """
-    thinking, visible_text, tool_uses = parse_model_output(
-        raw_text, has_tools=bool(tools), thinking_expected=thinking_expected
+    thinking, visible_text, tool_uses = parse_model_output_post(
+        raw_text,
+        has_tools=bool(tools),
+        declared_tools=tools,
+        thinking_expected=thinking_expected,
     )
-    resolve_tool_names(tool_uses, tools)
-    fill_missing_required_args(tool_uses, tools)
     if not tool_uses:
         return thinking, visible_text, None
     # ``fill_missing_required_args`` normalizes ``tu["input"]`` to a dict
