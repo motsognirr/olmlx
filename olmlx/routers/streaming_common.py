@@ -115,11 +115,6 @@ async def buffer_stream(
         if chunk.get("cache_info"):
             yield chunk
             continue
-        if "thinking_expected" in chunk:
-            # Engine meta chunk, emitted before any text: gates the orphan
-            # `</think>` heuristic in `parse_model_output` (issue #307).
-            out.thinking_expected = bool(chunk["thinking_expected"])
-            continue
         if chunk.get("done"):
             # gpt-oss models put the unfiltered channel output here so tool
             # calls survive the visible-text filter.
@@ -127,6 +122,11 @@ async def buffer_stream(
             out.done_reason = chunk.get("done_reason")
             out.stats = chunk.get("stats")
             break
+        if "thinking_expected" in chunk:
+            # Engine meta chunk, emitted before any text: gates the orphan
+            # `</think>` heuristic in `parse_model_output` (issue #307).
+            out.thinking_expected = bool(chunk["thinking_expected"])
+            continue
         parts.append(chunk.get("text", ""))
     out.full_text = "".join(parts)
     yield out
