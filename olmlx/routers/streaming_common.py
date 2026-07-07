@@ -9,6 +9,7 @@ router.
 """
 
 import asyncio
+import json
 import logging
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
@@ -155,12 +156,49 @@ def parse_buffered_output(
     omissions visible to the client) injects empty strings for required
     string args the model omitted.
     """
-    thinking, visible_text, tool_uses = parse_model_output(
+    return parse_model_output_post(
         out.parse_text,
         has_tools,
+        declared_tools,
         thinking_expected=out.thinking_expected,
+        fill_missing_args=fill_missing_args,
+    )
+
+
+def parse_model_output_post(
+    text: str,
+    has_tools: bool,
+    declared_tools: list[dict[str, Any]] | None,
+    *,
+    thinking_expected: bool = False,
+    fill_missing_args: bool = True,
+) -> tuple[str, str, list[dict[str, Any]]]:
+    """Run the post-parse triple: parse_model_output -> resolve_tool_names -> fill_missing_required_args.
+
+    Centralized so all routers (OpenAI, Responses, Ollama) share the exact
+    same logic.  The Anthropic surface sets ``fill_missing_args=False`` to
+    leave model omissions visible to the client.
+    """
+    thinking, visible_text, tool_uses = parse_model_output(
+        text,
+        has_tools,
+        thinking_expected=thinking_expected,
     )
     resolve_tool_names(tool_uses, declared_tools)
     if fill_missing_args:
         fill_missing_required_args(tool_uses, declared_tools)
     return thinking, visible_text, tool_uses
+
+
+def sse_error_event(error_message: str = "An internal server error occurred during streaming.") -> str:
+    """Shared SSE error event payload used by OpenAI and Responses streaming."""
+    error_payload = json.dumps(
+        {
+            "error": {
+                "message": error_message,
+                "type": "server_error",
+                "code": "internal_error",
+            }
+        }
+    )
+    return f"data: {error_payload}\n\n"

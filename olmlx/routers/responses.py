@@ -10,10 +10,10 @@ from olmlx.config import settings
 from olmlx.engine.grammar import GrammarSpec, parse_response_format
 from olmlx.engine.inference import generate_chat
 from olmlx.engine.responses_state import get_store
-from olmlx.engine.tool_parser import (
-    fill_missing_required_args,
-    parse_model_output,
-    resolve_tool_names,
+from olmlx.routers.streaming_common import (
+    BufferedModelOutput,
+    collect_stream,
+    parse_buffered_output,
 )
 from olmlx.routers.common import build_inference_options, resolve_openai_think
 from olmlx.routers.thinking_split import flush_split_thinking, split_thinking_parts
@@ -373,33 +373,14 @@ async def _stream_response(
 
     async def _stream_tools_response():
         """Buffer the engine output, parse once, replay full semantic events."""
-        full_text = ""
-        raw_text = ""
-        done_reason = None
-        thinking_expected = False
-        stats = None
-        async for chunk in result:
-            if chunk.get("cache_info"):
-                continue
-            # `done` is checked before `thinking_expected` so a terminal chunk
-            # that also carries the meta key can't have its stats dropped.
-            if chunk.get("done"):
-                raw_text = chunk.get("raw_text", raw_text)
-                done_reason = chunk.get("done_reason")
-                stats = chunk.get("stats")
-                break
-            if "thinking_expected" in chunk:
-                thinking_expected = bool(chunk["thinking_expected"])
-                continue
-            full_text += chunk.get("text", "")
+        out: BufferedModelOutput = await collect_stream(result)
 
-        parse_text = raw_text or full_text
-        thinking, visible_text, tool_uses = parse_model_output(
-            parse_text, bool(tools), thinking_expected=thinking_expected
+        thinking, visible_text, tool_uses = parse_buffered_output(
+            out, tools, fill_missing_args=True
         )
-        resolve_tool_names(tool_uses, tools)
-        fill_missing_required_args(tool_uses, tools)
         output_items = _build_output_items(thinking, visible_text, tool_uses)
+        done_reason = out.done_reason
+        stats = out.stats
 
         in_progress_resp = base_response("in_progress", [], None, None)
         yield ev("response.created", {"response": in_progress_resp})
@@ -808,14 +789,17 @@ async def create_response(req: ResponsesRequest, request: Request):
         grammar_spec=grammar_spec,
     )
 
-    parse_text = result.get("raw_text") or result.get("text", "")
-    thinking, visible_text, tool_uses = parse_model_output(
-        parse_text,
-        bool(tools),
+    # Wrap non-streaming result in BufferedModelOutput for shared parse path
+    out = BufferedModelOutput(
+        full_text=result.get("text", ""),
+        raw_text=result.get("raw_text", ""),
+        done_reason=result.get("done_reason"),
+        stats=result.get("stats"),
         thinking_expected=bool(result.get("thinking_expected")),
     )
-    resolve_tool_names(tool_uses, tools)
-    fill_missing_required_args(tool_uses, tools)
+    thinking, visible_text, tool_uses = parse_buffered_output(
+        out, tools, fill_missing_args=True
+    )
 
     output_items = _build_output_items(thinking, visible_text, tool_uses)
     response = _build_response_object(

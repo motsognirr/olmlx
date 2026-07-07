@@ -28,7 +28,7 @@ from olmlx.routers.common import (
     collect_content_parts,
     resolve_openai_think,
 )
-from olmlx.routers.streaming_common import collect_stream, parse_buffered_output
+from olmlx.routers.streaming_common import collect_stream, parse_buffered_output, parse_model_output_post, sse_error_event
 from olmlx.routers.thinking_split import (
     flush_thinking_buffer,
     strip_thinking_streaming,
@@ -176,16 +176,7 @@ async def _stream_openai_sse(
                 content_emitted = True
     except Exception as exc:
         logger.error("Error during OpenAI streaming: %s", exc, exc_info=True)
-        error_payload = json.dumps(
-            {
-                "error": {
-                    "message": "An internal server error occurred during streaming.",
-                    "type": "server_error",
-                    "code": "internal_error",
-                }
-            }
-        )
-        yield f"data: {error_payload}\n\n"
+        yield sse_error_event()
         yield "data: [DONE]\n\n"
     finally:
         await result.aclose()
@@ -272,16 +263,7 @@ async def _stream_openai_sse_with_tools(
         yield "data: [DONE]\n\n"
     except Exception as exc:
         logger.error("Error during OpenAI streaming: %s", exc, exc_info=True)
-        error_payload = json.dumps(
-            {
-                "error": {
-                    "message": "An internal server error occurred during streaming.",
-                    "type": "server_error",
-                    "code": "internal_error",
-                }
-            }
-        )
-        yield f"data: {error_payload}\n\n"
+        yield sse_error_event()
         yield "data: [DONE]\n\n"
     finally:
         await result.aclose()
@@ -450,7 +432,7 @@ async def openai_chat(req: OpenAIChatRequest, request: Request):
             cache_id=cache_id,
             enable_thinking=enable_thinking,
             grammar_spec=grammar_spec,
-        )
+)
         text = result.get("text", "")
         # Use raw_text for tool parsing (preserves gpt-oss channel tokens);
         # ``or text`` (not ``.get(key, text)``) so an empty-string ``raw_text``
@@ -463,17 +445,12 @@ async def openai_chat(req: OpenAIChatRequest, request: Request):
         usage = OpenAIUsage.from_stats(result.get("stats"))
 
         has_tools = bool(req.tools)
-        # Pass `thinking_expected` so the orphan-`</think>` heuristic only
-        # fires when the engine actually requested thinking (issue #307
-        # review): a non-thinking model that mentions the literal token
-        # would otherwise have its prefix silently dropped from content.
-        _thinking, visible_text, tool_uses = parse_model_output(
+        _thinking, visible_text, tool_uses = parse_model_output_post(
             parse_text,
             has_tools,
+            req.tools,
             thinking_expected=bool(result.get("thinking_expected")),
         )
-        resolve_tool_names(tool_uses, req.tools)
-        fill_missing_required_args(tool_uses, req.tools)
 
         tool_calls = _to_openai_tool_calls(tool_uses) if tool_uses else None
         done_reason = result.get("done_reason")
