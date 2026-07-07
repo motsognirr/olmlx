@@ -190,7 +190,9 @@ def parse_model_output_post(
     return thinking, visible_text, tool_uses
 
 
-def sse_error_event(error_message: str = "An internal server error occurred during streaming.") -> str:
+def sse_error_event(
+    error_message: str = "An internal server error occurred during streaming.",
+) -> str:
     """Shared SSE error event payload used by OpenAI and Responses streaming."""
     error_payload = json.dumps(
         {

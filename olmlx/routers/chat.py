@@ -39,7 +39,10 @@ def _build_tool_calls(
     because that handling runs above the ``has_tools`` gate.
     """
     thinking, visible_text, tool_uses = parse_model_output_post(
-        raw_text, has_tools=bool(tools), declared_tools=tools, thinking_expected=thinking_expected
+        raw_text,
+        has_tools=bool(tools),
+        declared_tools=tools,
+        thinking_expected=thinking_expected,
     )
     if not tool_uses:
         return thinking, visible_text, None

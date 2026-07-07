@@ -23,7 +23,12 @@ from olmlx.routers.common import (
     collect_content_parts,
     resolve_openai_think,
 )
-from olmlx.routers.streaming_common import collect_stream, parse_buffered_output, parse_model_output_post, sse_error_event
+from olmlx.routers.streaming_common import (
+    collect_stream,
+    parse_buffered_output,
+    parse_model_output_post,
+    sse_error_event,
+)
 from olmlx.routers.thinking_split import (
     flush_thinking_buffer,
     strip_thinking_streaming,
@@ -427,7 +432,7 @@ async def openai_chat(req: OpenAIChatRequest, request: Request):
             cache_id=cache_id,
             enable_thinking=enable_thinking,
             grammar_spec=grammar_spec,
-)
+        )
         text = result.get("text", "")
         # Use raw_text for tool parsing (preserves gpt-oss channel tokens);
         # ``or text`` (not ``.get(key, text)``) so an empty-string ``raw_text``
