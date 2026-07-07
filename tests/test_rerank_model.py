@@ -5,6 +5,7 @@ from olmlx.engine.rerank.config import RerankerConfig
 from olmlx.engine.rerank.model import (
     XLMRobertaCrossEncoder,
     XLMRobertaEmbeddings,
+    XLMRobertaSelfAttention,
     roberta_position_ids,
 )
 from olmlx.engine.rerank.weights import detect_layout, remap_flash, remap_standard
@@ -105,6 +106,46 @@ def test_cross_encoder_forward_shape():
     mx.eval(logits)
     assert logits.shape == (2, 1)
     assert not bool(mx.any(mx.isnan(logits)))  # masking must not produce NaN
+
+
+def test_self_attention_fused_sdpa_matches_reference():
+    # The attention must run through mx.fast.scaled_dot_product_attention (no
+    # materialized [b, heads, s, s] score tensor — issue #625) and match the
+    # unfused reference math on a random masked case.
+    cfg = _tiny_config()
+    attn = XLMRobertaSelfAttention(cfg)
+    mx.eval(attn.parameters())
+
+    calls: list[bool] = []
+    real_sdpa = mx.fast.scaled_dot_product_attention
+
+    def spy(*args, **kwargs):
+        calls.append(True)
+        return real_sdpa(*args, **kwargs)
+
+    b, s = 2, 6
+    x = mx.random.normal((b, s, cfg.hidden_size))
+    keep = mx.array([[1, 1, 1, 1, 1, 1], [1, 1, 1, 0, 0, 0]])
+    additive = (1.0 - keep.astype(mx.float32))[:, None, None, :] * -1.0e4
+
+    try:
+        mx.fast.scaled_dot_product_attention = spy
+        out = attn(x, additive)
+        mx.eval(out)
+    finally:
+        mx.fast.scaled_dot_product_attention = real_sdpa
+
+    assert calls, "attention must use mx.fast.scaled_dot_product_attention"
+
+    # Reference: the unfused attention math with the same projections.
+    q = attn.query(x).reshape(b, s, attn.num_heads, attn.head_dim).transpose(0, 2, 1, 3)
+    k = attn.key(x).reshape(b, s, attn.num_heads, attn.head_dim).transpose(0, 2, 1, 3)
+    v = attn.value(x).reshape(b, s, attn.num_heads, attn.head_dim).transpose(0, 2, 1, 3)
+    scores = (q @ k.transpose(0, 1, 3, 2)) * attn.scale + additive
+    ref = (mx.softmax(scores, axis=-1) @ v).transpose(0, 2, 1, 3).reshape(b, s, -1)
+    mx.eval(ref)
+    assert out.shape == ref.shape
+    assert float(mx.max(mx.abs(out - ref))) < 1e-4
 
 
 def test_cross_encoder_padding_invariance():
