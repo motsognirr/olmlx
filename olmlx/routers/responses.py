@@ -376,7 +376,7 @@ async def _stream_response(
         out: BufferedModelOutput = await collect_stream(result)
 
         thinking, visible_text, tool_uses = parse_buffered_output(
-            out, tools, fill_missing_args=True
+            out, tools, has_tools=True, fill_missing_args=True
         )
         output_items = _build_output_items(thinking, visible_text, tool_uses)
         done_reason = out.done_reason
@@ -798,7 +798,7 @@ async def create_response(req: ResponsesRequest, request: Request):
         thinking_expected=bool(result.get("thinking_expected")),
     )
     thinking, visible_text, tool_uses = parse_buffered_output(
-        out, tools, fill_missing_args=True
+        out, tools, has_tools=bool(tools), fill_missing_args=True
     )
 
     output_items = _build_output_items(thinking, visible_text, tool_uses)
