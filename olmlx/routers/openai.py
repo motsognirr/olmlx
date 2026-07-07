@@ -18,11 +18,6 @@ from olmlx.engine.inference import (
     generate_embeddings,
 )
 from olmlx.engine.panel import panel_generate_chat
-from olmlx.engine.tool_parser import (
-    fill_missing_required_args,
-    parse_model_output,
-    resolve_tool_names,
-)
 from olmlx.routers.common import (
     build_inference_options,
     collect_content_parts,
