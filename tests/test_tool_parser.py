@@ -168,7 +168,9 @@ class TestTryMistral:
         assert tool_uses[0]["input"] == {"cmd": "echo ]"}
 
     def test_nested_arrays(self):
-        text = '[TOOL_CALLS] [{"name": "plot", "arguments": {"points": [[1, 2], [3, 4]]}}]'
+        text = (
+            '[TOOL_CALLS] [{"name": "plot", "arguments": {"points": [[1, 2], [3, 4]]}}]'
+        )
         tool_uses, remaining = _try_mistral(text)
         assert len(tool_uses) == 1
         assert tool_uses[0]["input"] == {"points": [[1, 2], [3, 4]]}
@@ -224,7 +226,9 @@ class TestTryLlama:
         assert tool_uses[0]["input"] == {"a": 1}
 
     def test_brace_in_string_value_with_trailing_prose(self):
-        text = '<|python_tag|>{"name": "echo", "parameters": {"msg": "a } b"}} And done.'
+        text = (
+            '<|python_tag|>{"name": "echo", "parameters": {"msg": "a } b"}} And done.'
+        )
         tool_uses, remaining = _try_llama(text)
         assert len(tool_uses) == 1
         assert tool_uses[0]["input"] == {"msg": "a } b"}
@@ -823,6 +827,37 @@ class TestParseModelOutput:
         assert "Second thought" in thinking
         assert "End" in visible
 
+    def test_thinking_with_less_than_inside(self):
+        """Issue #621: a '<' inside thinking (code/comparison/HTML) must not
+        break extraction — the tags must not leak into visible text."""
+        text = "<think>if a < b: return early</think>The answer is 5."
+        thinking, visible, tools = parse_model_output(text, has_tools=False)
+        assert thinking == "if a < b: return early"
+        assert visible == "The answer is 5."
+        assert "<think>" not in visible
+        assert "</think>" not in visible
+
+    def test_thinking_with_less_than_expected_true(self):
+        """Issue #621: with thinking_expected=True a literal <think> must not
+        leak into the thinking channel when thinking contains '<'."""
+        text = "<think>if a < b: return early</think>The answer is 5."
+        thinking, visible, tools = parse_model_output(
+            text, has_tools=False, thinking_expected=True
+        )
+        assert thinking == "if a < b: return early"
+        assert "<think>" not in thinking
+        assert visible == "The answer is 5."
+
+    def test_multiple_thinking_blocks_with_less_than(self):
+        """Issue #621: the fix uses a non-greedy (.*?), so multiple <think>
+        blocks each containing '<' still split correctly (no greedy merge)."""
+        text = "<think>a < b</think>Middle<think>c < d</think>End"
+        thinking, visible, tools = parse_model_output(text, has_tools=False)
+        assert thinking == "a < b\nc < d"
+        assert "Middle" in visible
+        assert "End" in visible
+        assert "<think>" not in visible
+
     def test_tool_call_with_thinking(self):
         text = (
             "<think>I need to search</think>"
@@ -1086,3 +1121,60 @@ class TestTruncatedThinking:
         thinking, visible, tools = parse_model_output(text, has_tools=False)
         assert "partial reasoning" in thinking
         assert "<|channel>" not in visible
+
+
+class TestGptOssCommentaryChannel:
+    """Issue #621 item 4: recipient-less Harmony commentary is user-visible
+    preamble, not a tool call; dotted/hyphenated tool names must resolve."""
+
+    def test_recipient_less_commentary_visible_no_tools(self):
+        """With has_tools=False, a recipient-less commentary block must go to
+        visible text, not vanish from all channels."""
+        text = (
+            "<|start|>assistant<|channel|>commentary<|message|>"
+            "I will now update the files."
+            "<|end|>"
+        )
+        thinking, visible, tools = parse_model_output(text, has_tools=False)
+        assert visible == "I will now update the files."
+        assert thinking == ""
+        assert tools == []
+
+    def test_recipient_less_commentary_visible_with_tools(self):
+        """With has_tools=True, a commentary block lacking a to=functions.
+        header must NOT become a bogus 'unknown' tool call — it is visible."""
+        text = (
+            "<|start|>assistant<|channel|>commentary<|message|>"
+            "I will now update the files."
+            "<|end|>"
+        )
+        thinking, visible, tools = parse_model_output(text, has_tools=True)
+        assert visible == "I will now update the files."
+        assert tools == []
+
+    def test_recipient_less_commentary_then_final(self):
+        """Recipient-less commentary preamble coexists with a final block."""
+        text = (
+            "<|start|>assistant<|channel|>commentary<|message|>"
+            "Let me start."
+            "<|end|>"
+            "<|start|>assistant<|channel|>final<|message|>"
+            "Done."
+            "<|end|>"
+        )
+        thinking, visible, tools = parse_model_output(text, has_tools=True)
+        assert "Let me start." in visible
+        assert "Done." in visible
+        assert tools == []
+
+    def test_dotted_hyphenated_tool_name(self):
+        """to=functions.NAME must accept dotted/hyphenated names (not just \\w+)."""
+        text = (
+            "<|start|>assistant<|channel|>commentary to=functions.my.tool-name<|message|>"
+            '{"x": 1}'
+            "<|call|>"
+        )
+        thinking, visible, tools = parse_model_output(text, has_tools=True)
+        assert len(tools) == 1
+        assert tools[0]["name"] == "my.tool-name"
+        assert tools[0]["input"] == {"x": 1}

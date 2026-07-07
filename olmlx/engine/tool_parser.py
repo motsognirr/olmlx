@@ -25,7 +25,10 @@ def _make_tool_use_id() -> str:
 
 # --- Regex patterns ---
 
-_THINK_RE = re.compile(r"<think>([^<]*)</think>")
+# Non-greedy DOTALL so thinking may contain '<' (code, comparisons, HTML) and
+# newlines without the extraction breaking, while multiple <think> blocks still
+# split correctly (issue #621).
+_THINK_RE = re.compile(r"<think>(.*?)</think>", re.DOTALL)
 
 # gpt-oss channel format (harmony):
 # <|start|>assistant<|channel|>analysis<|message|>thinking<|end|>
@@ -44,7 +47,9 @@ _THINK_RE = re.compile(r"<think>([^<]*)</think>")
 # Group 4: message content
 _GPT_OSS_CHANNEL_RE = re.compile(r"<\|channel\|>\s*(\w+)")
 _GPT_OSS_END_RE = re.compile(r"<\|(?:end|call|return)\|>")
-_GPT_OSS_TOOL_NAME_RE = re.compile(r"to=functions\.(\w+)")
+# Tool names may contain dots and hyphens (e.g. functions.my.tool-name), so the
+# capture is broader than \w+ (issue #621).
+_GPT_OSS_TOOL_NAME_RE = re.compile(r"to=functions\.([\w.-]+)")
 _GPT_OSS_DETECT = "<|channel|>"
 # Gemma4 tool call: <|tool_call>call:Name{key:<|"|>val<|"|>}<tool_call|>
 _GEMMA4_TOOL_CALL_RE = re.compile(r"<\|tool_call>(.*?)<tool_call\|>", re.DOTALL)
@@ -654,28 +659,29 @@ def _parse_gpt_oss_channels(
             thinking_parts.append(content)
         elif channel == "final":
             visible_parts.append(content)
-        elif channel == "commentary" and has_tools and content:
+        elif channel == "commentary" and content:
+            # Only commentary carrying a `to=functions.NAME` recipient is a tool
+            # call. Recipient-less Harmony commentary is user-visible preamble
+            # (e.g. "I will now update the files.") and must go to visible text,
+            # never a bogus "unknown" tool call (issue #621).
             tool_name_match = _GPT_OSS_TOOL_NAME_RE.search(header)
-            if not tool_name_match:
-                logger.warning(
-                    "gpt-oss tool call missing to=functions.NAME in header: %s",
-                    header[:200],
+            if tool_name_match is None:
+                visible_parts.append(content)
+            elif has_tools:
+                try:
+                    args = json.loads(content)
+                except (json.JSONDecodeError, ValueError):
+                    args = {}
+                tool_uses.append(
+                    {
+                        "type": "tool_use",
+                        "id": _make_tool_use_id(),
+                        "name": tool_name_match.group(1),
+                        "input": args,
+                    }
                 )
-                tool_name = "unknown"
-            else:
-                tool_name = tool_name_match.group(1)
-            try:
-                args = json.loads(content)
-            except (json.JSONDecodeError, ValueError):
-                args = {}
-            tool_uses.append(
-                {
-                    "type": "tool_use",
-                    "id": _make_tool_use_id(),
-                    "name": tool_name,
-                    "input": args,
-                }
-            )
+            # else: a tool call the client can't run (has_tools=False). Discard
+            # rather than leak raw JSON args into visible text.
 
     thinking = "\n".join(thinking_parts)
     visible = " ".join(visible_parts) if visible_parts else ""
