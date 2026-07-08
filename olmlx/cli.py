@@ -1179,6 +1179,10 @@ def _cleanup_workers():
             pass
     _worker_procs.clear()
     _worker_log_fhs.clear()
+    try:
+        (Path.home() / ".olmlx" / "ring_hostfile.json").unlink(missing_ok=True)
+    except Exception:
+        pass
 
 
 def _pre_shard_and_distribute(
