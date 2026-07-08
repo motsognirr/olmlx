@@ -578,18 +578,18 @@ def _extract_gemma4_blocks(text: str) -> tuple[str, list[str]]:
 
     while True:
         prefixed = text.find("<|channel>thought\n", pos)
-        plain = text.find("thought\n", pos)
+        plain = text.startswith("thought\n", pos)
 
-        if prefixed < 0 and plain < 0:
+        if prefixed < 0 and not plain:
             out_parts.append(text[pos:])
             break
 
-        if prefixed >= 0 and (plain < 0 or prefixed <= plain):
+        if prefixed >= 0 and (not plain or prefixed <= pos):
             marker_end = prefixed + 18  # len("<|channel>thought\n")
             out_parts.append(text[pos:prefixed])
         else:
-            marker_end = plain + 8  # len("thought\n")
-            out_parts.append(text[pos:plain])
+            marker_end = pos + 8  # len("thought\n")
+            out_parts.append(text[pos:pos])
 
         close = text.find("<channel|>", marker_end)
         if close < 0:

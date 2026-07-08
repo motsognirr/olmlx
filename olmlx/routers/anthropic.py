@@ -486,6 +486,7 @@ async def _stream_buffered_with_tools(
     yield {
         "stop_reason": stop_reason,
         "output_tokens": output_tokens,
+        "input_tokens": out.stats.prompt_eval_count if out.stats else 0,
     }
 
 
@@ -840,6 +841,7 @@ async def anthropic_messages(req: AnthropicMessagesRequest, request: Request):
                         },
                         "usage": {
                             "output_tokens": meta.get("output_tokens", 0),
+                            "input_tokens": meta.get("input_tokens", 0),
                         },
                     },
                 )
