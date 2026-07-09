@@ -25,8 +25,6 @@ def _make_tool_use_id() -> str:
 
 # --- Regex patterns ---
 
-_THINK_RE = re.compile(r"<think>([^<]*)</think>")
-
 # gpt-oss channel format (harmony):
 # <|start|>assistant<|channel|>analysis<|message|>thinking<|end|>
 # <|start|>assistant<|channel|>final<|message|>visible<|return|>  (or end-of-string — mlx-lm strips EOS)
@@ -44,7 +42,9 @@ _THINK_RE = re.compile(r"<think>([^<]*)</think>")
 # Group 4: message content
 _GPT_OSS_CHANNEL_RE = re.compile(r"<\|channel\|>\s*(\w+)")
 _GPT_OSS_END_RE = re.compile(r"<\|(?:end|call|return)\|>")
-_GPT_OSS_TOOL_NAME_RE = re.compile(r"to=functions\.(\w+)")
+# Tool names may contain dots and hyphens (e.g. functions.my.tool-name), so the
+# capture is broader than \w+ (issue #621).
+_GPT_OSS_TOOL_NAME_RE = re.compile(r"to=functions\.([\w.-]+)")
 _GPT_OSS_DETECT = "<|channel|>"
 # Gemma4 tool call: <|tool_call>call:Name{key:<|"|>val<|"|>}<tool_call|>
 _GEMMA4_TOOL_CALL_RE = re.compile(r"<\|tool_call>(.*?)<tool_call\|>", re.DOTALL)
@@ -62,22 +62,37 @@ _GLM_BARE_NAME_RE = re.compile(r"[A-Za-z_][\w.-]*")
 # "true"/"false"/"null" block is noise, not a zero-arg call.
 _JSON_LITERALS = frozenset({"true", "false", "null"})
 
-# Mistral: [TOOL_CALLS] followed by a JSON array
-_MISTRAL_TOOL_RE = re.compile(r"\[TOOL_CALLS\]\s*(\[.*?\])", re.DOTALL)
+# Mistral: [TOOL_CALLS] followed by a JSON array. The array is extracted with a
+# bracket-counting scan (``_extract_json_array``) rather than a non-greedy regex,
+# so array-valued arguments and ``]`` inside string values don't truncate it
+# (issue #607).
+_MISTRAL_MARKER_RE = re.compile(r"\[TOOL_CALLS\]")
 
-# Llama 3.x: <|python_tag|> followed by JSON
-_LLAMA_TOOL_RE = re.compile(
-    r"<\|python_tag\|>\s*(\{.*?\})\s*(?:<\|eom_id\|>|$)", re.DOTALL
-)
+# Llama 3.x: <|python_tag|> followed by JSON. The object is extracted with
+# ``_extract_json_object`` (brace-counting) so a call followed by prose — the
+# JSON is not always terminal — isn't dropped (issue #621).
+_LLAMA_MARKER_RE = re.compile(r"<\|python_tag\|>")
+_LLAMA_EOM = "<|eom_id|>"
 
-# DeepSeek: <|tool_calls_begin|>...<|tool_calls_end|>
-_DEEPSEEK_TOOL_RE = re.compile(
-    r"<\|tool_calls_begin\|>(.*?)<\|tool_calls_end\|>", re.DOTALL
-)
-_DEEPSEEK_CALL_RE = re.compile(
-    r"<\|tool_call_begin\|>\s*(?:function)?\s*\n?\s*(\w+)\s*\n(.*?)<\|tool_call_end\|>",
-    re.DOTALL,
-)
+# DeepSeek: <|tool_calls_begin|>...<|tool_calls_end|>.
+# The official V3/R1 chat template emits fullwidth-bar markers (U+FF5C ``｜``)
+# with a U+2581 ``▁`` word-joiner (``<｜tool▁calls▁begin｜>``), a
+# ``<｜tool▁sep｜>`` between the ``function`` type and the name, and arguments
+# inside a ```` ```json ```` fence.  We normalize those two codepoints to their
+# ASCII equivalents (a 1:1, length-preserving translation, so spans stay valid)
+# and then match a single ASCII grammar that also covers the legacy ASCII form
+# and the V3.1 ``name<sep>args`` rendering (issue #621).
+_DEEPSEEK_BAR_TRANS = str.maketrans({"｜": "|", "▁": "_"})
+_DEEPSEEK_SEP = "<|tool_sep|>"
+# Delimiters are matched with literal ``str.find`` scans (see ``_try_deepseek``)
+# rather than ``<begin>(.*?)<end>`` search/finditer regexes — the latter is a
+# multi-start-position non-greedy match, i.e. a polynomial-ReDoS shape.
+_DEEPSEEK_CALLS_BEGIN = "<|tool_calls_begin|>"
+_DEEPSEEK_CALLS_END = "<|tool_calls_end|>"
+_DEEPSEEK_CALL_BEGIN = "<|tool_call_begin|>"
+_DEEPSEEK_CALL_END = "<|tool_call_end|>"
+# Anchored ``.match`` (single start position) is linear, not a ReDoS.
+_DEEPSEEK_FENCE_RE = re.compile(r"```(?:json)?\s*(.*?)\s*```", re.DOTALL)
 
 # MiniMax: <minimax:tool_call><invoke name="Name"><parameter name="key">value</parameter></invoke></minimax:tool_call>
 _MINIMAX_TOOL_RE = re.compile(
@@ -240,14 +255,26 @@ def _try_qwen(text: str) -> tuple[list[dict], str]:
 
 
 def _try_mistral(text: str) -> tuple[list[dict], str]:
-    """Parse Mistral-style [TOOL_CALLS] blocks."""
-    tool_uses = []
-    match = _MISTRAL_TOOL_RE.search(text)
-    if not match:
+    """Parse Mistral-style [TOOL_CALLS] blocks.
+
+    The JSON array is extracted with a bracket-counting scan rather than a
+    non-greedy regex, so a tool call whose arguments contain a nested array (or
+    a ``]`` inside a string value) is not truncated at the first ``]`` and
+    silently dropped (issue #607).
+    """
+    tool_uses: list[dict] = []
+    marker = _MISTRAL_MARKER_RE.search(text)
+    if not marker:
         return [], text
-    span = (match.start(), match.end())
+    arr_start = text.find("[", marker.end())
+    if arr_start == -1 or text[marker.end() : arr_start].strip():
+        return [], text
+    arr_str = _extract_json_array(text, arr_start)
+    if arr_str is None:
+        return [], text
+    span = (marker.start(), arr_start + len(arr_str))
     try:
-        calls = json.loads(match.group(1))
+        calls = json.loads(arr_str)
         for call in calls:
             result = _parse_json_call(call)
             if result:
@@ -259,37 +286,119 @@ def _try_mistral(text: str) -> tuple[list[dict], str]:
 
 
 def _try_llama(text: str) -> tuple[list[dict], str]:
-    """Parse Llama 3.x <|python_tag|> blocks."""
-    tool_uses = []
-    for match in _LLAMA_TOOL_RE.finditer(text):
+    """Parse Llama 3.x <|python_tag|> blocks.
+
+    The JSON object is extracted with a brace-counting scan (respecting string
+    literals) rather than a non-greedy regex anchored to end-of-string, so a
+    call followed by trailing prose — the JSON is not always terminal — is not
+    dropped, and a ``}`` inside a string value does not truncate it (issue
+    #621).
+    """
+    tool_uses: list[dict] = []
+    for match in _LLAMA_MARKER_RE.finditer(text):
+        brace = text.find("{", match.end())
+        if brace == -1 or text[match.end() : brace].strip():
+            continue
+        obj_str = _extract_json_object(text, brace)
+        if obj_str is None:
+            continue
         try:
-            call = json.loads(match.group(1))
-            result = _parse_json_call(call)
-            if result:
-                result["_span"] = (match.start(), match.end())
-                tool_uses.append(result)
-        except (json.JSONDecodeError, AttributeError):
-            logger.warning(
-                "Failed to parse <|python_tag|> block: %r", match.group(1)[:500]
-            )
+            call = json.loads(obj_str)
+        except json.JSONDecodeError:
+            logger.warning("Failed to parse <|python_tag|> block: %r", obj_str[:500])
+            continue
+        result = _parse_json_call(call)
+        if not result:
+            continue
+        end = brace + len(obj_str)
+        # Consume a trailing <|eom_id|> terminator into the span so it doesn't
+        # leak into visible text; any prose after it is preserved.
+        tail = text[end:]
+        stripped = tail.lstrip()
+        if stripped.startswith(_LLAMA_EOM):
+            end += len(tail) - len(stripped) + len(_LLAMA_EOM)
+        result["_span"] = (match.start(), end)
+        tool_uses.append(result)
     return tool_uses, text
 
 
+def _extract_deepseek_args(args_str: str) -> dict:
+    """Parse a DeepSeek call's argument text, stripping a ```json fence if any."""
+    args_str = args_str.strip()
+    fence = _DEEPSEEK_FENCE_RE.match(args_str)
+    if fence:
+        args_str = fence.group(1).strip()
+    if not args_str:
+        return {}
+    try:
+        parsed = json.loads(args_str)
+    except json.JSONDecodeError:
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def _parse_deepseek_call(inner: str) -> tuple[str, dict]:
+    """Parse the body of one <|tool_call_begin|>...<|tool_call_end|> block.
+
+    Handles three renderings that all normalize to ASCII markers here:
+    - legacy ASCII: ``function\\nname\\n{args}``
+    - official V3/R1: ``function<|tool_sep|>name\\n```json\\n{args}```
+    - V3.1: ``name<|tool_sep|>{args}``
+    """
+    inner = inner.strip()
+    if _DEEPSEEK_SEP in inner:
+        before, after = inner.split(_DEEPSEEK_SEP, 1)
+        before = before.strip()
+        if before and before != "function":
+            # V3.1: name<sep>args
+            return before, _extract_deepseek_args(after)
+        # official V3/R1: [function]<sep>name\n<fenced args>
+        after = after.strip()
+        newline = after.find("\n")
+        if newline == -1:
+            return after.strip(), {}
+        return after[:newline].strip(), _extract_deepseek_args(after[newline + 1 :])
+    # legacy ASCII: optional "function" type line, then name line, then args
+    lines = inner.split("\n")
+    if lines and lines[0].strip() == "function":
+        lines = lines[1:]
+    if not lines or not lines[0].strip():
+        return "", {}
+    return lines[0].strip(), _extract_deepseek_args("\n".join(lines[1:]))
+
+
 def _try_deepseek(text: str) -> tuple[list[dict], str]:
-    """Parse DeepSeek <|tool_calls_begin|>...<|tool_calls_end|> blocks."""
-    tool_uses = []
-    ds_match = _DEEPSEEK_TOOL_RE.search(text)
-    if not ds_match:
+    """Parse DeepSeek <|tool_calls_begin|>...<|tool_calls_end|> blocks.
+
+    The official V3/R1 template emits fullwidth-bar markers (U+FF5C / U+2581);
+    they are normalized to ASCII (a 1:1, length-preserving translation, so the
+    match spans stay valid against the original text) before matching (issue
+    #621).
+    """
+    tool_uses: list[dict] = []
+    norm = text.translate(_DEEPSEEK_BAR_TRANS)
+    begin = norm.find(_DEEPSEEK_CALLS_BEGIN)
+    if begin == -1:
         return [], text
-    span = (ds_match.start(), ds_match.end())
-    inner = ds_match.group(1)
-    for call_match in _DEEPSEEK_CALL_RE.finditer(inner):
-        name = call_match.group(1).strip()
-        args_str = call_match.group(2).strip()
-        try:
-            arguments = json.loads(args_str) if args_str else {}
-        except json.JSONDecodeError:
-            arguments = {}
+    inner_start = begin + len(_DEEPSEEK_CALLS_BEGIN)
+    end = norm.find(_DEEPSEEK_CALLS_END, inner_start)
+    if end == -1:
+        return [], text
+    span = (begin, end + len(_DEEPSEEK_CALLS_END))
+    inner = norm[inner_start:end]
+    pos = 0
+    while True:
+        cb = inner.find(_DEEPSEEK_CALL_BEGIN, pos)
+        if cb == -1:
+            break
+        body_start = cb + len(_DEEPSEEK_CALL_BEGIN)
+        ce = inner.find(_DEEPSEEK_CALL_END, body_start)
+        if ce == -1:
+            break
+        name, arguments = _parse_deepseek_call(inner[body_start:ce])
+        pos = ce + len(_DEEPSEEK_CALL_END)
+        if not name:
+            continue
         tool_uses.append(
             {
                 "type": "tool_use",
@@ -347,6 +456,35 @@ def _extract_json_object(text: str, start: int) -> str | None:
             if ch == "{":
                 depth += 1
             elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    return text[start : i + 1]
+        i += 1
+    return None
+
+
+def _extract_json_array(text: str, start: int) -> str | None:
+    """Extract a JSON array from text starting at a '[', counting brackets.
+
+    Respects string literals so brackets inside quoted strings are ignored.
+    Returns the substring from start to the matching ']', or None if unbalanced.
+    """
+    depth = 0
+    in_string = False
+    escape = False
+    i = start
+    while i < len(text):
+        ch = text[i]
+        if escape:
+            escape = False
+        elif ch == "\\" and in_string:
+            escape = True
+        elif ch == '"':
+            in_string = not in_string
+        elif not in_string:
+            if ch == "[":
+                depth += 1
+            elif ch == "]":
                 depth -= 1
                 if depth == 0:
                     return text[start : i + 1]
@@ -532,28 +670,29 @@ def _parse_gpt_oss_channels(
             thinking_parts.append(content)
         elif channel == "final":
             visible_parts.append(content)
-        elif channel == "commentary" and has_tools and content:
+        elif channel == "commentary" and content:
+            # Only commentary carrying a `to=functions.NAME` recipient is a tool
+            # call. Recipient-less Harmony commentary is user-visible preamble
+            # (e.g. "I will now update the files.") and must go to visible text,
+            # never a bogus "unknown" tool call (issue #621).
             tool_name_match = _GPT_OSS_TOOL_NAME_RE.search(header)
-            if not tool_name_match:
-                logger.warning(
-                    "gpt-oss tool call missing to=functions.NAME in header: %s",
-                    header[:200],
+            if tool_name_match is None:
+                visible_parts.append(content)
+            elif has_tools:
+                try:
+                    args = json.loads(content)
+                except (json.JSONDecodeError, ValueError):
+                    args = {}
+                tool_uses.append(
+                    {
+                        "type": "tool_use",
+                        "id": _make_tool_use_id(),
+                        "name": tool_name_match.group(1),
+                        "input": args,
+                    }
                 )
-                tool_name = "unknown"
-            else:
-                tool_name = tool_name_match.group(1)
-            try:
-                args = json.loads(content)
-            except (json.JSONDecodeError, ValueError):
-                args = {}
-            tool_uses.append(
-                {
-                    "type": "tool_use",
-                    "id": _make_tool_use_id(),
-                    "name": tool_name,
-                    "input": args,
-                }
-            )
+            # else: a tool call the client can't run (has_tools=False). Discard
+            # rather than leak raw JSON args into visible text.
 
     thinking = "\n".join(thinking_parts)
     visible = " ".join(visible_parts) if visible_parts else ""
@@ -608,6 +747,51 @@ def _extract_gemma4_blocks(text: str) -> tuple[str, list[str]]:
     return "".join(out_parts), blocks
 
 
+def _extract_think_blocks(text: str) -> tuple[str, list[str]]:
+    """Extract ``<think>...</think>`` blocks with a linear, non-backtracking scan.
+
+    Replaces the ``<think>(.*?)</think>`` regex (``re.DOTALL``): a non-greedy
+    ``.*?`` followed by a literal is a polynomial-ReDoS pattern (O(n^2) on a
+    long unclosed ``<think>``), and the older ``[^<]*`` variant was linear but
+    silently broke whenever thinking contained ``<`` (issue #621).
+
+    An index scan is O(n) and exactly reproduces the old
+    ``findall`` / ``sub("")`` pair:
+
+    - returns ``(cleaned_text, inner_strings)`` where *cleaned_text* has every
+      complete block removed and *inner_strings* are the raw (unstripped) inner
+      captures, matching ``_THINK_RE.findall`` (the caller strips);
+    - a ``<think>`` with no matching ``</think>`` is left untouched — the
+      regex simply didn't match it, so the downstream orphan/truncated
+      handlers keep processing it;
+    - the close tag is matched literally, so a near-miss like ``</thinkable>``
+      inside the block is not mistaken for the closer, and multiple blocks
+      still split correctly.
+    """
+    open_tag = "<think>"
+    close_tag = "</think>"
+    blocks: list[str] = []
+    out_parts: list[str] = []
+    pos = 0
+
+    while True:
+        start = text.find(open_tag, pos)
+        if start == -1:
+            out_parts.append(text[pos:])
+            break
+        inner_start = start + len(open_tag)
+        end = text.find(close_tag, inner_start)
+        if end == -1:
+            # Unclosed opener: leave the remainder (including <think>) intact.
+            out_parts.append(text[pos:])
+            break
+        out_parts.append(text[pos:start])
+        blocks.append(text[inner_start:end])
+        pos = end + len(close_tag)
+
+    return "".join(out_parts), blocks
+
+
 def parse_model_output(
     text: str,
     has_tools: bool,
@@ -640,11 +824,10 @@ def parse_model_output(
     if gemma4_blocks:
         thinking = "\n".join(gemma4_blocks)
 
-    think_matches = _THINK_RE.findall(text)
-    if think_matches:
-        think_text = "\n".join(m.strip() for m in think_matches)
+    text, think_blocks = _extract_think_blocks(text)
+    if think_blocks:
+        think_text = "\n".join(m.strip() for m in think_blocks)
         thinking = f"{thinking}\n{think_text}".strip() if thinking else think_text
-        text = _THINK_RE.sub("", text)
 
     # Handle orphaned </think> — the chat template may open <think> in the
     # prompt so the generated text starts mid-think with only a closing tag.
