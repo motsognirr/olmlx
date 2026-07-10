@@ -11,6 +11,7 @@ from olmlx.engine.flash.moe_lookahead_train import (
     build_multi_hot,
     recall_at_m,
     record_moe_router_traces,
+    record_moe_router_traces_decode,
     train_from_traces,
     train_moe_lookahead,
 )
@@ -66,6 +67,9 @@ class TestTrainFromTraces:
         assert "1→2" in recalls
         assert recalls["1→2"] > 0.9  # trivially learnable rule
         assert bank.trained_pairs == {0}
+        # Recall must also land on the bank itself (pair-indexed) so save()
+        # persists it and serve-time recall gating can use it.
+        assert bank.pair_recalls == {0: recalls["1→2"]}
 
     def test_missing_layer_trace_skipped(self):
         hid = np.zeros((10, 16), dtype=np.float32)
@@ -223,6 +227,67 @@ class TestRecordTraces:
         assert 2 not in traces
 
 
+class TestDecodeTraceRecording:
+    """Decode-state tracing (--self-generate): record hidden/routing during
+    the model's own greedy generation, not teacher-forced prefill — the
+    serve-time prediction runs on decode states, and prefill-trained heads
+    are off-distribution there (same lesson as DFlash --self-generate)."""
+
+    @staticmethod
+    def _gen_fn(prefill_len: int, decode_steps: int):
+        def _gen(model, tokenizer, prompt_ids, max_new):
+            model(mx.array([prompt_ids[:prefill_len]]))  # prefill: skipped
+            for _ in range(min(decode_steps, max_new)):
+                model(mx.array([[1]]))  # decode steps: recorded
+
+        return _gen
+
+    def test_records_only_decode_positions(self):
+        model = _FakeModel(hidden=8, num_experts=4, k=2)
+        traces = record_moe_router_traces_decode(
+            model,
+            _FakeTokenizer(),
+            [1, 2],
+            max_new_tokens=4,
+            max_prompts=1,
+            prompt_source=iter([[1, 2, 3, 4, 5]]),
+            _generate_fn=self._gen_fn(prefill_len=5, decode_steps=4),
+        )
+        assert set(traces.keys()) == {1, 2}
+        # Only the 4 decode steps recorded — the 5-position prefill skipped.
+        assert traces[1][0].shape[0] == 4
+        assert traces[2][1].shape == (4, 2)
+        assert traces[1][0].shape[0] == traces[2][0].shape[0]
+
+    def test_decode_position_cap(self):
+        model = _FakeModel(hidden=8, num_experts=4, k=2)
+        traces = record_moe_router_traces_decode(
+            model,
+            _FakeTokenizer(),
+            [1, 2],
+            max_positions_per_layer=3,
+            max_new_tokens=10,
+            max_prompts=5,
+            prompt_source=iter([[1, 2, 3]] * 5),
+            _generate_fn=self._gen_fn(prefill_len=3, decode_steps=10),
+        )
+        assert traces[1][0].shape[0] == 3
+
+    def test_originals_restored(self):
+        model = _FakeModel(hidden=8, num_experts=4, k=2)
+        original_1 = model.layers[1].mlp
+        record_moe_router_traces_decode(
+            model,
+            _FakeTokenizer(),
+            [1, 2],
+            max_new_tokens=2,
+            max_prompts=1,
+            prompt_source=iter([[1, 2]]),
+            _generate_fn=self._gen_fn(prefill_len=2, decode_steps=2),
+        )
+        assert model.layers[1].mlp is original_1
+
+
 class TestTrainMoeLookaheadCalibrationDatasetValidation:
     """Finding 3: an unrecognized ``calibration_dataset`` string used to
     silently fall back to c4 (only "synthetic" was special-cased). Must be
@@ -320,6 +385,7 @@ class TestTrainMoeLookaheadSidecarProvenance:
             "lr": 5e-4,
             "num_samples": 7,
             "holdout_fraction": 0.2,
+            "self_generate": False,
         }
         # load() must ignore the unknown key rather than choking on it.
         from olmlx.engine.flash.moe_predictor import MoeLookaheadBank

@@ -920,6 +920,7 @@ class ModelConfig:
             lookahead_margin=settings.flash_moe_lookahead_margin,
             prefetch_max_positions=settings.flash_moe_prefetch_max_positions,
             scored_eviction=settings.flash_moe_scored_eviction,
+            prefetch_min_recall=settings.flash_moe_prefetch_min_recall,
         )
 
     @classmethod

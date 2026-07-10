@@ -79,6 +79,102 @@ class TestMoeLookaheadBank:
         assert orig is not None and rt is not None
         np.testing.assert_allclose(orig[1], rt[1], rtol=1e-5)
 
+    def test_predict_next_np_matches_mlx_path(self):
+        bank = MoeLookaheadBank(
+            [0, 1], hidden_size=16, num_experts=8, rank=4, num_experts_per_tok=2
+        )
+        hidden = mx.random.normal((1, 3, 16))
+        hidden_np = np.array(hidden.reshape(-1, 16).astype(mx.float32))
+        mlx_result = bank.predict_next(0, hidden, margin=1.5)
+        np_result = bank.predict_next_np(0, hidden_np, margin=1.5)
+        assert mlx_result is not None and np_result is not None
+        assert np_result[0] == mlx_result[0]
+        # fp32 Metal vs CPU-BLAS accumulation order — indices above are the
+        # exact contract; scores only need to agree to backend noise.
+        np.testing.assert_allclose(np_result[1], mlx_result[1], rtol=2e-3, atol=1e-4)
+        assert np_result[1].dtype == np.float32
+
+    def test_predict_next_np_returns_none_for_last_layer(self):
+        bank = MoeLookaheadBank(
+            [0, 1], hidden_size=16, num_experts=8, rank=4, num_experts_per_tok=2
+        )
+        hidden_np = np.zeros((1, 16), dtype=np.float32)
+        assert bank.predict_next_np(1, hidden_np) is None
+
+    def test_predict_next_np_after_load_uses_loaded_weights(self, tmp_path):
+        bank = MoeLookaheadBank(
+            [1, 2], hidden_size=16, num_experts=8, rank=4, num_experts_per_tok=2
+        )
+        out = tmp_path / "moe_lookahead"
+        bank.save(out)
+        loaded = MoeLookaheadBank.load(out)
+        hidden = mx.random.normal((1, 1, 16))
+        hidden_np = np.array(hidden.reshape(-1, 16).astype(mx.float32))
+        orig = bank.predict_next_np(1, hidden_np)
+        rt = loaded.predict_next_np(1, hidden_np)
+        assert orig is not None and rt is not None
+        assert orig[0] == rt[0]
+        np.testing.assert_allclose(orig[1], rt[1], rtol=1e-5)
+
+    def test_pair_recalls_save_load_roundtrip(self, tmp_path):
+        bank = MoeLookaheadBank(
+            [1, 2, 4], hidden_size=16, num_experts=8, rank=4, num_experts_per_tok=2
+        )
+        bank.pair_recalls = {0: 0.2, 1: 0.5}
+        out = tmp_path / "moe_lookahead"
+        bank.save(out)
+        loaded = MoeLookaheadBank.load(out)
+        assert loaded.pair_recalls == {0: 0.2, 1: 0.5}
+
+    def test_load_without_pair_recalls_is_empty(self, tmp_path):
+        """Sidecars written before recall persistence load with no recalls
+        (and the gate below is then a no-op for those pairs)."""
+        bank = MoeLookaheadBank(
+            [1, 2], hidden_size=16, num_experts=8, rank=4, num_experts_per_tok=2
+        )
+        out = tmp_path / "moe_lookahead"
+        bank.save(out)
+        sidecar = json.loads((out / SIDECAR_NAME).read_text())
+        sidecar.pop("pair_recalls", None)
+        (out / SIDECAR_NAME).write_text(json.dumps(sidecar))
+        loaded = MoeLookaheadBank.load(out)
+        assert loaded.pair_recalls == {}
+
+    def test_apply_recall_gate_disables_low_recall_pairs(self):
+        bank = MoeLookaheadBank(
+            [1, 2, 4, 5],
+            hidden_size=16,
+            num_experts=8,
+            rank=4,
+            num_experts_per_tok=2,
+        )
+        bank.pair_recalls = {0: 0.15, 1: 0.40, 2: 0.55}
+        gated = bank.apply_recall_gate(0.35)
+        assert gated == 1
+        assert bank.next_moe_layer(1) is None  # pair 0 gated
+        assert bank.next_moe_layer(2) == 4  # pair 1 kept
+        assert bank.next_moe_layer(4) == 5  # pair 2 kept
+
+    def test_apply_recall_gate_keeps_pairs_without_recall(self):
+        """A pair with no recorded recall must survive the gate — gating on
+        absent data would silently disable prefetch for legacy banks."""
+        bank = MoeLookaheadBank(
+            [1, 2, 4], hidden_size=16, num_experts=8, rank=4, num_experts_per_tok=2
+        )
+        bank.pair_recalls = {0: 0.1}  # pair 1 has no recall recorded
+        gated = bank.apply_recall_gate(0.35)
+        assert gated == 1
+        assert bank.next_moe_layer(1) is None
+        assert bank.next_moe_layer(2) == 4
+
+    def test_apply_recall_gate_zero_threshold_is_noop(self):
+        bank = MoeLookaheadBank(
+            [1, 2], hidden_size=16, num_experts=8, rank=4, num_experts_per_tok=2
+        )
+        bank.pair_recalls = {0: 0.05}
+        assert bank.apply_recall_gate(0.0) == 0
+        assert bank.next_moe_layer(1) == 2
+
     def test_load_missing_dir_raises(self, tmp_path):
         with pytest.raises(FileNotFoundError):
             MoeLookaheadBank.load(tmp_path / "nonexistent")

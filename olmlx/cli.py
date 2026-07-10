@@ -2787,7 +2787,10 @@ def cmd_flash_train_moe_lookahead(args):
     from olmlx.engine.flash.moe_lookahead_train import train_moe_lookahead
 
     print(f"Training MoE expert lookahead for {args.model}...")
-    print(f"  Rank: {args.rank}  Epochs: {args.epochs}  Samples: {args.samples}")
+    print(
+        f"  Rank: {args.rank}  Epochs: {args.epochs}  Samples: {args.samples}"
+        f"  Max positions/layer: {args.max_positions}"
+    )
     print()
 
     out_dir = train_moe_lookahead(
@@ -2797,13 +2800,15 @@ def cmd_flash_train_moe_lookahead(args):
         epochs=args.epochs,
         num_samples=args.samples,
         calibration_dataset=args.calibration_dataset,
+        max_positions_per_layer=args.max_positions,
+        self_generate=args.self_generate,
         progress_callback=_flash_progress,
     )
 
     print("\nMoE lookahead training complete!")
     print(f"  Output: {out_dir}")
-    print("\nExpert prefetch activates automatically on the next model load")
-    print("(disable with OLMLX_FLASH_MOE_PREFETCH=false).")
+    print("\nExpert prefetch is off by default (it benchmarked slower than")
+    print("plain LRU caching); enable with OLMLX_FLASH_MOE_PREFETCH=true.")
 
 
 def cmd_dflash_precompute(args):
@@ -3494,6 +3499,25 @@ def build_parser() -> argparse.ArgumentParser:
         type=str,
         default=None,
         help="Calibration dataset: 'c4' (default) or 'synthetic'",
+    )
+    tml_p.add_argument(
+        "--max-positions",
+        type=int,
+        default=4096,
+        help="Max trace positions per MoE layer (default: 4096). This caps "
+        "the per-pair training-set size, so raising it (with enough "
+        "--samples to fill it) is the main recall lever. RAM cost is "
+        "~hidden_size*4 bytes per position per layer.",
+    )
+    tml_p.add_argument(
+        "--self-generate",
+        action="store_true",
+        help="Trace the model's own decode steps over chat prompts instead "
+        "of teacher-forced prefill over calibration text (same recipe as "
+        "dflash --self-generate). Serve-time predictions run on decode "
+        "states, and prefill-trained heads lose ~2/3 of their recall "
+        "there. --samples counts prompts; --calibration-dataset is "
+        "ignored. Slower: one forward per generated token.",
     )
 
     # DFlash draft training
