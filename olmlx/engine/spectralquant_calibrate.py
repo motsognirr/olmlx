@@ -371,9 +371,9 @@ def _load_calibration_model(model_path: str):
         try:
             model, tokenizer = load_model_with_strict_fallback(model_path, lazy=False)
         except ValueError:
-            import mlx_vlm
+            from olmlx.engine.vlm_load import load_vlm
 
-            model, processor = mlx_vlm.load(model_path, lazy=False)
+            model, processor = load_vlm(model_path, lazy=False)
             tokenizer = (
                 processor.tokenizer if hasattr(processor, "tokenizer") else processor
             )

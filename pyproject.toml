@@ -23,7 +23,15 @@ dependencies = [
     "jinja2>=3.0",
     "pydantic>=2.0",
     "pydantic-settings>=2.0",
-    "mlx-vlm>=0.5.0,<0.6",
+    # mlx-vlm 0.6.4 (specifically — the guard is present through 0.6.3)
+    # dropped the is_mlx_format guard around sanitize_weights, which
+    # scrambles gemma4 audio-tower conv weights on pre-converted MLX
+    # checkpoints; engine/gemma4_sanitize_fix.py carries a gemma4-scoped
+    # workaround until the upstream shape-guard fix (on main, unreleased as
+    # of 0.6.4) ships. 0.6.4 is taken despite the patch-free <0.6.4
+    # alternative for its server/TTS/STT endpoints, gemma4_unified module,
+    # and prefill performance work.
+    "mlx-vlm>=0.6.4,<0.7",
     "transformers>=5.5.0",
     # torch is NOT declared here on purpose (#469): xgrammar and mlx-whisper
     # both require it transitively, so it is always installed — but olmlx
