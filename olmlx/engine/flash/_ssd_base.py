@@ -237,3 +237,65 @@ class LayerLruCache(Generic[K, V]):
             for k in keys:
                 (cached if k in layer_cache else missing).append(k)
             return cached, missing
+
+
+class ScoredLayerCache(LayerLruCache[K, V]):
+    """LRU cache whose eviction victim can be steered by predicted-need scores.
+
+    Used by the MoE store: a lookahead predictor pushes per-expert scores via
+    ``set_scores`` before its prefetch I/O lands; on overflow the victim is
+    the lowest-scored non-protected key instead of the LRU-oldest. Behaves as
+    a plain ``LayerLruCache`` for layers without scores, so it can back the
+    store unconditionally.
+
+    Scores are consume-once: the store clears them when the layer's forward
+    pass loads its experts, so a prediction from a previous token can never
+    steer a later eviction.
+    """
+
+    def __init__(self, max_per_layer: int):
+        super().__init__(max_per_layer)
+        # Guarded by the parent class's self._lock.
+        self._scores: dict[int, dict[K, float]] = {}
+        self._protected: dict[int, set[K]] = {}
+
+    def set_scores(self, layer_idx: int, scores: dict[K, float]) -> None:
+        """Replace the predicted-need scores for *layer_idx*."""
+        with self._lock:
+            self._scores[layer_idx] = scores
+
+    def clear_scores(self, layer_idx: int) -> None:
+        """Drop scores for *layer_idx* (consume-once staleness guard)."""
+        with self._lock:
+            self._scores.pop(layer_idx, None)
+
+    def protect(self, layer_idx: int, keys: set[K]) -> None:
+        """Replace the eviction-protected set for *layer_idx* (in-flight experts)."""
+        with self._lock:
+            self._protected[layer_idx] = keys
+
+    def put(self, layer_idx: int, key: K, value: V) -> None:
+        if self._max <= 0:
+            return
+        with self._lock:
+            layer_cache = self._cache.setdefault(layer_idx, OrderedDict())
+            is_new_key = key not in layer_cache
+            layer_cache[key] = value
+            layer_cache.move_to_end(key)
+            while len(layer_cache) > self._max:
+                victim = self._pick_victim(layer_idx, layer_cache, new_key=key if is_new_key else None)
+                del layer_cache[victim]
+
+    def _pick_victim(self, layer_idx: int, layer_cache: "OrderedDict[K, V]", new_key: K | None = None) -> K:
+        """Choose the eviction victim. Caller holds self._lock."""
+        protected = self._protected.get(layer_idx, set())
+        candidates = [k for k in layer_cache if k not in protected and k != new_key]
+        if not candidates:
+            # Everything (except possibly the newly added key) is protected: the cache must not
+            # grow unbounded, so fall back to plain LRU-oldest.
+            return next(iter(layer_cache))
+        scores = self._scores.get(layer_idx)
+        if not scores:
+            return candidates[0]  # LRU-oldest non-protected (and non-new)
+        # min() keeps the first (LRU-oldest) key on score ties.
+        return min(candidates, key=lambda k: scores.get(k, 0.0))
