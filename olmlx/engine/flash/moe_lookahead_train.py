@@ -158,7 +158,13 @@ def record_moe_router_traces_decode(
 
     ``prompt_source`` yields chat-templated prompt token lists;
     ``_generate_fn(model, tokenizer, prompt_ids, max_new_tokens)`` is a test
-    hook replacing the default ``mlx_lm.stream_generate`` drive.
+    hook replacing the default ``mlx_lm.stream_generate`` drive. The drive
+    MUST decode with batch size 1 — the recorder identifies decode steps as
+    single-position forwards, so a batched drive records nothing. The first
+    single-position forward of each prompt is dropped: mlx_lm always feeds
+    the last prompt token as its own forward (teacher-forced, not a decode
+    state), so per prompt exactly one boundary position would otherwise
+    contaminate the trace.
     """
     import mlx.nn as nn
 
@@ -184,13 +190,13 @@ def record_moe_router_traces_decode(
                 self._inds_sink.append(np.array(flat_inds))
             return self._inner(x)
 
-    if _generate_fn is None:
+    def _default_generate_fn(model, tokenizer, prompt_ids, max_new):
+        from mlx_lm import stream_generate
 
-        def _generate_fn(model, tokenizer, prompt_ids, max_new):
-            from mlx_lm import stream_generate
+        for _ in stream_generate(model, tokenizer, prompt_ids, max_tokens=max_new):
+            pass
 
-            for _ in stream_generate(model, tokenizer, prompt_ids, max_tokens=max_new):
-                pass
+    generate_fn = _generate_fn if _generate_fn is not None else _default_generate_fn
 
     if prompt_source is None:
         from olmlx.engine.dflash.selfgen import iter_dataset_prompts
@@ -220,14 +226,32 @@ def record_moe_router_traces_decode(
         originals[layer_idx] = (mod, attr)
         setattr(layer, attr, _DecodeRecorder(mod, hidden_sink, inds_sink))
 
-    first_sink = next(iter(sinks.values()), None)
+    if not sinks:
+        # No recorder installed (no _route-style MoE layers) — generating
+        # would burn max_prompts full decodes and record nothing.
+        logger.warning("No recordable MoE layers — skipping decode tracing")
+        return {}
+
+    first_sink = next(iter(sinks.values()))
     try:
         for prompt_num, prompt_ids in enumerate(prompt_source):
             if prompt_num >= max_prompts:
                 break
-            if first_sink is not None and len(first_sink[0]) >= max_positions_per_layer:
+            if len(first_sink[0]) >= max_positions_per_layer:
                 break  # every layer records the same decode steps
-            _generate_fn(model, tokenizer, prompt_ids, max_new_tokens)
+            before = len(first_sink[0])
+            generate_fn(model, tokenizer, prompt_ids, max_new_tokens)
+            # Drop each layer's first recorded position for this prompt:
+            # mlx_lm's generate_step always leaves exactly one prompt token
+            # for the first sampling forward, so the first single-position
+            # call per prompt carries the LAST PROMPT TOKEN (teacher-forced),
+            # not a decode state. Recording it would contaminate the
+            # decode-only distribution this tracer exists to guarantee —
+            # one off-distribution position per prompt, every prompt.
+            for hidden_sink, inds_sink in sinks.values():
+                if len(hidden_sink) > before:
+                    del hidden_sink[before]
+                    del inds_sink[before]
     finally:
         for layer_idx, (mod, attr) in originals.items():
             setattr(layers[layer_idx], attr, mod)
@@ -386,13 +410,6 @@ def train_moe_lookahead(
             f"Need at least 2 MoE layers for lookahead, got {moe_layer_indices}"
         )
 
-    if self_generate:
-        texts = []  # prompts stream from iter_dataset_prompts instead
-    elif calibration_dataset == "synthetic":
-        texts = _get_calibration_data(num_samples)
-    else:
-        texts = _get_c4_calibration_data(num_samples)
-
     if progress_callback:
         progress_callback("Loading model (Flash-MoE, lazy)", 0.0)
 
@@ -415,6 +432,12 @@ def train_moe_lookahead(
                 max_prompts=num_samples,
             )
         else:
+            # self-generate streams prompts from iter_dataset_prompts;
+            # only the prefill path consumes calibration texts.
+            if calibration_dataset == "synthetic":
+                texts = _get_calibration_data(num_samples)
+            else:
+                texts = _get_c4_calibration_data(num_samples)
             traces = record_moe_router_traces(
                 model,
                 tokenizer,
@@ -427,7 +450,8 @@ def train_moe_lookahead(
 
     if not traces:
         raise RuntimeError(
-            "No router traces recorded — model has no _route-style MoE layers"
+            "No router traces recorded — model has no _route-style MoE "
+            "layers, or (self_generate) generation produced no decode steps"
         )
 
     bank, recalls = train_from_traces(

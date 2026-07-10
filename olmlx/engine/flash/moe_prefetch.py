@@ -76,6 +76,13 @@ class MoePrefetcher:
         pending. Prediction runs inline in NumPy on the calling thread; the
         hidden-state conversion below is the only (implicit) eval and it
         happens on the caller — nothing here touches mx from another thread.
+
+        Known limitation: the pending dedup returns before the score push,
+        so when a prefetch outlasts one decode step the next token pushes no
+        fresh eviction scores and that layer's eviction falls back to LRU
+        for the token (scores are consume-once). Latency-only; pushing
+        scores before the dedup check would cost a wasted prediction per
+        deduped submit instead.
         """
         next_layer = self._bank.next_moe_layer(layer_idx)
         if next_layer is None:
@@ -119,8 +126,11 @@ class MoePrefetcher:
             # forward consumes them. A failed push must not cancel the
             # prefetch itself — scores only steer eviction.
             try:
+                # dict(enumerate(tolist())) converts at C level — the
+                # per-element float(scores[i]) form boxes num_experts numpy
+                # scalars per MoE layer per token on the decode hot path.
                 self._weight_store.set_layer_scores(
-                    next_layer, {i: float(scores[i]) for i in range(len(scores))}
+                    next_layer, dict(enumerate(scores.tolist()))
                 )
             except Exception:
                 logger.warning(

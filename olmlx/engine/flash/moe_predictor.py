@@ -90,6 +90,15 @@ class MoeLookaheadBank:
         no prediction, no I/O). Pairs with no recorded recall (legacy banks)
         are kept: gating on absent data would silently disable prefetch
         wholesale. Returns the number of pairs gated.
+
+        DESTRUCTIVE: do not ``save()`` a gated bank — gated-but-trained
+        pairs would persist as untrained, indistinguishable from
+        never-trained. Serving only ever gates a fresh per-load instance
+        (``_maybe_create_prefetcher``), so relaxing ``min_recall`` takes
+        effect on the next model load. Note the recorded recall is measured
+        at the trainer's eval margin (1.5); if the serve-time
+        ``flash_moe_lookahead_margin`` differs, the gate compares against a
+        slightly different m than prefetch actually uses.
         """
         if min_recall <= 0.0:
             return 0

@@ -248,16 +248,34 @@ class TestDecodeTraceRecording:
             model,
             _FakeTokenizer(),
             [1, 2],
-            max_new_tokens=4,
+            max_new_tokens=5,
             max_prompts=1,
             prompt_source=iter([[1, 2, 3, 4, 5]]),
-            _generate_fn=self._gen_fn(prefill_len=5, decode_steps=4),
+            _generate_fn=self._gen_fn(prefill_len=5, decode_steps=5),
         )
         assert set(traces.keys()) == {1, 2}
-        # Only the 4 decode steps recorded — the 5-position prefill skipped.
+        # 5 single-position calls: the first carries the last PROMPT token
+        # (mlx_lm feeds it as its own forward — teacher-forced) and is
+        # dropped; the 5-position prefill call is skipped. 4 remain.
         assert traces[1][0].shape[0] == 4
         assert traces[2][1].shape == (4, 2)
         assert traces[1][0].shape[0] == traces[2][0].shape[0]
+
+    def test_prompt_boundary_position_dropped_per_prompt(self):
+        """Exactly one position per prompt (the prompt-final token's
+        forward) is excluded, keeping the trace decode-pure."""
+        model = _FakeModel(hidden=8, num_experts=4, k=2)
+        traces = record_moe_router_traces_decode(
+            model,
+            _FakeTokenizer(),
+            [1, 2],
+            max_new_tokens=3,
+            max_prompts=2,
+            prompt_source=iter([[1, 2], [3, 4]]),
+            _generate_fn=self._gen_fn(prefill_len=2, decode_steps=3),
+        )
+        # 2 prompts x (3 single-position calls - 1 boundary) = 4
+        assert traces[1][0].shape[0] == 4
 
     def test_decode_position_cap(self):
         model = _FakeModel(hidden=8, num_experts=4, k=2)
@@ -271,7 +289,9 @@ class TestDecodeTraceRecording:
             prompt_source=iter([[1, 2, 3]] * 5),
             _generate_fn=self._gen_fn(prefill_len=3, decode_steps=10),
         )
-        assert traces[1][0].shape[0] == 3
+        # Cap is respected; the per-prompt boundary drop may leave the
+        # final count one under the cap.
+        assert 0 < traces[1][0].shape[0] <= 3
 
     def test_originals_restored(self):
         model = _FakeModel(hidden=8, num_experts=4, k=2)
