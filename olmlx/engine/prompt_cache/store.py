@@ -628,6 +628,19 @@ class PromptCacheStore:
     #
     # All _entries mutations happen on the event loop.  Only pure disk I/O
     # (read/write safetensors, unlink, stat) is dispatched to a worker thread.
+    #
+    # Cross-thread array safety (mlx thread-local streams, >=0.31.2, #499):
+    # _save_to_disk's save_prompt_cache(...) call builds AND evaluates each
+    # layer's `.state` slice entirely within the worker thread it runs on,
+    # so that part is self-contained. What must hold *before* a
+    # CachedPromptState crosses into to_thread is that its cache arrays are
+    # already materialized (no lazy graph bound to the request's original
+    # worker thread) — guaranteed upstream by snapshot_cache_for_persistence
+    # (explicit eager_eval, or the prefill drive's own mx.eval right before
+    # the snapshot). _set_in_memory/_shed_transient_buffers/_estimate_state_
+    # bytes/takeover (all event-loop-side) are pure bookkeeping and never
+    # *evaluate* array ops (`_estimate_state_bytes` builds a lazy .state
+    # slice to read .nbytes but never evals it), so they don't perturb this.
 
     async def _to_thread_traced(self, fn: Any, *fn_args: Any) -> Any:
         """Run ``fn`` in a worker thread with the request's OTel context

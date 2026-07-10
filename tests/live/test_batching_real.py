@@ -2,9 +2,10 @@
 (docs/batching-plan.md Phase 0).
 
 Greedy batch_generate over identical prompts must produce identical,
-coherent rows under ``safe_rope_patch``. Without the patch, the mlx
-0.31.x ``mx.fast.rope`` B>1/L==1 bug silently corrupts every row but 0;
-this is the regression gate for both the patch and its eventual removal.
+coherent rows. mlx >= 0.32.0 fixed the ``mx.fast.rope`` B>1/L==1 bug
+(ml-explore/mlx#3498) that silently corrupted every row but 0, and
+``engine/ropefix.py`` was retired on that basis; this is the live
+regression gate for the unpatched kernel.
 
 Lives outside tests/integration/ to dodge its autouse MLX mock.
 real_model; skipped in CI (`-m "not real_model"`) and when the model
@@ -59,18 +60,15 @@ def test_batched_rows_match_single_stream_reference(model_and_tokenizer):
     to the unbatched generate() output."""
     from mlx_lm import batch_generate, generate
 
-    from olmlx.engine.ropefix import safe_rope_patch
-
     model, tokenizer = model_and_tokenizer
     prompt = _chat_tokens(tokenizer, "Count from one to five in words.")
     max_tokens = 32
 
     reference = generate(model, tokenizer, prompt, max_tokens=max_tokens)
 
-    with safe_rope_patch():
-        result = batch_generate(
-            model, tokenizer, [list(prompt) for _ in range(4)], max_tokens=max_tokens
-        )
+    result = batch_generate(
+        model, tokenizer, [list(prompt) for _ in range(4)], max_tokens=max_tokens
+    )
 
     assert len(result.texts) == 4
     # Rows must agree with each other — the rope bug corrupts rows >= 1
@@ -385,8 +383,6 @@ def test_mixed_length_batch_stays_coherent(model_and_tokenizer):
     coherent, on-topic output."""
     from mlx_lm import batch_generate
 
-    from olmlx.engine.ropefix import safe_rope_patch
-
     model, tokenizer = model_and_tokenizer
     prompts = [
         _chat_tokens(tokenizer, "What color is the sky on a clear day? One word."),
@@ -397,10 +393,7 @@ def test_mixed_length_batch_stays_coherent(model_and_tokenizer):
         ),
     ]
 
-    with safe_rope_patch():
-        result = batch_generate(
-            model, tokenizer, [list(p) for p in prompts], max_tokens=24
-        )
+    result = batch_generate(model, tokenizer, [list(p) for p in prompts], max_tokens=24)
 
     assert "blue" in result.texts[0].lower(), result.texts[0]
     assert "four" in result.texts[1].lower(), result.texts[1]

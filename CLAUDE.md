@@ -53,6 +53,8 @@ olmlx/
 
 **Metal stream hazard** — All non-speculative inference (prefill + decode) must run on `generation_stream`. Mixing streams leaves GatedDeltaNet/MoE recurrent state as a cross-stream lazy graph that corrupts expert routing on Qwen3.x hybrids — output looks coherent but is pretraining-data dumps. Speculative decoders are the exception: both prefill and decode run on `default_stream` (a split would reintroduce the same hazard). `snapshot_cache_for_persistence` does deepcopy + eager `mx.eval` before snapshots cross worker threads — lazy graphs bound to one stream crash on reuse from another.
 
+Since mlx 0.32.0 (#499) streams are **thread-local**: `generation_stream` is a per-thread proxy, so "same stream" is enforced as "same thread" — the checkpoint-prefill drive is deferred into the generation worker thread (`deferred_prefill` closure), never run on the event loop. Worker GPU work is fenced by the worker's own end-of-run sync + thread join; the event-loop thread never syncs generation streams. `PromptCacheStore` stays loop-affine — worker-side checkpoint inserts marshal through `loop.call_soon_threadsafe`.
+
 **Pure-RotatingKVCache prefill is single-chunk** — Models with only SWA (`RotatingKVCache`, no `ArraysCache`) — gpt-oss, Step-3.5, Gemma 3 — must prefill in ONE `model()` call. Splitting at a message boundary corrupts windowed attention: output is coherent but unrelated, and tool calls are silently skipped (tool defs add the system segment that creates the boundary). Detected by `_is_pure_rotating_cache`.
 
 **Grammar tokenizer identity** — CPython recycles `id()` addresses; each grammar cache entry carries a `weakref` to its tokenizer and validates referent identity before serving. A stale entry with a recycled id would serve a wrong-vocabulary grammar. `drop_for_tokenizer` in `_close_loaded_model` runs **first** so no other close-step failure can skip it.
@@ -72,8 +74,6 @@ olmlx/
 **MTP prefill chunking** — `MTPDecoder.prefill` pass-1 must chunk through `_chunked_prefill`. A single forward over a long prompt forces `lm_head` over every position, producing a `[1, seq-1, vocab]` float32 tensor that OOMs Metal (~44 GB at 73k tokens vs ~41.7 GB limit). GDN capture is suppressed (`use_buffer(None)`) during the chunked prefix — the capture call appends per forward, so leaving it active rebloats memory across sub-chunks on hybrid GDN targets.
 
 **DFlash training** — Always use `--self-generate`. Ground-truth dataset text → ~0.4% acceptance. Target-generated responses → real acceptance (~45% p1 on Qwen3-0.6B). This is the upstream recipe.
-
-**mlx 0.31.x rope bug** — `mx.fast.rope` corrupts batch rows ≥1 at B>1, L==1 (decode shape). `safe_rope_patch` in `engine/ropefix.py` folds B into the heads dim as the workaround. Applied in the continuous batching worker loop and dflash selfgen. Remove once mlx fixes it (guarded by a Metal-gated unit test).
 
 **TTS priming** — The router primes the PCM source generator's first chunk before starting the response. Priming the ffmpeg-encoded stream instead wouldn't work: ffmpeg emits its container header before reading stdin, so an upstream `ValueError` from a non-TTS model would leak after the 200 has been sent.
 

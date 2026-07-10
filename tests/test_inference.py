@@ -3334,17 +3334,16 @@ class TestGenerateEmbeddingsAcquiresLock:
 
 
 class TestSafeSync:
-    def test_success(self):
-        """_safe_sync() should sync default stream and any resolved generation streams."""
-        mock_stream = MagicMock()
-        with (
-            patch("olmlx.engine.inference.mx") as mock_mx,
-            patch("olmlx.engine.inference._generation_streams", [mock_stream]),
-        ):
+    def test_safe_sync_syncs_default_stream_only(self):
+        """_safe_sync() should sync only the calling thread's default stream.
+
+        Under mlx >= 0.31.2 streams are thread-local, so worker GPU work is
+        fenced by the worker's own end-of-run sync plus the thread join —
+        not by anything the loop thread does here.
+        """
+        with patch("olmlx.engine.inference._sync_default_stream") as sds:
             _safe_sync()
-            # Default stream + 1 generation stream
-            assert mock_mx.synchronize.call_count == 2
-            mock_mx.synchronize.assert_any_call(mock_stream)
+        sds.assert_called_once()
 
     def test_suppresses_exception(self):
         """_safe_sync() should suppress exceptions from mx.synchronize()."""
@@ -3354,70 +3353,50 @@ class TestSafeSync:
 
 
 class TestLockBoundarySync:
-    def test_full_matches_safe_sync(self):
-        """'full' mode: sync default + every generation stream."""
-        mock_stream = MagicMock()
-        with (
-            patch("olmlx.engine.inference.mx") as mock_mx,
-            patch("olmlx.engine.inference._generation_streams", [mock_stream]),
-        ):
+    def test_full_syncs_default_stream(self):
+        """'full' mode syncs the calling thread's default stream."""
+        with patch("olmlx.engine.inference._sync_default_stream") as sds:
             _lock_boundary_sync("full")
-            assert mock_mx.synchronize.call_count == 2
-            mock_mx.synchronize.assert_any_call(mock_stream)
+        sds.assert_called_once()
 
-    def test_minimal_skips_generation_streams(self):
-        """'minimal' mode: sync default stream only, skip generation streams."""
-        mock_stream = MagicMock()
-        with (
-            patch("olmlx.engine.inference.mx") as mock_mx,
-            patch("olmlx.engine.inference._generation_streams", [mock_stream]),
-        ):
+    def test_minimal_syncs_default_stream(self):
+        """'minimal' mode syncs the calling thread's default stream — same
+        behavior as 'full' since mlx >= 0.31.2 made generation streams
+        thread-local (worker-side sync + thread join fence worker GPU work)."""
+        with patch("olmlx.engine.inference._sync_default_stream") as sds:
             _lock_boundary_sync("minimal")
-            assert mock_mx.synchronize.call_count == 1
-            mock_mx.synchronize.assert_called_once_with()
+        sds.assert_called_once()
 
-    def test_none_skips_all_sync(self):
+    def test_none_skips_sync(self):
         """'none' mode: skip sync entirely at lock boundaries."""
-        mock_stream = MagicMock()
-        with (
-            patch("olmlx.engine.inference.mx") as mock_mx,
-            patch("olmlx.engine.inference._generation_streams", [mock_stream]),
-        ):
+        with patch("olmlx.engine.inference._sync_default_stream") as sds:
             _lock_boundary_sync("none")
-            assert mock_mx.synchronize.call_count == 0
+        sds.assert_not_called()
 
     def test_null_mode_falls_back_to_global_setting(self):
         """mode=None (Python None sentinel, not the "none" SyncMode string)
         should resolve to settings.sync_mode. The two are opposite: None
         inherits the global, "none" skips all sync."""
-        mock_stream = MagicMock()
         with (
-            patch("olmlx.engine.inference.mx") as mock_mx,
-            patch("olmlx.engine.inference._generation_streams", [mock_stream]),
+            patch("olmlx.engine.inference._sync_default_stream") as sds,
             patch("olmlx.engine.inference.settings") as mock_settings,
         ):
             mock_settings.sync_mode = "none"
             _lock_boundary_sync(None)
-            assert mock_mx.synchronize.call_count == 0
+            sds.assert_not_called()
 
-            mock_mx.reset_mock()
             mock_settings.sync_mode = "minimal"
             _lock_boundary_sync(None)
-            assert mock_mx.synchronize.call_count == 1
+            sds.assert_called_once()
 
     def test_suppresses_exceptions(self):
-        """Exceptions from mx.synchronize must not propagate — covers both the
-        default-stream and generation-stream suppression paths."""
-        mock_stream = MagicMock()
-        with (
-            patch("olmlx.engine.inference.mx") as mock_mx,
-            patch("olmlx.engine.inference._generation_streams", [mock_stream]),
-        ):
+        """Exceptions from mx.synchronize must not propagate."""
+        with patch("olmlx.engine.inference.mx") as mock_mx:
             mock_mx.synchronize.side_effect = RuntimeError("Metal error")
-            _lock_boundary_sync("full")  # exercises default + generation stream loop
-            _lock_boundary_sync("minimal")  # exercises default only
-            # Exactly: 1 default + 1 generation (full) + 1 default (minimal) = 3
-            assert mock_mx.synchronize.call_count == 3
+            _lock_boundary_sync("full")  # exercises default-stream sync
+            _lock_boundary_sync("minimal")  # exercises default-stream sync
+            # 1 default sync per call, for both "full" and "minimal".
+            assert mock_mx.synchronize.call_count == 2
 
     def test_unknown_mode_raises(self):
         """Unknown modes must raise ValueError instead of silently falling
@@ -3467,14 +3446,10 @@ class TestInferenceLocked:
     @pytest.mark.asyncio
     async def test_sync_mode_minimal_syncs_default_only(self):
         """sync_mode='minimal' should sync default stream only on entry+exit."""
-        mock_stream = MagicMock()
-        with (
-            patch("olmlx.engine.inference.mx") as mock_mx,
-            patch("olmlx.engine.inference._generation_streams", [mock_stream]),
-        ):
+        with patch("olmlx.engine.inference.mx") as mock_mx:
             async with _inference_locked(sync_mode="minimal"):
                 pass
-            # 1 default sync on entry + 1 default sync on exit, no generation streams
+            # 1 default sync on entry + 1 default sync on exit
             assert mock_mx.synchronize.call_count == 2
             for call in mock_mx.synchronize.call_args_list:
                 assert call.args == ()

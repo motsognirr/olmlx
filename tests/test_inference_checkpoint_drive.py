@@ -1,6 +1,8 @@
 """Tests for segment-aware tokenization and the segmented-prefill drive."""
 
 import asyncio
+import threading
+from types import SimpleNamespace
 
 import mlx.core as mx
 from mlx_lm.models.cache import ArraysCache, KVCache, RotatingKVCache
@@ -77,7 +79,10 @@ def test_drive_two_segment_cold_start():
     )
     cache = [KVCache()]
     suffix = _drive_segmented_prefill(
-        model=model, segmented=sp, cache=cache, store=store
+        model=model,
+        segmented=sp,
+        cache=cache,
+        insert_checkpoint=store.insert_checkpoint,
     )
     # Two chunks split at the single interior boundary (depth 3): the
     # system tokens, then the user segment minus its reserved trailing
@@ -111,7 +116,7 @@ def test_drive_skips_segments_below_already_covered():
         model=model,
         segmented=sp,
         cache=cache,
-        store=store,
+        insert_checkpoint=store.insert_checkpoint,
         already_covered_tokens=3,
     )
     assert len(model.calls) == 1
@@ -119,21 +124,17 @@ def test_drive_skips_segments_below_already_covered():
     assert suffix == [5]
 
 
-def test_drive_prefill_runs_on_generation_stream(monkeypatch):
-    """Prefill must run on mlx-lm's ``generation_stream`` — the same stream
-    ``stream_generate`` decodes on.
+def test_drive_resolves_generation_stream_at_call_time(monkeypatch):
+    """The drive must resolve mlx-lm's ``generation_stream`` when it RUNS —
+    not from a module-load-time capture. Under mlx >= 0.31.2 the stream is a
+    ThreadLocalStream proxy; resolving at call time (on the generation
+    worker thread) is what keeps prefill and decode on one stream (#284,
+    #499)."""
+    import importlib
 
-    Regression for Qwen3-Coder-Next (and the Qwen3-Next MoE-quant family):
-    prefilling the cache on ``mx.default_stream`` and then decoding on
-    ``generation_stream`` leaves the GatedDeltaNet recurrent state as a
-    cross-stream lazy graph whose materialization corrupts MoE expert routing
-    at scale (~16k+ prompt tokens), making the model emit pretraining-data
-    dumps instead of answering. Same Metal-stream hazard family as #284.
-    """
     import olmlx.engine.inference as inf
 
-    if not inf._generation_streams:
-        pytest.skip("mlx_lm generation_stream not available in this environment")
+    mlg = importlib.import_module("mlx_lm.generate")
 
     recorded: list = []
     real_stream = mx.stream
@@ -143,9 +144,10 @@ def test_drive_prefill_runs_on_generation_stream(monkeypatch):
         return real_stream(s)
 
     monkeypatch.setattr(inf.mx, "stream", spy_stream)
+    sentinel = mx.new_stream(mx.default_device())
+    monkeypatch.setattr(mlg, "generation_stream", sentinel)
 
     model = _DummyModel()
-    store = PromptCacheStore(max_slots=8)
     sp = SegmentedPrompt(
         segments=[
             Segment(tokens=[1, 2, 3], role="system"),
@@ -153,14 +155,64 @@ def test_drive_prefill_runs_on_generation_stream(monkeypatch):
         ]
     )
     cache = [KVCache()]
-    _drive_segmented_prefill(model=model, segmented=sp, cache=cache, store=store)
+    inserted: list = []
+    suffix = _drive_segmented_prefill(
+        model=model,
+        segmented=sp,
+        cache=cache,
+        insert_checkpoint=inserted.append,
+    )
+    assert suffix == [5]
+    assert sentinel in recorded, (
+        "drive did not resolve mlx_lm.generate.generation_stream at call time"
+    )
+    assert len(inserted) == 1 and list(inserted[0].tokens) == [1, 2, 3]
 
-    gen_stream = inf._generation_streams[0]
-    default_stream = mx.default_stream(mx.default_device())
-    assert gen_stream in recorded, "prefill did not run on mlx-lm's generation_stream"
-    assert default_stream not in recorded, (
-        "prefill ran on the default stream; it must use generation_stream so the "
-        "cache it builds is materialized on the same stream stream_generate decodes on"
+
+def test_async_mlx_stream_runs_deferred_prefill_in_worker_thread(monkeypatch):
+    """The deferred prefill closure must run on the SAME thread that decodes
+    (the CancellableStream worker), before generation starts."""
+    import olmlx.utils.streaming as streaming_mod
+
+    events: list[tuple[str, int]] = []
+
+    def fake_stream_generate(model, tokenizer, **kwargs):
+        events.append(("generate", threading.get_ident()))
+        yield SimpleNamespace(
+            text="x",
+            token=1,
+            prompt_tokens=1,
+            generation_tokens=1,
+            prompt_tps=0.0,
+            generation_tps=0.0,
+            finish_reason="stop",
+        )
+
+    monkeypatch.setattr("mlx_lm.stream_generate", fake_stream_generate)
+
+    def deferred(cancel_event):
+        assert cancel_event is not None  # worker passes its cancel_event
+        events.append(("prefill", threading.get_ident()))
+
+    async def _go():
+        stream = streaming_mod.async_mlx_stream(
+            object(),
+            object(),
+            [1],
+            max_tokens=4,
+            deferred_prefill=deferred,
+        )
+        async for _tok in stream:
+            pass
+        await stream.drain_and_join()
+
+    asyncio.run(_go())
+    assert [e[0] for e in events] == ["prefill", "generate"], (
+        "deferred prefill must run exactly once, before generation"
+    )
+    assert events[0][1] == events[1][1], "prefill and decode on different threads"
+    assert events[0][1] != threading.get_ident(), (
+        "deferred prefill ran on the event-loop thread"
     )
 
 
@@ -186,7 +238,10 @@ def test_drive_subchunks_long_prefill(monkeypatch):
     sp = SegmentedPrompt(segments=[Segment(tokens=[1, 2, 3, 4, 5, 6, 7], role="user")])
     cache = [KVCache()]  # not pure-rotating -> sub-chunked
     suffix = _drive_segmented_prefill(
-        model=model, segmented=sp, cache=cache, store=store
+        model=model,
+        segmented=sp,
+        cache=cache,
+        insert_checkpoint=store.insert_checkpoint,
     )
     assert model.calls == [[1, 2], [3, 4], [5, 6]]
     assert suffix == [7]
@@ -331,7 +386,12 @@ def test_drive_does_not_snapshot_last_segment_boundary():
         ]
     )
     cache = [KVCache()]
-    _drive_segmented_prefill(model=model, segmented=sp, cache=cache, store=store)
+    _drive_segmented_prefill(
+        model=model,
+        segmented=sp,
+        cache=cache,
+        insert_checkpoint=store.insert_checkpoint,
+    )
     # System boundary (3 tokens) is snapshotted; last boundary (5 tokens) is not.
     assert store.fetch_nearest([1, 2, 3, 99]) is not None, (
         "system-boundary checkpoint must be present"
@@ -705,6 +765,9 @@ def test_setup_prompt_cache_single_segment_request_still_uses_existing_checkpoin
         f"{cs.cache_read_tokens} — single-segment request didn't take "
         f"the hit"
     )
+    # The drive is deferred to the generation worker thread now; run it
+    # explicitly before asserting on its side effects.
+    cs.deferred_prefill(None)
     # Drive should have run on the un-covered tokens only.
     assert len(model.calls) == 1
     assert model.calls[0] == full_tokens[prefix_len : len(full_tokens) - 1], (
@@ -770,7 +833,10 @@ def test_drive_handles_mixed_rotating_arrays_layout():
         RotatingKVCache(max_size=32, keep=2),
     ]
     suffix = _drive_segmented_prefill(
-        model=model, segmented=sp, cache=cache, store=store
+        model=model,
+        segmented=sp,
+        cache=cache,
+        insert_checkpoint=store.insert_checkpoint,
     )
     # Two segments: one model call per uncovered segment, last token
     # reserved for stream_generate's decode init.
@@ -802,7 +868,7 @@ def test_drive_handles_mixed_rotating_arrays_layout():
         model=warm_model,
         segmented=sp,
         cache=warm,
-        store=PromptCacheStore(max_slots=4),
+        insert_checkpoint=PromptCacheStore(max_slots=4).insert_checkpoint,
         already_covered_tokens=4,
     )
     # Only the user segment's prefill tokens get fed; the trailing token
@@ -845,7 +911,7 @@ def test_drive_uses_two_chunks_and_one_snapshot_for_multi_segment_request():
         model=model,
         segmented=sp,
         cache=cache,
-        store=store,
+        insert_checkpoint=store.insert_checkpoint,
         already_covered_tokens=3,
     )
     # Deepest interior boundary > 3 and < 13 is the assistant boundary (10).
@@ -891,7 +957,7 @@ def test_drive_no_snapshot_when_only_final_segment_remains():
         model=model,
         segmented=sp,
         cache=cache,
-        store=store,
+        insert_checkpoint=store.insert_checkpoint,
         already_covered_tokens=9,  # end of assistant
     )
     # Single chunk = [10, 11] (12 reserved). No snapshot.

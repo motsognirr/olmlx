@@ -238,6 +238,40 @@ class SpectralQuantKVCache(_BaseCache):
             "Disable disk cache offload when using SpectralQuant."
         )
 
+    def _pin_state_to_offset(self) -> None:
+        """Trim the packed buffers to exactly ``self.offset``.
+
+        Called by ``snapshot_cache_for_persistence`` (on a snapshot copy
+        only — never the live cache) right after it evaluates ``.state``.
+        ``.state`` unconditionally slices ``[..., :self.offset, :]`` off the
+        ``step``-aligned (256) backing buffers, rebuilding a fresh lazy op on
+        every access. Trimming the buffers here makes that slice a full-range
+        no-op of an already-materialized array, which mlx's thread-local
+        streams (>=0.31.2, #499) can evaluate from any thread without needing
+        the stream of the thread that built the op. ``state`` has no setter
+        (``SpectralQuantKVCache`` rejects restoration), so this mutates the
+        private buffers directly instead of going through the property.
+        Mirrors ``TurboQuantKVCache._pin_state_to_offset``.
+        """
+        if self._k_sem is None:
+            return
+        if self._k_sem.shape[2] == self.offset:
+            return
+        self._k_sem = self._k_sem[..., : self.offset, :]
+        self._k_tail = self._k_tail[..., : self.offset, :]
+        self._k_norms = self._k_norms[..., : self.offset, :]
+        self._v_sem = self._v_sem[..., : self.offset, :]
+        self._v_tail = self._v_tail[..., : self.offset, :]
+        self._v_norms = self._v_norms[..., : self.offset, :]
+        mx.eval(
+            self._k_sem,
+            self._k_tail,
+            self._k_norms,
+            self._v_sem,
+            self._v_tail,
+            self._v_norms,
+        )
+
     def is_trimmable(self):
         return True
 

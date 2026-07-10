@@ -194,10 +194,14 @@ class CancellableStream:
             # the stream object after the thread exits.
             self._gen_factory = None
 
-            # Sync both the generation stream and the default stream.
-            # mlx_lm and mlx_vlm run GPU work on their own module-level
-            # generation_stream. We must also sync the default stream to
-            # catch any Metal operations not on the generation stream.
+            # Sync this thread's generation stream and default stream. Under
+            # mlx >= 0.31.2 ``generation_stream`` is a ThreadLocalStream
+            # proxy resolving per-thread — importing and syncing it HERE, on
+            # the worker thread that ran all the GPU work, fences exactly
+            # the stream that work was enqueued on. This worker-side sync
+            # plus the thread join in drain_and_join are the only completion
+            # barrier; the event-loop thread never syncs generation streams
+            # (#499).
             try:
                 import mlx.core as mx
 
@@ -383,6 +387,7 @@ def async_mlx_stream(
     audio: list[str] | None = None,
     memory_limit: int = 0,
     trace_context: Any = None,
+    deferred_prefill: Callable[[threading.Event | None], None] | None = None,
     **kwargs: Any,
 ) -> CancellableStream:
     """Bridge sync mlx_lm/mlx_vlm stream_generate into an async iterable.
@@ -426,6 +431,13 @@ def async_mlx_stream(
             )
         else:
             import mlx_lm
+
+            if deferred_prefill is not None:
+                # Checkpoint-path prefill, deferred from cache setup (event
+                # loop) to here (generation worker) so prefill and decode
+                # share this thread's thread-local generation_stream
+                # (#284/#499).
+                deferred_prefill(cancel_event)
 
             gen_kwargs = dict(prompt=prompt, max_tokens=max_tokens, **kwargs)
             gen_kwargs.pop("prompt_progress_callback", None)  # we control this below

@@ -98,4 +98,50 @@ def snapshot_cache_for_persistence(
         states = flatten_cache_state(cache)
         if states:
             mx.eval(states)
-    return copy.deepcopy(cache)
+    snapshot = copy.deepcopy(cache)
+    if eager_eval:
+        _pin_snapshot_state(snapshot)
+    return snapshot
+
+
+def _pin_snapshot_state(snapshot: list[Any]) -> None:
+    """Materialize each layer's ``.state`` on THIS thread and pin it so a
+    later ``.state`` access — possibly from a different worker thread —
+    returns already-materialized arrays instead of rebuilding a lazy slice.
+
+    Under mlx's thread-local streams (mlx >= 0.31.2, #499), evaluating a
+    lazy graph requires the stream of the thread that *built* the graph.
+    A step-based cache layer (``KVCache``, ``QuantizedKVCache``, ...)
+    over-allocates in ``step``-sized chunks, so its ``.state`` property
+    rebuilds a fresh ``[..., :offset, :]`` slice op on *every* access
+    whenever ``offset`` doesn't exactly fill the buffer — even if the
+    buffer itself is fully materialized. Evaluating that fresh slice on a
+    thread other than the one that built it reproduces the #284 hazard
+    this function exists to close, so it isn't enough to eval before the
+    deepcopy: the deepcopy's ``.state`` must also be pre-built here, once,
+    on the creating thread.
+
+    For layer types with a working ``state`` setter (the ``KVCache``
+    family), writing the evaluated, exact-length tuple back trims the
+    backing buffer to ``offset`` — the property's own fast path
+    (``offset == keys.shape[2]``) then returns the raw, already-
+    materialized arrays on every later access, building no op at all.
+    ``TurboQuantKVCache`` deliberately rejects ``state`` writes (it does
+    not support restoration), so it exposes ``_pin_state_to_offset``
+    instead to trim its packed buffers the same way.
+    """
+    for layer in snapshot:
+        state = layer.state
+        if not state:
+            continue
+        if isinstance(state, tuple):
+            mx.eval(state)
+            try:
+                layer.state = state
+            except NotImplementedError:
+                pass
+        else:
+            mx.eval(state)
+            pin = getattr(layer, "_pin_state_to_offset", None)
+            if pin is not None:
+                pin()

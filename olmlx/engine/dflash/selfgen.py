@@ -36,9 +36,6 @@ from typing import Any
 import mlx.core as mx
 from mlx_lm.models.cache import make_prompt_cache
 
-# Re-exported for old importers; the patch lives in engine/ropefix.py now
-# that the batch scheduler shares it (docs/batching-plan.md Phase 0).
-from olmlx.engine.ropefix import safe_rope_patch  # noqa: F401
 from olmlx.engine.dflash.training_data import (
     _FALLBACK_PROMPTS,
     DEFAULT_DATASET,
@@ -169,21 +166,20 @@ def generate_training_sequences(
             )
 
     groups: dict[int, list[list[int]]] = defaultdict(list)
-    with safe_rope_patch():
-        for ids in prompts:
-            if len(out) >= num_seqs:
-                break
-            groups[len(ids)].append(ids)
-            if len(groups[len(ids)]) >= group_size:
-                _run_group(groups.pop(len(ids)))
-        # Flush leftovers (largest groups first) until the quota is met.
-        for length in sorted(groups, key=lambda k: -len(groups[k])):
-            if len(out) >= num_seqs:
-                break
-            rows = groups[length]
-            while rows and len(out) < num_seqs:
-                _run_group(rows[:group_size])
-                rows = rows[group_size:]
+    for ids in prompts:
+        if len(out) >= num_seqs:
+            break
+        groups[len(ids)].append(ids)
+        if len(groups[len(ids)]) >= group_size:
+            _run_group(groups.pop(len(ids)))
+    # Flush leftovers (largest groups first) until the quota is met.
+    for length in sorted(groups, key=lambda k: -len(groups[k])):
+        if len(out) >= num_seqs:
+            break
+        rows = groups[length]
+        while rows and len(out) < num_seqs:
+            _run_group(rows[:group_size])
+            rows = rows[group_size:]
 
     if len(out) < num_seqs:
         logger.warning(

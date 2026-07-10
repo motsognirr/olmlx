@@ -235,6 +235,146 @@ def test_snapshot_turboquant_cache_safe_in_other_thread():
     assert not err, f"cross-thread eval failed: {err}"
 
 
+def _make_spectralquant_cache(head_dim: int = 32, d_eff: int = 4):
+    """Minimal SpectralQuantKVCache with synthetic-but-valid calibration."""
+    import numpy as np
+
+    from olmlx.engine.spectralquant import SpectralRotation, fit_codebook
+    from olmlx.engine.spectralquant_cache import SpectralQuantKVCache
+
+    bits_high, bits_low = 4, 2
+    rng = np.random.RandomState(42)
+    q, _ = np.linalg.qr(rng.randn(head_dim, head_dim).astype(np.float32))
+    rotation_k = SpectralRotation(mx.array(q))
+    q2, _ = np.linalg.qr(rng.randn(head_dim, head_dim).astype(np.float32))
+    rotation_v = SpectralRotation(mx.array(q2))
+
+    data = mx.random.normal((500, head_dim))
+    norms = mx.linalg.norm(data, axis=-1, keepdims=True)
+    data_n = data / mx.maximum(norms, mx.array(1e-8))
+    rotated = rotation_k.rotate(data_n)
+    cb_sem = fit_codebook(rotated[..., :d_eff].reshape(-1), bits=bits_high)
+    cb_tail = fit_codebook(rotated[..., d_eff:].reshape(-1), bits=bits_low)
+
+    return SpectralQuantKVCache(
+        rotation_key=rotation_k,
+        rotation_value=rotation_v,
+        codebook_sem_key=cb_sem,
+        codebook_tail_key=cb_tail,
+        codebook_sem_value=cb_sem,
+        codebook_tail_value=cb_tail,
+        d_eff=d_eff,
+        bits_high=bits_high,
+        bits_low=bits_low,
+    )
+
+
+def _make_shardquant_cache(D: int = 16, H: int = 2, sink: int = 4, window: int = 8):
+    """Minimal ShardKVCache with synthetic-but-valid calibration."""
+    import numpy as np
+
+    from olmlx.engine.shardquant import fit_vq_codebooks, make_v_rotation
+    from olmlx.engine.shardquant_cache import ShardKVCache
+    from olmlx.engine.spectralquant import fit_codebook
+
+    bits = 4
+    rng = np.random.RandomState(0)
+    basis = mx.array(
+        np.stack(
+            [np.linalg.qr(rng.randn(D, D).astype(np.float32))[0] for _ in range(H)]
+        )
+    )
+    k_codebook = fit_codebook(
+        mx.array(rng.randn(4096).astype(np.float32) * 0.3), bits=bits
+    )
+    v_rot = make_v_rotation(D)
+    sample = rng.randn(4096, D).astype(np.float32)
+    sample /= np.linalg.norm(sample, axis=-1, keepdims=True)
+    v_codebooks = fit_vq_codebooks(sample @ np.array(v_rot).T, group_size=8 // bits)
+    return ShardKVCache(
+        rope_spec=None,
+        k_basis=basis,
+        k_rank=D,
+        k_codebook=k_codebook,
+        k_bits=bits,
+        v_rotation=v_rot,
+        v_codebooks=v_codebooks,
+        sink_size=sink,
+        window_size=window,
+    )
+
+
+def test_snapshot_spectralquant_cache_safe_in_other_thread():
+    """A spectral snapshot taken on this thread must be readable from a
+    worker thread — same contract as the TurboQuant test above. Spectral's
+    ``.state`` property rebuilds ``[..., :offset, :]`` slices off the
+    step-aligned (256) backing buffers on every access, so without pinning
+    the snapshot to exactly ``offset`` on the creating thread, a
+    cross-thread read hits the thread-local-streams partial-slice hazard
+    (#499). Reachable in production via ``_SpecCacheStore`` reuse and the
+    checkpoint store — ``_KV_QUANT_PREFIXES_BLOCKING_SNAPSHOT`` is empty,
+    so spectral caches flow through the in-memory snapshot path (only the
+    DISK path is gated by ``_is_serializable_cache``)."""
+    cache = [_make_spectralquant_cache()]
+    head_dim = 32
+    keys = mx.random.normal((1, 2, 8, head_dim)).astype(mx.float16)
+    values = mx.random.normal((1, 2, 8, head_dim)).astype(mx.float16)
+    mx.eval(keys, values)
+    k_out, v_out = cache[0].update_and_fetch(keys, values)
+    mx.eval(k_out, v_out)
+
+    snap = snapshot_cache_for_persistence(cache, eager_eval=True)
+    state = snap[0].state
+    err: list[Exception] = []
+
+    def _read() -> None:
+        try:
+            for arr in state:
+                mx.eval(arr)
+        except Exception as e:  # pragma: no cover
+            err.append(e)
+
+    t = threading.Thread(target=_read)
+    t.start()
+    t.join()
+    assert not err, f"cross-thread eval failed: {err}"
+
+
+def test_snapshot_shardquant_cache_safe_in_other_thread():
+    """A shard snapshot taken on this thread must be readable from a worker
+    thread — same contract as the TurboQuant/Spectral tests. Shard's
+    ``.state`` returns the sink/window buffers raw (full-range, safe) but
+    slices the compressed middle ``[..., :_mid_len, :]`` off step-aligned
+    buffers, so the middle needs the same creating-thread pin (#499)."""
+    cache = [_make_shardquant_cache()]
+    D, H = 16, 2
+    # 20 tokens: sink takes 4, window keeps 8, overflow of 8 is compressed
+    # into the middle — so all three regions (and the partial-slice hazard)
+    # are populated.
+    keys = mx.random.normal((1, H, 20, D)).astype(mx.float16)
+    values = mx.random.normal((1, H, 20, D)).astype(mx.float16)
+    mx.eval(keys, values)
+    k_out, v_out = cache[0].update_and_fetch(keys, values)
+    mx.eval(k_out, v_out)
+    assert cache[0]._mid_len > 0, "test setup must populate the compressed middle"
+
+    snap = snapshot_cache_for_persistence(cache, eager_eval=True)
+    state = snap[0].state
+    err: list[Exception] = []
+
+    def _read() -> None:
+        try:
+            for arr in state:
+                mx.eval(arr)
+        except Exception as e:  # pragma: no cover
+            err.append(e)
+
+    t = threading.Thread(target=_read)
+    t.start()
+    t.join()
+    assert not err, f"cross-thread eval failed: {err}"
+
+
 def test_snapshot_spectralquant_cache_deepcopies():
     """Regression guard: ``SpectralQuantKVCache`` has no ``mx.Dtype`` attr
     and already deepcopies cleanly. It was excluded from the checkpoint

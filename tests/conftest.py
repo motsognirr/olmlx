@@ -105,9 +105,9 @@ def metal_default_device():
     ``OLMLX_TESTS_CPU_DEVICE=1`` (see tests/__init__.py) moves the suite's
     default device to the CPU so unit-test compute can't contend with real
     inference on the shared CI Mac. Tests whose subject *is* the Metal
-    kernel path (shardquant kernel parity, the mlx rope-bug removal gate)
-    opt back in through this fixture; ``kernels_supported`` and the rope
-    corruption both key off the default device, so without it they would
+    kernel path (shardquant kernel parity, the rope batched-decode parity
+    gate) opt back in through this fixture; ``kernels_supported`` and the
+    rope parity gate both key off the default device, so without it they would
     silently exercise the reference/CPU path instead. Skips on machines
     without Metal — same behavior the previous ``skipif`` gates had.
     """

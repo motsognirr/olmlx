@@ -18,7 +18,6 @@ import pytest
 from olmlx.engine.dflash.selfgen import (
     cycle_training_batches,
     generate_training_sequences,
-    safe_rope_patch,
 )
 from olmlx.engine.dflash.prepare import (
     _select_pivot,
@@ -30,41 +29,6 @@ from tests.test_dflash_prepare import (  # reuse the existing fakes
     _mock_target_loader,
     _write_target_config,
 )
-
-
-# ---------------------------------------------------------------------------
-# safe_rope_patch
-# ---------------------------------------------------------------------------
-
-
-class TestSafeRopePatch:
-    def test_batched_decode_rope_matches_per_row_reference(self):
-        """mlx 0.31.1's mx.fast.rope corrupts rows >= 1 for B > 1, L == 1.
-        Under the patch, the batched call must match per-row results."""
-        B, H, L, D = 4, 8, 1, 64
-        mx.random.seed(0)
-        rows = [mx.random.normal((1, H, L, D)).astype(mx.bfloat16) for _ in range(B)]
-        x = mx.concatenate(rows, axis=0)
-        kwargs = dict(traditional=False, base=1e6, scale=1.0, offset=11)
-        with safe_rope_patch():
-            batched = mx.fast.rope(x, D, **kwargs)
-            refs = [mx.fast.rope(r, D, **kwargs) for r in rows]
-        mx.eval(batched, *refs)
-        for b in range(B):
-            assert float(mx.abs(batched[b] - refs[b][0]).max().item()) == 0.0
-
-    def test_patch_is_reverted_on_exit(self):
-        orig = mx.fast.rope
-        with safe_rope_patch():
-            assert mx.fast.rope is not orig
-        assert mx.fast.rope is orig
-
-    def test_patch_reverted_on_exception(self):
-        orig = mx.fast.rope
-        with pytest.raises(RuntimeError):
-            with safe_rope_patch():
-                raise RuntimeError("boom")
-        assert mx.fast.rope is orig
 
 
 # ---------------------------------------------------------------------------

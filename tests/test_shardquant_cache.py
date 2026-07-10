@@ -116,14 +116,24 @@ class TestShardKVCacheBasics:
         mx.random.seed(3)
         ks = mx.random.normal((1, 2, 34, 16)).astype(mx.float16)
         vs = mx.random.normal((1, 2, 34, 16)).astype(mx.float16)
-        c1.update_and_fetch(ks[..., :30, :], vs[..., :30, :])
-        k1 = v1 = None
-        for i in range(30, 34):
-            k1, v1 = c1.update_and_fetch(ks[..., i : i + 1, :], vs[..., i : i + 1, :])
-        out = None
-        for i in range(34):
-            out = c2.update_and_fetch(ks[..., i : i + 1, :], vs[..., i : i + 1, :])
-        k2, v2 = out
+        # mlx >= 0.32.0 routes fp32 matmul through M5 NAX (~1e-3 element
+        # precision); reference on CPU stream stays exact, tolerance covers
+        # the NAX delta. Both feed orders run on the CPU stream: the subject
+        # is the prefill-vs-decode bookkeeping equivalence, and on GPU the
+        # NAX rounding differs between the batch and single-token matmul
+        # shapes — near a codebook decision boundary that flips a quantized
+        # index, an element-level jump (~0.24 observed) no tolerance covers.
+        with mx.stream(mx.cpu):
+            c1.update_and_fetch(ks[..., :30, :], vs[..., :30, :])
+            k1 = v1 = None
+            for i in range(30, 34):
+                k1, v1 = c1.update_and_fetch(
+                    ks[..., i : i + 1, :], vs[..., i : i + 1, :]
+                )
+            out = None
+            for i in range(34):
+                out = c2.update_and_fetch(ks[..., i : i + 1, :], vs[..., i : i + 1, :])
+            k2, v2 = out
         np.testing.assert_allclose(
             np.array(k1, dtype=np.float32),
             np.array(k2, dtype=np.float32),

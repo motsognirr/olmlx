@@ -40,15 +40,19 @@ class TestMiddleRefOps:
 
         got = shard_middle_weighted_v_ref(w, cache)
 
-        v_lit = shard_decompress_values(
-            cache._v_mid,
-            cache._v_mid_norms,
-            cache.v_rotation,
-            cache.v_codebooks,
-            dtype=mx.float32,
-        )[..., :m, :]
-        want = w @ v_lit
-        assert mx.allclose(got, want, atol=1e-4), float(mx.abs(got - want).max())
+        # mlx >= 0.32.0 routes fp32 matmul through M5 NAX (~1e-3 element
+        # precision); reference on CPU stream stays exact, tolerance covers
+        # the NAX delta.
+        with mx.stream(mx.cpu):
+            v_lit = shard_decompress_values(
+                cache._v_mid,
+                cache._v_mid_norms,
+                cache.v_rotation,
+                cache.v_codebooks,
+                dtype=mx.float32,
+            )[..., :m, :]
+            want = w @ v_lit
+        assert mx.allclose(got, want, atol=3e-3), float(mx.abs(got - want).max())
 
     def test_scores_ref_matches_decompressed_keys(self):
         from olmlx.engine.shardquant_fused import shard_middle_scores_ref

@@ -1,8 +1,8 @@
 """Phase 0 tests for continuous batching (docs/batching-plan.md).
 
-Covers the shared rope-bug workaround (`engine/ropefix.py`), the
-batch-convertible cache probe (`engine/batching.py`), and the batching
-settings. The scheduler itself is Phase 1.
+Covers the rope batched-decode parity gate, the batch-convertible cache
+probe (`engine/batching.py`), and the batching settings. The scheduler
+itself is Phase 1.
 """
 
 import asyncio
@@ -21,100 +21,19 @@ from olmlx.config import Settings
 
 
 # ---------------------------------------------------------------------------
-# safe_rope_patch — promoted to engine/ropefix.py
+# Rope batched-decode parity gate
 # ---------------------------------------------------------------------------
 
 
-class TestRopefix:
-    def _rope_kwargs(self):
-        return dict(traditional=False, base=10000.0, scale=1.0, offset=7)
-
-    def test_importable_from_ropefix(self):
-        from olmlx.engine.ropefix import safe_rope_patch  # noqa: F401
-
-    def test_selfgen_reexport_is_same_object(self):
-        """Old importers (`dflash.selfgen`) must keep working."""
-        from olmlx.engine.dflash.selfgen import safe_rope_patch as old
-        from olmlx.engine.ropefix import safe_rope_patch as new
-
-        assert old is new
-
-    def test_batched_decode_rope_matches_per_row_reference(self):
-        """The patched call must equal per-row (B=1) reference output for
-        the buggy B>1, L==1 shape."""
-        from olmlx.engine.ropefix import safe_rope_patch
-
-        B, H, L, D = 3, 2, 1, 8
-        mx.random.seed(0)
-        x = mx.random.normal((B, H, L, D))
-        rows = [x[i : i + 1] for i in range(B)]
-        kwargs = self._rope_kwargs()
-        with safe_rope_patch():
-            batched = mx.fast.rope(x, D, **kwargs)
-            refs = [mx.fast.rope(r, D, **kwargs) for r in rows]
-        for i in range(B):
-            assert mx.allclose(batched[i : i + 1], refs[i], atol=1e-5).item()
-
-    def test_vector_offset_passes_through(self):
-        """Per-row offset vectors (BatchKVCache's decode shape) cannot be
-        folded and are *correct* on the unpatched kernel — the patch must
-        leave them alone."""
-        from olmlx.engine.ropefix import safe_rope_patch
-
-        B, H, L, D = 3, 2, 1, 8
-        x = mx.random.normal((B, H, L, D))
-        offsets = mx.array([5, 12, 60])
-        kwargs = dict(traditional=False, base=10000.0, scale=1.0)
-        refs = mx.concatenate(
-            [
-                mx.fast.rope(x[i : i + 1], D, offset=int(offsets[i].item()), **kwargs)
-                for i in range(B)
-            ]
-        )
-        with safe_rope_patch():
-            patched = mx.fast.rope(x, D, offset=offsets, **kwargs)
-        assert mx.allclose(patched, refs, atol=1e-5).item()
-
-    def test_prefill_shape_passes_through(self):
-        """L > 1 (prefill) must hit the original kernel path unchanged."""
-        from olmlx.engine.ropefix import safe_rope_patch
-
-        x = mx.random.normal((2, 2, 5, 8))
-        kwargs = self._rope_kwargs()
-        ref = mx.fast.rope(x, 8, **kwargs)
-        with safe_rope_patch():
-            patched = mx.fast.rope(x, 8, **kwargs)
-        assert mx.allclose(ref, patched, atol=1e-6).item()
-
-    def test_patch_restored_on_exit(self):
-        from olmlx.engine.ropefix import safe_rope_patch
-
-        orig = mx.fast.rope
-        with safe_rope_patch():
-            assert mx.fast.rope is not orig
-        assert mx.fast.rope is orig
-
-    def test_patch_restored_on_exception(self):
-        from olmlx.engine.ropefix import safe_rope_patch
-
-        orig = mx.fast.rope
-        with pytest.raises(RuntimeError):
-            with safe_rope_patch():
-                raise RuntimeError("boom")
-        assert mx.fast.rope is orig
-
-    # metal_default_device skips without Metal and forces the GPU default
-    # device: the corruption is Metal-only, so under OLMLX_TESTS_CPU_DEVICE=1
-    # the unforced CPU kernel is correct and this gate would fail spuriously.
+class TestRopeBatchedDecodeParity:
+    # metal_default_device: the historical corruption was Metal-only.
     @pytest.mark.usefixtures("metal_default_device")
-    def test_rope_bug_still_present_remove_patch_when_this_fails(self):
-        """Removal gate for safe_rope_patch (#499).
-
-        Asserts the mlx B>1/L==1 ``mx.fast.rope`` corruption still
-        reproduces on the unpatched kernel. When an mlx upgrade fixes it,
-        this test FAILS — that is the signal to delete engine/ropefix.py,
-        drop the patch from its holders, and delete this test.
-        """
+    def test_unpatched_rope_matches_per_row_reference(self):
+        """mlx >= 0.32.0 fixed the B>1/L==1 mx.fast.rope corruption
+        (ml-explore/mlx#3498); engine/ropefix.py was deleted on that basis.
+        This gate keeps the unpatched kernel honest — if it regresses,
+        batched decode (continuous batching, dflash selfgen) silently
+        corrupts rows >= 1 again."""
         B, H, L, D = 4, 2, 1, 64
         mx.random.seed(1)
         x = mx.random.normal((B, H, L, D))
@@ -123,9 +42,8 @@ class TestRopefix:
         refs = mx.concatenate(
             [mx.fast.rope(x[i : i + 1], D, **kwargs) for i in range(B)]
         )
-        assert not mx.allclose(direct, refs, atol=1e-4).item(), (
-            "mx.fast.rope now matches per-row reference at B>1/L==1 — the "
-            "mlx bug appears fixed; remove safe_rope_patch and this test"
+        assert mx.allclose(direct, refs, atol=1e-4).item(), (
+            "mx.fast.rope B>1/L==1 corruption is BACK — see #499 / mlx#3498"
         )
 
 

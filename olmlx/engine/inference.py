@@ -3,14 +3,13 @@ import collections.abc
 import contextlib
 import dataclasses
 import gc
-import importlib
 import itertools
 import logging
 import sys
 import threading
 import time
 import weakref
-from collections.abc import AsyncGenerator
+from collections.abc import AsyncGenerator, Callable
 from typing import TYPE_CHECKING, Any, Literal, overload
 
 import mlx.core as mx
@@ -27,7 +26,6 @@ from olmlx.utils import memory as memory_utils
 
 if TYPE_CHECKING:
     from olmlx.engine.prompt_cache.checkpoint import SegmentedPrompt
-    from olmlx.engine.prompt_cache.store import PromptCacheStore
 
 try:
     from mlx_lm.models.cache import (
@@ -146,21 +144,6 @@ def _maybe_broadcast_distributed(
 
         distributed_barrier()
 
-
-# Resolve generation streams at module load time to avoid repeated
-# importlib.import_module() calls in the hot path (_safe_sync).
-def _resolve_generation_streams() -> list[Any]:
-    streams = []
-    for mod_name in ("mlx_lm.generate", "mlx_vlm.generate"):
-        try:
-            mod = importlib.import_module(mod_name)
-            streams.append(mod.generation_stream)
-        except (ImportError, AttributeError):
-            pass
-    return streams
-
-
-_generation_streams = _resolve_generation_streams()
 
 # Metal does not support concurrent command buffer submission across any
 # models — they all share the same Metal device and command queue.  A per-model
@@ -332,24 +315,21 @@ def _sync_default_stream() -> None:
         logger.debug("mx.synchronize() failed", exc_info=True)
 
 
-def _sync_generation_streams() -> None:
-    for stream in _generation_streams:
-        try:
-            mx.synchronize(stream)
-        except Exception:
-            logger.debug("generation_stream sync failed", exc_info=True)
-
-
 def _safe_sync():
-    """Synchronize Metal GPU state unconditionally, suppressing and logging errors.
+    """Synchronize the calling thread's default Metal stream, suppressing
+    and logging errors.
 
-    Syncs both the default stream and the generation stream (mlx_lm/mlx_vlm
-    use a separate stream from the default). Callers rely on this being
-    unconditional — notably cache-eviction and deferred-cleanup paths,
-    which must sync regardless of ``settings.sync_mode``.
+    Under mlx >= 0.31.2 streams are thread-local: worker-thread GPU work is
+    fenced by the worker's own end-of-run sync (CancellableStream._run's
+    finally / _generate_sync) plus the thread join in drain_and_join. A
+    cross-thread sync of a generation stream would only sync THIS thread's
+    idle instance of the proxy — so this helper fences exactly what the
+    calling (event-loop) thread itself issued: cache deepcopy/eval,
+    eviction cleanup. Callers rely on this being unconditional — notably
+    cache-eviction and deferred-cleanup paths, which must sync regardless
+    of ``settings.sync_mode``.
     """
     _sync_default_stream()
-    _sync_generation_streams()
 
 
 def _derive_timing_stats(
@@ -502,15 +482,11 @@ def _lock_boundary_sync(mode: SyncMode | None = None) -> None:
     ``mode`` resolves per call (not cached) so a per-model override wins over
     the global default. Values:
 
-    - ``"full"`` (default): identical to ``_safe_sync`` — sync default + all
-      generation streams.
-    - ``"minimal"``: sync the default stream only; skip the generation-stream
-      loop. Safe because ``_generate_sync`` and mlx_lm's ``stream_generate``
-      already synchronize the generation stream from inside the worker thread
-      before it exits. **Same mlx_lm-internals assumption as ``"none"`` for
-      the generation stream** — if mlx_lm ever drops that guarantee,
-      ``"minimal"`` streaming is as unsafe as ``"none"`` for the
-      generation-stream part (the default stream is still synced here).
+    - ``"full"`` / ``"minimal"``: sync the calling thread's default stream.
+      The two modes are equivalent since mlx >= 0.31.2 made generation
+      streams thread-local (worker-side sync + thread join fence worker GPU
+      work; see ``_safe_sync``). ``"full"`` remains an accepted value for
+      config compatibility.
     - ``"none"``: skip lock-boundary sync entirely. Safety depends on
       per-path guarantees that Metal work is complete before the lock
       releases:
@@ -536,12 +512,8 @@ def _lock_boundary_sync(mode: SyncMode | None = None) -> None:
     effective = mode if mode is not None else settings.sync_mode
     if effective == "none":
         return
-    if effective == "minimal":
+    if effective in ("full", "minimal"):
         _sync_default_stream()
-        return
-    if effective == "full":
-        _sync_default_stream()
-        _sync_generation_streams()
         return
     raise ValueError(f"Unknown sync_mode: {effective!r}")
 
@@ -1691,6 +1663,10 @@ class _CacheSetupResult:
     full_prompt_tokens: list[int] | None = None
     prompt: str | list[int] = ""
     cache_setup_done: bool = False
+    # Checkpoint path only: closure that runs the segmented-prefill drive.
+    # Executed on the generation worker thread (same thread-local
+    # generation_stream as decode, #284/#499), never on the event loop.
+    deferred_prefill: Callable[[threading.Event | None], None] | None = None
 
 
 # Sub-chunk size for the segmented-prefill drive's per-chunk ``model()`` calls
@@ -1706,8 +1682,9 @@ def _drive_segmented_prefill(
     model: Any,
     segmented: "SegmentedPrompt",
     cache: list[Any],
-    store: "PromptCacheStore",
+    insert_checkpoint: Callable[[CachedPromptState], None],
     already_covered_tokens: int = 0,
+    cancel_event: threading.Event | None = None,
 ) -> list[int]:
     """Run prefill in at most two ``model(...)`` calls and snapshot the
     cache at the deepest interior message boundary; return the suffix to
@@ -1717,6 +1694,11 @@ def _drive_segmented_prefill(
     populated (from a checkpoint hit). Segments wholly inside that depth
     are skipped automatically — the first chunk's start is
     ``already_covered_tokens``.
+
+    ``insert_checkpoint`` is called with each boundary snapshot; when the
+    drive runs on the generation worker thread the caller passes a
+    loop-marshalling wrapper because ``PromptCacheStore`` is loop-affine
+    (#463).
 
     The returned suffix is ``[full_flat_tokens[-1]]`` — one token —
     because ``mlx_lm.stream_generate`` requires at least one prompt
@@ -1787,11 +1769,16 @@ def _drive_segmented_prefill(
     # requests never hit this because they skip the drive entirely and let
     # ``stream_generate`` prefill on ``generation_stream``.  ``mx.clear_cache()``
     # per chunk mirrors mlx-lm's prefill loop.
-    prefill_stream = (
-        _generation_streams[0]
-        if _generation_streams
-        else mx.default_stream(mx.default_device())
-    )
+    # Resolve mlx-lm's generation stream AT CALL TIME: under mlx >= 0.31.2 it
+    # is a ThreadLocalStream proxy that resolves per-thread. This function
+    # runs on the generation worker thread (deferred from cache setup), so
+    # resolving here yields the same underlying stream ``stream_generate``
+    # decodes on — the #284 same-stream contract, now expressed as
+    # same-thread (#499).
+    try:
+        from mlx_lm.generate import generation_stream as prefill_stream
+    except ImportError:  # mlx-lm absent (pure unit-test environments)
+        prefill_stream = mx.default_stream(mx.default_device())
     pure_rotating = _is_pure_rotating_cache(cache)
 
     def _run(start: int, end: int) -> None:
@@ -1813,6 +1800,8 @@ def _drive_segmented_prefill(
                 # peak memory at roughly one sub-chunk's worth of activations.
                 pos = start
                 while pos < end:
+                    if cancel_event is not None and cancel_event.is_set():
+                        return
                     stop = min(pos + _PREFILL_CHUNK, end)
                     model(
                         mx.array(flat[pos:stop], dtype=mx.int32)[None, :], cache=cache
@@ -1837,7 +1826,7 @@ def _drive_segmented_prefill(
         _run(already_covered_tokens, final_prefill_end)
         if final_prefill_end > already_covered_tokens and segmented.segments:
             snap = snapshot_cache_for_persistence(cache, eager_eval=False)
-            store.insert_checkpoint(
+            insert_checkpoint(
                 CachedPromptState(
                     tokens=flat[:final_prefill_end],
                     cache=snap,
@@ -1858,7 +1847,7 @@ def _drive_segmented_prefill(
         # inner ``mx.eval(flatten_cache_state(cache))`` just materialised
         # the state on the prefill stream; deepcopy alone is sufficient.
         snap = snapshot_cache_for_persistence(cache, eager_eval=False)
-        store.insert_checkpoint(
+        insert_checkpoint(
             CachedPromptState(
                 tokens=flat[:deepest_boundary],
                 cache=snap,
@@ -1867,6 +1856,8 @@ def _drive_segmented_prefill(
             )
         )
         # Chunk 2: boundary to the reserved trailing token.
+        if cancel_event is not None and cancel_event.is_set():
+            return [flat[-1]]
         _run(deepest_boundary, final_prefill_end)
 
     return [flat[-1]]
@@ -1989,24 +1980,52 @@ async def _setup_via_checkpoint_path(
         )
         already_covered = len(cached_state.tokens)
 
-    # ArraysCache layers carry lazy metal_kernel graphs — the drive's
-    # per-segment ``mx.eval`` materialises them before each snapshot, so
-    # callers don't need to pass an eager-eval flag here (#284).
-    suffix = _drive_segmented_prefill(
-        model=lm.model,
-        segmented=segmented,
-        cache=cache,
-        store=lm.prompt_cache_store,
-        already_covered_tokens=already_covered,
-    )
+    # The drive is DEFERRED to the generation worker thread: under
+    # thread-local streams (mlx >= 0.31.2) running it here, on the event
+    # loop, would prefill on the loop thread's generation-stream instance
+    # while decode uses the worker's — the #284 cross-stream GDN hazard.
+    # Suffix and token counts are deterministic (the drive always reserves
+    # exactly the trailing token for stream_generate), so they are computed
+    # here; only the model() forwards move.
+    flat = segmented.flatten()
+
+    loop = asyncio.get_running_loop()
+    store = lm.prompt_cache_store
+
+    def _insert_checkpoint_threadsafe(state: CachedPromptState) -> None:
+        # PromptCacheStore is loop-affine (assert_loop_thread, #463); the
+        # drive runs on the worker thread, so marshal insertion back to the
+        # loop. The snapshot is already materialized on the worker (mx.eval
+        # per chunk), so the arrays may cross threads.
+        def _do_insert() -> None:
+            try:
+                store.insert_checkpoint(state)
+            except Exception:
+                logger.warning("checkpoint insert failed", exc_info=True)
+
+        loop.call_soon_threadsafe(_do_insert)
+
+    model = lm.model
+
+    def _deferred_prefill(cancel_event: threading.Event | None = None) -> None:
+        _drive_segmented_prefill(
+            model=model,
+            segmented=segmented,
+            cache=cache,
+            insert_checkpoint=_insert_checkpoint_threadsafe,
+            already_covered_tokens=already_covered,
+            cancel_event=cancel_event,
+        )
 
     gen_kwargs["prompt_cache"] = cache
+    suffix: list[int] = [flat[-1]] if flat else []
     return _CacheSetupResult(
         prompt=suffix,
         full_prompt_tokens=prompt_tokens,
         cache_read_tokens=already_covered,
         cache_creation_tokens=max(0, len(prompt_tokens) - already_covered),
         cache_setup_done=True,
+        deferred_prefill=_deferred_prefill if flat else None,
     )
 
 
@@ -3493,6 +3512,7 @@ async def _stream_completion(
                     audio=audio_paths,
                     memory_limit=memory_limit,
                     trace_context=_tracing.current_context(),
+                    deferred_prefill=cs.deferred_prefill,
                     **gen_kwargs,
                 )
 
@@ -3847,6 +3867,7 @@ async def _full_completion(
             generation_complete = False
             generated_tokens: list[int] = []
             result_dict: dict = {}
+            deferred_prefill: Callable[[threading.Event | None], None] | None = None
             try:
                 if use_prompt_cache and lm.is_vlm:
                     # VLM: attach an mlx_vlm PromptCacheState. Leave ``prompt``
@@ -3881,6 +3902,7 @@ async def _full_completion(
                     cache_creation_tokens = cs.cache_creation_tokens
                     full_prompt_tokens = cs.full_prompt_tokens
                     cache_setup_done = cs.cache_setup_done
+                    deferred_prefill = cs.deferred_prefill
 
                     pf = await _kv_cache_preflight_check(
                         lm,
@@ -3905,6 +3927,7 @@ async def _full_completion(
                     has_tools=has_tools,
                     generated_tokens_out=generated_tokens if use_prompt_cache else None,
                     grammar_active=grammar_active,
+                    deferred_prefill=deferred_prefill,
                 )
                 generation_complete = True
 
@@ -3997,6 +4020,7 @@ async def _full_completion_inner(
     *,
     generated_tokens_out: list[int] | None = None,
     grammar_active: bool = False,
+    deferred_prefill: Callable[[threading.Event | None], None] | None = None,
 ) -> dict:
     audio_paths: list[str] = []
     _audio_temps: list[str] = []
@@ -4012,6 +4036,11 @@ async def _full_completion_inner(
             _maybe_broadcast_distributed(lm, tokens, prompt, max_tokens, gen_kwargs)
 
         _apply_seed(gen_kwargs, consume=not lm.is_vlm)
+
+        if deferred_prefill is not None:
+            # Checkpoint-path prefill: run on this worker thread so prefill
+            # and decode share its thread-local generation_stream (#284/#499).
+            deferred_prefill(None)
 
         # Decide speculative use explicitly (mirrors _stream_completion).
         # The disable-on-grammar path is taken when both speculative is

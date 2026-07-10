@@ -11,19 +11,19 @@ dependencies = [
     # speculative/VLM paths reach into upstream module internals. Bump the
     # bounds only after re-verifying that copy and the GDN linearity
     # assumption against the new release.
-    "mlx-lm>=0.31.1,<0.32",
-    # mlx is pinned explicitly (normally it would ride mlx-lm's pin) because
-    # 0.31.2 made streams thread-local: an array lazily bound to a stream
-    # created on another thread can no longer be mx.eval'd cross-thread
-    # ("There is no Stream(gpu, N) in current thread"). olmlx's snapshot /
-    # disk-spill / prefetcher paths all eval on worker threads (#284 family),
-    # so 0.31.2 fails 16 tests. Lift this only after adapting those paths (#499).
-    "mlx>=0.31.1,<0.31.2",
+    "mlx-lm>=0.31.3,<0.32",
+    # mlx is pinned explicitly (normally it would ride mlx-lm's pin) to set
+    # the floor at 0.32.0: it fixes the mx.fast.rope B>1/L==1 decode-shape
+    # corruption (ml-explore/mlx#3498; engine/ropefix.py was the workaround)
+    # and ships the thread-local stream model this codebase is written
+    # against (#499): generation streams resolve per-thread, worker GPU work
+    # is fenced by worker-side sync + thread join, never cross-thread sync.
+    "mlx>=0.32.0,<0.33",
     "huggingface-hub>=0.20",
     "jinja2>=3.0",
     "pydantic>=2.0",
     "pydantic-settings>=2.0",
-    "mlx-vlm>=0.4.4,<0.5",
+    "mlx-vlm>=0.5.0,<0.6",
     "transformers>=5.5.0",
     # torch is NOT declared here on purpose (#469): xgrammar and mlx-whisper
     # both require it transitively, so it is always installed — but olmlx
