@@ -79,7 +79,10 @@ def test_drive_two_segment_cold_start():
     )
     cache = [KVCache()]
     suffix = _drive_segmented_prefill(
-        model=model, segmented=sp, cache=cache, store=store
+        model=model,
+        segmented=sp,
+        cache=cache,
+        insert_checkpoint=store.insert_checkpoint,
     )
     # Two chunks split at the single interior boundary (depth 3): the
     # system tokens, then the user segment minus its reserved trailing
@@ -113,7 +116,7 @@ def test_drive_skips_segments_below_already_covered():
         model=model,
         segmented=sp,
         cache=cache,
-        store=store,
+        insert_checkpoint=store.insert_checkpoint,
         already_covered_tokens=3,
     )
     assert len(model.calls) == 1
@@ -235,7 +238,10 @@ def test_drive_subchunks_long_prefill(monkeypatch):
     sp = SegmentedPrompt(segments=[Segment(tokens=[1, 2, 3, 4, 5, 6, 7], role="user")])
     cache = [KVCache()]  # not pure-rotating -> sub-chunked
     suffix = _drive_segmented_prefill(
-        model=model, segmented=sp, cache=cache, store=store
+        model=model,
+        segmented=sp,
+        cache=cache,
+        insert_checkpoint=store.insert_checkpoint,
     )
     assert model.calls == [[1, 2], [3, 4], [5, 6]]
     assert suffix == [7]
@@ -380,7 +386,12 @@ def test_drive_does_not_snapshot_last_segment_boundary():
         ]
     )
     cache = [KVCache()]
-    _drive_segmented_prefill(model=model, segmented=sp, cache=cache, store=store)
+    _drive_segmented_prefill(
+        model=model,
+        segmented=sp,
+        cache=cache,
+        insert_checkpoint=store.insert_checkpoint,
+    )
     # System boundary (3 tokens) is snapshotted; last boundary (5 tokens) is not.
     assert store.fetch_nearest([1, 2, 3, 99]) is not None, (
         "system-boundary checkpoint must be present"
@@ -754,6 +765,9 @@ def test_setup_prompt_cache_single_segment_request_still_uses_existing_checkpoin
         f"{cs.cache_read_tokens} — single-segment request didn't take "
         f"the hit"
     )
+    # The drive is deferred to the generation worker thread now; run it
+    # explicitly before asserting on its side effects.
+    cs.deferred_prefill(None)
     # Drive should have run on the un-covered tokens only.
     assert len(model.calls) == 1
     assert model.calls[0] == full_tokens[prefix_len : len(full_tokens) - 1], (
@@ -819,7 +833,10 @@ def test_drive_handles_mixed_rotating_arrays_layout():
         RotatingKVCache(max_size=32, keep=2),
     ]
     suffix = _drive_segmented_prefill(
-        model=model, segmented=sp, cache=cache, store=store
+        model=model,
+        segmented=sp,
+        cache=cache,
+        insert_checkpoint=store.insert_checkpoint,
     )
     # Two segments: one model call per uncovered segment, last token
     # reserved for stream_generate's decode init.
@@ -851,7 +868,7 @@ def test_drive_handles_mixed_rotating_arrays_layout():
         model=warm_model,
         segmented=sp,
         cache=warm,
-        store=PromptCacheStore(max_slots=4),
+        insert_checkpoint=PromptCacheStore(max_slots=4).insert_checkpoint,
         already_covered_tokens=4,
     )
     # Only the user segment's prefill tokens get fed; the trailing token
@@ -894,7 +911,7 @@ def test_drive_uses_two_chunks_and_one_snapshot_for_multi_segment_request():
         model=model,
         segmented=sp,
         cache=cache,
-        store=store,
+        insert_checkpoint=store.insert_checkpoint,
         already_covered_tokens=3,
     )
     # Deepest interior boundary > 3 and < 13 is the assistant boundary (10).
@@ -940,7 +957,7 @@ def test_drive_no_snapshot_when_only_final_segment_remains():
         model=model,
         segmented=sp,
         cache=cache,
-        store=store,
+        insert_checkpoint=store.insert_checkpoint,
         already_covered_tokens=9,  # end of assistant
     )
     # Single chunk = [10, 11] (12 reserved). No snapshot.

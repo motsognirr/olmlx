@@ -383,6 +383,7 @@ def async_mlx_stream(
     audio: list[str] | None = None,
     memory_limit: int = 0,
     trace_context: Any = None,
+    deferred_prefill: Callable[[threading.Event | None], None] | None = None,
     **kwargs: Any,
 ) -> CancellableStream:
     """Bridge sync mlx_lm/mlx_vlm stream_generate into an async iterable.
@@ -426,6 +427,13 @@ def async_mlx_stream(
             )
         else:
             import mlx_lm
+
+            if deferred_prefill is not None:
+                # Checkpoint-path prefill, deferred from cache setup (event
+                # loop) to here (generation worker) so prefill and decode
+                # share this thread's thread-local generation_stream
+                # (#284/#499).
+                deferred_prefill(cancel_event)
 
             gen_kwargs = dict(prompt=prompt, max_tokens=max_tokens, **kwargs)
             gen_kwargs.pop("prompt_progress_callback", None)  # we control this below

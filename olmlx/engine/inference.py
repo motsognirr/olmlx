@@ -10,7 +10,7 @@ import sys
 import threading
 import time
 import weakref
-from collections.abc import AsyncGenerator
+from collections.abc import AsyncGenerator, Callable
 from typing import TYPE_CHECKING, Any, Literal, overload
 
 import mlx.core as mx
@@ -27,7 +27,6 @@ from olmlx.utils import memory as memory_utils
 
 if TYPE_CHECKING:
     from olmlx.engine.prompt_cache.checkpoint import SegmentedPrompt
-    from olmlx.engine.prompt_cache.store import PromptCacheStore
 
 try:
     from mlx_lm.models.cache import (
@@ -1691,6 +1690,10 @@ class _CacheSetupResult:
     full_prompt_tokens: list[int] | None = None
     prompt: str | list[int] = ""
     cache_setup_done: bool = False
+    # Checkpoint path only: closure that runs the segmented-prefill drive.
+    # Executed on the generation worker thread (same thread-local
+    # generation_stream as decode, #284/#499), never on the event loop.
+    deferred_prefill: Callable[[threading.Event | None], None] | None = None
 
 
 # Sub-chunk size for the segmented-prefill drive's per-chunk ``model()`` calls
@@ -1706,8 +1709,9 @@ def _drive_segmented_prefill(
     model: Any,
     segmented: "SegmentedPrompt",
     cache: list[Any],
-    store: "PromptCacheStore",
+    insert_checkpoint: Callable[[CachedPromptState], None],
     already_covered_tokens: int = 0,
+    cancel_event: threading.Event | None = None,
 ) -> list[int]:
     """Run prefill in at most two ``model(...)`` calls and snapshot the
     cache at the deepest interior message boundary; return the suffix to
@@ -1717,6 +1721,11 @@ def _drive_segmented_prefill(
     populated (from a checkpoint hit). Segments wholly inside that depth
     are skipped automatically — the first chunk's start is
     ``already_covered_tokens``.
+
+    ``insert_checkpoint`` is called with each boundary snapshot; when the
+    drive runs on the generation worker thread the caller passes a
+    loop-marshalling wrapper because ``PromptCacheStore`` is loop-affine
+    (#463).
 
     The returned suffix is ``[full_flat_tokens[-1]]`` — one token —
     because ``mlx_lm.stream_generate`` requires at least one prompt
@@ -1787,11 +1796,16 @@ def _drive_segmented_prefill(
     # requests never hit this because they skip the drive entirely and let
     # ``stream_generate`` prefill on ``generation_stream``.  ``mx.clear_cache()``
     # per chunk mirrors mlx-lm's prefill loop.
-    prefill_stream = (
-        _generation_streams[0]
-        if _generation_streams
-        else mx.default_stream(mx.default_device())
-    )
+    # Resolve mlx-lm's generation stream AT CALL TIME: under mlx >= 0.31.2 it
+    # is a ThreadLocalStream proxy that resolves per-thread. This function
+    # runs on the generation worker thread (deferred from cache setup), so
+    # resolving here yields the same underlying stream ``stream_generate``
+    # decodes on — the #284 same-stream contract, now expressed as
+    # same-thread (#499).
+    try:
+        from mlx_lm.generate import generation_stream as prefill_stream
+    except ImportError:  # mlx-lm absent (pure unit-test environments)
+        prefill_stream = mx.default_stream(mx.default_device())
     pure_rotating = _is_pure_rotating_cache(cache)
 
     def _run(start: int, end: int) -> None:
@@ -1813,6 +1827,8 @@ def _drive_segmented_prefill(
                 # peak memory at roughly one sub-chunk's worth of activations.
                 pos = start
                 while pos < end:
+                    if cancel_event is not None and cancel_event.is_set():
+                        return
                     stop = min(pos + _PREFILL_CHUNK, end)
                     model(
                         mx.array(flat[pos:stop], dtype=mx.int32)[None, :], cache=cache
@@ -1837,7 +1853,7 @@ def _drive_segmented_prefill(
         _run(already_covered_tokens, final_prefill_end)
         if final_prefill_end > already_covered_tokens and segmented.segments:
             snap = snapshot_cache_for_persistence(cache, eager_eval=False)
-            store.insert_checkpoint(
+            insert_checkpoint(
                 CachedPromptState(
                     tokens=flat[:final_prefill_end],
                     cache=snap,
@@ -1858,7 +1874,7 @@ def _drive_segmented_prefill(
         # inner ``mx.eval(flatten_cache_state(cache))`` just materialised
         # the state on the prefill stream; deepcopy alone is sufficient.
         snap = snapshot_cache_for_persistence(cache, eager_eval=False)
-        store.insert_checkpoint(
+        insert_checkpoint(
             CachedPromptState(
                 tokens=flat[:deepest_boundary],
                 cache=snap,
@@ -1867,6 +1883,8 @@ def _drive_segmented_prefill(
             )
         )
         # Chunk 2: boundary to the reserved trailing token.
+        if cancel_event is not None and cancel_event.is_set():
+            return [flat[-1]]
         _run(deepest_boundary, final_prefill_end)
 
     return [flat[-1]]
@@ -1989,24 +2007,52 @@ async def _setup_via_checkpoint_path(
         )
         already_covered = len(cached_state.tokens)
 
-    # ArraysCache layers carry lazy metal_kernel graphs — the drive's
-    # per-segment ``mx.eval`` materialises them before each snapshot, so
-    # callers don't need to pass an eager-eval flag here (#284).
-    suffix = _drive_segmented_prefill(
-        model=lm.model,
-        segmented=segmented,
-        cache=cache,
-        store=lm.prompt_cache_store,
-        already_covered_tokens=already_covered,
-    )
+    # The drive is DEFERRED to the generation worker thread: under
+    # thread-local streams (mlx >= 0.31.2) running it here, on the event
+    # loop, would prefill on the loop thread's generation-stream instance
+    # while decode uses the worker's — the #284 cross-stream GDN hazard.
+    # Suffix and token counts are deterministic (the drive always reserves
+    # exactly the trailing token for stream_generate), so they are computed
+    # here; only the model() forwards move.
+    flat = segmented.flatten()
+
+    loop = asyncio.get_running_loop()
+    store = lm.prompt_cache_store
+
+    def _insert_checkpoint_threadsafe(state: CachedPromptState) -> None:
+        # PromptCacheStore is loop-affine (assert_loop_thread, #463); the
+        # drive runs on the worker thread, so marshal insertion back to the
+        # loop. The snapshot is already materialized on the worker (mx.eval
+        # per chunk), so the arrays may cross threads.
+        def _do_insert() -> None:
+            try:
+                store.insert_checkpoint(state)
+            except Exception:
+                logger.warning("checkpoint insert failed", exc_info=True)
+
+        loop.call_soon_threadsafe(_do_insert)
+
+    model = lm.model
+
+    def _deferred_prefill(cancel_event: threading.Event | None = None) -> None:
+        _drive_segmented_prefill(
+            model=model,
+            segmented=segmented,
+            cache=cache,
+            insert_checkpoint=_insert_checkpoint_threadsafe,
+            already_covered_tokens=already_covered,
+            cancel_event=cancel_event,
+        )
 
     gen_kwargs["prompt_cache"] = cache
+    suffix: list[int] = [flat[-1]] if flat else []
     return _CacheSetupResult(
         prompt=suffix,
         full_prompt_tokens=prompt_tokens,
         cache_read_tokens=already_covered,
         cache_creation_tokens=max(0, len(prompt_tokens) - already_covered),
         cache_setup_done=True,
+        deferred_prefill=_deferred_prefill if flat else None,
     )
 
 
@@ -3493,6 +3539,7 @@ async def _stream_completion(
                     audio=audio_paths,
                     memory_limit=memory_limit,
                     trace_context=_tracing.current_context(),
+                    deferred_prefill=cs.deferred_prefill,
                     **gen_kwargs,
                 )
 
@@ -3847,6 +3894,7 @@ async def _full_completion(
             generation_complete = False
             generated_tokens: list[int] = []
             result_dict: dict = {}
+            deferred_prefill: Callable[[threading.Event | None], None] | None = None
             try:
                 if use_prompt_cache and lm.is_vlm:
                     # VLM: attach an mlx_vlm PromptCacheState. Leave ``prompt``
@@ -3881,6 +3929,7 @@ async def _full_completion(
                     cache_creation_tokens = cs.cache_creation_tokens
                     full_prompt_tokens = cs.full_prompt_tokens
                     cache_setup_done = cs.cache_setup_done
+                    deferred_prefill = cs.deferred_prefill
 
                     pf = await _kv_cache_preflight_check(
                         lm,
@@ -3905,6 +3954,7 @@ async def _full_completion(
                     has_tools=has_tools,
                     generated_tokens_out=generated_tokens if use_prompt_cache else None,
                     grammar_active=grammar_active,
+                    deferred_prefill=deferred_prefill,
                 )
                 generation_complete = True
 
@@ -3997,6 +4047,7 @@ async def _full_completion_inner(
     *,
     generated_tokens_out: list[int] | None = None,
     grammar_active: bool = False,
+    deferred_prefill: Callable[[threading.Event | None], None] | None = None,
 ) -> dict:
     audio_paths: list[str] = []
     _audio_temps: list[str] = []
@@ -4012,6 +4063,11 @@ async def _full_completion_inner(
             _maybe_broadcast_distributed(lm, tokens, prompt, max_tokens, gen_kwargs)
 
         _apply_seed(gen_kwargs, consume=not lm.is_vlm)
+
+        if deferred_prefill is not None:
+            # Checkpoint-path prefill: run on this worker thread so prefill
+            # and decode share its thread-local generation_stream (#284/#499).
+            deferred_prefill(None)
 
         # Decide speculative use explicitly (mirrors _stream_completion).
         # The disable-on-grammar path is taken when both speculative is
