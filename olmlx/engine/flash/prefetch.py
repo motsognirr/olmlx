@@ -126,9 +126,9 @@ class Prefetcher:
         Prediction runs on a dedicated single-thread executor so it overlaps
         with the current layer's SSD I/O and compute.  The hidden state is
         materialized on the calling thread first (``mx.eval`` is not safe
-        for concurrent calls) — also required by mlx >= 0.31.2 thread-local
+        for concurrent calls) (also required by mlx >= 0.31.2 thread-local
         streams: a lazy graph built on the forward thread cannot be
-        evaluated on the pool thread, #499.
+        evaluated on the pool thread, #499).
 
         The ``_pending`` entry is registered *before* enqueueing so that
         ``wait(layer_idx + 1)`` in the next layer blocks until both

@@ -316,6 +316,41 @@ class ShardKVCache(_BaseCache):
             "Disable disk cache offload when using shard quantization."
         )
 
+    def _pin_state_to_offset(self) -> None:
+        """Trim the compressed-middle buffers to exactly ``self._mid_len``.
+
+        Called by ``snapshot_cache_for_persistence`` (on a snapshot copy
+        only — never the live cache) right after it evaluates ``.state``.
+        ``.state`` returns the sink/window buffers raw (full-range — safe to
+        evaluate cross-thread once materialized) but slices the middle
+        ``[..., :self._mid_len, :]`` off the ``step``-aligned buffers,
+        rebuilding a fresh lazy op on every access. Trimming the middle here
+        makes that slice a full-range no-op of an already-materialized
+        array, which mlx's thread-local streams (>=0.31.2, #499) can
+        evaluate from any thread without needing the stream of the thread
+        that built the op. ``state`` has no setter (``ShardKVCache`` rejects
+        restoration), so this mutates the private buffers directly instead
+        of going through the property. The capacity trim breaks the
+        ``step``-alignment ``_decompress_middle`` relies on for mx.compile
+        trace reuse, but only on the snapshot copy: a resumed copy's first
+        ``_append_middle`` regrows to step alignment (one extra retrace).
+        Mirrors ``TurboQuantKVCache._pin_state_to_offset``.
+        """
+        if self._k_mid is None or self._mid_len == 0:
+            return
+        if self._k_mid.shape[2] == self._mid_len:
+            return
+        self._k_mid = self._k_mid[..., : self._mid_len, :]
+        self._k_mid_norms = self._k_mid_norms[..., : self._mid_len, :]
+        self._v_mid = self._v_mid[..., : self._mid_len, :]
+        self._v_mid_norms = self._v_mid_norms[..., : self._mid_len, :]
+        mx.eval(
+            self._k_mid,
+            self._k_mid_norms,
+            self._v_mid,
+            self._v_mid_norms,
+        )
+
     def is_trimmable(self):
         return True
 

@@ -639,7 +639,8 @@ class PromptCacheStore:
     # (explicit eager_eval, or the prefill drive's own mx.eval right before
     # the snapshot). _set_in_memory/_shed_transient_buffers/_estimate_state_
     # bytes/takeover (all event-loop-side) are pure bookkeeping and never
-    # build or evaluate array ops, so they don't perturb this.
+    # *evaluate* array ops (`_estimate_state_bytes` builds a lazy .state
+    # slice to read .nbytes but never evals it), so they don't perturb this.
 
     async def _to_thread_traced(self, fn: Any, *fn_args: Any) -> Any:
         """Run ``fn`` in a worker thread with the request's OTel context
