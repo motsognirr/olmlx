@@ -8,7 +8,7 @@ import logging
 import re
 import threading
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -611,6 +611,38 @@ def _cache_supports_persistence(cache_list: list) -> bool:
         if type(layer).__name__ not in _PERSISTABLE_CACHE_CLASSES:
             return False
     return True
+
+
+def _effective_flash_moe_config(
+    flash_moe_config: FlashMoeConfig,
+    spec_config: SpeculativeConfig,
+    hf_path: str,
+) -> FlashMoeConfig:
+    """Force MoE expert prefetch off under ``self_speculative``.
+
+    ``SelfSpeculativeDecoder`` drafts by running the target's early layers
+    directly and calling ``mx.eval`` per draft token. With prefetch active,
+    the last MoE layer inside the draft window can call
+    ``MoePrefetcher.submit`` targeting a successor layer the draft loop never
+    reaches — so no ``wait()`` ever consumes it, and the decoder's
+    per-token ``mx.eval`` races the prediction thread's ``mx.eval``
+    (``MoeLookaheadBank.predict_next``). Concurrent ``mx.eval`` is the
+    documented Metal-deadlock hazard (see CLAUDE.md). Classic and PLD
+    strategies were verified safe and are left untouched.
+    """
+    if (
+        spec_config.enabled
+        and spec_config.strategy == "self_speculative"
+        and flash_moe_config.prefetch
+    ):
+        logger.info(
+            "MoE expert prefetch disabled for %s: self_speculative's "
+            "early-exit draft loop would leave prefetch predictions "
+            "unconsumed (concurrent mx.eval hazard).",
+            hf_path,
+        )
+        return replace(flash_moe_config, prefetch=False)
+    return flash_moe_config
 
 
 class ModelLoadTimeoutError(TimeoutError):
@@ -3462,6 +3494,9 @@ class ModelManager(SpeculativeLoaderMixin):
                         weight_quant_str,
                         hf_path,
                     )
+                flash_moe_config = _effective_flash_moe_config(
+                    flash_moe_config, spec_config, hf_path
+                )
                 model, tokenizer, is_vlm, caps = self._load_flash_moe_model(
                     hf_path, load_path, flash_moe_dir, flash_moe_config=flash_moe_config
                 )

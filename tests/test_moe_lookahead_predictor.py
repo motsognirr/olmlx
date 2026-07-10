@@ -86,3 +86,60 @@ class TestMoeLookaheadBank:
     def test_requires_two_moe_layers(self):
         with pytest.raises(ValueError):
             MoeLookaheadBank([3], hidden_size=16, num_experts=8, rank=4)
+
+    def test_direct_construction_defaults_all_pairs_trained(self):
+        """Directly constructing a bank (not via train_from_traces) marks
+        every pair trained — preserves the pre-existing usable-by-default
+        behaviour for hand-built or legacy banks."""
+        bank = MoeLookaheadBank(
+            [1, 2, 4], hidden_size=16, num_experts=8, rank=4, num_experts_per_tok=2
+        )
+        assert bank.trained_pairs == {0, 1}
+
+    def test_next_moe_layer_returns_none_for_untrained_pair(self):
+        bank = MoeLookaheadBank(
+            [1, 2, 4], hidden_size=16, num_experts=8, rank=4, num_experts_per_tok=2
+        )
+        bank.trained_pairs = {1}  # only pair 1 (layer 2 -> 4) is trained
+
+        assert bank.next_moe_layer(1) is None  # pair 0 (1 -> 2) untrained
+        assert bank.next_moe_layer(2) == 4  # pair 1 trained
+
+    def test_predict_next_returns_none_for_untrained_pair(self):
+        bank = MoeLookaheadBank(
+            [0, 1], hidden_size=16, num_experts=8, rank=4, num_experts_per_tok=2
+        )
+        bank.trained_pairs = set()  # nothing trained
+
+        assert bank.predict_next(0, mx.random.normal((1, 1, 16))) is None
+
+    def test_save_load_round_trips_trained_pairs(self, tmp_path):
+        bank = MoeLookaheadBank(
+            [1, 2, 4], hidden_size=16, num_experts=8, rank=4, num_experts_per_tok=2
+        )
+        bank.trained_pairs = {1}
+        out = tmp_path / "moe_lookahead"
+        bank.save(out)
+
+        sidecar = json.loads((out / SIDECAR_NAME).read_text())
+        assert sidecar["trained_pairs"] == [1]
+
+        loaded = MoeLookaheadBank.load(out)
+        assert loaded.trained_pairs == {1}
+
+    def test_load_missing_trained_pairs_key_defaults_to_all_trained(self, tmp_path):
+        """No released banks predate this field, but the sidecar-missing-key
+        case should still resolve to all-trained for constructor-default
+        consistency."""
+        bank = MoeLookaheadBank(
+            [1, 2, 4], hidden_size=16, num_experts=8, rank=4, num_experts_per_tok=2
+        )
+        out = tmp_path / "moe_lookahead"
+        bank.save(out)
+        sidecar_path = out / SIDECAR_NAME
+        sidecar = json.loads(sidecar_path.read_text())
+        del sidecar["trained_pairs"]
+        sidecar_path.write_text(json.dumps(sidecar))
+
+        loaded = MoeLookaheadBank.load(out)
+        assert loaded.trained_pairs == {0, 1}

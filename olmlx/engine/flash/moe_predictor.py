@@ -39,6 +39,7 @@ class MoeLookaheadBank:
         num_experts: int,
         rank: int = 128,
         num_experts_per_tok: int = 8,
+        trained_pairs: set[int] | None = None,
     ):
         indices = sorted(moe_layer_indices)
         if len(indices) < 2:
@@ -56,9 +57,25 @@ class MoeLookaheadBank:
         self._next_for_layer = {
             indices[i]: indices[i + 1] for i in range(len(indices) - 1)
         }
+        # Default: all pairs trained — matches prior behaviour for banks
+        # built directly (not via train_from_traces), e.g. in tests or
+        # hand-assembled banks.
+        self.trained_pairs: set[int] = (
+            set(range(len(indices) - 1))
+            if trained_pairs is None
+            else set(trained_pairs)
+        )
 
     def next_moe_layer(self, layer_idx: int) -> int | None:
-        """The MoE layer whose experts head(layer_idx) predicts, or None."""
+        """The MoE layer whose experts head(layer_idx) predicts, or None.
+
+        Returns None when the pair is untrained (randomly-initialized head)
+        even if a successor layer exists structurally — an untrained head's
+        scores are garbage and must not drive prefetch or eviction.
+        """
+        pair_idx = self._pair_for_layer.get(layer_idx)
+        if pair_idx is None or pair_idx not in self.trained_pairs:
+            return None
         return self._next_for_layer.get(layer_idx)
 
     def predict_next(
@@ -72,13 +89,14 @@ class MoeLookaheadBank:
 
         Returns ``(sorted top-m expert indices, full score vector)`` where
         ``m = min(num_experts, ceil(margin * num_experts_per_tok))``, or
-        ``None`` if *layer_idx* has no successor head. Calls ``mx.eval`` —
-        only safe on the prediction thread (or when no prediction is in
-        flight).
+        ``None`` if *layer_idx* has no successor head or the pair is
+        untrained (routed through the same check as ``next_moe_layer`` so
+        the two stay consistent). Calls ``mx.eval`` — only safe on the
+        prediction thread (or when no prediction is in flight).
         """
-        pair_idx = self._pair_for_layer.get(layer_idx)
-        if pair_idx is None:
+        if self.next_moe_layer(layer_idx) is None:
             return None
+        pair_idx = self._pair_for_layer[layer_idx]
         flat = hidden_state.reshape(-1, hidden_state.shape[-1])
         scores = self.heads[pair_idx](flat).mean(axis=0)
         mx.eval(scores)
@@ -110,6 +128,7 @@ class MoeLookaheadBank:
                     "num_experts_per_tok": self.num_experts_per_tok,
                     "rank": self.rank,
                     "moe_layer_indices": self.moe_layer_indices,
+                    "trained_pairs": sorted(self.trained_pairs),
                 },
                 indent=2,
             )
@@ -117,17 +136,30 @@ class MoeLookaheadBank:
 
     @classmethod
     def load(cls, path: Path) -> MoeLookaheadBank:
-        """Load a bank from a directory written by :meth:`save`."""
+        """Load a bank from a directory written by :meth:`save`.
+
+        A sidecar missing ``trained_pairs`` (there are no released banks
+        that predate this field — this only covers hand-edited/legacy
+        sidecars) is treated as all-trained, matching the constructor
+        default.
+        """
         sidecar_path = path / SIDECAR_NAME
         if not sidecar_path.exists():
             raise FileNotFoundError(f"No {SIDECAR_NAME} in {path}")
         meta = json.loads(sidecar_path.read_text())
+        num_pairs = len(meta["moe_layer_indices"]) - 1
+        trained_pairs = (
+            set(meta["trained_pairs"])
+            if "trained_pairs" in meta
+            else set(range(num_pairs))
+        )
         bank = cls(
             meta["moe_layer_indices"],
             hidden_size=meta["hidden_size"],
             num_experts=meta["num_experts"],
             rank=meta["rank"],
             num_experts_per_tok=meta["num_experts_per_tok"],
+            trained_pairs=trained_pairs,
         )
         for i, head in enumerate(bank.heads):
             weights = dict(mx.load(str(path / f"head_{i:02d}.npz")))  # pyright: ignore[reportCallIssue]

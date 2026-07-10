@@ -158,6 +158,10 @@ def train_from_traces(
         num_experts,
         rank=rank,
         num_experts_per_tok=num_experts_per_tok,
+        # Start with nothing trained — pairs are added as they actually
+        # train below (Finding 2); a skipped pair (missing trace) must
+        # never be marked usable.
+        trained_pairs=set(),
     )
     indices = bank.moe_layer_indices
     recalls: dict[str, float] = {}
@@ -195,6 +199,10 @@ def train_from_traces(
             pos_weight_multiplier=2.0,
             epoch_callback=_on_epoch,
         )
+        # Only pairs that actually trained are marked usable — a head for a
+        # pair with a missing trace stays randomly initialized and must not
+        # be saved/served as if it were trained (Finding 2).
+        bank.trained_pairs.add(pair_idx)
 
         if n_hold:
             scores = bank.heads[pair_idx](mx.array(hid[n_train:]))
@@ -203,6 +211,8 @@ def train_from_traces(
             recalls[f"{src}→{dst}"] = recall_at_m(
                 np.array(scores, dtype=np.float32), next_inds[n_train:], m
             )
+        else:
+            logger.info("Pair %d→%d trained, not evaluated (n=%d ≤ 10)", src, dst, n)
 
     return bank, recalls
 
@@ -234,6 +244,14 @@ def train_moe_lookahead(
         _get_c4_calibration_data,
         _get_calibration_data,
     )
+
+    # Only "synthetic" was ever special-cased; any other unrecognized string
+    # used to silently fall back to c4 instead of failing loudly (Finding 3).
+    if calibration_dataset not in (None, "c4", "synthetic"):
+        raise ValueError(
+            "calibration_dataset must be one of None, 'c4', 'synthetic'; "
+            f"got {calibration_dataset!r}"
+        )
 
     moe_config = json.loads((flash_moe_dir / "flash_moe_config.json").read_text())
     moe_layer_indices = moe_config["moe_layer_indices"]
@@ -291,6 +309,23 @@ def train_moe_lookahead(
 
     out_dir = flash_moe_dir / "moe_lookahead"
     bank.save(out_dir)
+
+    # Record training provenance in the sidecar. Read-modify-write rather
+    # than a MoeLookaheadBank.save() parameter so the bank itself stays
+    # provenance-agnostic (Finding 4) — this pipeline function is the only
+    # thing that knows about epochs/lr/num_samples.
+    from olmlx.engine.flash.moe_predictor import SIDECAR_NAME
+
+    sidecar_path = out_dir / SIDECAR_NAME
+    sidecar = json.loads(sidecar_path.read_text())
+    sidecar["training_config"] = {
+        "epochs": epochs,
+        "lr": lr,
+        "num_samples": num_samples,
+        "holdout_fraction": holdout_fraction,
+    }
+    sidecar_path.write_text(json.dumps(sidecar, indent=2))
+
     for pair, recall in recalls.items():
         logger.info("Holdout recall@m for pair %s: %.3f", pair, recall)
     if progress_callback:
