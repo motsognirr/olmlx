@@ -420,6 +420,13 @@ def _drive_spec_prefill(
     *replicated* rather than reused because it forces ``generation_stream``, and
     splitting prefill/decode across streams reintroduces the GatedDeltaNet /
     MoE-routing corruption on Qwen3-Next-family targets (#284 / #396 family).
+    Under mlx's thread-local streams (>=0.31.2, #499) "the default stream"
+    means this worker thread's own default stream — still correct here
+    because the whole decoder (this prefill drive and every later ``step()``)
+    runs start-to-finish on one worker thread; the invariant this docstring
+    protects (prefill and decode never straddle two streams) would break the
+    same way it always did if that thread affinity were ever lost, just via
+    a "no Stream in current thread" crash instead of silent corruption.
     Each sub-chunk is bounded at ``_PREFILL_CHUNK`` and ``cancel_event`` is
     checked at every boundary so a client disconnect interrupts within one
     sub-chunk.

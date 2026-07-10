@@ -83,6 +83,22 @@ class Prefetcher:
             max_workers=1, thread_name_prefix="prefetch-predict"
         )
 
+        # Materialize every predictor's weights here, on the thread that
+        # constructs the Prefetcher (the model-load / forward-pass thread),
+        # not lazily on first use.  Without this, a layer whose predictor
+        # the forward thread hasn't touched yet (e.g. layer_idx + 1 on the
+        # very first submit()) would have its freshly-initialized-or-loaded
+        # weight graph evaluated for the first time on the "prefetch-predict"
+        # pool thread inside _predict()/_predict_lookahead().  Under mlx's
+        # thread-local streams (mlx >= 0.31.2, #499) a lazy graph built on
+        # one thread cannot be evaluated on another, so that would crash
+        # with "no Stream(gpu, N) in current thread".
+        for pred in predictor_bank.predictors:
+            mx.eval(pred.parameters())
+        if lookahead_bank is not None:
+            for pred in lookahead_bank.predictors:
+                mx.eval(pred.parameters())
+
         self._lock = threading.Lock()
         self._pending: dict[int, _LayerPrefetchState] = {}
         self._predict_in_flight = 0
@@ -110,7 +126,9 @@ class Prefetcher:
         Prediction runs on a dedicated single-thread executor so it overlaps
         with the current layer's SSD I/O and compute.  The hidden state is
         materialized on the calling thread first (``mx.eval`` is not safe
-        for concurrent calls).
+        for concurrent calls) — also required by mlx >= 0.31.2 thread-local
+        streams: a lazy graph built on the forward thread cannot be
+        evaluated on the pool thread, #499.
 
         The ``_pending`` entry is registered *before* enqueueing so that
         ``wait(layer_idx + 1)`` in the next layer blocks until both

@@ -254,6 +254,37 @@ class TurboQuantKVCache(_BaseCache):
             "Disable disk cache offload when using TurboQuant."
         )
 
+    def _pin_state_to_offset(self) -> None:
+        """Trim the packed indices/norms buffers to exactly ``self.offset``.
+
+        Called by ``snapshot_cache_for_persistence`` (on a snapshot copy
+        only — never the live cache) right after it evaluates ``.state``.
+        ``.state`` unconditionally slices ``[..., :self.offset, :]`` off
+        the ``step``-aligned (256) backing buffer, so — unlike
+        ``KVCache``, which has a fast path when ``offset`` fills the
+        buffer exactly — every access rebuilds a fresh lazy op. Trimming
+        the buffer here makes that slice a full-range no-op of an
+        already-materialized array, which mlx's thread-local streams
+        (>=0.31.2, #499) can evaluate from any thread without needing the
+        stream of the thread that built the op. ``state`` has no setter
+        (``TurboQuantKVCache`` rejects restoration), so this mutates the
+        private buffers directly instead of going through the property.
+        """
+        if self._key_indices is None:
+            return
+        if self._key_indices.shape[2] == self.offset:
+            return
+        self._key_indices = self._key_indices[..., : self.offset, :]
+        self._key_norms = self._key_norms[..., : self.offset, :]
+        self._value_indices = self._value_indices[..., : self.offset, :]
+        self._value_norms = self._value_norms[..., : self.offset, :]
+        mx.eval(
+            self._key_indices,
+            self._key_norms,
+            self._value_indices,
+            self._value_norms,
+        )
+
     def release_dequant_buffers(self) -> None:
         """Drop the dequantized side buffers, keeping the packed state.
 
