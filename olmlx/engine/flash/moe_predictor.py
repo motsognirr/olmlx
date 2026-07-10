@@ -53,6 +53,13 @@ class MoeLookaheadBank:
             SparsityPredictor(hidden_size, num_experts, rank)
             for _ in range(len(indices) - 1)
         ]
+        # Materialize head weights on the constructing thread. predict_next
+        # evals on the prefetcher's prediction thread, and a lazy weight
+        # graph stays bound to the creating thread's stream — mlx >= 0.32
+        # makes the stream registry thread-local, so evaluating it from the
+        # prediction thread raises "There is no Stream(...) in current
+        # thread". Same invariant as snapshot_cache_for_persistence.
+        mx.eval([h.parameters() for h in self.heads])
         self._pair_for_layer = {indices[i]: i for i in range(len(indices) - 1)}
         self._next_for_layer = {
             indices[i]: indices[i + 1] for i in range(len(indices) - 1)
@@ -165,4 +172,8 @@ class MoeLookaheadBank:
             weights = dict(mx.load(str(path / f"head_{i:02d}.npz")))  # pyright: ignore[reportCallIssue]
             head.down.weight = weights[f"pair_{i}.down.weight"]
             head.up.weight = weights[f"pair_{i}.up.weight"]
+        # mx.load arrays replace the eagerly-evaled constructor weights and
+        # may themselves be lazy — re-materialize before the bank crosses to
+        # the prediction thread (see the constructor comment).
+        mx.eval([h.parameters() for h in bank.heads])
         return bank
