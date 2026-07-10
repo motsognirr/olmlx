@@ -2680,7 +2680,9 @@ class TestFlashMoeActivationInstruction:
             "olmlx.engine.flash.moe_prepare.prepare_moe_for_flash",
             lambda model_path, progress_callback: tmp_path / "flash_moe",
         )
-        _cmd_flash_moe_prepare(MagicMock(), str(tmp_path))
+        args = MagicMock()
+        args.train_lookahead = False
+        _cmd_flash_moe_prepare(args, str(tmp_path))
 
         out = capsys.readouterr().out
         assert "OLMLX_FLASH_MOE=true olmlx serve" in out

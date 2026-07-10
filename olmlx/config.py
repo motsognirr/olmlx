@@ -432,6 +432,13 @@ class Settings(BaseSettings):
     flash_moe_cache_budget_experts: Annotated[int, Field(ge=0)] = 48
     flash_moe_io_threads: Annotated[int, Field(gt=0)] = 32
 
+    # MoE expert prefetch (requires a trained lookahead bank —
+    # ``olmlx flash train-moe-lookahead``; silently off without one).
+    flash_moe_prefetch: bool = True
+    flash_moe_lookahead_margin: Annotated[float, Field(ge=1.0)] = 1.5
+    flash_moe_prefetch_max_positions: Annotated[int, Field(gt=0)] = 8
+    flash_moe_scored_eviction: bool = True
+
     # Flash prefetch — promoted toggle. Advanced prefetch tuning
     # (confidence_threshold, min/max_neurons, io_threads) stays on
     # ``ExperimentalSettings``. Controls both runtime prefetch and whether
@@ -843,3 +850,8 @@ class FlashMoeConfig:
     enabled: bool
     cache_budget_experts: int
     io_threads: int
+    # Prefetch knobs are global-only (no per-model registry override).
+    prefetch: bool = True
+    lookahead_margin: float = 1.5
+    prefetch_max_positions: int = 8
+    scored_eviction: bool = True
