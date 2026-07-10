@@ -15,7 +15,10 @@ class TestMoeLookaheadBank:
     def test_head_count_and_pair_map(self):
         # Non-contiguous MoE layers (dense layers at 0 and 3)
         bank = MoeLookaheadBank(
-            [1, 2, 4, 5], hidden_size=16, num_experts=8, rank=4,
+            [1, 2, 4, 5],
+            hidden_size=16,
+            num_experts=8,
+            rank=4,
             num_experts_per_tok=2,
         )
         assert len(bank.heads) == 3

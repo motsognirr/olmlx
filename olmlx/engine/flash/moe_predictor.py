@@ -42,9 +42,7 @@ class MoeLookaheadBank:
     ):
         indices = sorted(moe_layer_indices)
         if len(indices) < 2:
-            raise ValueError(
-                f"Need at least 2 MoE layers for lookahead, got {indices}"
-            )
+            raise ValueError(f"Need at least 2 MoE layers for lookahead, got {indices}")
         self.moe_layer_indices = indices
         self.hidden_size = hidden_size
         self.num_experts = num_experts
@@ -86,7 +84,11 @@ class MoeLookaheadBank:
         mx.eval(scores)
         scores_np = np.array(scores, dtype=np.float32)
         m = min(self.num_experts, math.ceil(margin * self.num_experts_per_tok))
-        top_m = np.argpartition(-scores_np, m - 1)[:m] if m < len(scores_np) else np.arange(len(scores_np))
+        top_m = (
+            np.argpartition(-scores_np, m - 1)[:m]
+            if m < len(scores_np)
+            else np.arange(len(scores_np))
+        )
         return sorted(int(i) for i in top_m), scores_np
 
     def save(self, path: Path) -> None:
