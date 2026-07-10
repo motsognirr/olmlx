@@ -10,13 +10,16 @@ from __future__ import annotations
 import gc
 import logging
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import mlx.core as mx
 import mlx.nn as nn
 
 from olmlx.engine.flash.flash_moe import FlashMoE
 from olmlx.engine.flash.moe_weight_store import FlashMoeWeightStore
+
+if TYPE_CHECKING:
+    from olmlx.engine.flash.moe_prefetch import MoePrefetcher
 
 logger = logging.getLogger(__name__)
 
@@ -219,10 +222,15 @@ class FlashMoeModelWrapper(nn.Module):
         intermediate_size: int,
         num_experts: int,
         num_experts_per_tok: int,
+        prefetcher: MoePrefetcher | None = None,
     ):
         super().__init__()
         self._model = model
         self._weight_store = weight_store
+        # Surfaced for ModelManager._close_model_resources, which closes
+        # ``lm.model.prefetcher`` BEFORE the weight store (prefetch tasks
+        # submit into the store's I/O pool). Mirrors FlashModelWrapper.
+        self.prefetcher = prefetcher
         _replace_moe_layers(
             model,
             weight_store,
@@ -231,6 +239,7 @@ class FlashMoeModelWrapper(nn.Module):
             intermediate_size,
             num_experts,
             num_experts_per_tok,
+            prefetcher=prefetcher,
         )
 
     def __call__(
@@ -257,12 +266,86 @@ class FlashMoeModelWrapper(nn.Module):
         return self._model.args
 
 
+def _maybe_create_prefetcher(
+    flash_moe_dir: Path,
+    moe_config: dict[str, Any],
+    store: FlashMoeWeightStore,
+    *,
+    margin: float,
+    max_positions: int,
+    scored_eviction: bool,
+) -> MoePrefetcher | None:
+    """Load the trained lookahead bank and build a prefetcher, or None.
+
+    Never raises: a missing/corrupt/stale ``moe_lookahead/`` directory is an
+    optional accelerator, not a load failure. A sidecar that disagrees with
+    the bundle (re-bundled model, wrong architecture) is rejected — serving a
+    wrong-shaped predictor would prefetch garbage every token.
+    """
+    from olmlx.engine.flash.moe_predictor import MoeLookaheadBank
+    from olmlx.engine.flash.moe_prefetch import MoePrefetcher
+
+    lookahead_dir = flash_moe_dir / "moe_lookahead"
+    if not lookahead_dir.exists():
+        logger.debug("No moe_lookahead/ in %s — prefetch disabled", flash_moe_dir)
+        return None
+    try:
+        bank = MoeLookaheadBank.load(lookahead_dir)
+    except Exception:
+        logger.warning(
+            "Failed to load MoE lookahead bank from %s — prefetch disabled",
+            lookahead_dir,
+            exc_info=True,
+        )
+        return None
+
+    expected = {
+        "hidden_size": moe_config["hidden_size"],
+        "num_experts": moe_config["num_experts"],
+        "moe_layer_indices": sorted(moe_config["moe_layer_indices"]),
+    }
+    actual = {
+        "hidden_size": bank.hidden_size,
+        "num_experts": bank.num_experts,
+        "moe_layer_indices": bank.moe_layer_indices,
+    }
+    if expected != actual:
+        logger.warning(
+            "MoE lookahead bank at %s does not match the bundle "
+            "(expected %s, got %s) — prefetch disabled; retrain with "
+            "`olmlx flash train-moe-lookahead`",
+            lookahead_dir,
+            expected,
+            actual,
+        )
+        return None
+
+    logger.info(
+        "MoE expert prefetch enabled (margin=%.2f, max_positions=%d, "
+        "scored_eviction=%s)",
+        margin,
+        max_positions,
+        scored_eviction,
+    )
+    return MoePrefetcher(
+        bank,
+        store,
+        margin=margin,
+        max_positions=max_positions,
+        scored_eviction=scored_eviction,
+    )
+
+
 def wrap_flash_moe(
     model: Any,
     flash_moe_dir: Path | str,
     *,
     io_threads: int,
     cache_budget_experts: int,
+    prefetch: bool = False,
+    lookahead_margin: float = 1.5,
+    prefetch_max_positions: int = 8,
+    scored_eviction: bool = True,
 ) -> tuple[Any, Any]:
     """Wrap a lazily-loaded MoE model with SSD-streamed experts.
 
@@ -286,6 +369,16 @@ def wrap_flash_moe(
         num_io_threads=io_threads,
         cache_budget_experts=cache_budget_experts,
     )
+    prefetcher = None
+    if prefetch:
+        prefetcher = _maybe_create_prefetcher(
+            flash_moe_dir,
+            moe_config,
+            store,
+            margin=lookahead_margin,
+            max_positions=prefetch_max_positions,
+            scored_eviction=scored_eviction,
+        )
     try:
         wrapped = FlashMoeModelWrapper(
             model,
@@ -295,10 +388,13 @@ def wrap_flash_moe(
             intermediate_size=moe_config["intermediate_size"],
             num_experts=moe_config["num_experts"],
             num_experts_per_tok=moe_config["num_experts_per_tok"],
+            prefetcher=prefetcher,
         )
         # Materialize only non-expert weights.
         mx.eval(wrapped.parameters())
     except Exception:
+        if prefetcher is not None:
+            prefetcher.close()
         store.close()
         raise
     return wrapped, store
@@ -374,6 +470,7 @@ def _replace_moe_layers(
     intermediate_size: int,
     num_experts: int,
     num_experts_per_tok: int,
+    prefetcher: MoePrefetcher | None = None,
 ) -> None:
     """Replace MoE layers with FlashMoE variants."""
     layers = model.layers
@@ -405,6 +502,7 @@ def _replace_moe_layers(
             num_experts_per_tok=num_experts_per_tok,
             weight_store=weight_store,
             activation=activation,
+            prefetcher=prefetcher,
         )
 
         if moe_attr == "experts":
