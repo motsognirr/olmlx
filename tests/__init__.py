@@ -12,7 +12,7 @@ import time, and tests/conftest.py imports both. Package ``__init__`` is
 the one hook guaranteed to run first.
 
 Tests that exercise Metal kernels explicitly (shardquant kernel parity,
-the mlx rope-bug removal gate) opt back into the GPU via the
+the rope batched-decode parity gate) opt back into the GPU via the
 ``metal_default_device`` fixture in tests/conftest.py.
 """
 

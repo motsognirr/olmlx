@@ -57,7 +57,12 @@ class TestRotation:
         from olmlx.engine.turboquant import TurboQuantRotation
 
         rot = TurboQuantRotation(head_dim=128, seed=42)
-        product = rot.matrix @ rot.matrix.T
+        # mlx >= 0.32.0 routes fp32 matmul through M5 NAX (~1e-3 element
+        # precision); reference on CPU stream stays exact, tolerance covers
+        # the NAX delta. The subject here is the rotation's orthogonality,
+        # not the GPU matmul, so the check runs on the CPU stream and keeps
+        # the tight tolerance.
+        product = mx.matmul(rot.matrix, rot.matrix.T, stream=mx.cpu)
         identity = mx.eye(128)
         np.testing.assert_allclose(np.array(product), np.array(identity), atol=1e-5)
 

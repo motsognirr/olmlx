@@ -21,8 +21,6 @@ import mlx.core as mx
 from mlx_lm import load
 from mlx_lm.models.cache import make_prompt_cache
 
-from olmlx.engine.ropefix import safe_rope_patch
-
 
 def main() -> None:
     ap = argparse.ArgumentParser()
@@ -89,33 +87,32 @@ def main() -> None:
             flush=True,
         )
 
-    with safe_rope_patch():
-        for ex in stream:
-            if written >= args.num_seqs:
-                break
-            prompt = ex.get("prompt")
-            if not prompt or not isinstance(prompt, str):
-                continue
-            text = tok.apply_chat_template(
-                [{"role": "user", "content": prompt}],
-                tokenize=False,
-                add_generation_prompt=True,
-            )
-            ids = tok.encode(text, add_special_tokens=False)
-            if len(ids) > args.max_prompt_tokens:
-                continue
-            groups[len(ids)].append(ids)
-            if len(groups[len(ids)]) >= args.batch:
-                run_batch(groups.pop(len(ids)))
+    for ex in stream:
+        if written >= args.num_seqs:
+            break
+        prompt = ex.get("prompt")
+        if not prompt or not isinstance(prompt, str):
+            continue
+        text = tok.apply_chat_template(
+            [{"role": "user", "content": prompt}],
+            tokenize=False,
+            add_generation_prompt=True,
+        )
+        ids = tok.encode(text, add_special_tokens=False)
+        if len(ids) > args.max_prompt_tokens:
+            continue
+        groups[len(ids)].append(ids)
+        if len(groups[len(ids)]) >= args.batch:
+            run_batch(groups.pop(len(ids)))
 
-        # Flush remaining groups (largest first) until quota.
-        for length in sorted(groups, key=lambda k: -len(groups[k])):
-            if written >= args.num_seqs:
-                break
-            rows = groups[length]
-            while rows and written < args.num_seqs:
-                run_batch(rows[: args.batch])
-                rows = rows[args.batch :]
+    # Flush remaining groups (largest first) until quota.
+    for length in sorted(groups, key=lambda k: -len(groups[k])):
+        if written >= args.num_seqs:
+            break
+        rows = groups[length]
+        while rows and written < args.num_seqs:
+            run_batch(rows[: args.batch])
+            rows = rows[args.batch :]
 
     out_f.close()
     print(f"wrote {written} sequences to {out_path}")

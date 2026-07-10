@@ -388,8 +388,6 @@ class BatchScheduler:
     # -- worker (dedicated thread, holds the GPU) ------------------------
 
     def _worker(self) -> None:
-        from olmlx.engine.ropefix import safe_rope_patch
-
         active: dict[int, BatchSequence] = {}
         # Created lazily on first admission: a busy period that admits
         # nothing (pause latched at entry, or every inbox item already
@@ -399,71 +397,70 @@ class BatchScheduler:
         paused = False
         period_start = self._now()
         try:
-            with safe_rope_patch():
-                while True:
-                    # Latch: once an exclusive request is waiting on the
-                    # lock, stop admitting for the rest of this busy period
-                    # (it can only unblock after our release). The fairness
-                    # quantum delays this until the batch has had a minimum
-                    # service slice, so steady exclusive traffic can't
-                    # collapse it to one sequence (plan §11). ``held`` only
-                    # grows, so the latch always fires within ``quantum`` of
-                    # the waiter appearing — exclusive is never starved.
-                    if not paused and self._exclusive_pending():
-                        held = self._now() - period_start
-                        if held >= self._fairness_quantum:
-                            paused = True
-                            self._fairness_pauses += 1
-                            logger.info(
-                                "batch[%s]: yielding lock to exclusive "
-                                "waiter after %.2fs service, %d running",
-                                self._name,
-                                held,
-                                len(active),
-                            )
-                    if not paused and not self._closing:
-                        gen = self._admit(gen, active)
-                    if self._closing:
-                        for seq in active.values():
-                            seq.cancelled.set()
-                    self._sweep_lagging(active)
-                    self._sweep_cancelled(gen, active)
-                    self._active_count = len(active)
-                    if not active:
-                        break
-                    prompt_responses, gen_responses = gen.next()
-                    for r in prompt_responses:
-                        seq = active.get(r.uid)
-                        if seq is not None:
-                            seq.emit(
-                                {
-                                    "type": "progress",
-                                    "processed": r.progress[0],
-                                    "total": r.progress[1],
-                                }
-                            )
-                    for r in gen_responses:
-                        seq = active.get(r.uid)
-                        if seq is None:
-                            continue
-                        # Mirror mlx-lm's batch_generate: the EOS step's
-                        # token is not part of the output. The counter
-                        # matches too, so olmlx_batch_aggregate_tokens_total
-                        # agrees with the eval_count-based token metrics.
-                        if r.finish_reason != "stop":
-                            self._tokens_total += 1
-                            seq.emit({"type": "token", "token": r.token})
-                        if r.finish_reason is not None:
-                            done: dict[str, Any] = {
-                                "type": "done",
-                                "reason": r.finish_reason,
+            while True:
+                # Latch: once an exclusive request is waiting on the
+                # lock, stop admitting for the rest of this busy period
+                # (it can only unblock after our release). The fairness
+                # quantum delays this until the batch has had a minimum
+                # service slice, so steady exclusive traffic can't
+                # collapse it to one sequence (plan §11). ``held`` only
+                # grows, so the latch always fires within ``quantum`` of
+                # the waiter appearing — exclusive is never starved.
+                if not paused and self._exclusive_pending():
+                    held = self._now() - period_start
+                    if held >= self._fairness_quantum:
+                        paused = True
+                        self._fairness_pauses += 1
+                        logger.info(
+                            "batch[%s]: yielding lock to exclusive "
+                            "waiter after %.2fs service, %d running",
+                            self._name,
+                            held,
+                            len(active),
+                        )
+                if not paused and not self._closing:
+                    gen = self._admit(gen, active)
+                if self._closing:
+                    for seq in active.values():
+                        seq.cancelled.set()
+                self._sweep_lagging(active)
+                self._sweep_cancelled(gen, active)
+                self._active_count = len(active)
+                if not active:
+                    break
+                prompt_responses, gen_responses = gen.next()
+                for r in prompt_responses:
+                    seq = active.get(r.uid)
+                    if seq is not None:
+                        seq.emit(
+                            {
+                                "type": "progress",
+                                "processed": r.progress[0],
+                                "total": r.progress[1],
                             }
-                            cache = getattr(r, "prompt_cache", None)
-                            if seq.want_cache and cache is not None:
-                                self._attach_cache(done, cache, r.all_tokens)
-                            seq.emit(done)
-                            del active[r.uid]
-                    self._active_count = len(active)
+                        )
+                for r in gen_responses:
+                    seq = active.get(r.uid)
+                    if seq is None:
+                        continue
+                    # Mirror mlx-lm's batch_generate: the EOS step's
+                    # token is not part of the output. The counter
+                    # matches too, so olmlx_batch_aggregate_tokens_total
+                    # agrees with the eval_count-based token metrics.
+                    if r.finish_reason != "stop":
+                        self._tokens_total += 1
+                        seq.emit({"type": "token", "token": r.token})
+                    if r.finish_reason is not None:
+                        done: dict[str, Any] = {
+                            "type": "done",
+                            "reason": r.finish_reason,
+                        }
+                        cache = getattr(r, "prompt_cache", None)
+                        if seq.want_cache and cache is not None:
+                            self._attach_cache(done, cache, r.all_tokens)
+                        seq.emit(done)
+                        del active[r.uid]
+                self._active_count = len(active)
         except BaseException as exc:  # noqa: BLE001 — fan failure out to consumers
             # A worker exception poisons the whole batch (shared forward
             # pass). Fail active AND queued sequences — retrying the
