@@ -383,6 +383,18 @@ class TestScoredLayerCache:
         assert cache.get(0, "a") == 1
         assert cache.get(0, "b") is None
 
+    def test_new_unprotected_key_is_victim_of_last_resort(self):
+        """When all pre-existing keys are protected, the just-inserted
+        unprotected key is evicted — never a protected key."""
+        cache = self._cache(max_per_layer=2)
+        cache.put(0, "a", 1)
+        cache.put(0, "b", 2)
+        cache.protect(0, {"a", "b"})
+        cache.put(0, "c", 3)  # only unprotected key is "c" itself
+        assert cache.get(0, "a") == 1
+        assert cache.get(0, "b") == 2
+        assert cache.get(0, "c") is None
+
     def test_all_protected_falls_back_to_lru_oldest(self):
         cache = self._cache(max_per_layer=2)
         cache.put(0, "a", 1)

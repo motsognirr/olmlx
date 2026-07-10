@@ -251,6 +251,18 @@ class ScoredLayerCache(LayerLruCache[K, V]):
     Scores are consume-once: the store clears them when the layer's forward
     pass loads its experts, so a prediction from a previous token can never
     steer a later eviction.
+
+    Victim hierarchy on overflow:
+
+    1. Among keys that are non-protected AND not the just-inserted key:
+       lowest ``scores.get(k, 0.0)`` when scores are set, else LRU-oldest.
+       Ties resolve to LRU-oldest.
+    2. If no such key exists and the just-inserted key is not protected,
+       the just-inserted key itself is evicted (a wasted insert, but
+       protected keys survive).
+    3. If everything including the just-inserted key is protected, the
+       LRU-oldest key overall is evicted — the cache must not grow
+       unbounded.
     """
 
     def __init__(self, max_per_layer: int):
@@ -283,19 +295,33 @@ class ScoredLayerCache(LayerLruCache[K, V]):
             layer_cache[key] = value
             layer_cache.move_to_end(key)
             while len(layer_cache) > self._max:
-                victim = self._pick_victim(layer_idx, layer_cache, new_key=key if is_new_key else None)
+                victim = self._pick_victim(
+                    layer_idx, layer_cache, new_key=key if is_new_key else None
+                )
                 del layer_cache[victim]
 
-    def _pick_victim(self, layer_idx: int, layer_cache: "OrderedDict[K, V]", new_key: K | None = None) -> K:
-        """Choose the eviction victim. Caller holds self._lock."""
+    def _pick_victim(
+        self,
+        layer_idx: int,
+        layer_cache: "OrderedDict[K, V]",
+        new_key: K | None = None,
+    ) -> K:
+        """Choose the eviction victim. Caller holds self._lock.
+
+        Implements the victim hierarchy documented on the class.
+        """
         protected = self._protected.get(layer_idx, set())
         candidates = [k for k in layer_cache if k not in protected and k != new_key]
-        if not candidates:
-            # Everything (except possibly the newly added key) is protected: the cache must not
-            # grow unbounded, so fall back to plain LRU-oldest.
-            return next(iter(layer_cache))
-        scores = self._scores.get(layer_idx)
-        if not scores:
-            return candidates[0]  # LRU-oldest non-protected (and non-new)
-        # min() keeps the first (LRU-oldest) key on score ties.
-        return min(candidates, key=lambda k: scores.get(k, 0.0))
+        if candidates:
+            scores = self._scores.get(layer_idx)
+            if not scores:
+                return candidates[0]  # LRU-oldest non-protected (and non-new)
+            # min() keeps the first (LRU-oldest) key on score ties.
+            return min(candidates, key=lambda k: scores.get(k, 0.0))
+        if new_key is not None and new_key not in protected:
+            # Every pre-existing key is protected: the just-inserted key is the
+            # victim of last resort (wasted insert, but protected keys survive).
+            return new_key
+        # Everything including the just-inserted key is protected: the cache
+        # must not grow unbounded, so fall back to plain LRU-oldest.
+        return next(iter(layer_cache))
