@@ -3,7 +3,6 @@ import collections.abc
 import contextlib
 import dataclasses
 import gc
-import importlib
 import itertools
 import logging
 import sys
@@ -145,21 +144,6 @@ def _maybe_broadcast_distributed(
 
         distributed_barrier()
 
-
-# Resolve generation streams at module load time to avoid repeated
-# importlib.import_module() calls in the hot path (_safe_sync).
-def _resolve_generation_streams() -> list[Any]:
-    streams = []
-    for mod_name in ("mlx_lm.generate", "mlx_vlm.generate"):
-        try:
-            mod = importlib.import_module(mod_name)
-            streams.append(mod.generation_stream)
-        except (ImportError, AttributeError):
-            pass
-    return streams
-
-
-_generation_streams = _resolve_generation_streams()
 
 # Metal does not support concurrent command buffer submission across any
 # models — they all share the same Metal device and command queue.  A per-model
@@ -331,24 +315,21 @@ def _sync_default_stream() -> None:
         logger.debug("mx.synchronize() failed", exc_info=True)
 
 
-def _sync_generation_streams() -> None:
-    for stream in _generation_streams:
-        try:
-            mx.synchronize(stream)
-        except Exception:
-            logger.debug("generation_stream sync failed", exc_info=True)
-
-
 def _safe_sync():
-    """Synchronize Metal GPU state unconditionally, suppressing and logging errors.
+    """Synchronize the calling thread's default Metal stream, suppressing
+    and logging errors.
 
-    Syncs both the default stream and the generation stream (mlx_lm/mlx_vlm
-    use a separate stream from the default). Callers rely on this being
-    unconditional — notably cache-eviction and deferred-cleanup paths,
-    which must sync regardless of ``settings.sync_mode``.
+    Under mlx >= 0.31.2 streams are thread-local: worker-thread GPU work is
+    fenced by the worker's own end-of-run sync (CancellableStream._run's
+    finally / _generate_sync) plus the thread join in drain_and_join. A
+    cross-thread sync of a generation stream would only sync THIS thread's
+    idle instance of the proxy — so this helper fences exactly what the
+    calling (event-loop) thread itself issued: cache deepcopy/eval,
+    eviction cleanup. Callers rely on this being unconditional — notably
+    cache-eviction and deferred-cleanup paths, which must sync regardless
+    of ``settings.sync_mode``.
     """
     _sync_default_stream()
-    _sync_generation_streams()
 
 
 def _derive_timing_stats(
@@ -501,15 +482,11 @@ def _lock_boundary_sync(mode: SyncMode | None = None) -> None:
     ``mode`` resolves per call (not cached) so a per-model override wins over
     the global default. Values:
 
-    - ``"full"`` (default): identical to ``_safe_sync`` — sync default + all
-      generation streams.
-    - ``"minimal"``: sync the default stream only; skip the generation-stream
-      loop. Safe because ``_generate_sync`` and mlx_lm's ``stream_generate``
-      already synchronize the generation stream from inside the worker thread
-      before it exits. **Same mlx_lm-internals assumption as ``"none"`` for
-      the generation stream** — if mlx_lm ever drops that guarantee,
-      ``"minimal"`` streaming is as unsafe as ``"none"`` for the
-      generation-stream part (the default stream is still synced here).
+    - ``"full"`` / ``"minimal"``: sync the calling thread's default stream.
+      The two modes are equivalent since mlx >= 0.31.2 made generation
+      streams thread-local (worker-side sync + thread join fence worker GPU
+      work; see ``_safe_sync``). ``"full"`` remains an accepted value for
+      config compatibility.
     - ``"none"``: skip lock-boundary sync entirely. Safety depends on
       per-path guarantees that Metal work is complete before the lock
       releases:
@@ -535,12 +512,8 @@ def _lock_boundary_sync(mode: SyncMode | None = None) -> None:
     effective = mode if mode is not None else settings.sync_mode
     if effective == "none":
         return
-    if effective == "minimal":
+    if effective in ("full", "minimal"):
         _sync_default_stream()
-        return
-    if effective == "full":
-        _sync_default_stream()
-        _sync_generation_streams()
         return
     raise ValueError(f"Unknown sync_mode: {effective!r}")
 

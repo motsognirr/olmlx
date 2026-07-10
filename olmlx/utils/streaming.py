@@ -194,10 +194,14 @@ class CancellableStream:
             # the stream object after the thread exits.
             self._gen_factory = None
 
-            # Sync both the generation stream and the default stream.
-            # mlx_lm and mlx_vlm run GPU work on their own module-level
-            # generation_stream. We must also sync the default stream to
-            # catch any Metal operations not on the generation stream.
+            # Sync this thread's generation stream and default stream. Under
+            # mlx >= 0.31.2 ``generation_stream`` is a ThreadLocalStream
+            # proxy resolving per-thread — importing and syncing it HERE, on
+            # the worker thread that ran all the GPU work, fences exactly
+            # the stream that work was enqueued on. This worker-side sync
+            # plus the thread join in drain_and_join are the only completion
+            # barrier; the event-loop thread never syncs generation streams
+            # (#499).
             try:
                 import mlx.core as mx
 
