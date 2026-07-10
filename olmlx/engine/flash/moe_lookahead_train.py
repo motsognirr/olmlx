@@ -62,6 +62,8 @@ def record_moe_router_traces(
     """
     import mlx.nn as nn
 
+    from olmlx.engine.flash.flash_moe_model import _find_moe_module
+
     class _Recorder(nn.Module):
         def __init__(self, inner: Any, hidden_sink: list, inds_sink: list):
             super().__init__()
@@ -90,13 +92,10 @@ def record_moe_router_traces(
     for layer_idx in sorted(moe_layer_indices):
         layer = layers[layer_idx]
         # The Flash-MoE replacement sits where the original MoE module was.
-        attr = None
-        for candidate in ("mlp", "block_sparse_moe", "mixer", "experts"):
-            mod = getattr(layer, candidate, None)
-            if mod is not None:
-                attr = candidate
-                break
-        mod = getattr(layer, attr, None) if attr else None
+        try:
+            attr, mod = _find_moe_module(layer)
+        except AttributeError:
+            attr, mod = None, None
         if mod is None or not hasattr(mod, "_route"):
             logger.warning(
                 "MoE layer %d has no _route-style module — skipping trace "

@@ -158,6 +158,14 @@ class TestRecordTraces:
         )
         assert traces[1][0].shape[0] <= 5
 
+    def test_originals_restored_after_recording(self):
+        model = _FakeModel(hidden=8, num_experts=4, k=2)
+        original_1 = model.layers[1].mlp
+        original_2 = model.layers[2].mlp
+        record_moe_router_traces(model, _FakeTokenizer(), ["hello"], [1, 2])
+        assert model.layers[1].mlp is original_1
+        assert model.layers[2].mlp is original_2
+
     def test_layer_without_route_skipped(self):
         model = _FakeModel(hidden=8, num_experts=4, k=2)
         del model.layers[2].mlp  # layer 2 has no MoE module at all
