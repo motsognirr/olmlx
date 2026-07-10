@@ -1,6 +1,8 @@
 """Tests for segment-aware tokenization and the segmented-prefill drive."""
 
 import asyncio
+import threading
+from types import SimpleNamespace
 
 import mlx.core as mx
 from mlx_lm.models.cache import ArraysCache, KVCache, RotatingKVCache
@@ -119,21 +121,17 @@ def test_drive_skips_segments_below_already_covered():
     assert suffix == [5]
 
 
-def test_drive_prefill_runs_on_generation_stream(monkeypatch):
-    """Prefill must run on mlx-lm's ``generation_stream`` — the same stream
-    ``stream_generate`` decodes on.
+def test_drive_resolves_generation_stream_at_call_time(monkeypatch):
+    """The drive must resolve mlx-lm's ``generation_stream`` when it RUNS —
+    not from a module-load-time capture. Under mlx >= 0.31.2 the stream is a
+    ThreadLocalStream proxy; resolving at call time (on the generation
+    worker thread) is what keeps prefill and decode on one stream (#284,
+    #499)."""
+    import importlib
 
-    Regression for Qwen3-Coder-Next (and the Qwen3-Next MoE-quant family):
-    prefilling the cache on ``mx.default_stream`` and then decoding on
-    ``generation_stream`` leaves the GatedDeltaNet recurrent state as a
-    cross-stream lazy graph whose materialization corrupts MoE expert routing
-    at scale (~16k+ prompt tokens), making the model emit pretraining-data
-    dumps instead of answering. Same Metal-stream hazard family as #284.
-    """
     import olmlx.engine.inference as inf
 
-    if not inf._generation_streams:
-        pytest.skip("mlx_lm generation_stream not available in this environment")
+    mlg = importlib.import_module("mlx_lm.generate")
 
     recorded: list = []
     real_stream = mx.stream
@@ -143,9 +141,10 @@ def test_drive_prefill_runs_on_generation_stream(monkeypatch):
         return real_stream(s)
 
     monkeypatch.setattr(inf.mx, "stream", spy_stream)
+    sentinel = mx.new_stream(mx.default_device())
+    monkeypatch.setattr(mlg, "generation_stream", sentinel)
 
     model = _DummyModel()
-    store = PromptCacheStore(max_slots=8)
     sp = SegmentedPrompt(
         segments=[
             Segment(tokens=[1, 2, 3], role="system"),
@@ -153,14 +152,64 @@ def test_drive_prefill_runs_on_generation_stream(monkeypatch):
         ]
     )
     cache = [KVCache()]
-    _drive_segmented_prefill(model=model, segmented=sp, cache=cache, store=store)
+    inserted: list = []
+    suffix = _drive_segmented_prefill(
+        model=model,
+        segmented=sp,
+        cache=cache,
+        insert_checkpoint=inserted.append,
+    )
+    assert suffix == [5]
+    assert sentinel in recorded, (
+        "drive did not resolve mlx_lm.generate.generation_stream at call time"
+    )
+    assert len(inserted) == 1 and list(inserted[0].tokens) == [1, 2, 3]
 
-    gen_stream = inf._generation_streams[0]
-    default_stream = mx.default_stream(mx.default_device())
-    assert gen_stream in recorded, "prefill did not run on mlx-lm's generation_stream"
-    assert default_stream not in recorded, (
-        "prefill ran on the default stream; it must use generation_stream so the "
-        "cache it builds is materialized on the same stream stream_generate decodes on"
+
+def test_async_mlx_stream_runs_deferred_prefill_in_worker_thread(monkeypatch):
+    """The deferred prefill closure must run on the SAME thread that decodes
+    (the CancellableStream worker), before generation starts."""
+    import olmlx.utils.streaming as streaming_mod
+
+    events: list[tuple[str, int]] = []
+
+    def fake_stream_generate(model, tokenizer, **kwargs):
+        events.append(("generate", threading.get_ident()))
+        yield SimpleNamespace(
+            text="x",
+            token=1,
+            prompt_tokens=1,
+            generation_tokens=1,
+            prompt_tps=0.0,
+            generation_tps=0.0,
+            finish_reason="stop",
+        )
+
+    monkeypatch.setattr("mlx_lm.stream_generate", fake_stream_generate)
+
+    def deferred(cancel_event):
+        assert cancel_event is not None  # worker passes its cancel_event
+        events.append(("prefill", threading.get_ident()))
+
+    async def _go():
+        stream = streaming_mod.async_mlx_stream(
+            object(),
+            object(),
+            [1],
+            max_tokens=4,
+            deferred_prefill=deferred,
+        )
+        async for _tok in stream:
+            pass
+        await stream.drain_and_join()
+
+    asyncio.run(_go())
+    assert [e[0] for e in events] == ["prefill", "generate"], (
+        "deferred prefill must run exactly once, before generation"
+    )
+    assert events[0][1] == events[1][1], "prefill and decode on different threads"
+    assert events[0][1] != threading.get_ident(), (
+        "deferred prefill ran on the event-loop thread"
     )
 
 
