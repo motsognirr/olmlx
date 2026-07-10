@@ -378,12 +378,9 @@ def _stream_record_activations(
     except ValueError:
         # mlx_lm doesn't support this model type (e.g. gemma4 VLM) —
         # fall back to mlx_vlm and extract the language model.
-        import mlx_vlm
+        from olmlx.engine.vlm_load import load_vlm
 
-        from olmlx.engine.gemma4_sanitize_fix import ensure_gemma4_sanitize_patch
-
-        ensure_gemma4_sanitize_patch()
-        vlm_model, processor = mlx_vlm.load(model_path, lazy=True)
+        vlm_model, processor = load_vlm(model_path, lazy=True)
         model = vlm_model.language_model
         tokenizer = (
             processor.tokenizer if hasattr(processor, "tokenizer") else processor

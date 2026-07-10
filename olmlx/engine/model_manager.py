@@ -2590,13 +2590,10 @@ class ModelManager(SpeculativeLoaderMixin):
             return model, tokenizer, False, caps
         except _FALLBACK_EXCEPTIONS as exc:
             logger.warning("mlx-lm failed for %s (%s), trying mlx-vlm", label, exc)
-            import mlx_vlm
+            from olmlx.engine.vlm_load import load_vlm
 
-            from olmlx.engine.gemma4_sanitize_fix import ensure_gemma4_sanitize_patch
-
-            ensure_gemma4_sanitize_patch()
             try:
-                model, processor = mlx_vlm.load(load_path)
+                model, processor = load_vlm(load_path)
             except FileNotFoundError as vlm_exc:
                 raise ValueError(
                     f"Model '{label}' not found at '{load_path}'. "
@@ -2616,13 +2613,10 @@ class ModelManager(SpeculativeLoaderMixin):
 
         Returns (language_model, tokenizer, vlm_model).
         """
-        import mlx_vlm
-
-        from olmlx.engine.gemma4_sanitize_fix import ensure_gemma4_sanitize_patch
+        from olmlx.engine.vlm_load import load_vlm
 
         logger.info("mlx-lm failed for %s, falling back to mlx-vlm", hf_path)
-        ensure_gemma4_sanitize_patch()
-        vlm_model, processor = mlx_vlm.load(load_path, lazy=lazy)
+        vlm_model, processor = load_vlm(load_path, lazy=lazy)
         model = vlm_model.language_model
         tokenizer = (
             processor.tokenizer if hasattr(processor, "tokenizer") else processor
@@ -3559,14 +3553,9 @@ class ModelManager(SpeculativeLoaderMixin):
         if kind == "vlm":
             # VLM detected — load with mlx-vlm directly
             try:
-                import mlx_vlm
+                from olmlx.engine.vlm_load import load_vlm
 
-                from olmlx.engine.gemma4_sanitize_fix import (
-                    ensure_gemma4_sanitize_patch,
-                )
-
-                ensure_gemma4_sanitize_patch()
-                model, processor = mlx_vlm.load(load_path)
+                model, processor = load_vlm(load_path)
                 tok = (
                     processor.tokenizer
                     if hasattr(processor, "tokenizer")

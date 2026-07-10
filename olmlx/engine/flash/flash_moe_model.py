@@ -326,12 +326,9 @@ def load_flash_moe_model(
         # VLM-shaped architectures mlx-lm rejects (Gemma4-class, Kimi-K2.5)
         # are served via the same fallback in the manager's Flash-MoE loader;
         # without it here, bundle-bearing VLMs could not be calibrated.
-        import mlx_vlm
+        from olmlx.engine.vlm_load import load_vlm
 
-        from olmlx.engine.gemma4_sanitize_fix import ensure_gemma4_sanitize_patch
-
-        ensure_gemma4_sanitize_patch()
-        model, processor = mlx_vlm.load(load_path, lazy=True)
+        model, processor = load_vlm(load_path, lazy=True)
         tokenizer = (
             processor.tokenizer if hasattr(processor, "tokenizer") else processor
         )
