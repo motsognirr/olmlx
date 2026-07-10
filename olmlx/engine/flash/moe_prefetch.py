@@ -71,6 +71,11 @@ class MoePrefetcher:
         if positions > self._max_positions:
             return  # prefill: most experts activate anyway, skip the work
 
+        # Check before mx.eval to avoid wasted materialization when the
+        # previous prediction is still in flight. The check and the
+        # registration below are two separate lock acquisitions, but there
+        # is no TOCTOU race: submit() is only ever called from the single
+        # forward-pass thread (same contract as the dense Prefetcher.submit).
         with self._lock:
             if next_layer in self._pending:
                 return  # already in flight
