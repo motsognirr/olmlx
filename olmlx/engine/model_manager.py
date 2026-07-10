@@ -3261,6 +3261,10 @@ class ModelManager(SpeculativeLoaderMixin):
             flash_moe_dir,
             io_threads=flash_moe_config.io_threads,
             cache_budget_experts=flash_moe_config.cache_budget_experts,
+            prefetch=flash_moe_config.prefetch,
+            lookahead_margin=flash_moe_config.lookahead_margin,
+            prefetch_max_positions=flash_moe_config.prefetch_max_positions,
+            scored_eviction=flash_moe_config.scored_eviction,
         )
 
         return wrapped, tokenizer, is_vlm, caps

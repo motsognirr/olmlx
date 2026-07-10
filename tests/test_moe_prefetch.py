@@ -155,3 +155,30 @@ class TestMoePrefetcher:
         pf = _make_prefetcher(bank, store)
         pf.close()
         pf.close()
+
+
+class TestPrefetchConfig:
+    def test_flash_moe_config_prefetch_defaults(self):
+        from olmlx.config import FlashMoeConfig
+
+        cfg = FlashMoeConfig(enabled=True, cache_budget_experts=48, io_threads=32)
+        assert cfg.prefetch is True
+        assert cfg.lookahead_margin == 1.5
+        assert cfg.prefetch_max_positions == 8
+        assert cfg.scored_eviction is True
+
+    def test_settings_prefetch_defaults(self, monkeypatch):
+        from olmlx.config import Settings
+
+        for var in (
+            "OLMLX_FLASH_MOE_PREFETCH",
+            "OLMLX_FLASH_MOE_LOOKAHEAD_MARGIN",
+            "OLMLX_FLASH_MOE_PREFETCH_MAX_POSITIONS",
+            "OLMLX_FLASH_MOE_SCORED_EVICTION",
+        ):
+            monkeypatch.delenv(var, raising=False)
+        s = Settings(_env_file=None)
+        assert s.flash_moe_prefetch is True
+        assert s.flash_moe_lookahead_margin == 1.5
+        assert s.flash_moe_prefetch_max_positions == 8
+        assert s.flash_moe_scored_eviction is True
