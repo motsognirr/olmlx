@@ -2592,6 +2592,9 @@ class ModelManager(SpeculativeLoaderMixin):
             logger.warning("mlx-lm failed for %s (%s), trying mlx-vlm", label, exc)
             import mlx_vlm
 
+            from olmlx.engine.gemma4_sanitize_fix import ensure_gemma4_sanitize_patch
+
+            ensure_gemma4_sanitize_patch()
             try:
                 model, processor = mlx_vlm.load(load_path)
             except FileNotFoundError as vlm_exc:
@@ -2615,7 +2618,10 @@ class ModelManager(SpeculativeLoaderMixin):
         """
         import mlx_vlm
 
+        from olmlx.engine.gemma4_sanitize_fix import ensure_gemma4_sanitize_patch
+
         logger.info("mlx-lm failed for %s, falling back to mlx-vlm", hf_path)
+        ensure_gemma4_sanitize_patch()
         vlm_model, processor = mlx_vlm.load(load_path, lazy=lazy)
         model = vlm_model.language_model
         tokenizer = (
@@ -3555,6 +3561,11 @@ class ModelManager(SpeculativeLoaderMixin):
             try:
                 import mlx_vlm
 
+                from olmlx.engine.gemma4_sanitize_fix import (
+                    ensure_gemma4_sanitize_patch,
+                )
+
+                ensure_gemma4_sanitize_patch()
                 model, processor = mlx_vlm.load(load_path)
                 tok = (
                     processor.tokenizer

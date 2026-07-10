@@ -328,6 +328,9 @@ def load_flash_moe_model(
         # without it here, bundle-bearing VLMs could not be calibrated.
         import mlx_vlm
 
+        from olmlx.engine.gemma4_sanitize_fix import ensure_gemma4_sanitize_patch
+
+        ensure_gemma4_sanitize_patch()
         model, processor = mlx_vlm.load(load_path, lazy=True)
         tokenizer = (
             processor.tokenizer if hasattr(processor, "tokenizer") else processor

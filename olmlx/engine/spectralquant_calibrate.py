@@ -373,6 +373,9 @@ def _load_calibration_model(model_path: str):
         except ValueError:
             import mlx_vlm
 
+            from olmlx.engine.gemma4_sanitize_fix import ensure_gemma4_sanitize_patch
+
+            ensure_gemma4_sanitize_patch()
             model, processor = mlx_vlm.load(model_path, lazy=False)
             tokenizer = (
                 processor.tokenizer if hasattr(processor, "tokenizer") else processor

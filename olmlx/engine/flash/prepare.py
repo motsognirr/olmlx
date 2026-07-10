@@ -380,6 +380,9 @@ def _stream_record_activations(
         # fall back to mlx_vlm and extract the language model.
         import mlx_vlm
 
+        from olmlx.engine.gemma4_sanitize_fix import ensure_gemma4_sanitize_patch
+
+        ensure_gemma4_sanitize_patch()
         vlm_model, processor = mlx_vlm.load(model_path, lazy=True)
         model = vlm_model.language_model
         tokenizer = (
