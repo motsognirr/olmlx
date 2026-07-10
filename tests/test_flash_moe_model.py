@@ -1311,8 +1311,12 @@ class TestMoePrefetchIntegration:
             np.array(baseline), np.array(with_prefetch), rtol=1e-5
         )
 
-    def test_flash_moe_submits_after_eval_and_waits_first(self, tmp_path):
-        """FlashMoE calls wait(layer) before eval and submit(layer) before load."""
+    def test_flash_moe_submits_without_waiting(self, tmp_path):
+        """FlashMoE calls submit(layer) before load — and never wait().
+
+        Non-blocking prefetch: the forward path must not block on in-flight
+        prefetch I/O; load_experts races it and fetches whatever is missing.
+        """
         import mlx.core as mx
 
         from olmlx.engine.flash.flash_moe import FlashMoE
@@ -1345,7 +1349,7 @@ class TestMoePrefetchIntegration:
         finally:
             store.close()
 
-        assert calls == [("wait", 1), ("submit", 1)]
+        assert calls == [("submit", 1)]
 
     def test_maybe_create_prefetcher_missing_dir_returns_none(self, tmp_path):
         from olmlx.engine.flash.flash_moe_model import _maybe_create_prefetcher

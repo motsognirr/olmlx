@@ -72,6 +72,43 @@ class MoeLookaheadBank:
             if trained_pairs is None
             else set(trained_pairs)
         )
+        # NumPy copies of head weights for predict_next_np, built on first
+        # use (load() replaces the constructor weights, so building here
+        # would capture the wrong ones). ~rank*(hidden+experts) fp32 per
+        # head — small next to the expert bundle.
+        self._np_heads: list[tuple[np.ndarray, np.ndarray]] | None = None
+        # Holdout recall@m per pair, set by the trainer and persisted in the
+        # sidecar. Empty for banks trained before recall persistence.
+        self.pair_recalls: dict[int, float] = {}
+
+    def apply_recall_gate(self, min_recall: float) -> int:
+        """Disable pairs whose holdout recall@m is below *min_recall*.
+
+        A low-recall head mostly prefetches wrong experts — pure wasted SSD
+        bandwidth — so gated pairs are removed from ``trained_pairs`` and
+        behave exactly like untrained ones (``next_moe_layer`` returns None;
+        no prediction, no I/O). Pairs with no recorded recall (legacy banks)
+        are kept: gating on absent data would silently disable prefetch
+        wholesale. Returns the number of pairs gated.
+
+        DESTRUCTIVE: do not ``save()`` a gated bank — gated-but-trained
+        pairs would persist as untrained, indistinguishable from
+        never-trained. Serving only ever gates a fresh per-load instance
+        (``_maybe_create_prefetcher``), so relaxing ``min_recall`` takes
+        effect on the next model load. Note the recorded recall is measured
+        at the trainer's eval margin (1.5); if the serve-time
+        ``flash_moe_lookahead_margin`` differs, the gate compares against a
+        slightly different m than prefetch actually uses.
+        """
+        if min_recall <= 0.0:
+            return 0
+        gated = {
+            pair_idx
+            for pair_idx, recall in self.pair_recalls.items()
+            if recall < min_recall and pair_idx in self.trained_pairs
+        }
+        self.trained_pairs -= gated
+        return len(gated)
 
     def next_moe_layer(self, layer_idx: int) -> int | None:
         """The MoE layer whose experts head(layer_idx) predicts, or None.
@@ -116,6 +153,58 @@ class MoeLookaheadBank:
         )
         return sorted(int(i) for i in top_m), scores_np
 
+    def ensure_np_heads(self) -> None:
+        """Materialize NumPy copies of every head's weights.
+
+        Must run on a thread that may evaluate the head arrays (the loading
+        thread, or the generation thread) — the ``astype`` below is a fresh
+        lazy op on the current thread's stream. Idempotent; call after
+        :meth:`load` and before handing the bank to a prefetcher.
+        """
+        if self._np_heads is not None:
+            return
+        self._np_heads = [
+            (
+                np.array(head.down.weight.astype(mx.float32)),
+                np.array(head.up.weight.astype(mx.float32)),
+            )
+            for head in self.heads
+        ]
+
+    def predict_next_np(
+        self,
+        layer_idx: int,
+        hidden_np: np.ndarray,
+        *,
+        margin: float = 1.5,
+    ) -> tuple[list[int], np.ndarray] | None:
+        """NumPy twin of :meth:`predict_next` — no mx ops, no mx.eval.
+
+        Takes an already-materialized float32 hidden state of shape
+        ``(positions, hidden_size)``. Safe to call from any thread (the
+        head weights are one-time NumPy copies), which is what lets the
+        prefetcher predict inline on the forward-pass thread without a
+        background-eval rendezvous. Same return contract as
+        :meth:`predict_next`.
+        """
+        if self.next_moe_layer(layer_idx) is None:
+            return None
+        if self._np_heads is None:
+            self.ensure_np_heads()
+        assert self._np_heads is not None
+        down_w, up_w = self._np_heads[self._pair_for_layer[layer_idx]]
+        # SparsityPredictor forward: sigmoid(up(relu(down(x)))), nn.Linear
+        # convention y = x @ W.T, averaged over positions.
+        pre = np.maximum(hidden_np @ down_w.T, 0.0) @ up_w.T
+        scores_np = (1.0 / (1.0 + np.exp(-pre))).mean(axis=0).astype(np.float32)
+        m = min(self.num_experts, math.ceil(margin * self.num_experts_per_tok))
+        top_m = (
+            np.argpartition(-scores_np, m - 1)[:m]
+            if m < len(scores_np)
+            else np.arange(len(scores_np))
+        )
+        return sorted(int(i) for i in top_m), scores_np
+
     def save(self, path: Path) -> None:
         """Save heads + sidecar to a directory."""
         path.mkdir(parents=True, exist_ok=True)
@@ -136,6 +225,10 @@ class MoeLookaheadBank:
                     "rank": self.rank,
                     "moe_layer_indices": self.moe_layer_indices,
                     "trained_pairs": sorted(self.trained_pairs),
+                    # JSON keys are strings; load() converts back to int.
+                    "pair_recalls": {
+                        str(k): v for k, v in sorted(self.pair_recalls.items())
+                    },
                 },
                 indent=2,
             )
@@ -168,6 +261,9 @@ class MoeLookaheadBank:
             num_experts_per_tok=meta["num_experts_per_tok"],
             trained_pairs=trained_pairs,
         )
+        bank.pair_recalls = {
+            int(k): float(v) for k, v in meta.get("pair_recalls", {}).items()
+        }
         for i, head in enumerate(bank.heads):
             weights = dict(mx.load(str(path / f"head_{i:02d}.npz")))  # pyright: ignore[reportCallIssue]
             head.down.weight = weights[f"pair_{i}.down.weight"]

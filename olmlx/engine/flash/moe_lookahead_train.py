@@ -12,6 +12,7 @@ from __future__ import annotations
 import logging
 import math
 from pathlib import Path
+from collections.abc import Iterator
 from typing import Any, Callable
 
 import mlx.core as mx
@@ -132,6 +133,141 @@ def record_moe_router_traces(
     return traces
 
 
+def record_moe_router_traces_decode(
+    model: Any,
+    tokenizer: Any,
+    moe_layer_indices: list[int],
+    *,
+    max_positions_per_layer: int = 4096,
+    max_new_tokens: int = 256,
+    max_prompts: int = 256,
+    prompt_source: Iterator[list[int]] | None = None,
+    _generate_fn: Callable[..., None] | None = None,
+) -> dict[int, tuple[np.ndarray, np.ndarray]]:
+    """Record per-MoE-layer (input hidden, router top-k) during DECODE.
+
+    Serve-time expert prediction runs on decode-token hidden states of the
+    model's own output, but :func:`record_moe_router_traces` records
+    teacher-forced prefill states — an off-distribution training set (the
+    DFlash ``--self-generate`` lesson). This variant chat-prompts the model
+    (ultrachat prompts via dflash's ``iter_dataset_prompts`` by default) and
+    records only single-position forwards, i.e. the greedy decode steps of
+    the model's own responses. Prefill calls (multi-position) are skipped,
+    so positions stay aligned across layers exactly as in the prefill
+    recorder.
+
+    ``prompt_source`` yields chat-templated prompt token lists;
+    ``_generate_fn(model, tokenizer, prompt_ids, max_new_tokens)`` is a test
+    hook replacing the default ``mlx_lm.stream_generate`` drive. The drive
+    MUST decode with batch size 1 — the recorder identifies decode steps as
+    single-position forwards, so a batched drive records nothing. The first
+    single-position forward of each prompt is dropped: mlx_lm always feeds
+    the last prompt token as its own forward (teacher-forced, not a decode
+    state), so per prompt exactly one boundary position would otherwise
+    contaminate the trace.
+    """
+    import mlx.nn as nn
+
+    from olmlx.engine.flash.flash_moe_model import _find_moe_module
+
+    class _DecodeRecorder(nn.Module):
+        def __init__(self, inner: Any, hidden_sink: list, inds_sink: list):
+            super().__init__()
+            object.__setattr__(self, "_inner", inner)
+            object.__setattr__(self, "_hidden_sink", hidden_sink)
+            object.__setattr__(self, "_inds_sink", inds_sink)
+
+        def __call__(self, x: mx.array) -> mx.array:
+            flat = x.reshape(-1, x.shape[-1])
+            # Decode steps are exactly one position; prefill (or chunked
+            # prefill) is many. Recording only the former keeps the trace
+            # on the serve-time prediction distribution.
+            if flat.shape[0] == 1 and len(self._hidden_sink) < max_positions_per_layer:
+                inds, _ = self._inner._route(x)
+                flat_inds = inds.reshape(-1, inds.shape[-1])
+                mx.eval(flat, flat_inds)
+                self._hidden_sink.append(np.array(flat.astype(mx.float32)))
+                self._inds_sink.append(np.array(flat_inds))
+            return self._inner(x)
+
+    def _default_generate_fn(model, tokenizer, prompt_ids, max_new):
+        from mlx_lm import stream_generate
+
+        for _ in stream_generate(model, tokenizer, prompt_ids, max_tokens=max_new):
+            pass
+
+    generate_fn = _generate_fn if _generate_fn is not None else _default_generate_fn
+
+    if prompt_source is None:
+        from olmlx.engine.dflash.selfgen import iter_dataset_prompts
+
+        prompt_source = iter_dataset_prompts(tokenizer)
+
+    sinks: dict[int, tuple[list, list]] = {}
+    originals: dict[int, tuple[Any, str]] = {}
+    layers = model.layers
+
+    for layer_idx in sorted(moe_layer_indices):
+        layer = layers[layer_idx]
+        try:
+            attr, mod = _find_moe_module(layer)
+        except AttributeError:
+            attr, mod = None, None
+        if mod is None or not hasattr(mod, "_route"):
+            logger.warning(
+                "MoE layer %d has no _route-style module — skipping decode "
+                "trace recording",
+                layer_idx,
+            )
+            continue
+        hidden_sink: list = []
+        inds_sink: list = []
+        sinks[layer_idx] = (hidden_sink, inds_sink)
+        originals[layer_idx] = (mod, attr)
+        setattr(layer, attr, _DecodeRecorder(mod, hidden_sink, inds_sink))
+
+    if not sinks:
+        # No recorder installed (no _route-style MoE layers) — generating
+        # would burn max_prompts full decodes and record nothing.
+        logger.warning("No recordable MoE layers — skipping decode tracing")
+        return {}
+
+    first_sink = next(iter(sinks.values()))
+    try:
+        for prompt_num, prompt_ids in enumerate(prompt_source):
+            if prompt_num >= max_prompts:
+                break
+            if len(first_sink[0]) >= max_positions_per_layer:
+                break  # every layer records the same decode steps
+            before = len(first_sink[0])
+            generate_fn(model, tokenizer, prompt_ids, max_new_tokens)
+            # Drop each layer's first recorded position for this prompt:
+            # mlx_lm's generate_step always leaves exactly one prompt token
+            # for the first sampling forward, so the first single-position
+            # call per prompt carries the LAST PROMPT TOKEN (teacher-forced),
+            # not a decode state. Recording it would contaminate the
+            # decode-only distribution this tracer exists to guarantee —
+            # one off-distribution position per prompt, every prompt.
+            for hidden_sink, inds_sink in sinks.values():
+                if len(hidden_sink) > before:
+                    del hidden_sink[before]
+                    del inds_sink[before]
+    finally:
+        for layer_idx, (mod, attr) in originals.items():
+            setattr(layers[layer_idx], attr, mod)
+
+    traces: dict[int, tuple[np.ndarray, np.ndarray]] = {}
+    for layer_idx, (hidden_sink, inds_sink) in sinks.items():
+        if not hidden_sink:
+            logger.warning("No decode positions recorded for MoE layer %d", layer_idx)
+            continue
+        traces[layer_idx] = (
+            np.concatenate(hidden_sink, axis=0),
+            np.concatenate(inds_sink, axis=0).astype(np.int32),
+        )
+    return traces
+
+
 def train_from_traces(
     traces: dict[int, tuple[np.ndarray, np.ndarray]],
     moe_layer_indices: list[int],
@@ -208,9 +344,13 @@ def train_from_traces(
             scores = bank.heads[pair_idx](mx.array(hid[n_train:]))
             mx.eval(scores)
             m = min(num_experts, math.ceil(eval_margin * num_experts_per_tok))
-            recalls[f"{src}→{dst}"] = recall_at_m(
+            recall = recall_at_m(
                 np.array(scores, dtype=np.float32), next_inds[n_train:], m
             )
+            recalls[f"{src}→{dst}"] = recall
+            # Pair-indexed copy on the bank itself: save() persists it so
+            # serve-time recall gating (apply_recall_gate) can use it.
+            bank.pair_recalls[pair_idx] = recall
         else:
             logger.info("Pair %d→%d trained, not evaluated (n=%d ≤ 10)", src, dst, n)
 
@@ -230,12 +370,22 @@ def train_moe_lookahead(
     holdout_fraction: float = 0.1,
     io_threads: int = 16,
     cache_budget_experts: int = 48,
+    self_generate: bool = False,
+    selfgen_max_new: int = 256,
     progress_callback: Callable[[str, float], None] | None = None,
 ) -> Path:
     """End-to-end: record traces on the Flash-MoE model, train, save.
 
     Saves to ``<flash_moe_dir>/moe_lookahead`` and returns that path. Prints
     per-pair holdout recall via the logger; the CLI surfaces it to the user.
+
+    ``self_generate``: record traces from the model's OWN decode steps over
+    chat prompts (``record_moe_router_traces_decode``) instead of
+    teacher-forced prefill over calibration text. Serve-time predictions run
+    on decode states; prefill-trained heads measured 0.39 holdout recall but
+    only 0.14 on real decode states (measured 2026-07-10, Qwen3.5-35B-A3B).
+    ``num_samples`` then counts prompts and ``calibration_dataset`` is
+    ignored. Tracing is slower per position (one forward per token).
     """
     import json
 
@@ -260,11 +410,6 @@ def train_moe_lookahead(
             f"Need at least 2 MoE layers for lookahead, got {moe_layer_indices}"
         )
 
-    if calibration_dataset == "synthetic":
-        texts = _get_calibration_data(num_samples)
-    else:
-        texts = _get_c4_calibration_data(num_samples)
-
     if progress_callback:
         progress_callback("Loading model (Flash-MoE, lazy)", 0.0)
 
@@ -277,19 +422,36 @@ def train_moe_lookahead(
     try:
         if progress_callback:
             progress_callback("Recording router traces", 0.05)
-        traces = record_moe_router_traces(
-            model,
-            tokenizer,
-            texts,
-            moe_layer_indices,
-            max_positions_per_layer=max_positions_per_layer,
-        )
+        if self_generate:
+            traces = record_moe_router_traces_decode(
+                model,
+                tokenizer,
+                moe_layer_indices,
+                max_positions_per_layer=max_positions_per_layer,
+                max_new_tokens=selfgen_max_new,
+                max_prompts=num_samples,
+            )
+        else:
+            # self-generate streams prompts from iter_dataset_prompts;
+            # only the prefill path consumes calibration texts.
+            if calibration_dataset == "synthetic":
+                texts = _get_calibration_data(num_samples)
+            else:
+                texts = _get_c4_calibration_data(num_samples)
+            traces = record_moe_router_traces(
+                model,
+                tokenizer,
+                texts,
+                moe_layer_indices,
+                max_positions_per_layer=max_positions_per_layer,
+            )
     finally:
         store.close()
 
     if not traces:
         raise RuntimeError(
-            "No router traces recorded — model has no _route-style MoE layers"
+            "No router traces recorded — model has no _route-style MoE "
+            "layers, or (self_generate) generation produced no decode steps"
         )
 
     bank, recalls = train_from_traces(
@@ -323,6 +485,7 @@ def train_moe_lookahead(
         "lr": lr,
         "num_samples": num_samples,
         "holdout_fraction": holdout_fraction,
+        "self_generate": self_generate,
     }
     sidecar_path.write_text(json.dumps(sidecar, indent=2))
 

@@ -274,13 +274,17 @@ def _maybe_create_prefetcher(
     margin: float,
     max_positions: int,
     scored_eviction: bool,
+    min_recall: float = 0.0,
 ) -> MoePrefetcher | None:
     """Load the trained lookahead bank and build a prefetcher, or None.
 
     Never raises: a missing/corrupt/stale ``moe_lookahead/`` directory is an
     optional accelerator, not a load failure. A sidecar that disagrees with
     the bundle (re-bundled model, wrong architecture) is rejected — serving a
-    wrong-shaped predictor would prefetch garbage every token.
+    wrong-shaped predictor would prefetch garbage every token. Pairs whose
+    trained holdout recall is below *min_recall* are gated off (their
+    predictions are mostly wasted SSD reads); if that gates every pair, no
+    prefetcher is built at all.
     """
     from olmlx.engine.flash.moe_predictor import MoeLookaheadBank
     from olmlx.engine.flash.moe_prefetch import MoePrefetcher
@@ -320,12 +324,29 @@ def _maybe_create_prefetcher(
         )
         return None
 
+    gated = bank.apply_recall_gate(min_recall)
+    if gated:
+        logger.info(
+            "Recall gate (min_recall=%.2f): disabled %d of %d lookahead pairs",
+            min_recall,
+            gated,
+            len(bank.heads),
+        )
+    if not bank.trained_pairs:
+        logger.info(
+            "All lookahead pairs gated below min_recall=%.2f — prefetch disabled",
+            min_recall,
+        )
+        return None
+
     logger.info(
         "MoE expert prefetch enabled (margin=%.2f, max_positions=%d, "
-        "scored_eviction=%s)",
+        "scored_eviction=%s, active_pairs=%d/%d)",
         margin,
         max_positions,
         scored_eviction,
+        len(bank.trained_pairs),
+        len(bank.heads),
     )
     return MoePrefetcher(
         bank,
@@ -346,6 +367,7 @@ def wrap_flash_moe(
     lookahead_margin: float = 1.5,
     prefetch_max_positions: int = 8,
     scored_eviction: bool = True,
+    prefetch_min_recall: float = 0.0,
 ) -> tuple[Any, Any]:
     """Wrap a lazily-loaded MoE model with SSD-streamed experts.
 
@@ -378,6 +400,7 @@ def wrap_flash_moe(
             margin=lookahead_margin,
             max_positions=prefetch_max_positions,
             scored_eviction=scored_eviction,
+            min_recall=prefetch_min_recall,
         )
     try:
         wrapped = FlashMoeModelWrapper(

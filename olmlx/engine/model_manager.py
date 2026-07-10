@@ -621,13 +621,13 @@ def _effective_flash_moe_config(
     """Force MoE expert prefetch off under ``self_speculative``.
 
     ``SelfSpeculativeDecoder`` drafts by running the target's early layers
-    directly and calling ``mx.eval`` per draft token. With prefetch active,
-    the last MoE layer inside the draft window can call
-    ``MoePrefetcher.submit`` targeting a successor layer the draft loop never
-    reaches — so no ``wait()`` ever consumes it, and the decoder's
-    per-token ``mx.eval`` races the prediction thread's ``mx.eval``
-    (``MoeLookaheadBank.predict_next``). Concurrent ``mx.eval`` is the
-    documented Metal-deadlock hazard (see CLAUDE.md). Classic and PLD
+    directly. With prefetch active, the last MoE layer inside the draft
+    window can call ``MoePrefetcher.submit`` targeting a successor layer the
+    draft loop never reaches — no ``wait()`` ever consumes it, so every
+    draft token pays prediction + prefetch I/O for experts that are never
+    used. (Prediction is now inline NumPy on the calling thread, so the
+    former concurrent-``mx.eval`` hazard this guard was added for is gone —
+    the guard stays as a pure waste-avoidance measure.) Classic and PLD
     strategies were verified safe and are left untouched.
     """
     if (
@@ -3297,6 +3297,7 @@ class ModelManager(SpeculativeLoaderMixin):
             lookahead_margin=flash_moe_config.lookahead_margin,
             prefetch_max_positions=flash_moe_config.prefetch_max_positions,
             scored_eviction=flash_moe_config.scored_eviction,
+            prefetch_min_recall=flash_moe_config.prefetch_min_recall,
         )
 
         return wrapped, tokenizer, is_vlm, caps

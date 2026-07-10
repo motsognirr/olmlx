@@ -77,12 +77,11 @@ class FlashMoE(nn.Module):
         Returns:
             Output hidden states, shape (B, L, hidden_size).
         """
-        # Wait for any pending prefetch targeting THIS layer (submitted by
-        # the previous MoE layer) BEFORE the mx.eval below — the prediction
-        # thread owns the only background mx.eval, and it must have finished
-        # before the main thread evaluates.
-        if self.prefetcher is not None:
-            self.prefetcher.wait(self.layer_idx)
+        # Prefetch is non-blocking: any prefetch I/O targeting THIS layer
+        # (submitted by the previous MoE layer) races the load_experts call
+        # below. Landed predictions are cache hits; still-in-flight ones are
+        # re-read by load_experts (occasional duplicate read — cheaper than
+        # blocking every layer on mostly-speculative I/O).
 
         # Collect unique expert indices for the SSD read list (Python-side, one eval per layer).
         # Invariant: ``unique_experts`` must contain every value in ``inds`` so the remap LUT
@@ -93,10 +92,11 @@ class FlashMoE(nn.Module):
         unique_experts = sorted(set(flat_inds))
 
         # Kick off prediction + SSD I/O for the NEXT MoE layer before this
-        # layer's blocking load, so they overlap with the load, the expert
-        # matmuls, and the intervening dense/attention work. Must come AFTER
-        # the mx.eval above (concurrent mx.eval is unsafe) and the main
-        # thread must not eval again until the next wait().
+        # layer's blocking load, so the I/O overlaps with the load, the
+        # expert matmuls, and the intervening dense/attention work.
+        # Prediction runs inline (NumPy) on this thread; keep the call AFTER
+        # the mx.eval above so x is already materialized and submit()'s
+        # NumPy conversion is a cast, not a graph drive.
         if self.prefetcher is not None:
             self.prefetcher.submit(self.layer_idx, x)
 
