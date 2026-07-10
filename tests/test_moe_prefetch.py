@@ -94,7 +94,7 @@ class TestMoePrefetcher:
             pf.submit(1, hidden)
             pf.submit(1, hidden)  # second submit while first pending: no-op
             pf.wait(2)
-            assert pf.stats.submitted <= 2  # never double-registers pending
+            assert pf.stats.submitted == 1  # never double-registers pending
         finally:
             pf.close()
 
@@ -108,6 +108,24 @@ class TestMoePrefetcher:
             bank.predict_next = _boom
             pf.submit(1, mx.random.normal((1, 1, HIDDEN)))
             pf.wait(2)  # must not hang
+            assert pf.stats.failures == 1
+        finally:
+            pf.close()
+
+    def test_score_push_failure_unblocks_wait(self, bank, store):
+        """A raising set_layer_scores must not leave wait() hanging."""
+        pf = _make_prefetcher(bank, store, scored_eviction=True)
+        try:
+
+            def _boom(*a, **k):
+                raise RuntimeError("synthetic score-push failure")
+
+            store.set_layer_scores = _boom
+            pf.submit(1, mx.random.normal((1, 1, HIDDEN)))
+            with pf._lock:
+                state = pf._pending.get(2)
+            assert state is not None
+            assert state.done.wait(timeout=5.0), "wait(2) would hang forever"
             assert pf.stats.failures == 1
         finally:
             pf.close()

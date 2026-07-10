@@ -125,10 +125,18 @@ class MoePrefetcher:
         if self._scored_eviction:
             # Push BEFORE the I/O lands so prefetch inserts already evict by
             # predicted need. The store clears these when next_layer's
-            # forward consumes them.
-            self._weight_store.set_layer_scores(
-                next_layer, {i: float(scores[i]) for i in range(len(scores))}
-            )
+            # forward consumes them. A failed push must not cancel the
+            # prefetch itself — scores only steer eviction.
+            try:
+                self._weight_store.set_layer_scores(
+                    next_layer, {i: float(scores[i]) for i in range(len(scores))}
+                )
+            except Exception:
+                logger.warning(
+                    "Expert score push failed for layer %d", next_layer, exc_info=True
+                )
+                with self._lock:
+                    self.stats.failures += 1
 
         with self._lock:
             self.stats.submitted += 1
