@@ -1864,14 +1864,31 @@ def _drive_segmented_prefill(
 
 
 def _cache_list_contains_lazy_state(cache: list[Any]) -> bool:
-    """True iff the cache contains layer types known to produce lazy
-    metal_kernel outputs that need eager mx.eval before cross-thread reuse.
+    """True iff the cache contains layer types that hold thread-bound lazy
+    state needing eager mx.eval before cross-thread reuse.
 
-    Currently flags ArraysCache (used by hybrid SSM models like Qwen3.5).
-    Pure KVCache/QuantizedKVCache/RotatingKVCache layouts return False
-    because their .state arrays are produced by stock matmul/concat ops.
+    Flags two families:
+
+    - ``ArraysCache`` (hybrid SSM models like Qwen3.5): ``gated_delta_kernel``
+      outputs carry a lazy graph bound to the building thread's Metal stream.
+    - Quantized KV caches (TurboQuant / Spectral / Shard): their ``.state``
+      property rebuilds a fresh ``[..., :offset, :]`` slice on every access, and
+      ``trim`` can shrink the packed buffers via a lazy slice — both bound to the
+      building thread's stream. Reusing/trimming such a cache on a *different*
+      worker-pool thread crashes with "There is no Stream(gpu, N) in current
+      thread". (These expose a ``_pin_state_to_offset`` marker method; matched by
+      class name rather than ``hasattr`` so a MagicMock — which answers True to
+      any ``hasattr`` — doesn't spuriously match in tests.)
+
+    Pure KVCache/QuantizedKVCache/RotatingKVCache layouts return False because
+    their ``.state`` arrays are produced by stock matmul/concat ops.
     """
-    LAZY_STATE_CLASSES = {"ArraysCache"}
+    LAZY_STATE_CLASSES = {
+        "ArraysCache",
+        "TurboQuantKVCache",
+        "SpectralQuantKVCache",
+        "ShardKVCache",
+    }
     return any(type(layer).__name__ in LAZY_STATE_CLASSES for layer in cache)
 
 
@@ -2228,8 +2245,48 @@ async def _setup_prompt_cache(
         # Trim cache to suffix_start so it aligns with where we resume
         trim_amount = len(cached.tokens) - suffix_start
         trimmed = 0
+        # A lazy-state cache (TurboQuant/Spectral/Shard) trimmed HERE — on the
+        # event-loop thread — leaves a lazy op bound to this thread's Metal
+        # stream: a large trim takes the buffer-shrink branch
+        # (``_key_indices = _key_indices[..., :cap, :]`` — a lazy slice) and the
+        # quant ``.state`` rebuilds a lazy ``[:offset]`` slice on every access.
+        # Under mlx thread-local streams (#499) the generation worker thread then
+        # crashes evaluating it: "There is no Stream(gpu, N) in current thread"
+        # at flash-MoE's ``mx.eval(inds)`` (pure-MoE + kv_cache_quant models —
+        # GLM-4.5-Air, Qwen3-235B).  Defer the GPU trim to the worker via
+        # ``deferred_prefill`` so it runs on the same thread that decodes.  A
+        # trimmable cache trims exactly ``trim_amount`` whenever
+        # ``trim_amount <= offset`` (always true here, ``suffix_start >= 0``), so
+        # the count is predictable — the partial-trim fallback below is only for
+        # non-lazy custom caches whose ``trim()`` clamps.
+        defer_trim = lm.supports_cache_trim and _cache_list_contains_lazy_state(
+            working_cache
+        )
         if trim_amount > 0 and lm.supports_cache_trim:
-            trimmed = trim_prompt_cache(working_cache, trim_amount)
+            if defer_trim:
+                # Predicted count (see comment): the actual trim runs on the
+                # worker.  Defensive: a lazy-state cache here is always fully
+                # trimmable, so a short trim would mean a broken invariant — log
+                # it loudly rather than let a misaligned cache pass silently.
+                trimmed = trim_amount
+
+                def _deferred_trim(
+                    _cancel: threading.Event | None = None,
+                    _cache: list[Any] = working_cache,
+                    _amount: int = trim_amount,
+                ) -> None:
+                    got = trim_prompt_cache(_cache, _amount)
+                    if got != _amount:
+                        logger.warning(
+                            "Deferred prompt-cache trim under-delivered "
+                            "(asked %d, got %d); cache may be misaligned",
+                            _amount,
+                            got,
+                        )
+
+                result.deferred_prefill = _deferred_trim
+            else:
+                trimmed = trim_prompt_cache(working_cache, trim_amount)
 
         if trim_amount > 0 and not lm.supports_cache_trim:
             # Hybrid sliding-window models (RotatingKVCache layers) cannot
