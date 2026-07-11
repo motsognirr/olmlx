@@ -1161,3 +1161,46 @@ class TestSpectralConfig:
             bits_low=2,
         )
         assert not _is_serializable_cache([cache])
+
+
+class TestSpectralRotationCrossThreadStreamSafety:
+    """SpectralRotation must build on one thread and evaluate on another.
+
+    Same hazard as TurboQuantRotation: the cache (and its rotations) is built on
+    the event-loop thread while prefill/decode run on a separate worker thread
+    (asyncio.to_thread).  Under mlx >= 0.31.2 thread-local streams (#499), a lazy
+    ``V.T`` op built on the constructing thread cannot be evaluated from the
+    worker thread.
+    """
+
+    def test_rotation_eval_safe_from_other_thread(self):
+        import threading
+
+        from olmlx.engine.spectralquant import SpectralRotation
+
+        holder: dict = {}
+
+        def build() -> None:
+            v = mx.array(
+                np.linalg.qr(np.random.RandomState(0).randn(64, 64))[0]
+            ).astype(mx.float32)
+            holder["rot"] = SpectralRotation(V=v)
+
+        t = threading.Thread(target=build)
+        t.start()
+        t.join()
+
+        rot = holder["rot"]
+        errors: list[Exception] = []
+
+        def use() -> None:
+            try:
+                mx.eval(rot.V, rot.V_T)
+                mx.eval(rot.rotate(mx.random.normal((2, 64))))
+            except Exception as exc:  # noqa: BLE001
+                errors.append(exc)
+
+        u = threading.Thread(target=use)
+        u.start()
+        u.join()
+        assert not errors, f"cross-thread spectral rotation eval failed: {errors!r}"
