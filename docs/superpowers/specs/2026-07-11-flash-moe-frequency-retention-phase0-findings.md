@@ -74,6 +74,45 @@ at the good operating point. The remaining honest levers are:
 2. **Budget / RAM:** the only knob that reliably moved throughput (48→128 = +34%).
    A cheaper expert representation (more experts resident per GB) attacks this.
 
+## Path C measurement (chosen continuation) — miss cost is parse-bound
+
+Instrumented the real decode path at budget 128 (`scratchpad/measure_misscost.py`,
+61k expert reads):
+
+- Per expert: **2082 µs = 511 µs pread (24.6%) + 1571 µs parse (75.4%)**.
+- pread p50 = 157 µs for 1.69 MiB ≈ **10 GiB/s = page-cache/memcpy speed** — reads
+  are served from RAM, not SSD. **This definitively kills the I/O-bandwidth
+  theories** and explains why prefetch never helped: there was no I/O latency to
+  hide. The bottleneck is the host-side `mx.array` construction, not the disk.
+- The parse (`_parse_expert_with_manifest`) does `raw[pos:pos+n]` (slice copy) →
+  `np.frombuffer(...).copy()` (copy #2) → `mx.array(arr)` (copy #3) = **~3 host
+  memcpys per component × 9 components/expert**. The in-situ 1571 µs (vs 81 µs
+  isolated) is 32-way thread contention → memory-bandwidth bound.
+
+### Proven fix (micro-benchmark `scratchpad/bench_parse.py`, mx.eval forced)
+
+| parse variant | µs/expert |
+|---|---:|
+| current (`.copy()`) | 81.6 |
+| **memoryview, no `.copy()`** | **34.2 (2.4×)** |
+| single-buffer on-device views | 67.2 |
+
+Dropping the redundant `.copy()` + bytes-slice (use a `memoryview`, let `mx.array`
+do the one necessary host→MLX copy) is **2.4× faster in isolation** and should
+help *more* in-situ (relieves the memory-bandwidth contention). **Safe:** the
+current code's own correctness proves `mx.array` copies at construction (its local
+numpy `.copy()` is GC'd before the deferred eval), so it never retains the view.
+
+### Plan
+
+1. Rewrite the three `_parse_*` methods (`moe_weight_store.py:238–363`) to parse
+   from a `memoryview` without the intermediate `.copy()`. TDD: assert parsed
+   arrays are bit-identical to current output; micro-bench confirms the speedup.
+2. A/B end-to-end throughput at budgets {48, 64, 128} on the flash-moe bench.
+   Expected: modest gain at 128 (read+parse is ~6% of decode wall there), larger
+   at low budgets (misses 3.4× higher) → the **RAM win** (budget 48–64 matching
+   higher-budget throughput).
+
 ## Reusable artifacts
 
 - `scratchpad/record_experts.py` — faithful decode expert-trace recorder (any
