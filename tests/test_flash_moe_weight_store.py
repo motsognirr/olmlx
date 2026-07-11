@@ -81,6 +81,40 @@ class TestFlashMoeWeightStore:
                 atol=1e-6,
             )
 
+    def test_parse_does_not_alias_source_buffer(self, store_with_model):
+        """Parsed mx.arrays must not alias the raw source bytes.
+
+        ``mx.array`` copies host data at construction, so the parser can skip a
+        defensive ``.copy()``. This test locks that invariant: parse from a
+        mutable buffer, scribble over it BEFORE eval, and the arrays must still
+        equal a golden parse of the original bytes. If a future change (or MLX
+        version) made ``mx.array`` alias the host buffer, this fails loudly
+        instead of silently corrupting expert weights.
+        """
+        import os
+
+        from olmlx.engine.flash.moe_weight_store import FlashMoeWeightStore
+
+        store, _, _, _, _ = store_with_model
+        layout = store._layouts[1]  # first MoE layer
+        manifest = layout.manifest
+        assert manifest is not None
+        fd = store._fds[1]
+        raw = bytearray(os.pread(fd, layout.expert_byte_size, int(layout.offsets[0])))
+
+        golden = FlashMoeWeightStore._parse_expert_with_manifest(bytes(raw), manifest)
+        mx.eval([v for v in golden.values() if v is not None])
+
+        parsed = FlashMoeWeightStore._parse_expert_with_manifest(raw, manifest)
+        for i in range(len(raw)):  # wipe source before eval
+            raw[i] = 0
+        mx.eval([v for v in parsed.values() if v is not None])
+
+        for key, gv in golden.items():
+            if gv is None:
+                continue
+            assert mx.array_equal(parsed[key], gv), f"{key} aliased the source buffer"
+
     def test_cache_hit_avoids_reread(self, store_with_model):
         """Second load of same experts should use cache."""
         store, _, _, _, _ = store_with_model
