@@ -2969,3 +2969,42 @@ class TestMultiCacheBehavior:
         # Both caches cleared, but agent-a gets a new one from this request
         assert lm.prompt_cache_store.get("agent-a") is not None
         assert lm.prompt_cache_store.get("agent-b") is None
+
+
+class TestCacheListContainsLazyState:
+    """`_cache_list_contains_lazy_state` gates eager-eval / deferred-trim for
+    caches that hold thread-bound lazy state (ArraysCache + quantized caches).
+
+    Quantized caches (TurboQuant/Spectral/Shard) must be flagged: reusing or
+    trimming them on a different worker-pool thread than the one that built
+    them crashes under mlx thread-local streams (#499) with "There is no
+    Stream(gpu, N) in current thread". Matched by class name (not hasattr) so a
+    MagicMock does not spuriously match.
+    """
+
+    def test_flags_turboquant_not_plain_kvcache(self):
+        from mlx_lm.models.cache import KVCache
+
+        from olmlx.engine.inference import _cache_list_contains_lazy_state
+        from olmlx.engine.turboquant import TurboQuantRotation
+        from olmlx.engine.turboquant_cache import TurboQuantKVCache
+
+        tq = TurboQuantKVCache(
+            bits=4,
+            rotation_key=TurboQuantRotation(head_dim=64, seed=0),
+            rotation_value=TurboQuantRotation(head_dim=64, seed=1),
+        )
+        assert _cache_list_contains_lazy_state([tq]) is True
+        assert _cache_list_contains_lazy_state([KVCache()]) is False
+        # A mixed list is flagged if any layer is lazy-state.
+        assert _cache_list_contains_lazy_state([KVCache(), tq]) is True
+        assert _cache_list_contains_lazy_state([]) is False
+
+    def test_magicmock_layer_does_not_spuriously_match(self):
+        from unittest.mock import MagicMock
+
+        from olmlx.engine.inference import _cache_list_contains_lazy_state
+
+        # MagicMock answers True to any hasattr; the class-name match must not
+        # be fooled (guards the prompt-cache flat-path tests that use mocks).
+        assert _cache_list_contains_lazy_state([MagicMock()]) is False
