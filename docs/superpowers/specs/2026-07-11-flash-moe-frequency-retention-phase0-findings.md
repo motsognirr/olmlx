@@ -131,6 +131,37 @@ line and this win share one root cause: **I/O was never the bottleneck** (expert
 are page-cache-resident), so bandwidth-speculation could only lose while
 CPU-copy-reduction wins.
 
+## Belady headroom (48%) — rigorously oracle-only, do not chase
+
+Follow-up (`scratchpad/analyze_policies.py`) tested whether *any* online policy
+reaches the Belady bound, and how much foresight it needs.
+
+**Advanced online policies gain almost nothing** (miss reduction vs LRU):
+
+| budget | SLRU | LRU-2 | ARC | Belady |
+|---:|---:|---:|---:|---:|
+| 48  | +2.5% | −1.5% | +3.1% | +48.0% |
+| 128 | −4.8% | −13.0% | +0.1% | +47.8% |
+
+ARC (self-tuning recency+frequency) is the best and gives ~0% at budget 128. The
+residual gap is neither recency- nor frequency-structured. (LRU already captures
+the *short-range* locality: 9.4% miss at budget 128 vs ~50% under independence.)
+
+**Windowed-Belady** — the miss reduction a *perfect* predictor with only `k`-token
+foresight could achieve (upper bound on any `k`-horizon predictor):
+
+| budget | k=1 | k=2 | k=4 | k=8 | k=16 | k=32 | ∞ |
+|---:|---:|---:|---:|---:|---:|---:|---:|
+| 48  | −36% | −22% | −7% | +12% | +34% | +46% | +48% |
+| 128 | −103% | −86% | −67% | −43% | −13% | +12% | +48% |
+
+A perfect *shallow* predictor is **worse** than LRU (at budget 128 a perfect
+next-token predictor doubles misses). The gain needs **16–32+ tokens of exact
+foresight** — routing that depends on not-yet-generated text. This is why the
+neural predictor (shallow horizon) never helped: in the reachable horizon even a
+perfect predictor loses. **Conclusion: the 48% is oracle-only. No causal policy —
+learned or otherwise — reaches it. Closed.**
+
 ## Reusable artifacts
 
 - `scratchpad/record_experts.py` — faithful decode expert-trace recorder (any
