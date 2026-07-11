@@ -162,6 +162,31 @@ neural predictor (shallow horizon) never helped: in the reachable horizon even a
 perfect predictor loses. **Conclusion: the 48% is oracle-only. No causal policy —
 learned or otherwise — reaches it. Closed.**
 
+## Parse squeeze — the fix captured it; the well is dry
+
+Follow-up to see if more decode throughput is recoverable from the parse/I/O path
+(`scratchpad/parse_scaling.py`, re-run of `measure_misscost.py`, `throughput_ab.py`
+`io_threads` sweep):
+
+- **The real mechanism was GIL starvation, not I/O latency.** `mx.array`
+  construction holds the GIL — parse does **not** parallelize (1 thread 36 µs vs
+  32 threads 46 µs/expert). The old 3-copy parse on 32 worker threads starved the
+  Python-driven forward loop of the GIL; the fix cut GIL-held parse time **24×**
+  in situ (1571 → 64 µs/expert), letting the forward loop run. That is the +7–23%.
+- **`pread` is off the critical path.** After the fix the miss split is 92% pread
+  / 8% parse — but `pread` *releases* the GIL (syscall) and overlaps with compute,
+  so `io_threads` is **flat** at both budgets (128: 30.8–31.0 across 8–48 threads;
+  48: 25.0–25.1 across 8–32). I/O is not the bottleneck.
+- **Consequences:** mmap (removing a `pread` copy) would not raise throughput —
+  the I/O it targets is already hidden. Single-buffer parse holds the GIL *longer*
+  (isolated 67 µs vs 34 µs), so it's a regression. Parse at 64 µs/expert ≈ 26 GiB/s
+  is already near memory bandwidth.
+
+**Conclusion:** decode at budget 128 is now compute/forward-bound (thread- and
+I/O-invariant). The shipped copy-elision captured the available expert-loading
+win; further parse/I/O micro-opt hits diminishing returns. The next lever would be
+the forward compute itself — a different problem, out of this scope.
+
 ## Reusable artifacts
 
 - `scratchpad/record_experts.py` — faithful decode expert-trace recorder (any
