@@ -2717,17 +2717,6 @@ def _cmd_flash_moe_prepare(args, model_path):
     print("\nTo use Flash-MoE inference:")
     print("  OLMLX_FLASH_MOE=true olmlx serve")
 
-    if getattr(args, "train_lookahead", False):
-        from olmlx.engine.flash.moe_lookahead_train import train_moe_lookahead
-
-        print("\nTraining expert lookahead predictors...")
-        lookahead_dir = train_moe_lookahead(
-            model_path,
-            output_dir,
-            progress_callback=_flash_progress,
-        )
-        print(f"  Lookahead predictors: {lookahead_dir}")
-
 
 def _cmd_flash_dense_prepare(args, model_path):
     """Prepare a dense model for flash inference."""
@@ -2765,50 +2754,6 @@ def _cmd_flash_dense_prepare(args, model_path):
     print("\nTo use flash inference:")
     print("  olmlx serve --flash")
     print("  # or set OLMLX_FLASH=true")
-
-
-def cmd_flash_train_moe_lookahead(args):
-    """Train expert lookahead predictors for Flash-MoE prefetch."""
-    from pathlib import Path
-
-    _configure_logging()
-    store = _create_store()
-    _resolved = store.registry.resolve(args.model)
-    hf_path = _resolved.hf_path if _resolved is not None else args.model
-    local_dir = store.ensure_downloaded(hf_path)
-    model_path = str(local_dir)
-
-    flash_moe_dir = Path(model_path) / "flash_moe"
-    if not (flash_moe_dir / "flash_moe_layout.json").exists():
-        print(f"No Flash-MoE bundle at {flash_moe_dir}")
-        print("Run `olmlx flash prepare <model>` first.")
-        raise SystemExit(1)
-
-    from olmlx.engine.flash.moe_lookahead_train import train_moe_lookahead
-
-    print(f"Training MoE expert lookahead for {args.model}...")
-    print(
-        f"  Rank: {args.rank}  Epochs: {args.epochs}  Samples: {args.samples}"
-        f"  Max positions/layer: {args.max_positions}"
-    )
-    print()
-
-    out_dir = train_moe_lookahead(
-        model_path,
-        flash_moe_dir,
-        rank=args.rank,
-        epochs=args.epochs,
-        num_samples=args.samples,
-        calibration_dataset=args.calibration_dataset,
-        max_positions_per_layer=args.max_positions,
-        self_generate=args.self_generate,
-        progress_callback=_flash_progress,
-    )
-
-    print("\nMoE lookahead training complete!")
-    print(f"  Output: {out_dir}")
-    print("\nExpert prefetch is off by default (it benchmarked slower than")
-    print("plain LRU caching); enable with OLMLX_FLASH_MOE_PREFETCH=true.")
 
 
 def cmd_dflash_precompute(args):
@@ -3466,59 +3411,10 @@ def build_parser() -> argparse.ArgumentParser:
         default=4,
         help="Rank multiplier for sensitive layers (default: 4)",
     )
-    prepare_p.add_argument(
-        "--train-lookahead",
-        action="store_true",
-        help="MoE models: also train expert lookahead predictors after bundling",
-    )
     info_p = flash_sub.add_parser(
         "info", help="Show flash preparation info for a model"
     )
     info_p.add_argument("model", help="Model name or HF path")
-
-    tml_p = flash_sub.add_parser(
-        "train-moe-lookahead",
-        help="Train expert lookahead predictors for Flash-MoE prefetch",
-    )
-    tml_p.add_argument("model", help="Model name or HF path (must be flash-prepared)")
-    tml_p.add_argument(
-        "--rank", type=int, default=128, help="Predictor rank (default: 128)"
-    )
-    tml_p.add_argument(
-        "--epochs", type=int, default=5, help="Training epochs (default: 5)"
-    )
-    tml_p.add_argument(
-        "--samples",
-        type=int,
-        default=32,
-        help="Calibration texts to trace (default: 32; each forward pass "
-        "streams experts from SSD, so tracing is slow)",
-    )
-    tml_p.add_argument(
-        "--calibration-dataset",
-        type=str,
-        default=None,
-        help="Calibration dataset: 'c4' (default) or 'synthetic'",
-    )
-    tml_p.add_argument(
-        "--max-positions",
-        type=int,
-        default=4096,
-        help="Max trace positions per MoE layer (default: 4096). This caps "
-        "the per-pair training-set size, so raising it (with enough "
-        "--samples to fill it) is the main recall lever. RAM cost is "
-        "~hidden_size*4 bytes per position per layer.",
-    )
-    tml_p.add_argument(
-        "--self-generate",
-        action="store_true",
-        help="Trace the model's own decode steps over chat prompts instead "
-        "of teacher-forced prefill over calibration text (same recipe as "
-        "dflash --self-generate). Serve-time predictions run on decode "
-        "states, and prefill-trained heads lose ~2/3 of their recall "
-        "there. --samples counts prompts; --calibration-dataset is "
-        "ignored. Slower: one forward per generated token.",
-    )
 
     # DFlash draft training
     dflash = sub.add_parser("dflash", help="DFlash block-diffusion draft training")
@@ -4033,7 +3929,6 @@ _COMMAND_HANDLERS: dict[tuple[str, str | None], str] = {
     ("models", "search"): "cmd_models_search",
     ("flash", "prepare"): "cmd_flash_prepare",
     ("flash", "info"): "cmd_flash_info",
-    ("flash", "train-moe-lookahead"): "cmd_flash_train_moe_lookahead",
     ("dflash", "prepare"): "cmd_dflash_prepare",
     ("dflash", "precompute"): "cmd_dflash_precompute",
     ("eagle", "prepare"): "cmd_eagle_prepare",

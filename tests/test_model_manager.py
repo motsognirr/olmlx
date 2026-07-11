@@ -17,7 +17,6 @@ from olmlx.engine.model_manager import (
     ModelLoadTimeoutError,
     ModelManager,
     SpectralCalibrationMissingError,
-    _effective_flash_moe_config,
     _ensure_tokenizer_eos_in_stops,
     parse_keep_alive,
 )
@@ -5692,111 +5691,6 @@ class TestSpeculativeLoading:
             )
         assert (model, tokenizer, is_vlm, caps) == sentinel_load
         assert decoder is sentinel_decoder
-
-    def test_effective_flash_moe_config_disables_prefetch_for_self_speculative(self):
-        """self_speculative's early-exit draft loop can leave a prefetch
-        prediction unconsumed, racing the decoder's own mx.eval — the
-        documented concurrent-mx.eval Metal-deadlock hazard. Prefetch must
-        be forced off for this strategy."""
-        fm_config = FlashMoeConfig(
-            enabled=True, cache_budget_experts=48, io_threads=32, prefetch=True
-        )
-        spec_config = SpeculativeConfig(True, None, 10, strategy="self_speculative")
-
-        result = _effective_flash_moe_config(fm_config, spec_config, "test/moe-model")
-
-        assert result.prefetch is False
-        # Untouched fields carry through unchanged.
-        assert result.cache_budget_experts == 48
-        assert result.io_threads == 32
-
-    @pytest.mark.parametrize("strategy", [None, "classic", "pld"])
-    def test_effective_flash_moe_config_passes_through_for_other_strategies(
-        self, strategy
-    ):
-        """Classic and PLD were verified safe under prefetch — must not be
-        touched."""
-        fm_config = FlashMoeConfig(
-            enabled=True, cache_budget_experts=48, io_threads=32, prefetch=True
-        )
-        enabled = strategy is not None
-        spec_config = SpeculativeConfig(
-            enabled, None, 10, strategy=strategy or "classic"
-        )
-
-        result = _effective_flash_moe_config(fm_config, spec_config, "test/moe-model")
-
-        assert result.prefetch is True
-        assert result is fm_config
-
-    def test_effective_flash_moe_config_noop_when_prefetch_already_off(self):
-        """No-op (and no spurious replace) when prefetch is already off."""
-        fm_config = FlashMoeConfig(
-            enabled=True, cache_budget_experts=48, io_threads=32, prefetch=False
-        )
-        spec_config = SpeculativeConfig(True, None, 10, strategy="self_speculative")
-
-        result = _effective_flash_moe_config(fm_config, spec_config, "test/moe-model")
-
-        assert result is fm_config
-
-    def test_flash_moe_path_disables_prefetch_under_self_speculative(
-        self, monkeypatch, caplog
-    ):
-        """Finding 1 (CRITICAL): Flash-MoE + self_speculative must load with
-        prefetch forced off, or the draft loop's per-token mx.eval can race
-        MoePrefetcher's prediction-thread mx.eval (concurrent mx.eval is a
-        documented Metal-deadlock hazard)."""
-        import logging
-
-        from olmlx.config import ExperimentalSettings
-
-        registry = MagicMock()
-        store = MagicMock()
-        store.ensure_downloaded.return_value = Path("/tmp/test-moe")
-
-        manager = ModelManager(registry, store)
-        monkeypatch.setattr(manager, "_is_flash_moe_enabled", lambda *a: True)
-        monkeypatch.setattr(
-            manager, "_flash_moe_dir", lambda hf_path: Path("/tmp/test-moe/flash_moe")
-        )
-        captured_configs = []
-        sentinel_load = (object(), object(), False, TemplateCaps())
-
-        def fake_load_flash_moe_model(
-            hf_path, load_path, flash_moe_dir, *, flash_moe_config
-        ):
-            captured_configs.append(flash_moe_config)
-            return sentinel_load
-
-        monkeypatch.setattr(manager, "_load_flash_moe_model", fake_load_flash_moe_model)
-        sentinel_decoder = object()
-        monkeypatch.setattr(
-            manager,
-            "_load_self_speculative_decoder",
-            lambda model, spec_config: sentinel_decoder,
-        )
-
-        model_exp = ExperimentalSettings(_env_file=None)
-        spec_config = SpeculativeConfig(True, None, 10, strategy="self_speculative")
-        fm_config = FlashMoeConfig(
-            enabled=True, cache_budget_experts=48, io_threads=32, prefetch=True
-        )
-
-        with caplog.at_level(logging.INFO, logger="olmlx.engine.model_manager"):
-            model, tokenizer, is_vlm, caps, decoder = manager._load_model(
-                "test/moe-model",
-                model_exp=model_exp,
-                spec_config=spec_config,
-                flash_moe_config=fm_config,
-            )
-
-        assert (model, tokenizer, is_vlm, caps) == sentinel_load
-        assert decoder is sentinel_decoder
-        assert len(captured_configs) == 1
-        assert captured_configs[0].prefetch is False
-        assert "self_speculative" in caplog.text
-        assert "prefetch" in caplog.text.lower()
 
     def test_load_pld_decoder_unwraps_vlm_language_model(self, monkeypatch):
         """When ``is_vlm=True``, _load_pld_decoder must construct the

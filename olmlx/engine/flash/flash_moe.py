@@ -7,15 +7,10 @@ routed expert weights are loaded per-token from the FlashMoeWeightStore.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
-
 import mlx.core as mx
 import mlx.nn as nn
 
 from olmlx.engine.flash.moe_weight_store import FlashMoeWeightStore
-
-if TYPE_CHECKING:
-    from olmlx.engine.flash.moe_prefetch import MoePrefetcher
 
 
 class FlashMoE(nn.Module):
@@ -34,7 +29,6 @@ class FlashMoE(nn.Module):
         num_experts_per_tok: int,
         weight_store: FlashMoeWeightStore,
         activation: nn.Module | None = None,
-        prefetcher: MoePrefetcher | None = None,
     ):
         super().__init__()
         self.layer_idx = layer_idx
@@ -44,7 +38,6 @@ class FlashMoE(nn.Module):
         self.num_experts_per_tok = num_experts_per_tok
         self.weight_store = weight_store
         self._activation = activation
-        self.prefetcher = prefetcher
 
     def _apply_gated_activation(self, up_out: mx.array, gate_out: mx.array) -> mx.array:
         """Apply gated activation (SwiGLU). Activation is a 2-arg callable."""
@@ -77,12 +70,6 @@ class FlashMoE(nn.Module):
         Returns:
             Output hidden states, shape (B, L, hidden_size).
         """
-        # Prefetch is non-blocking: any prefetch I/O targeting THIS layer
-        # (submitted by the previous MoE layer) races the load_experts call
-        # below. Landed predictions are cache hits; still-in-flight ones are
-        # re-read by load_experts (occasional duplicate read — cheaper than
-        # blocking every layer on mostly-speculative I/O).
-
         # Collect unique expert indices for the SSD read list (Python-side, one eval per layer).
         # Invariant: ``unique_experts`` must contain every value in ``inds`` so the remap LUT
         # has a valid entry for each routed token. ``mx.take`` would silently return the
@@ -90,15 +77,6 @@ class FlashMoE(nn.Module):
         mx.eval(inds)
         flat_inds = inds.reshape(-1).tolist()
         unique_experts = sorted(set(flat_inds))
-
-        # Kick off prediction + SSD I/O for the NEXT MoE layer before this
-        # layer's blocking load, so the I/O overlaps with the load, the
-        # expert matmuls, and the intervening dense/attention work.
-        # Prediction runs inline (NumPy) on this thread; keep the call AFTER
-        # the mx.eval above so x is already materialized and submit()'s
-        # NumPy conversion is a cast, not a graph drive.
-        if self.prefetcher is not None:
-            self.prefetcher.submit(self.layer_idx, x)
 
         # Load experts from SSD (or RAM cache); LoadedExperts includes a device-side
         # remap LUT that maps global expert idx -> local stack position.

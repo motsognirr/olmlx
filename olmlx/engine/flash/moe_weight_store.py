@@ -14,7 +14,7 @@ import mlx.core as mx
 import numpy as np
 
 from olmlx.engine.flash._ssd_base import (
-    ScoredLayerCache,
+    LayerLruCache,
     close_fds,
     full_pread,
     open_fds,
@@ -117,7 +117,7 @@ class ExpertCacheStats:
             }
 
 
-_ExpertCache = ScoredLayerCache[int, dict[str, Any]]
+_ExpertCache = LayerLruCache[int, dict[str, Any]]
 
 
 class FlashMoeWeightStore:
@@ -131,7 +131,7 @@ class FlashMoeWeightStore:
     ):
         self._flash_dir = flash_dir
         self._executor = ThreadPoolExecutor(max_workers=num_io_threads)
-        self._cache: _ExpertCache = ScoredLayerCache(max_per_layer=cache_budget_experts)
+        self._cache: _ExpertCache = LayerLruCache(max_per_layer=cache_budget_experts)
         self._layout_config = json.loads(
             (flash_dir / "flash_moe_layout.json").read_text()
         )
@@ -197,43 +197,6 @@ class FlashMoeWeightStore:
             return self._parse_float16_expert(
                 raw, layout.hidden_size, layout.intermediate_size
             )
-
-    def set_layer_scores(self, layer_idx: int, scores: dict[int, float]) -> None:
-        """Push predicted-need scores for *layer_idx* (consumed by eviction)."""
-        self._cache.set_scores(layer_idx, scores)
-
-    def prefetch_experts(
-        self, layer_idx: int, expert_indices: list[int]
-    ) -> tuple[int, int]:
-        """Warm the cache with *expert_indices* for *layer_idx*.
-
-        Blocks until all reads land. Read failures are logged and skipped —
-        the synchronous ``load_experts`` path re-reads and reports them.
-        Returns ``(already_cached, fetched)`` counts.
-        """
-        if not expert_indices:
-            return (0, 0)
-        cached, missing = self._cache.get_cached_indices(layer_idx, expert_indices)
-        if not missing:
-            return (len(cached), 0)
-        future_to_idx = {
-            self._executor.submit(self._read_expert, layer_idx, idx): idx
-            for idx in missing
-        }
-        fetched = 0
-        for future in as_completed(future_to_idx):
-            idx = future_to_idx[future]
-            try:
-                self._cache.put(layer_idx, idx, future.result())
-                fetched += 1
-            except Exception:
-                logger.warning(
-                    "Prefetch read failed for layer %d expert %d",
-                    layer_idx,
-                    idx,
-                    exc_info=True,
-                )
-        return (len(cached), fetched)
 
     @staticmethod
     def _parse_expert_with_manifest(
@@ -410,10 +373,6 @@ class FlashMoeWeightStore:
         if not expert_indices:
             raise ValueError("expert_indices must not be empty")
         layout = self._layouts[layer_idx]
-        # Protect the in-flight request set from scored eviction, so a
-        # low-scored expert of THIS batch is not evicted mid-load by a
-        # concurrent prefetch insert for the same layer.
-        self._cache.protect(layer_idx, set(expert_indices))
 
         # Check cache
         cached = self._cache.get_batch(layer_idx, expert_indices)
@@ -453,14 +412,6 @@ class FlashMoeWeightStore:
                                     f.cancel()
         finally:
             self.stats.record(hits, misses, failures)
-            # Scores are consume-once: this layer's forward has now used
-            # (or bypassed) them; a stale prediction must not steer later
-            # evictions.
-            self._cache.clear_scores(layer_idx)
-            # Protection is scoped to THIS load. If it lingered, the next
-            # prefetch insert for this layer would find every cached key
-            # protected and evict LRU-oldest, defeating scored eviction.
-            self._cache.protect(layer_idx, set())
 
         if first_exc is not None:
             raise first_exc

@@ -14,7 +14,6 @@ import pytest
 from olmlx.engine.flash._ssd_base import (
     HeaderSpec,
     LayerLruCache,
-    ScoredLayerCache,
     encode_header,
     full_pread,
     open_fds,
@@ -333,90 +332,3 @@ class TestOpenFds:
         # Every fd handed out by os.open must have been closed by the cleanup path.
         assert opened, "test setup should have opened at least one fd"
         assert set(closed) == set(opened), f"fd leak: opened={opened}, closed={closed}"
-
-
-# ---------------------------------------------------------------------------
-# ScoredLayerCache
-# ---------------------------------------------------------------------------
-
-
-class TestScoredLayerCache:
-    def _cache(self, max_per_layer=3):
-        return ScoredLayerCache(max_per_layer=max_per_layer)
-
-    def test_behaves_as_lru_without_scores(self):
-        cache = self._cache(max_per_layer=2)
-        cache.put(0, "a", 1)
-        cache.put(0, "b", 2)
-        cache.put(0, "c", 3)  # evicts "a" (LRU-oldest)
-        assert cache.get(0, "a") is None
-        assert cache.get(0, "b") == 2
-        assert cache.get(0, "c") == 3
-
-    def test_evicts_lowest_scored(self):
-        cache = self._cache(max_per_layer=2)
-        cache.put(0, "a", 1)
-        cache.put(0, "b", 2)
-        # "a" is LRU-oldest but has the higher predicted need
-        cache.set_scores(0, {"a": 0.9, "b": 0.1})
-        cache.put(0, "c", 3)  # evicts "b" (lowest score), not "a"
-        assert cache.get(0, "b") is None
-        assert cache.get(0, "a") == 1
-        assert cache.get(0, "c") == 3
-
-    def test_missing_score_treated_as_zero(self):
-        cache = self._cache(max_per_layer=2)
-        cache.put(0, "a", 1)
-        cache.put(0, "b", 2)
-        cache.set_scores(0, {"a": 0.5})  # "b" unscored -> 0.0
-        cache.put(0, "c", 3)  # evicts "b"
-        assert cache.get(0, "b") is None
-        assert cache.get(0, "a") == 1
-
-    def test_protected_keys_survive_scored_eviction(self):
-        cache = self._cache(max_per_layer=2)
-        cache.put(0, "a", 1)
-        cache.put(0, "b", 2)
-        cache.set_scores(0, {"a": 0.0, "b": 0.9})
-        cache.protect(0, {"a"})
-        cache.put(0, "c", 3)  # "a" protected -> evicts "b" despite high score
-        assert cache.get(0, "a") == 1
-        assert cache.get(0, "b") is None
-
-    def test_new_unprotected_key_is_victim_of_last_resort(self):
-        """When all pre-existing keys are protected, the just-inserted
-        unprotected key is evicted — never a protected key."""
-        cache = self._cache(max_per_layer=2)
-        cache.put(0, "a", 1)
-        cache.put(0, "b", 2)
-        cache.protect(0, {"a", "b"})
-        cache.put(0, "c", 3)  # only unprotected key is "c" itself
-        assert cache.get(0, "a") == 1
-        assert cache.get(0, "b") == 2
-        assert cache.get(0, "c") is None
-
-    def test_all_protected_falls_back_to_lru_oldest(self):
-        cache = self._cache(max_per_layer=2)
-        cache.put(0, "a", 1)
-        cache.put(0, "b", 2)
-        cache.protect(0, {"a", "b", "c"})
-        cache.put(0, "c", 3)  # cannot grow unbounded: evicts LRU-oldest "a"
-        assert cache.get(0, "a") is None
-
-    def test_clear_scores_restores_lru(self):
-        cache = self._cache(max_per_layer=2)
-        cache.put(0, "a", 1)
-        cache.put(0, "b", 2)
-        cache.set_scores(0, {"a": 0.9, "b": 0.1})
-        cache.clear_scores(0)
-        cache.put(0, "c", 3)  # back to LRU: evicts "a"
-        assert cache.get(0, "a") is None
-        assert cache.get(0, "b") == 2
-
-    def test_scores_are_per_layer(self):
-        cache = self._cache(max_per_layer=2)
-        cache.put(1, "a", 1)
-        cache.put(1, "b", 2)
-        cache.set_scores(0, {"a": 0.9, "b": 0.1})  # different layer
-        cache.put(1, "c", 3)  # layer 1 has no scores -> LRU evicts "a"
-        assert cache.get(1, "a") is None
