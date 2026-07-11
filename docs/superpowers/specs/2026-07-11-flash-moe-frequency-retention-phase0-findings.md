@@ -103,15 +103,33 @@ help *more* in-situ (relieves the memory-bandwidth contention). **Safe:** the
 current code's own correctness proves `mx.array` copies at construction (its local
 numpy `.copy()` is GC'd before the deferred eval), so it never retains the view.
 
-### Plan
+### Plan → DONE (shipped in commit `c44d450`)
 
-1. Rewrite the three `_parse_*` methods (`moe_weight_store.py:238–363`) to parse
-   from a `memoryview` without the intermediate `.copy()`. TDD: assert parsed
-   arrays are bit-identical to current output; micro-bench confirms the speedup.
-2. A/B end-to-end throughput at budgets {48, 64, 128} on the flash-moe bench.
-   Expected: modest gain at 128 (read+parse is ~6% of decode wall there), larger
-   at low budgets (misses 3.4× higher) → the **RAM win** (budget 48–64 matching
-   higher-budget throughput).
+1. Rewrote the three `_parse_*` methods to parse from a zero-copy `memoryview`
+   and let `mx.array` do the one necessary host copy (dropping the bytes-slice +
+   `.copy()`). Guarded by `test_parse_does_not_alias_source_buffer` (locks the
+   `mx.array`-copies-at-construction invariant); all round-trip parse tests green.
+2. **Controlled A/B** (same harness, back-to-back, on Qwen3.5-35B-A3B-4bit flash
+   decode of the 7 bench prompts; per-prompt spread far tighter than the gap):
+
+   | budget | baseline (`.copy()`) | no-copy | delta |
+   |---:|---:|---:|---:|
+   | 48  | 20.22 | 24.96 | **+23.4%** |
+   | 128 | 29.18 | 31.31 | **+7.3%** |
+
+   The gain is largest at low budget (miss-heavy, memory-constrained) — exactly
+   the regime that matters for fitting bigger models. One wasted memcpy per
+   component was costing 7–23% of decode throughput.
+
+### Outcome vs the original goal
+
+The frequency-retention hypothesis was **wrong** (Phase-0 NO-GO), but the
+measurement it forced exposed the real bottleneck: miss cost, not miss rate, and
+parse, not I/O. Attacking that yielded a clean **+7–23%** — a bigger, more robust
+win than any prefetch/retention policy, at near-zero risk. The failed prefetch
+line and this win share one root cause: **I/O was never the bottleneck** (experts
+are page-cache-resident), so bandwidth-speculation could only lose while
+CPU-copy-reduction wins.
 
 ## Reusable artifacts
 
