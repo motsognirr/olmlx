@@ -52,7 +52,19 @@ def get_codebook(bits: int, dim: int) -> mx.array:
     key = (bits, dim)
     if key not in _codebook_cache:
         centroids = mx.array(GAUSSIAN_CODEBOOKS[bits], dtype=mx.float32)
-        _codebook_cache[key] = centroids / mx.sqrt(mx.array(float(dim)))
+        codebook = centroids / mx.sqrt(mx.array(float(dim)))
+        # Materialize before caching. ``_codebook_cache`` is module-global and
+        # shared across requests and worker threads; the scaled codebook is a
+        # *lazy* divide op. Under mlx >= 0.31.2 thread-local streams (#499) a
+        # lazy op stays bound to the thread that built it, so the first thread
+        # to populate an entry would bind it — and a later graph referencing
+        # the cached codebook from another thread raises "There is no
+        # Stream(cpu, N) in current thread" (surfaces at flash-MoE's
+        # mx.eval(inds) under concurrent requests, since the router graph
+        # transitively references the dequantized K/V). A materialized leaf
+        # carries no stream binding — same fix as TurboQuantRotation.
+        mx.eval(codebook)
+        _codebook_cache[key] = codebook
     return _codebook_cache[key]
 
 
