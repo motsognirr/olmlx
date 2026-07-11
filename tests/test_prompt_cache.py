@@ -266,6 +266,80 @@ class TestCacheReusedOnPrefixMatch:
             prompt_cache_arg is existing_cache
         )  # same object, removed from store before use
 
+    @pytest.mark.asyncio
+    async def test_lazy_state_cache_defers_trim_to_worker(self, mock_manager):
+        """A lazy-state (quantized) cache on the flat reuse path must NOT be
+        trimmed inline on the event-loop thread — the trim is deferred into the
+        generation worker via ``deferred_prefill`` (else the loop-thread lazy
+        slice crashes the worker's ``mx.eval`` under thread-local streams).
+
+        Locks the actual fix wiring, not just the ``_cache_list_contains_lazy_state``
+        helper: asserts ``trim_prompt_cache`` is not called during setup, that a
+        ``deferred_prefill`` closure reaches ``async_mlx_stream``, and that
+        invoking it performs the trim.
+        """
+        from olmlx.engine.inference import generate_chat
+        from olmlx.engine.model_manager import CachedPromptState
+
+        lm = mock_manager._loaded["qwen3:latest"]
+        lm.tokenizer.apply_chat_template = MagicMock(return_value="formatted prompt v2")
+        lm.tokenizer.bos_token = None
+
+        # A cache whose layer's class name matches the lazy-state allowlist
+        # (TurboQuant/Spectral/Shard), without constructing a real GPU cache.
+        # MagicMock base supplies the incidental cache methods (is_trimmable, …);
+        # the class name is what _cache_list_contains_lazy_state matches on.
+        lazy_layer = type("TurboQuantKVCache", (MagicMock,), {})()
+        existing_cache = [lazy_layer]
+        lm.prompt_cache_store.set(
+            "",
+            CachedPromptState(
+                tokens=[10, 20, 30, 40, 50, 100, 101],  # prompt + generated
+                cache=existing_cache,
+            ),
+        )
+        lm.tokenizer.encode = MagicMock(return_value=[10, 20, 30, 40, 50, 60, 70, 80])
+
+        tokens = _make_stream_tokens("New", " output", prompt_tokens=3)
+        mock_stream = _make_mock_stream(tokens)
+        mock_trim = MagicMock(return_value=2)
+        mock_mx = MagicMock()
+        with (
+            patch("olmlx.engine.inference.mx", mock_mx),
+            patch(
+                "olmlx.engine.inference.async_mlx_stream", return_value=mock_stream
+            ) as mock_async_stream,
+            patch("olmlx.engine.inference.trim_prompt_cache", mock_trim),
+            patch("olmlx.engine.inference.settings") as mock_settings,
+        ):
+            mock_settings.prompt_cache = True
+            mock_settings.prompt_cache_max_tokens = 32768
+            mock_settings.default_keep_alive = "5m"
+            mock_settings.inference_timeout = None
+            mock_settings.sync_mode = "full"
+            gen = await generate_chat(
+                mock_manager,
+                "qwen3",
+                [{"role": "user", "content": "hi again"}],
+                stream=True,
+            )
+            async for _chunk in gen:
+                pass
+
+            # The mocked async_mlx_stream never invokes deferred_prefill, so the
+            # trim must NOT have run inline during event-loop-thread setup.
+            mock_trim.assert_not_called()
+
+            # A deferred_prefill closure must have been handed to async_mlx_stream…
+            deferred = mock_async_stream.call_args[1].get("deferred_prefill")
+            assert deferred is not None
+
+            # …and invoking it (as the worker thread would) performs the trim by
+            # 2 (still inside the patch so trim_prompt_cache is the mock).
+            deferred(None)
+            mock_trim.assert_called_once()
+            assert mock_trim.call_args[0][1] == 2
+
 
 class TestNonTrimmableCacheFallback:
     @pytest.mark.asyncio

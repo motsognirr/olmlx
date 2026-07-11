@@ -2264,6 +2264,10 @@ async def _setup_prompt_cache(
         )
         if trim_amount > 0 and lm.supports_cache_trim:
             if defer_trim:
+                # Predicted count (see comment): the actual trim runs on the
+                # worker.  Defensive: a lazy-state cache here is always fully
+                # trimmable, so a short trim would mean a broken invariant — log
+                # it loudly rather than let a misaligned cache pass silently.
                 trimmed = trim_amount
 
                 def _deferred_trim(
@@ -2271,7 +2275,14 @@ async def _setup_prompt_cache(
                     _cache: list[Any] = working_cache,
                     _amount: int = trim_amount,
                 ) -> None:
-                    trim_prompt_cache(_cache, _amount)
+                    got = trim_prompt_cache(_cache, _amount)
+                    if got != _amount:
+                        logger.warning(
+                            "Deferred prompt-cache trim under-delivered "
+                            "(asked %d, got %d); cache may be misaligned",
+                            _amount,
+                            got,
+                        )
 
                 result.deferred_prefill = _deferred_trim
             else:
