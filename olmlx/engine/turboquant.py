@@ -68,6 +68,16 @@ class TurboQuantRotation:
         # every step) would otherwise allocate a fresh transposed view per
         # call. Mirrors what SpectralRotation already does for V_T.
         self.matrix_T: mx.array = self.matrix.T
+        # Materialize both eagerly. The prompt cache (and these rotations) is
+        # built on the event-loop thread while prefill/decode run on a separate
+        # generation worker thread (asyncio.to_thread). Under mlx >= 0.31.2
+        # thread-local streams (#499), the lazy ``.T`` op would stay bound to
+        # the constructing thread's stream, so evaluating any graph that
+        # references it from the worker thread raises "There is no Stream(gpu,
+        # N) in current thread" (surfaces at flash-MoE's mx.eval(inds)). A
+        # materialized leaf carries no stream binding and is safe to read from
+        # any thread.
+        mx.eval(self.matrix, self.matrix_T)
 
 
 def pack_indices(indices: mx.array, bits: int) -> mx.array:
