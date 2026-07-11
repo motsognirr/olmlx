@@ -432,23 +432,11 @@ class Settings(BaseSettings):
     flash_moe_cache_budget_experts: Annotated[int, Field(ge=0)] = 48
     flash_moe_io_threads: Annotated[int, Field(gt=0)] = 32
 
-    # MoE expert prefetch (requires a trained lookahead bank —
-    # ``olmlx flash train-moe-lookahead``; silently off without one).
-    # Default OFF: benchmarked 2026-07-10 on Qwen3.5-35B-A3B (32 GB M-series,
-    # cache budget 128/layer), every prefetch configuration lost 30-45% decode
-    # throughput to plain LRU (best ~14.5 vs 20.4 tok/s) — speculative expert
-    # reads cost more SSD bandwidth than their hits save, and raising real
-    # decode-state recall 0.11→0.28 (via --self-generate retraining) did not
-    # change that: predicted-and-routed experts are mostly already cached.
-    flash_moe_prefetch: bool = False
-    flash_moe_lookahead_margin: Annotated[float, Field(ge=1.0)] = 1.5
-    flash_moe_prefetch_max_positions: Annotated[int, Field(gt=0)] = 8
-    flash_moe_scored_eviction: bool = True
-    # Only prefetch from lookahead pairs whose trained holdout recall@m is at
-    # least this value — a low-recall head mostly reads wrong experts (pure
-    # wasted SSD bandwidth). 0.0 = no gating. Banks trained before recall
-    # persistence have no per-pair recall recorded and are never gated.
-    flash_moe_prefetch_min_recall: Annotated[float, Field(ge=0.0, le=1.0)] = 0.0
+    # (MoE expert predictive prefetch / lookahead was removed 2026-07-11: it
+    # never beat plain LRU. Root cause — expert I/O is not the bottleneck
+    # (experts are page-cache-resident), so speculative reads only added
+    # contention, and the routing is load-balanced so no causal predictor can
+    # anticipate reuse. See docs/superpowers/specs/2026-07-11-flash-moe-*.)
 
     # Flash prefetch — promoted toggle. Advanced prefetch tuning
     # (confidence_threshold, min/max_neurons, io_threads) stays on
@@ -861,9 +849,3 @@ class FlashMoeConfig:
     enabled: bool
     cache_budget_experts: int
     io_threads: int
-    # Prefetch knobs are global-only (no per-model registry override).
-    prefetch: bool = False
-    lookahead_margin: float = 1.5
-    prefetch_max_positions: int = 8
-    scored_eviction: bool = True
-    prefetch_min_recall: float = 0.0

@@ -14,7 +14,7 @@ import mlx.core as mx
 import numpy as np
 
 from olmlx.engine.flash._ssd_base import (
-    ScoredLayerCache,
+    LayerLruCache,
     close_fds,
     full_pread,
     open_fds,
@@ -117,7 +117,7 @@ class ExpertCacheStats:
             }
 
 
-_ExpertCache = ScoredLayerCache[int, dict[str, Any]]
+_ExpertCache = LayerLruCache[int, dict[str, Any]]
 
 
 class FlashMoeWeightStore:
@@ -131,7 +131,7 @@ class FlashMoeWeightStore:
     ):
         self._flash_dir = flash_dir
         self._executor = ThreadPoolExecutor(max_workers=num_io_threads)
-        self._cache: _ExpertCache = ScoredLayerCache(max_per_layer=cache_budget_experts)
+        self._cache: _ExpertCache = LayerLruCache(max_per_layer=cache_budget_experts)
         self._layout_config = json.loads(
             (flash_dir / "flash_moe_layout.json").read_text()
         )
@@ -198,46 +198,19 @@ class FlashMoeWeightStore:
                 raw, layout.hidden_size, layout.intermediate_size
             )
 
-    def set_layer_scores(self, layer_idx: int, scores: dict[int, float]) -> None:
-        """Push predicted-need scores for *layer_idx* (consumed by eviction)."""
-        self._cache.set_scores(layer_idx, scores)
-
-    def prefetch_experts(
-        self, layer_idx: int, expert_indices: list[int]
-    ) -> tuple[int, int]:
-        """Warm the cache with *expert_indices* for *layer_idx*.
-
-        Blocks until all reads land. Read failures are logged and skipped —
-        the synchronous ``load_experts`` path re-reads and reports them.
-        Returns ``(already_cached, fetched)`` counts.
-        """
-        if not expert_indices:
-            return (0, 0)
-        cached, missing = self._cache.get_cached_indices(layer_idx, expert_indices)
-        if not missing:
-            return (len(cached), 0)
-        future_to_idx = {
-            self._executor.submit(self._read_expert, layer_idx, idx): idx
-            for idx in missing
-        }
-        fetched = 0
-        for future in as_completed(future_to_idx):
-            idx = future_to_idx[future]
-            try:
-                self._cache.put(layer_idx, idx, future.result())
-                fetched += 1
-            except Exception:
-                logger.warning(
-                    "Prefetch read failed for layer %d expert %d",
-                    layer_idx,
-                    idx,
-                    exc_info=True,
-                )
-        return (len(cached), fetched)
-
     @staticmethod
-    def _parse_expert_with_manifest(raw: bytes, manifest: list[dict]) -> dict:
-        """Parse expert from raw bytes using the component manifest."""
+    def _parse_expert_with_manifest(
+        raw: bytes | bytearray | memoryview, manifest: list[dict]
+    ) -> dict:
+        """Parse expert from raw bytes using the component manifest.
+
+        Slices a zero-copy ``memoryview`` and lets ``mx.array`` perform the one
+        necessary host->device copy — no intermediate ``bytes`` slice copy and
+        no ``np.frombuffer(...).copy()``. ``mx.array`` copies at construction
+        (locked by ``test_parse_does_not_alias_source_buffer``), so the parsed
+        arrays never alias ``raw``.
+        """
+        mv = memoryview(raw)
         result = {}
         pos = 0
         for entry in manifest:
@@ -250,7 +223,7 @@ class FlashMoeWeightStore:
             if np_dtype is None:
                 raise ValueError(f"Unsupported dtype {dtype_str!r} in manifest")
 
-            arr = np.frombuffer(raw[pos : pos + nbytes], dtype=np_dtype).copy()
+            arr = np.frombuffer(mv[pos : pos + nbytes], dtype=np_dtype)
             if shape:
                 arr = arr.reshape(shape)
 
@@ -276,31 +249,38 @@ class FlashMoeWeightStore:
         return result
 
     @staticmethod
-    def _parse_float16_expert(raw: bytes, hidden: int, inter: int) -> dict:
-        """Parse non-quantized expert from raw bytes (legacy, no manifest)."""
+    def _parse_float16_expert(
+        raw: bytes | bytearray | memoryview, hidden: int, inter: int
+    ) -> dict:
+        """Parse non-quantized expert from raw bytes (legacy, no manifest).
+
+        Zero-copy ``memoryview`` slices; ``mx.array`` does the one host->device
+        copy (see :meth:`_parse_expert_with_manifest`).
+        """
         gate_size = inter * hidden * 2
         up_size = inter * hidden * 2
         down_size = hidden * inter * 2
 
+        mv = memoryview(raw)
         pos = 0
         gate_w = mx.array(
-            np.frombuffer(raw[pos : pos + gate_size], dtype=np.float16)
-            .copy()
-            .reshape(inter, hidden)
+            np.frombuffer(mv[pos : pos + gate_size], dtype=np.float16).reshape(
+                inter, hidden
+            )
         )
         pos += gate_size
 
         up_w = mx.array(
-            np.frombuffer(raw[pos : pos + up_size], dtype=np.float16)
-            .copy()
-            .reshape(inter, hidden)
+            np.frombuffer(mv[pos : pos + up_size], dtype=np.float16).reshape(
+                inter, hidden
+            )
         )
         pos += up_size
 
         down_w = mx.array(
-            np.frombuffer(raw[pos : pos + down_size], dtype=np.float16)
-            .copy()
-            .reshape(hidden, inter)
+            np.frombuffer(mv[pos : pos + down_size], dtype=np.float16).reshape(
+                hidden, inter
+            )
         )
 
         return {
@@ -319,8 +299,14 @@ class FlashMoeWeightStore:
         }
 
     @staticmethod
-    def _parse_quantized_expert(raw: bytes, layout: MoeExpertLayout) -> dict:
-        """Parse quantized expert from raw bytes (legacy, no manifest)."""
+    def _parse_quantized_expert(
+        raw: bytes | bytearray | memoryview, layout: MoeExpertLayout
+    ) -> dict:
+        """Parse quantized expert from raw bytes (legacy, no manifest).
+
+        Zero-copy ``memoryview`` slices; ``mx.array`` does the one host->device
+        copy (see :meth:`_parse_expert_with_manifest`).
+        """
         hidden = layout.hidden_size
         inter = layout.intermediate_size
         bits = layout.bits
@@ -329,6 +315,7 @@ class FlashMoeWeightStore:
         gate_packed_dim = hidden * bits // 32
         down_packed_dim = inter * bits // 32
 
+        mv = memoryview(raw)
         result = {}
         pos = 0
 
@@ -340,21 +327,24 @@ class FlashMoeWeightStore:
             in_dim = hidden if proj != "down" else inter
 
             w_size = out_dim * packed_dim * 4
-            w = np.frombuffer(raw[pos : pos + w_size], dtype=np.uint32).copy()
-            w = w.reshape(out_dim, packed_dim)
+            w = np.frombuffer(mv[pos : pos + w_size], dtype=np.uint32).reshape(
+                out_dim, packed_dim
+            )
             result[f"{proj}_weight"] = mx.array(w)
             pos += w_size
 
             s_dim = in_dim // group_size
             s_size = out_dim * s_dim * 2
-            s = np.frombuffer(raw[pos : pos + s_size], dtype=np.float16).copy()
-            s = s.reshape(out_dim, s_dim)
+            s = np.frombuffer(mv[pos : pos + s_size], dtype=np.float16).reshape(
+                out_dim, s_dim
+            )
             result[f"{proj}_scales"] = mx.array(s)
             pos += s_size
 
             b_size = out_dim * s_dim * 2
-            b = np.frombuffer(raw[pos : pos + b_size], dtype=np.float16).copy()
-            b = b.reshape(out_dim, s_dim)
+            b = np.frombuffer(mv[pos : pos + b_size], dtype=np.float16).reshape(
+                out_dim, s_dim
+            )
             result[f"{proj}_biases"] = mx.array(b)
             pos += b_size
 
@@ -383,10 +373,6 @@ class FlashMoeWeightStore:
         if not expert_indices:
             raise ValueError("expert_indices must not be empty")
         layout = self._layouts[layer_idx]
-        # Protect the in-flight request set from scored eviction, so a
-        # low-scored expert of THIS batch is not evicted mid-load by a
-        # concurrent prefetch insert for the same layer.
-        self._cache.protect(layer_idx, set(expert_indices))
 
         # Check cache
         cached = self._cache.get_batch(layer_idx, expert_indices)
@@ -426,14 +412,6 @@ class FlashMoeWeightStore:
                                     f.cancel()
         finally:
             self.stats.record(hits, misses, failures)
-            # Scores are consume-once: this layer's forward has now used
-            # (or bypassed) them; a stale prediction must not steer later
-            # evictions.
-            self._cache.clear_scores(layer_idx)
-            # Protection is scoped to THIS load. If it lingered, the next
-            # prefetch insert for this layer would find every cached key
-            # protected and evict LRU-oldest, defeating scored eviction.
-            self._cache.protect(layer_idx, set())
 
         if first_exc is not None:
             raise first_exc

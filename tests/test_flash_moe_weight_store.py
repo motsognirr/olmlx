@@ -81,6 +81,40 @@ class TestFlashMoeWeightStore:
                 atol=1e-6,
             )
 
+    def test_parse_does_not_alias_source_buffer(self, store_with_model):
+        """Parsed mx.arrays must not alias the raw source bytes.
+
+        ``mx.array`` copies host data at construction, so the parser can skip a
+        defensive ``.copy()``. This test locks that invariant: parse from a
+        mutable buffer, scribble over it BEFORE eval, and the arrays must still
+        equal a golden parse of the original bytes. If a future change (or MLX
+        version) made ``mx.array`` alias the host buffer, this fails loudly
+        instead of silently corrupting expert weights.
+        """
+        import os
+
+        from olmlx.engine.flash.moe_weight_store import FlashMoeWeightStore
+
+        store, _, _, _, _ = store_with_model
+        layout = store._layouts[1]  # first MoE layer
+        manifest = layout.manifest
+        assert manifest is not None
+        fd = store._fds[1]
+        raw = bytearray(os.pread(fd, layout.expert_byte_size, int(layout.offsets[0])))
+
+        golden = FlashMoeWeightStore._parse_expert_with_manifest(bytes(raw), manifest)
+        mx.eval([v for v in golden.values() if v is not None])
+
+        parsed = FlashMoeWeightStore._parse_expert_with_manifest(raw, manifest)
+        for i in range(len(raw)):  # wipe source before eval
+            raw[i] = 0
+        mx.eval([v for v in parsed.values() if v is not None])
+
+        for key, gv in golden.items():
+            if gv is None:
+                continue
+            assert mx.array_equal(parsed[key], gv), f"{key} aliased the source buffer"
+
     def test_cache_hit_avoids_reread(self, store_with_model):
         """Second load of same experts should use cache."""
         store, _, _, _, _ = store_with_model
@@ -382,74 +416,3 @@ class TestFlashMoeWeightStoreHeterogeneous:
             "language_model.model.layers.2.experts.switch_glu.gate_proj.weight"
         ][1]
         np.testing.assert_array_equal(np.array(loaded.gate_weight[0]), gate_orig)
-
-
-class TestPrefetchExperts:
-    @pytest.fixture()
-    def store_setup(self, tmp_path):
-        hidden, inter, experts = 64, 32, 8
-        model_dir = _make_synthetic_moe_weights(hidden, inter, experts, 2, 1, tmp_path)
-        output_dir = tmp_path / "flash_moe"
-
-        from olmlx.engine.flash.moe_bundler import bundle_moe_experts
-
-        bundle_moe_experts(model_dir, output_dir)
-
-        from olmlx.engine.flash.moe_weight_store import FlashMoeWeightStore
-
-        store = FlashMoeWeightStore(
-            output_dir, num_io_threads=4, cache_budget_experts=4
-        )
-        yield store, experts
-        store.close()
-
-    def test_prefetch_warms_cache(self, store_setup):
-        store, _ = store_setup
-        cached, fetched = store.prefetch_experts(1, [0, 2])
-        assert (cached, fetched) == (0, 2)
-        # Subsequent load is a pure cache hit
-        store.load_experts(1, [0, 2])
-        snap = store.stats.snapshot()
-        assert snap["cache_hits"] == 2
-        assert snap["cache_misses"] == 0
-
-    def test_prefetch_counts_already_cached(self, store_setup):
-        store, _ = store_setup
-        store.prefetch_experts(1, [0, 2])
-        cached, fetched = store.prefetch_experts(1, [0, 2, 3])
-        assert (cached, fetched) == (2, 1)
-
-    def test_prefetch_empty_is_noop(self, store_setup):
-        store, _ = store_setup
-        assert store.prefetch_experts(1, []) == (0, 0)
-
-    def test_scored_eviction_keeps_predicted_experts(self, store_setup):
-        store, _ = store_setup  # budget = 4
-        # Fill cache for layer 1 with experts 0-3
-        store.load_experts(1, [0, 1, 2, 3])
-        # Predictor says 0 and 1 are needed next, 2 and 3 are not
-        store.set_layer_scores(1, {0: 0.9, 1: 0.8, 2: 0.1, 3: 0.05})
-        # Prefetch two more -> two evictions, victims must be 3 then 2
-        store.prefetch_experts(1, [4, 5])
-        store.set_layer_scores(1, {0: 0.9, 1: 0.8, 4: 0.5, 5: 0.5})
-        store.load_experts(1, [0, 1])
-        snap = store.stats.snapshot()
-        assert snap["cache_misses"] == 4  # only the initial fill missed
-        assert snap["cache_hits"] == 2  # 0 and 1 survived eviction
-
-    def test_load_clears_scores(self, store_setup):
-        store, _ = store_setup
-        store.set_layer_scores(1, {0: 0.9, 1: 0.9, 2: 0.9, 3: 0.9})
-        store.load_experts(1, [0])  # consume -> clears scores for layer 1
-        # With scores cleared, filling past budget uses plain LRU again
-        store.load_experts(1, [1, 2, 3, 4])
-        # LRU-oldest (0) evicted despite its old high score
-        _, missing = store._cache.get_cached_indices(1, [0])
-        assert missing == [0]
-
-    def test_in_flight_request_protected(self, store_setup):
-        store, _ = store_setup  # budget = 4
-        # Request more experts than the budget in one call: the request's own
-        # experts must not evict each other into a miss for the return value.
-        loaded = store.load_experts(1, [0, 1, 2, 3, 4, 5])
-        assert loaded.up_weight.shape[0] == 6  # all six stacked

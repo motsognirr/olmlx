@@ -2681,7 +2681,6 @@ class TestFlashMoeActivationInstruction:
             lambda model_path, progress_callback: tmp_path / "flash_moe",
         )
         args = MagicMock()
-        args.train_lookahead = False
         _cmd_flash_moe_prepare(args, str(tmp_path))
 
         out = capsys.readouterr().out
