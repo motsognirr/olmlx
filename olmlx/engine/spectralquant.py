@@ -88,6 +88,14 @@ class SpectralRotation:
         """Initialize with eigenvector matrix V (head_dim, head_dim)."""
         self.V: mx.array = V
         self.V_T: mx.array = V.T
+        # Materialize both eagerly: the cache (and these rotations) is built on
+        # the event-loop thread while prefill/decode run on a separate worker
+        # thread. Under mlx >= 0.31.2 thread-local streams (#499) the lazy
+        # ``.T`` op would stay bound to the constructing thread's stream and
+        # crash with "There is no Stream(gpu, N) in current thread" when the
+        # graph is evaluated from the worker thread. Same fix as
+        # TurboQuantRotation.__init__.
+        mx.eval(self.V, self.V_T)
 
     def rotate(self, x: mx.array) -> mx.array:
         """Project into spectral basis: x @ V^T."""

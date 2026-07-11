@@ -1261,3 +1261,73 @@ class TestDetectHeadDim:
         del model.config.head_dim
         # No layers for k_proj fallback
         assert _detect_head_dim(model) == 128
+
+
+class TestRotationCrossThreadStreamSafety:
+    """Rotation matrices must build on one thread and evaluate on another.
+
+    Reproduces the TurboQuant + flash-MoE ``RuntimeError: There is no
+    Stream(gpu, N) in current thread`` crash.  The prompt cache — and the
+    ``TurboQuantRotation`` matrices it holds — is constructed on the event-loop
+    thread (``_make_prompt_cache_for_lm`` at ``inference.py``), while prefill
+    and decode run on a separate generation worker thread via
+    ``asyncio.to_thread``.  Under mlx >= 0.31.2 thread-local streams (#499), a
+    *lazy* op built on the constructing thread cannot be evaluated from the
+    worker thread.  ``matrix_T = self.matrix.T`` was such a lazy op, so the
+    router ``inds`` graph that transitively references it crashed at
+    ``flash_moe.py``'s ``mx.eval(inds)``.
+    """
+
+    def _build_on_thread(self, head_dim: int, seed: int):
+        import threading
+
+        from olmlx.engine.turboquant import TurboQuantRotation
+
+        holder: dict = {}
+
+        def build() -> None:
+            holder["rot"] = TurboQuantRotation(head_dim=head_dim, seed=seed)
+
+        t = threading.Thread(target=build)
+        t.start()
+        t.join()
+        return holder["rot"]
+
+    def test_matrix_T_eval_safe_from_other_thread(self):
+        import threading
+
+        rot = self._build_on_thread(head_dim=64, seed=1)
+        errors: list[Exception] = []
+
+        def use() -> None:
+            try:
+                mx.eval(rot.matrix_T)
+                mx.eval(rot.matrix)
+            except Exception as exc:  # noqa: BLE001
+                errors.append(exc)
+
+        u = threading.Thread(target=use)
+        u.start()
+        u.join()
+        assert not errors, f"cross-thread matrix eval failed: {errors!r}"
+
+    def test_quantize_eval_safe_from_other_thread(self):
+        import threading
+
+        from olmlx.engine.turboquant import turboquant_quantize
+
+        rot = self._build_on_thread(head_dim=64, seed=2)
+        errors: list[Exception] = []
+
+        def use() -> None:
+            try:
+                x = mx.random.normal((1, 2, 4, 64))
+                idx, nrm = turboquant_quantize(x, rot, bits=4)
+                mx.eval(idx, nrm)
+            except Exception as exc:  # noqa: BLE001
+                errors.append(exc)
+
+        u = threading.Thread(target=use)
+        u.start()
+        u.join()
+        assert not errors, f"cross-thread quantize eval failed: {errors!r}"
