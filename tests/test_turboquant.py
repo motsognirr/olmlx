@@ -1331,3 +1331,57 @@ class TestRotationCrossThreadStreamSafety:
         u.start()
         u.join()
         assert not errors, f"cross-thread quantize eval failed: {errors!r}"
+
+
+class TestCodebookCrossThreadStreamSafety:
+    """The module-global codebook cache must hold materialized leaves.
+
+    ``get_codebook`` caches ``centroids / mx.sqrt(mx.array(dim))`` — a *lazy*
+    divide op — in the module-global ``_codebook_cache``, shared across every
+    request and worker thread.  Under mlx >= 0.31.2 thread-local streams
+    (#499) a lazy op is bound to its constructing thread's stream, so the
+    first thread to build a given codebook binds it; a *second* concurrent
+    request whose worker thread references the same cached codebook then
+    crashes at ``mx.eval`` with "There is no Stream(cpu, N) in current
+    thread".  It surfaces at flash-MoE's ``mx.eval(inds)`` because the router
+    ``inds`` graph transitively references the dequantized K/V, hence the
+    codebook.  Same class of bug as ``TurboQuantRotation`` (both must
+    eager-eval), but the codebook was missed — the existing quantize test
+    happened to build the codebook on the same thread that evaluates it.
+    """
+
+    def test_codebook_built_on_one_thread_eval_safe_on_another(self):
+        import threading
+
+        from olmlx.engine import turboquant
+
+        # Force the *build* to happen on the builder thread, not the consumer:
+        # drop any entry a prior test cached on this (the main) thread.
+        turboquant._codebook_cache.pop((4, 64), None)
+
+        def build() -> None:
+            turboquant.get_codebook(bits=4, dim=64)
+
+        b = threading.Thread(target=build)
+        b.start()
+        b.join()
+
+        errors: list[Exception] = []
+
+        def use() -> None:
+            try:
+                # Evaluate the cached codebook directly...
+                cb = turboquant.get_codebook(bits=4, dim=64)
+                mx.eval(cb)
+                # ...and inside a real quantize graph, as production does.
+                rot = turboquant.TurboQuantRotation(head_dim=64, seed=7)
+                x = mx.random.normal((1, 2, 4, 64))
+                idx, nrm = turboquant.turboquant_quantize(x, rot, bits=4)
+                mx.eval(idx, nrm)
+            except Exception as exc:  # noqa: BLE001
+                errors.append(exc)
+
+        u = threading.Thread(target=use)
+        u.start()
+        u.join()
+        assert not errors, f"cross-thread codebook eval failed: {errors!r}"
