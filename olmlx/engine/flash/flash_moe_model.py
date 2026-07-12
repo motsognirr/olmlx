@@ -301,8 +301,19 @@ def wrap_flash_moe(
             num_experts=moe_config["num_experts"],
             num_experts_per_tok=moe_config["num_experts_per_tok"],
         )
-        # Materialize only non-expert weights.
-        mx.eval(wrapped.parameters())
+        # Materialize only non-expert weights. Eval the INNER model's params,
+        # not ``wrapped.parameters()``: the wrapper stores the model under the
+        # underscore-prefixed ``self._model``, which mlx's nn.Module.parameters()
+        # does NOT traverse, so ``wrapped.parameters()`` is empty and evaluating
+        # it materializes nothing. ``model`` was mutated in place by
+        # ``_replace_moe_layers`` (routed experts are now served from the SSD
+        # store, not the module tree), so ``model.parameters()`` is exactly the
+        # in-RAM non-expert set (embeddings, attention, router gates, norms).
+        # Leaving these lazy binds them to the load thread; under mlx thread-local
+        # streams (#499) the generation worker — a *different* asyncio.to_thread
+        # thread — then crashes evaluating them ("There is no Stream(cpu, N) in
+        # current thread") at flash-MoE's ``mx.eval(inds)`` on the first token.
+        mx.eval(model.parameters())
     except Exception:
         store.close()
         raise
