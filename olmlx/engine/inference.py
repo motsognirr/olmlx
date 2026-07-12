@@ -2659,6 +2659,17 @@ async def _store_prompt_cache_after_generation(
             # next request's pre-generation path will sync before
             # its own allocation.
         else:
+            # The store-time trim above ran on THIS (event-loop) thread. For a
+            # lazy-state cache (TurboQuant) a large trim takes `trim`'s
+            # buffer-shrink branch (`_key_indices = _key_indices[..., :cap, :]`
+            # — a lazy slice) and re-binds the packed buffers to the loop
+            # thread's Metal stream, *after* the worker-side materialize already
+            # ran. `_shed_transient_buffers` only nulls the dequant side
+            # buffers, so that lazy slice would be stored as-is and crash the
+            # next request's worker ("no Stream(gpu, N)"). Re-materialize here,
+            # on the loop thread that owns the freshly-created slice op, so the
+            # stored buffers are thread-agnostic leaves again.
+            materialize_lazy_cache_state(prompt_cache)
             evicted = await lm.prompt_cache_store.async_set(
                 cache_id,
                 CachedPromptState(tokens=stored_tokens, cache=prompt_cache),

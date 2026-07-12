@@ -278,6 +278,20 @@ class TurboQuantKVCache(_BaseCache):
         self._key_norms = self._key_norms[..., : self.offset, :]
         self._value_indices = self._value_indices[..., : self.offset, :]
         self._value_norms = self._value_norms[..., : self.offset, :]
+        self._eval_packed_buffers()
+
+    def _eval_packed_buffers(self) -> None:
+        """Force-evaluate the four packed persistent buffers in place.
+
+        Turns whatever lazy op currently backs them (a `slice_update` chain
+        from `update_and_fetch`, or a `[..., :cap, :]` slice from `trim` /
+        `_pin_state_to_offset`) into a materialized leaf, which mlx's
+        thread-local streams (>=0.31.2, #499) can read from any thread. The
+        four buffers are always allocated/sliced/nulled together, so guarding
+        on `_key_indices` alone is sufficient.
+        """
+        if self._key_indices is None:
+            return
         mx.eval(
             self._key_indices,
             self._key_norms,
@@ -330,14 +344,7 @@ class TurboQuantKVCache(_BaseCache):
         live cache keeps its ``step``-aligned headroom so a resumed request can
         append without an immediate regrow.
         """
-        if self._key_indices is None:
-            return
-        mx.eval(
-            self._key_indices,
-            self._key_norms,
-            self._value_indices,
-            self._value_norms,
-        )
+        self._eval_packed_buffers()
 
     def is_trimmable(self):
         return True

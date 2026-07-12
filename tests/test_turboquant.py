@@ -908,6 +908,59 @@ class TestTurboQuantKVCache:
         assert cache._key_indices is None
         cache.ensure_state_materialized()  # must not raise
 
+    @pytest.mark.usefixtures("metal_default_device")
+    def test_store_time_shrink_trim_then_materialize_survives_handoff(self):
+        """The store-time ``max_cache_tokens`` trim runs on the event-loop
+        thread; for a large shrink it takes ``trim``'s buffer-shrink branch
+        (`_key_indices = _key_indices[..., :cap, :]` — a lazy slice) and
+        re-binds the packed buffers to THAT thread, *after* the worker-side
+        materialize already ran. ``_store_prompt_cache_after_generation`` calls
+        ``ensure_state_materialized`` again after the trim; without it the
+        stored slice stays lazy and the next request's worker crashes with
+        "no Stream(gpu, N)".
+        """
+        head_dim = 64
+        holder: dict = {}
+
+        def build():
+            cache = self._make_cache(bits=4, head_dim=head_dim)
+            # 600 tokens -> capacity rounds up to 768 (step=256).
+            k, v = cache.update_and_fetch(
+                mx.random.normal((1, 4, 600, head_dim)),
+                mx.random.normal((1, 4, 600, head_dim)),
+            )
+            mx.eval(k, v)
+            cache.release_dequant_buffers()
+            cache.ensure_state_materialized()  # worker-side end-of-gen fix
+            holder["cache"] = cache
+
+        r0 = _run_cache_in_thread(build)
+        assert "error" not in r0, f"build thread crashed: {r0.get('error')!r}"
+        cache = holder["cache"]
+
+        # 'Event-loop' thread (this test thread): the store-time shrink trim
+        # (offset 600 -> 200 < capacity//2 fires the shrink branch), then the
+        # store path's re-materialize.
+        from olmlx.utils.streaming import materialize_lazy_cache_state
+
+        got = cache.trim(400)
+        assert got == 400 and cache.offset == 200
+        assert cache._key_indices.shape[2] < 600, "shrink branch did not fire"
+        materialize_lazy_cache_state([cache])
+
+        def reuse():
+            k, v = cache.update_and_fetch(
+                mx.random.normal((1, 4, 1, head_dim)),
+                mx.random.normal((1, 4, 1, head_dim)),
+            )
+            mx.eval(k, v)
+            return float(k.sum().item())
+
+        r = _run_cache_in_thread(reuse)
+        assert "error" not in r, (
+            f"reuse after store-time shrink trim crashed: {r.get('error')!r}"
+        )
+
 
 # ---------------------------------------------------------------------------
 # make_turboquant_cache tests
