@@ -94,7 +94,7 @@ from olmlx.engine.template_caps import TemplateCaps
 from olmlx.utils import metrics as _metrics
 from olmlx.utils import tracing as _tracing
 from olmlx.utils.audio_input import cleanup_temp_audio, materialize_audio
-from olmlx.utils.streaming import async_mlx_stream
+from olmlx.utils.streaming import async_mlx_stream, materialize_lazy_cache_state
 from olmlx.utils.timing import Timer, TimingStats
 
 
@@ -4232,6 +4232,16 @@ async def _full_completion_inner(
             from mlx_lm.generate import (
                 generation_stream,
             )  # used by mx.synchronize below
+
+        # Flat-path lazy-state caches (TurboQuant) leave their packed buffers
+        # bound to this worker thread's Metal stream (the fetch path returns
+        # from a dequant side buffer, so the packed writes never enter the
+        # per-token eval). Materialize them here, on the generating worker,
+        # before the cache is stored and reused from another worker thread —
+        # symmetric with the streaming path's gen_factory finalizer. Skipped by
+        # the speculative branch, which returns above and does not build these
+        # caches. No-op for plain/Spectral/Shard caches.
+        materialize_lazy_cache_state(gen_kwargs.get("prompt_cache"))
 
         # Sync the generation_stream specifically — mlx_lm/mlx_vlm run GPU
         # work on this module-level stream, not the default stream.  Without

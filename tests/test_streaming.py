@@ -12,7 +12,29 @@ from olmlx.utils.streaming import (
     CancellableStream,
     StreamToken,
     async_mlx_stream,
+    materialize_lazy_cache_state,
 )
+
+
+class TestMaterializeLazyCacheState:
+    def test_calls_ensure_state_materialized_on_lazy_layers(self):
+        calls = []
+
+        class _Lazy:
+            def ensure_state_materialized(self):
+                calls.append(self)
+
+        layers = [_Lazy(), _Lazy()]
+        materialize_lazy_cache_state(layers)
+        assert calls == layers
+
+    def test_skips_layers_without_the_method(self):
+        # Plain KVCache-style layers (no ensure_state_materialized) and None
+        # entries must be tolerated without raising.
+        materialize_lazy_cache_state([object(), None])
+
+    def test_none_cache_is_noop(self):
+        materialize_lazy_cache_state(None)
 
 
 class TestStreamToken:
@@ -122,6 +144,52 @@ class TestAsyncMlxStream:
 
         assert len(tokens) == 1
         assert tokens[0].text == "Description"
+
+    @pytest.mark.asyncio
+    async def test_lazy_cache_state_materialized_after_generation(self):
+        """After the text stream is exhausted, the worker must finalize any
+        lazy-state (TurboQuant) cache layer so its packed buffers stop being
+        bound to the generation worker thread — otherwise the next request's
+        worker crashes with "no Stream(gpu, N)" on the first forward.
+        """
+        mock_responses = [
+            MagicMock(
+                text="hi",
+                token=1,
+                prompt_tokens=5,
+                generation_tokens=1,
+                prompt_tps=100.0,
+                generation_tps=50.0,
+                finish_reason="stop",
+            ),
+        ]
+        mock_mlx_lm = MagicMock()
+        mock_mlx_lm.stream_generate = MagicMock(return_value=iter(mock_responses))
+
+        materialize_calls: list[int] = []
+
+        class _RecordingCacheLayer:
+            def ensure_state_materialized(self):
+                materialize_calls.append(1)
+
+        cache = [_RecordingCacheLayer()]
+
+        with patch.dict("sys.modules", {"mlx_lm": mock_mlx_lm}):
+            stream = async_mlx_stream(
+                MagicMock(),
+                MagicMock(),
+                "prompt",
+                max_tokens=10,
+                is_vlm=False,
+                prompt_cache=cache,
+            )
+            async for _ in stream:
+                pass
+
+        assert materialize_calls, (
+            "ensure_state_materialized was never called on the lazy-state cache "
+            "layer after generation — the worker-side finalization is not wired in"
+        )
 
     @pytest.mark.asyncio
     async def test_error_propagation(self):

@@ -302,6 +302,43 @@ class TurboQuantKVCache(_BaseCache):
         self._key_dequant = None
         self._value_dequant = None
 
+    def ensure_state_materialized(self) -> None:
+        """Force-evaluate the packed persistent buffers so they become
+        materialized leaves, safe to read from any worker thread.
+
+        ``update_and_fetch`` returns views over the ``_key_dequant`` /
+        ``_value_dequant`` *side* buffers, so the packed-buffer writes at
+        ``_key_indices[..., prev:offset, :] = k_idx`` (and the norms/value
+        equivalents) never enter the returned token's graph. mlx-lm's
+        per-token ``mx.eval`` therefore never materializes them: they
+        accumulate as a lazy ``slice_update`` chain bound to the generating
+        worker thread's Metal stream.
+
+        On the checkpoint persistence path this is handled by
+        ``_pin_state_to_offset`` (invoked by ``snapshot_cache_for_persistence``
+        on the worker). The **flat** persistence path — taken by trimmable
+        layouts, which includes every TurboQuant flash-MoE model
+        (``uses_checkpoint_persistence=False``) — stores the *live* cache
+        object without any such eval, so the next request's worker thread hits
+        a lazy graph bound to a now-dead thread and crashes with
+        "There is no Stream(gpu, N) in current thread" at the first forward
+        (flash-MoE ``mx.eval(inds)``). Calling this on the generating worker at
+        end-of-generation, before the cache can cross into another thread,
+        turns the packed buffers into stream-agnostic materialized leaves.
+
+        Unlike ``_pin_state_to_offset`` this does NOT slice to ``offset`` — the
+        live cache keeps its ``step``-aligned headroom so a resumed request can
+        append without an immediate regrow.
+        """
+        if self._key_indices is None:
+            return
+        mx.eval(
+            self._key_indices,
+            self._key_norms,
+            self._value_indices,
+            self._value_norms,
+        )
+
     def is_trimmable(self):
         return True
 

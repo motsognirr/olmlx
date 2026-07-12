@@ -377,6 +377,38 @@ def _make_prefill_progress(
     return _prefill_progress
 
 
+def materialize_lazy_cache_state(cache: Any) -> None:
+    """Force-evaluate any lazy, thread-bound packed state in a prompt cache.
+
+    Duck-typed dispatcher: calls ``ensure_state_materialized`` on every cache
+    layer that exposes it (only ``TurboQuantKVCache`` does — its packed buffers
+    are write-only during generation and stay bound to the generating worker
+    thread's Metal stream; see ``TurboQuantKVCache.ensure_state_materialized``).
+    Must be called ON the generation worker thread, after generation, before
+    the cache can be stored and reused from another thread. Plain KVCache /
+    Spectral / Shard / ArraysCache layers lack the method and are skipped —
+    their fetch path already reads (and thus materializes) their packed state.
+
+    Mirrors ``_shed_transient_buffers``'s duck-typed dispatch (store.py).
+    """
+    for layer in cache or ():
+        fn = getattr(layer, "ensure_state_materialized", None)
+        if callable(fn):
+            fn()
+
+
+def _cache_needs_materialize(cache: Any) -> bool:
+    """True iff any cache layer exposes ``ensure_state_materialized``.
+
+    Lets ``gen_factory`` skip wrapping the generator (and its per-token frame
+    overhead) for the common case of a plain, non-lazy cache or no cache.
+    """
+    return any(
+        callable(getattr(layer, "ensure_state_materialized", None))
+        for layer in cache or ()
+    )
+
+
 def async_mlx_stream(
     model: Any,
     tokenizer: Any,
@@ -447,7 +479,28 @@ def async_mlx_stream(
                     cancel_event, memory_limit=memory_limit
                 )
 
-            return mlx_lm.stream_generate(model, tokenizer, **gen_kwargs)
+            gen = mlx_lm.stream_generate(model, tokenizer, **gen_kwargs)
+            prompt_cache = gen_kwargs.get("prompt_cache")
+            if not _cache_needs_materialize(prompt_cache):
+                return gen
+
+            # Flat-path lazy-state caches (TurboQuant) leave their packed
+            # buffers as a lazy graph bound to THIS worker thread's Metal
+            # stream — ``update_and_fetch`` returns from a dequant side buffer,
+            # so the packed writes never enter mlx-lm's per-token ``mx.eval``.
+            # Materialize them here, on the generating worker, before the cache
+            # is stored and reused by a different worker thread (which would
+            # otherwise crash: "no Stream(gpu, N) in current thread"). The
+            # wrapper's ``finally`` runs on this thread on both exhaustion and
+            # ``gen.close()`` (cancel), and ``mx.eval`` blocks until done, so
+            # the buffers are materialized leaves before the worker returns.
+            def _finalizing():
+                try:
+                    yield from gen
+                finally:
+                    materialize_lazy_cache_state(prompt_cache)
+
+            return _finalizing()
 
     stream = CancellableStream(gen_factory, is_vlm=is_vlm, trace_context=trace_context)
     stream.start()
