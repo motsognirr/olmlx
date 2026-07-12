@@ -1,8 +1,31 @@
 """Tests for TurboQuant KV cache quantization."""
 
+import threading
+
 import mlx.core as mx
 import numpy as np
 import pytest
+
+
+def _run_cache_in_thread(fn):
+    """Run ``fn()`` on a fresh thread; return {'value': ...} or {'error': exc}.
+
+    Used to reproduce the mlx >=0.31.2 thread-local-stream (#499) hazard where a
+    lazy graph built on one thread cannot be evaluated from another.
+    """
+    result: dict = {}
+
+    def _target():
+        try:
+            result["value"] = fn()
+        except Exception as exc:  # noqa: BLE001 — the exception IS the result
+            result["error"] = exc
+
+    t = threading.Thread(target=_target)
+    t.start()
+    t.join(timeout=30)
+    assert not t.is_alive(), "worker thread hung"
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -818,6 +841,125 @@ class TestTurboQuantKVCache:
         assert state[0].shape[2] == 4
         # Norms: (B, H, offset, 1)
         assert state[1].shape[-1] == 1
+
+    @pytest.mark.usefixtures("metal_default_device")
+    def test_flat_path_reuse_survives_worker_thread_handoff(self):
+        """A TurboQuant cache built + shed on one worker thread, then reused on
+        a *different* worker thread, must not crash with "no Stream(gpu, N)".
+
+        This reproduces the flat-path cross-request crash: unlike the checkpoint
+        path (``snapshot_cache_for_persistence`` → ``_pin_state_to_offset``), the
+        flat store path never force-evaluates the packed buffers. Because
+        ``update_and_fetch`` returns from the ``_key_dequant`` *side* buffer, the
+        packed-buffer writes (``_key_indices`` etc.) never enter the returned
+        token's eval graph, so mlx-lm's per-token ``mx.eval`` leaves them a lazy
+        graph bound to the generating worker thread's Metal stream. Reusing the
+        cache on the next request's worker thread then dies at the first forward
+        (flash-MoE ``mx.eval(inds)``). ``ensure_state_materialized`` — called on
+        the generating worker before the cache can cross threads — turns the
+        packed buffers into materialized leaves that any thread can read.
+        """
+        head_dim = 64
+        holder: dict = {}
+
+        def build_and_shed():
+            # Runs on worker thread 1 — mirrors a generation request that
+            # prefills, decodes a few tokens, then hands the cache to the store.
+            cache = self._make_cache(bits=4, head_dim=head_dim)
+            k, v = cache.update_and_fetch(
+                mx.random.normal((1, 4, 16, head_dim)),
+                mx.random.normal((1, 4, 16, head_dim)),
+            )
+            mx.eval(k, v)  # simulate token eval: materializes dequant, NOT packed
+            for _ in range(3):
+                k, v = cache.update_and_fetch(
+                    mx.random.normal((1, 4, 1, head_dim)),
+                    mx.random.normal((1, 4, 1, head_dim)),
+                )
+                mx.eval(k, v)
+            cache.release_dequant_buffers()  # store chokepoint sheds the side buffer
+            cache.ensure_state_materialized()  # flat-path worker-side finalization
+            holder["cache"] = cache
+
+        r1 = _run_cache_in_thread(build_and_shed)
+        assert "error" not in r1, f"build thread crashed: {r1.get('error')!r}"
+        cache = holder["cache"]
+
+        def reuse():
+            # Runs on worker thread 2 — the next request rebuilds the shed
+            # dequant buffers from the packed state and appends a token.
+            k, v = cache.update_and_fetch(
+                mx.random.normal((1, 4, 1, head_dim)),
+                mx.random.normal((1, 4, 1, head_dim)),
+            )
+            mx.eval(k, v)
+            return float(k.sum().item())
+
+        r2 = _run_cache_in_thread(reuse)
+        assert "error" not in r2, (
+            f"cross-thread reuse crashed: {r2.get('error')!r} — packed buffers "
+            "were still bound to the build thread's Metal stream"
+        )
+
+    def test_ensure_state_materialized_no_packed_state_is_noop(self):
+        """ensure_state_materialized on a fresh (never-updated) cache is a no-op:
+        there are no packed buffers to evaluate, so it must not raise."""
+        cache = self._make_cache(bits=4, head_dim=32)
+        assert cache._key_indices is None
+        cache.ensure_state_materialized()  # must not raise
+
+    @pytest.mark.usefixtures("metal_default_device")
+    def test_store_time_shrink_trim_then_materialize_survives_handoff(self):
+        """The store-time ``max_cache_tokens`` trim runs on the event-loop
+        thread; for a large shrink it takes ``trim``'s buffer-shrink branch
+        (`_key_indices = _key_indices[..., :cap, :]` — a lazy slice) and
+        re-binds the packed buffers to THAT thread, *after* the worker-side
+        materialize already ran. ``_store_prompt_cache_after_generation`` calls
+        ``ensure_state_materialized`` again after the trim; without it the
+        stored slice stays lazy and the next request's worker crashes with
+        "no Stream(gpu, N)".
+        """
+        head_dim = 64
+        holder: dict = {}
+
+        def build():
+            cache = self._make_cache(bits=4, head_dim=head_dim)
+            # 600 tokens -> capacity rounds up to 768 (step=256).
+            k, v = cache.update_and_fetch(
+                mx.random.normal((1, 4, 600, head_dim)),
+                mx.random.normal((1, 4, 600, head_dim)),
+            )
+            mx.eval(k, v)
+            cache.release_dequant_buffers()
+            cache.ensure_state_materialized()  # worker-side end-of-gen fix
+            holder["cache"] = cache
+
+        r0 = _run_cache_in_thread(build)
+        assert "error" not in r0, f"build thread crashed: {r0.get('error')!r}"
+        cache = holder["cache"]
+
+        # 'Event-loop' thread (this test thread): the store-time shrink trim
+        # (offset 600 -> 200 < capacity//2 fires the shrink branch), then the
+        # store path's re-materialize.
+        from olmlx.utils.streaming import materialize_lazy_cache_state
+
+        got = cache.trim(400)
+        assert got == 400 and cache.offset == 200
+        assert cache._key_indices.shape[2] < 600, "shrink branch did not fire"
+        materialize_lazy_cache_state([cache])
+
+        def reuse():
+            k, v = cache.update_and_fetch(
+                mx.random.normal((1, 4, 1, head_dim)),
+                mx.random.normal((1, 4, 1, head_dim)),
+            )
+            mx.eval(k, v)
+            return float(k.sum().item())
+
+        r = _run_cache_in_thread(reuse)
+        assert "error" not in r, (
+            f"reuse after store-time shrink trim crashed: {r.get('error')!r}"
+        )
 
 
 # ---------------------------------------------------------------------------

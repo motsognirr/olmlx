@@ -94,7 +94,7 @@ from olmlx.engine.template_caps import TemplateCaps
 from olmlx.utils import metrics as _metrics
 from olmlx.utils import tracing as _tracing
 from olmlx.utils.audio_input import cleanup_temp_audio, materialize_audio
-from olmlx.utils.streaming import async_mlx_stream
+from olmlx.utils.streaming import async_mlx_stream, materialize_lazy_cache_state
 from olmlx.utils.timing import Timer, TimingStats
 
 
@@ -2659,6 +2659,17 @@ async def _store_prompt_cache_after_generation(
             # next request's pre-generation path will sync before
             # its own allocation.
         else:
+            # The store-time trim above ran on THIS (event-loop) thread. For a
+            # lazy-state cache (TurboQuant) a large trim takes `trim`'s
+            # buffer-shrink branch (`_key_indices = _key_indices[..., :cap, :]`
+            # — a lazy slice) and re-binds the packed buffers to the loop
+            # thread's Metal stream, *after* the worker-side materialize already
+            # ran. `_shed_transient_buffers` only nulls the dequant side
+            # buffers, so that lazy slice would be stored as-is and crash the
+            # next request's worker ("no Stream(gpu, N)"). Re-materialize here,
+            # on the loop thread that owns the freshly-created slice op, so the
+            # stored buffers are thread-agnostic leaves again.
+            materialize_lazy_cache_state(prompt_cache)
             evicted = await lm.prompt_cache_store.async_set(
                 cache_id,
                 CachedPromptState(tokens=stored_tokens, cache=prompt_cache),
@@ -4232,6 +4243,16 @@ async def _full_completion_inner(
             from mlx_lm.generate import (
                 generation_stream,
             )  # used by mx.synchronize below
+
+        # Flat-path lazy-state caches (TurboQuant) leave their packed buffers
+        # bound to this worker thread's Metal stream (the fetch path returns
+        # from a dequant side buffer, so the packed writes never enter the
+        # per-token eval). Materialize them here, on the generating worker,
+        # before the cache is stored and reused from another worker thread —
+        # symmetric with the streaming path's gen_factory finalizer. Skipped by
+        # the speculative branch, which returns above and does not build these
+        # caches. No-op for plain/Spectral/Shard caches.
+        materialize_lazy_cache_state(gen_kwargs.get("prompt_cache"))
 
         # Sync the generation_stream specifically — mlx_lm/mlx_vlm run GPU
         # work on this module-level stream, not the default stream.  Without
