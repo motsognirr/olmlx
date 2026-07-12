@@ -293,6 +293,94 @@ class TestFlashMoeModelWrapper:
             assert isinstance(wrapped.layers[i].mlp, _FlashMoEBase)
 
 
+class TestWrapFlashMoeMaterializesParams:
+    """``wrap_flash_moe`` must materialize the inner model's (non-expert) params.
+
+    Regression: the wrapper stores the model under ``self._model`` (underscore),
+    which mlx's ``nn.Module.parameters()`` does NOT traverse — so
+    ``wrapped.parameters()`` is EMPTY and ``mx.eval(wrapped.parameters())`` was a
+    no-op that materialized nothing. Every weight stayed *lazy*, bound to the
+    thread that loaded it. Under mlx thread-local streams (#499) the server loads
+    on one ``asyncio.to_thread`` worker and generates on another, so the forward
+    evaluated load-thread-bound lazy weights and crashed with "There is no
+    Stream(cpu, N) in current thread" at flash-MoE's ``mx.eval(inds)`` —
+    ``embed_tokens.weight`` (and every other in-RAM weight) is the lazy leaf hit.
+    Deterministic for every ``kv_cache_quant`` flash-MoE model (GLM-4.5-Air,
+    Qwen3-235B, ...). Fix: eval the inner model's params, not the wrapper's.
+    """
+
+    def _setup(self, tmp_path):
+        import json
+
+        from olmlx.engine.flash.moe_bundler import bundle_moe_experts
+
+        hidden, inter, experts = 64, 32, 8
+        num_dense, num_moe = 1, 2
+        num_experts_per_tok = 2
+
+        model_dir = _make_synthetic_moe_weights(
+            hidden, inter, experts, num_moe, num_dense, tmp_path
+        )
+        output_dir = tmp_path / "flash_moe"
+        bundle_moe_experts(model_dir, output_dir)
+        # The bundler writes flash_moe_layout.json; wrap_flash_moe additionally
+        # reads flash_moe_config.json (normally emitted by the serving prepare
+        # step). Write the minimal config it needs.
+        (output_dir / "flash_moe_config.json").write_text(
+            json.dumps(
+                {
+                    "moe_layer_indices": [1, 2],
+                    "hidden_size": hidden,
+                    "intermediate_size": inter,
+                    "num_experts": experts,
+                    "num_experts_per_tok": num_experts_per_tok,
+                }
+            )
+        )
+        model = _MockModel(
+            hidden, inter, experts, num_experts_per_tok, num_dense, num_moe
+        )
+        return model, output_dir
+
+    def test_inner_params_materialized_cross_thread(self, tmp_path):
+        """After wrap, the inner model's params must eval safely from another
+        thread — i.e. they were materialized on the wrapping thread, not left
+        lazy and stream-bound."""
+        import threading
+
+        from mlx.utils import tree_flatten
+
+        from olmlx.engine.flash.flash_moe_model import wrap_flash_moe
+
+        model, flash_dir = self._setup(tmp_path)
+        # wrap_flash_moe runs on THIS (main) thread — same as the server's load
+        # worker. Its mx.eval must materialize the inner weights here.
+        wrapped, store = wrap_flash_moe(
+            model, flash_dir, io_threads=2, cache_budget_experts=8
+        )
+        try:
+            leaves = [v for _, v in tree_flatten(wrapped._model.parameters())]
+            assert leaves, "inner model exposed no parameters — test setup is wrong"
+
+            errors: list[Exception] = []
+
+            def use() -> None:
+                try:
+                    mx.eval(leaves)
+                except Exception as exc:  # noqa: BLE001
+                    errors.append(exc)
+
+            t = threading.Thread(target=use)
+            t.start()
+            t.join()
+            assert not errors, (
+                "inner params not materialized by wrap_flash_moe — cross-thread "
+                f"eval failed: {errors!r}"
+            )
+        finally:
+            store.close()
+
+
 # ---------------------------------------------------------------------------
 # Synthetic Qwen3-Next-like model for testing (plain nn.Linear gate)
 # ---------------------------------------------------------------------------
