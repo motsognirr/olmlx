@@ -182,6 +182,58 @@ def _ensure_tokenizer_eos_in_stops(tokenizer: Any) -> None:
     stops.add(inner_eos)
 
 
+def _materialize_module_buffers(model: Any) -> None:
+    """Eager-eval a model's non-parameter array buffers on the current thread.
+
+    mlx-lm's ``load`` materializes ``mx.eval(model.parameters())``, but
+    ``nn.Module.parameters()`` skips **underscore-prefixed** dict keys (the
+    same traversal gap behind the flash-MoE #657 crash). Scaled-RoPE variants
+    — Yarn, longrope, llama3, proportional — precompute ``self._freqs`` (and
+    ``self._scale``) as *lazy* arrays in ``__init__``, so they are never
+    reached by the load-time parameter eval and stay bound to the load
+    thread's Metal stream.
+
+    Under mlx >= 0.31.2 thread-local streams (#499) the model is loaded on one
+    ``asyncio``/generation worker thread and generated on another, so the first
+    forward that evaluates a graph referencing the lazy ``_freqs`` raises
+    "There is no Stream(gpu, N) in current thread" — deterministically, on
+    every request. This surfaces on long-context models whose RoPE is scaled
+    (e.g. the 1M-context Qwen3.5 hybrid ``empero-ai/Qwythos-9B``); models on
+    the default/mrope RoPE carry no ``_freqs`` buffer and are unaffected.
+
+    Materializing the buffers here, on the load thread, turns them into leaves
+    (which carry no stream binding) so they can be read from any worker thread.
+    ``nn.Module`` is a ``dict`` subclass whose attributes are stored as items,
+    so we walk ``named_modules()`` and collect the underscore-keyed array
+    leaves (recursing into plain list/tuple/dict containers, but not into
+    child ``nn.Module``s — those are visited by ``named_modules()`` in turn).
+    """
+    buffers: list[mx.array] = []
+
+    def _collect(value: Any) -> None:
+        if isinstance(value, nn.Module):
+            return  # visited independently by named_modules()
+        if isinstance(value, mx.array):
+            buffers.append(value)
+        elif isinstance(value, (list, tuple)):
+            for item in value:
+                _collect(item)
+        elif isinstance(value, dict):
+            for item in value.values():
+                _collect(item)
+
+    try:
+        modules = model.named_modules()
+    except AttributeError:
+        return  # not an nn.Module tree (e.g. a test double) — nothing to do
+    for _name, module in modules:
+        for key, value in module.items():
+            if key.startswith("_"):
+                _collect(value)
+    if buffers:
+        mx.eval(buffers)
+
+
 def _load_with_model_type_fallback(mlx_lm, load_path, **kwargs):
     """Load model + tokenizer, remapping unrecognised model_type if needed.
 
@@ -247,6 +299,12 @@ def _load_with_model_type_fallback(mlx_lm, load_path, **kwargs):
     # Outside try/except: an AttributeError from the EOS helper must not
     # trigger the model-type remapping fallback with a misleading error.
     _ensure_tokenizer_eos_in_stops(tokenizer)
+    # Materialize non-parameter buffers (scaled-RoPE ``_freqs``, ...) on THIS
+    # (load) thread — mlx-lm's ``mx.eval(model.parameters())`` skips them, and
+    # left lazy they crash when first evaluated on the generation worker thread
+    # (#499 thread-local streams). Covers both the mlx-lm happy path and the
+    # config-remap fallback above.
+    _materialize_module_buffers(model)
     return model, tokenizer
 
 
