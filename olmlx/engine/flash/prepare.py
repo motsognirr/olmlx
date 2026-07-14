@@ -65,7 +65,10 @@ def load_model_with_strict_fallback(model_path: str, *, lazy: bool) -> tuple:
     # Function-local import: model_manager doesn't import flash.prepare at
     # module level, but a top-level import here would still cross a module
     # boundary for an internal helper. Keep the dependency lazy.
-    from olmlx.engine.model_manager import _ensure_tokenizer_eos_in_stops
+    from olmlx.engine.model_manager import (
+        _ensure_tokenizer_eos_in_stops,
+        _materialize_module_buffers,
+    )
 
     try:
         # mlx_lm.load returns 2- or 3-tuple depending on return_config; default
@@ -90,6 +93,12 @@ def load_model_with_strict_fallback(model_path: str, *, lazy: bool) -> tuple:
             model_dir, eos_token_ids=[eos] if isinstance(eos, int) else eos
         )
     _ensure_tokenizer_eos_in_stops(tokenizer)
+    # Materialize non-parameter buffers (scaled-RoPE ``_freqs``, ...) on THIS
+    # (load) thread — mlx-lm's parameter eval skips underscore buffers, which
+    # otherwise crash when first evaluated on the generation worker thread
+    # (#499). Only touches small computed constants, never the (lazy=True)
+    # weights this path deliberately keeps unmaterialized.
+    _materialize_module_buffers(model)
     return model, tokenizer
 
 

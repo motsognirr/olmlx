@@ -121,3 +121,131 @@ class TestThreadLocalStreamSemantics:
 
         res = _run_in_thread(work)
         assert res.get("error") is None, f"worker failed: {res.get('error')!r}"
+
+
+def _yarn_rope_model():
+    """A minimal module tree carrying a scaled-RoPE ``_freqs`` buffer.
+
+    Mirrors mlx-lm's ``Qwen3_5``/``Qwen3Next`` attention layout: each attention
+    submodule owns a ``YarnRoPE`` whose ``self._freqs`` is a *lazy* array built
+    in ``__init__`` (no ``with mx.stream``), bound to the constructing thread's
+    default stream. Because the key is underscore-prefixed, it is NOT part of
+    ``nn.Module.parameters()`` — so mlx-lm's load-time ``mx.eval(parameters())``
+    never materializes it.
+    """
+    import mlx.nn as nn
+    from mlx_lm.models.rope_utils import YarnRoPE
+
+    class Attn(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.q_proj = nn.Linear(32, 32, bias=False)
+            self.rope = YarnRoPE(
+                dims=32,
+                max_position_embeddings=1048576,
+                scaling_factor=4.0,
+                original_max_position_embeddings=262144,
+            )
+
+    class Model(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.layers = [Attn(), Attn()]
+
+    return Model()
+
+
+def _rope_forward_on_worker(model):
+    """Run ``model.layers[0].rope`` on a fresh thread; return _run_in_thread result."""
+
+    def work():
+        x = mx.random.normal((1, 4, 8, 32))
+        mx.eval(model.layers[0].rope(x))
+        return True
+
+    return _run_in_thread(work)
+
+
+@pytest.mark.usefixtures("metal_default_device")
+class TestScaledRopeBufferMaterialization:
+    """Regression gate for the Yarn/longrope ``_freqs`` cross-thread crash.
+
+    A 1M-context model (e.g. Qwen3.5 hybrid ``empero-ai/Qwythos-9B``) uses a
+    scaled RoPE whose ``_freqs`` buffer is not reached by
+    ``mx.eval(model.parameters())``. Loaded on one worker thread and generated
+    on another, the first forward eval raised "There is no Stream(gpu, 0) in
+    current thread". ``_materialize_module_buffers`` closes that gap by eager-
+    evaluating the non-parameter buffers on the load thread.
+    """
+
+    def test_lazy_rope_freqs_crashes_cross_thread_without_fix(self):
+        # Negative control: reproduces the reported crash. Locks in the fact
+        # that mx.eval(parameters()) is insufficient, so a future refactor that
+        # drops _materialize_module_buffers can't silently pass.
+        model = _yarn_rope_model()
+        mx.eval(model.parameters())  # mimic mlx-lm load (misses _freqs)
+
+        res = _rope_forward_on_worker(model)
+        assert res.get("error") is not None, (
+            "expected the load-thread-bound lazy _freqs to crash on the worker "
+            "thread — if this passes, scaled-RoPE buffers no longer stay lazy "
+            "and the fix may be unnecessary"
+        )
+        assert "Stream" in str(res["error"])
+
+    def test_materialize_module_buffers_fixes_cross_thread(self):
+        from olmlx.engine.model_manager import _materialize_module_buffers
+
+        model = _yarn_rope_model()
+        mx.eval(model.parameters())
+        _materialize_module_buffers(model)  # the fix, on the load thread
+
+        res = _rope_forward_on_worker(model)
+        assert res.get("error") is None, (
+            f"scaled-RoPE _freqs not materialized cross-thread: {res.get('error')!r}"
+        )
+        assert res["value"] is True
+
+
+@pytest.mark.usefixtures("metal_default_device")
+class TestScaledRopeBufferMaterializationWiring:
+    """The three loader chokepoints materialize buffers on the load thread.
+
+    Text goes through ``_load_with_model_type_fallback``; every mlx-vlm load
+    (main VLM, lm-then-vlm fallback, flash / flash-MoE VLM fallback) through
+    ``load_vlm``; the flash dense path through
+    ``load_model_with_strict_fallback``. Each is monkeypatched to return a
+    scaled-RoPE model so the wiring is exercised without a real model load.
+    """
+
+    def test_load_vlm_materializes_buffers(self, monkeypatch):
+        import mlx_vlm
+
+        from olmlx.engine.vlm_load import load_vlm
+
+        model = _yarn_rope_model()
+        mx.eval(model.parameters())  # load-time param eval (misses _freqs)
+        monkeypatch.setattr(mlx_vlm, "load", lambda *a, **k: (model, object()))
+
+        out_model, _ = load_vlm("fake/path", lazy=True)
+        assert out_model is model
+        res = _rope_forward_on_worker(out_model)
+        assert res.get("error") is None, (
+            f"load_vlm left scaled-RoPE _freqs lazy: {res.get('error')!r}"
+        )
+
+    def test_strict_fallback_materializes_buffers(self, monkeypatch):
+        import mlx_lm
+
+        from olmlx.engine.flash.prepare import load_model_with_strict_fallback
+
+        model = _yarn_rope_model()
+        mx.eval(model.parameters())
+        monkeypatch.setattr(mlx_lm, "load", lambda *a, **k: (model, object()))
+
+        out_model, _ = load_model_with_strict_fallback("fake/path", lazy=False)
+        assert out_model is model
+        res = _rope_forward_on_worker(out_model)
+        assert res.get("error") is None, (
+            f"strict-fallback load left scaled-RoPE _freqs lazy: {res.get('error')!r}"
+        )
