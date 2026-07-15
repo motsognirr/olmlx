@@ -249,3 +249,145 @@ class TestScaledRopeBufferMaterializationWiring:
         assert res.get("error") is None, (
             f"strict-fallback load left scaled-RoPE _freqs lazy: {res.get('error')!r}"
         )
+
+
+def _whisper_buffer_model():
+    """A minimal module tree carrying mlx_whisper's two lazy underscore buffers.
+
+    Mirrors ``mlx_whisper.whisper``: ``AudioEncoder.__init__`` sets
+    ``self._positional_embedding = sinusoids(...).astype(dtype)`` and
+    ``TextDecoder.__init__`` sets ``self._mask =
+    create_additive_causal_mask(...).astype(dtype)`` — both *lazy* arrays built
+    in ``__init__`` and stored under underscore keys, so they are NOT part of
+    ``nn.Module.parameters()``. ``mlx_whisper.load_models.load_model``'s
+    ``mx.eval(model.parameters())`` therefore never materializes them, leaving
+    them bound to the load thread's stream.
+    """
+    import mlx.nn as nn
+    from mlx_whisper.whisper import sinusoids
+
+    class Encoder(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.conv = nn.Linear(8, 8, bias=False)  # a real parameter
+            self._positional_embedding = sinusoids(16, 8).astype(mx.float16)
+
+    class Decoder(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self._mask = nn.MultiHeadAttention.create_additive_causal_mask(16).astype(
+                mx.float16
+            )
+
+    class Model(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.encoder = Encoder()
+            self.decoder = Decoder()
+
+    return Model()
+
+
+def _whisper_buffers_on_worker(model):
+    """Consume both underscore buffers via new ops on a fresh thread."""
+
+    def work():
+        mx.eval(model.encoder._positional_embedding + 0.0)
+        mx.eval(model.decoder._mask + 0.0)
+        return True
+
+    return _run_in_thread(work)
+
+
+@pytest.mark.usefixtures("metal_default_device")
+class TestWhisperBufferMaterialization:
+    """Regression gate for the whisper cross-thread crash (issue #651).
+
+    ``mlx_whisper.load_models.load_model`` runs ``mx.eval(model.parameters())``,
+    which skips the underscore-keyed ``_positional_embedding`` / ``_mask``
+    buffers. Loaded on one ``asyncio.to_thread`` pool thread and run on another
+    (whisper *load* vs. *transcribe* land on different pool threads once prior
+    traffic has rotated the executor), the first forward that evaluates them
+    raised the uncatchable ``libc++abi ... There is no Stream(gpu, N) in current
+    thread`` process abort. Same class as the scaled-RoPE ``_freqs`` gap.
+    """
+
+    def test_whisper_lazy_buffers_crash_cross_thread_without_fix(self):
+        # Negative control: reproduces the reported crash so a future refactor
+        # that drops _materialize_module_buffers on the whisper path can't
+        # silently pass. Mirrors the scaled-RoPE negative control.
+        model = _whisper_buffer_model()
+        mx.eval(model.parameters())  # mimic mlx_whisper.load_model (misses them)
+
+        res = _whisper_buffers_on_worker(model)
+        assert res.get("error") is not None, (
+            "expected the load-thread-bound lazy whisper buffers to crash on the "
+            "worker thread — if this passes, mlx_whisper's _positional_embedding/"
+            "_mask no longer stay lazy and the fix may be unnecessary"
+        )
+        assert "Stream" in str(res["error"])
+
+    def test_materialize_module_buffers_fixes_whisper(self):
+        from olmlx.engine.model_manager import _materialize_module_buffers
+
+        model = _whisper_buffer_model()
+        mx.eval(model.parameters())
+        _materialize_module_buffers(model)  # the fix, on the load thread
+
+        res = _whisper_buffers_on_worker(model)
+        assert res.get("error") is None, (
+            f"whisper buffers not materialized cross-thread: {res.get('error')!r}"
+        )
+        assert res["value"] is True
+
+
+@pytest.mark.usefixtures("metal_default_device")
+class TestWhisperTtsLoaderWiring:
+    """The whisper and TTS loader chokepoints materialize buffers at load.
+
+    ``ModelManager._load_model_whisper`` (whisper STT) and ``_load_model_tts``
+    (Kokoro etc.) both return a model whose non-parameter buffers must be
+    materialized on the load thread — otherwise a cross-thread forward aborts
+    the process. Each underlying loader is monkeypatched to return a model with
+    lazy underscore buffers so the wiring is exercised without a real load.
+    """
+
+    def test_load_model_whisper_materializes_buffers(self, monkeypatch):
+        import mlx_whisper.load_models as whisper_loader
+
+        from olmlx.engine.model_manager import ModelManager
+
+        model = _whisper_buffer_model()
+        mx.eval(model.parameters())  # load-time param eval (misses the buffers)
+        monkeypatch.setattr(whisper_loader, "load_model", lambda *a, **k: model)
+
+        out_model, tokenizer, is_vlm, _caps, decoder = ModelManager._load_model_whisper(
+            "fake/path"
+        )
+        assert out_model is model
+        assert tokenizer is None and is_vlm is False and decoder is None
+        res = _whisper_buffers_on_worker(out_model)
+        assert res.get("error") is None, (
+            f"_load_model_whisper left buffers lazy: {res.get('error')!r}"
+        )
+
+    def test_load_model_tts_materializes_buffers(self, monkeypatch):
+        tts_utils = pytest.importorskip("mlx_audio.tts.utils")
+
+        from olmlx.engine.model_manager import ModelManager
+
+        model = _whisper_buffer_model()  # stands in for a TTS model w/ lazy bufs
+        mx.eval(model.parameters())
+        monkeypatch.setattr(tts_utils, "load_model", lambda *a, **k: model)
+
+        # _load_model_tts ignores self; a bare instance avoids full construction.
+        mgr = ModelManager.__new__(ModelManager)
+        out_model, tokenizer, is_vlm, _caps, decoder = mgr._load_model_tts(
+            "fake/hf", "fake/path"
+        )
+        assert out_model is model
+        assert tokenizer is None and is_vlm is False and decoder is None
+        res = _whisper_buffers_on_worker(out_model)
+        assert res.get("error") is None, (
+            f"_load_model_tts left buffers lazy: {res.get('error')!r}"
+        )

@@ -3584,14 +3584,7 @@ class ModelManager(SpeculativeLoaderMixin):
         logger.info("Detected model kind for %s: %s", hf_path, kind)
 
         if kind == "whisper":
-            # Whisper STT (issue #366). Load via mlx-whisper's loader and
-            # return no tokenizer/caps/speculative — the transcription path
-            # drives mlx_whisper.transcribe() directly.
-            import mlx.core as mx
-            import mlx_whisper.load_models as whisper_loader
-
-            model = whisper_loader.load_model(load_path, dtype=mx.float16)
-            return model, None, False, TemplateCaps(), None
+            return self._load_model_whisper(load_path)
 
         if kind == "tts":
             return self._load_model_tts(hf_path, load_path)
@@ -3688,6 +3681,33 @@ class ModelManager(SpeculativeLoaderMixin):
 
         return model, tokenizer, is_vlm, caps, None
 
+    @staticmethod
+    def _load_model_whisper(load_path: str):
+        """Load a Whisper STT model via mlx-whisper (issue #366).
+
+        Returns the 5-tuple shape ``_load_model`` uses
+        ``(model, tokenizer, is_vlm, caps, speculative_decoder)``. Whisper has
+        no tokenizer / chat template / speculative decoder — the transcription
+        path drives ``mlx_whisper.transcribe()`` directly.
+
+        ``mlx_whisper.load_models.load_model`` runs ``mx.eval(model.parameters())``,
+        but ``AudioEncoder._positional_embedding`` and ``TextDecoder._mask`` are
+        lazy arrays stored under underscore keys, so ``parameters()`` skips them
+        (the same gap behind the scaled-RoPE ``_freqs`` crash — see
+        ``_materialize_module_buffers``). Left lazy they stay bound to the load
+        thread's Metal stream, and the first transcription forward — which runs
+        on a *different* ``asyncio.to_thread`` pool thread once prior traffic has
+        rotated the executor — aborts the process with
+        ``libc++abi ... There is no Stream(gpu, N) in current thread`` (#651).
+        Materialize them here, on the load thread.
+        """
+        import mlx.core as mx
+        import mlx_whisper.load_models as whisper_loader
+
+        model = whisper_loader.load_model(load_path, dtype=mx.float16)
+        _materialize_module_buffers(model)
+        return model, None, False, TemplateCaps(), None
+
     def _load_model_tts(self, hf_path: str, load_path: str):
         """Load a TTS model (Kokoro) via mlx-audio (issue #367).
 
@@ -3710,6 +3730,13 @@ class ModelManager(SpeculativeLoaderMixin):
             ) from exc
 
         model = tts_utils.load_model(Path(load_path))
+        # Kokoro carries no lazy underscore buffers, but the loader is generic
+        # over all mlx-audio TTS models — several (fish, spark, indextts, ...)
+        # stash lazy ``_cos``/``_sin``/``_pe``/``_inv_freq`` buffers under
+        # underscore keys that ``mx.eval(model.parameters())`` skips. Materialize
+        # them on the load thread so a cross-thread speech forward can't abort
+        # the process (same class as the whisper #651 crash).
+        _materialize_module_buffers(model)
         return model, None, False, TemplateCaps(), None
 
     @staticmethod
