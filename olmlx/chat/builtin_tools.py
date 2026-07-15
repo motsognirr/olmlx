@@ -75,24 +75,45 @@ def _strip_html(text: str) -> str:
     return parser.get_text()
 
 
-def _resolve_path(path: str, base_dir: Path | None = None) -> Path:
+def _resolve_path(
+    path: str, base_dir: Path | None = None, confine_root: Path | None = None
+) -> Path:
     """Resolve and validate path to prevent path traversal attacks.
 
-    Handles both relative and absolute paths. For absolute paths, returns
-    resolved directly. For relative paths, resolves relative to base_dir
-    (defaults to cwd) and prevents traversal via '..'.
+    Handles both relative and absolute paths. For relative paths, resolves
+    relative to base_dir (defaults to cwd) and prevents traversal via '..'.
+
+    ``confine_root`` (issue #611) tightens this to a hard sandbox: when set,
+    **both** absolute and relative paths must resolve inside it — absolute
+    paths no longer bypass the containment check. Relative paths resolve
+    against ``confine_root``. Used by the headless agent so web-content-driven
+    ``write_file``/``edit_file`` calls can't escape the workspace. When
+    ``confine_root`` is None the legacy behavior is preserved (absolute paths
+    pass through unchecked).
 
     Args:
         path: User-provided file path (absolute or relative)
         base_dir: Allowed base directory for relative paths (defaults to cwd)
+        confine_root: Hard sandbox root; absolute and relative paths alike must
+            resolve within it
 
     Returns:
         Resolved absolute Path
 
     Raises:
-        ValueError: If path attempts to escape base_dir via traversal
+        ValueError: If the path escapes base_dir/confine_root
     """
     input_path = Path(path).expanduser()
+
+    if confine_root is not None:
+        root = confine_root.resolve()
+        candidate = input_path if input_path.is_absolute() else root / path
+        resolved = candidate.resolve()
+        try:
+            resolved.relative_to(root)
+        except ValueError:
+            raise ValueError(f"Path {path!r} is outside the allowed workspace {root}")
+        return resolved
 
     if input_path.is_absolute():
         return input_path.resolve()
@@ -163,12 +184,14 @@ async def _handle_read_file(args: dict) -> str | ToolError:
     return "\n".join(numbered)
 
 
-async def _handle_write_file(args: dict) -> str | ToolError:
+async def _handle_write_file(
+    args: dict, confine_root: Path | None = None
+) -> str | ToolError:
     path = args.get("path", "")
     content = args.get("content", "")
 
     try:
-        safe_path = _resolve_path(path)
+        safe_path = _resolve_path(path, confine_root=confine_root)
     except ValueError as exc:
         return ToolError(message=str(exc), tool_name="write_file", is_user_error=True)
 
@@ -188,13 +211,15 @@ async def _handle_write_file(args: dict) -> str | ToolError:
     return f"Wrote {len(content.encode())} bytes to {safe_path}"
 
 
-async def _handle_edit_file(args: dict) -> str | ToolError:
+async def _handle_edit_file(
+    args: dict, confine_root: Path | None = None
+) -> str | ToolError:
     path = args.get("path", "")
     old_text = args.get("old_text", "")
     new_text = args.get("new_text", "")
 
     try:
-        safe_path = _resolve_path(path)
+        safe_path = _resolve_path(path, confine_root=confine_root)
     except ValueError as exc:
         return ToolError(message=str(exc), tool_name="edit_file", is_user_error=True)
 
@@ -1029,6 +1054,13 @@ class BuiltinToolManager:
             and self._config.tool_timeout is not None
         ):
             arguments = {**arguments, "timeout": self._config.tool_timeout}
+        # write_file/edit_file honor the configured workspace sandbox (#611):
+        # when write_root is set, absolute-path writes that escape it are
+        # rejected. write_root is None for interactive chat (unchanged).
+        if name in ("write_file", "edit_file"):
+            return await _SIMPLE_HANDLERS[name](
+                arguments, confine_root=self._config.write_root
+            )
         if name in _SIMPLE_HANDLERS:
             return await _SIMPLE_HANDLERS[name](arguments)
         if name in _PLAN_HANDLERS:

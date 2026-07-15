@@ -58,6 +58,12 @@ class ChatConfig:
     repetition_min_phrase_len: int = 20
     repetition_min_repeats: int = 4
     local_tool_safety: bool = False
+    #: When set, ``write_file``/``edit_file`` are confined to this directory —
+    #: absolute paths that resolve outside it are rejected (issue #611). ``None``
+    #: keeps the legacy behavior (absolute paths allowed). The autonomous agent
+    #: sets this to bound web-content-driven writes; interactive chat leaves it
+    #: unset (it gates writes via per-tool CONFIRM instead).
+    write_root: Path | None = None
     mcp_connect_retries: int = 3
     tool_result_truncation: int = 2000
     max_consecutive_tool_failures: int = 3
