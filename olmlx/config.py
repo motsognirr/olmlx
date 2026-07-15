@@ -497,6 +497,20 @@ class Settings(BaseSettings):
     #: (root run is depth 0; a child would be depth 1 > depth cap of 0).
     agent_max_subagent_depth: Annotated[int, Field(ge=0)] = 2
     agent_max_subagent_fanout: Annotated[int, Field(gt=0)] = 4
+    #: Tool-safety posture for the headless agent's mutating/exec builtin tools
+    #: (issue #611). The agent has no human to CONFIRM, and untrusted content
+    #: pulled in via ``web_fetch`` could otherwise drive ungated shell/file
+    #: actions. ``auto`` (default) routes each such call through an LLM safety
+    #: judge; ``allow`` trusts them unconditionally; ``deny`` blocks them.
+    #: ``agent_shell_policy`` governs ``bash``; ``agent_file_write_policy``
+    #: governs ``write_file`` and ``edit_file``. All other tools stay allowed.
+    agent_shell_policy: Literal["allow", "auto", "deny"] = "auto"
+    agent_file_write_policy: Literal["allow", "auto", "deny"] = "auto"
+    #: Confine agent file writes to this directory — absolute-path escapes are
+    #: rejected (``write_file``/``edit_file``). ``None`` confines to the
+    #: server's working directory. Only bounds the agent; interactive chat is
+    #: unaffected.
+    agent_workspace_dir: Path | None = None
 
     @model_validator(mode="after")
     def validate_auto_calibrate(self) -> "Settings":

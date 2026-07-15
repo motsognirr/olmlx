@@ -185,7 +185,7 @@ olmlx              # implicit
 olmlx serve        # explicit
 ```
 
-The server binds to `OLMLX_HOST:OLMLX_PORT` (default `0.0.0.0:11434`). All configuration is via environment variables or `.env` file (see [Configuration Reference](#configuration-reference)).
+The server binds to `OLMLX_HOST:OLMLX_PORT` (default `127.0.0.1:11434` — loopback only; set `OLMLX_HOST=0.0.0.0` to expose it on the LAN). All configuration is via environment variables or `.env` file (see [Configuration Reference](#configuration-reference)).
 
 ### `olmlx chat`
 
@@ -1318,7 +1318,7 @@ All settings are configured via `OLMLX_`-prefixed environment variables. You can
 
 | Variable | Type | Default | Description |
 |---|---|---|---|
-| `OLMLX_HOST` | string | `0.0.0.0` | Server bind address |
+| `OLMLX_HOST` | string | `127.0.0.1` | Server bind address (loopback by default; set `0.0.0.0` to expose on the LAN) |
 | `OLMLX_PORT` | int | `11434` | Server port (1-65535) |
 | `OLMLX_MODELS_DIR` | path | `~/.olmlx/models` | Local model storage directory |
 | `OLMLX_MODELS_CONFIG` | path | `~/.olmlx/models.json` | Model name->HF path mapping file |

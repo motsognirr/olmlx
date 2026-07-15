@@ -327,7 +327,7 @@ All settings can be overridden with `OLMLX_`-prefixed environment variables or a
 
 | Variable | Default | Description |
 |---|---|---|
-| `OLMLX_HOST` | `0.0.0.0` | Bind address |
+| `OLMLX_HOST` | `127.0.0.1` | Bind address (loopback by default; set `0.0.0.0` to expose on the LAN — see below) |
 | `OLMLX_PORT` | `11434` | Port |
 | `OLMLX_MODELS_DIR` | `~/.olmlx/models` | Where downloaded models are stored |
 | `OLMLX_MODELS_CONFIG` | `~/.olmlx/models.json` | Path to model mapping file |
