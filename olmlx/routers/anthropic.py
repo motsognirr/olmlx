@@ -509,6 +509,7 @@ async def _stream_thinking_state_machine(result):
     """
     block_idx = 0
     output_tokens = 0
+    input_tokens = 0
     done_reason = None
     split_state: dict = {}
     current: str | None = None  # open block type: None | "thinking" | "text"
@@ -599,6 +600,10 @@ async def _stream_thinking_state_machine(result):
             stats = chunk.get("stats")
             if stats:
                 output_tokens = stats.eval_count
+                # Issue #610: report the real prompt token count so streaming
+                # clients get non-zero input_tokens (via message_delta.usage),
+                # matching the non-streaming and buffered-tools paths.
+                input_tokens = stats.prompt_eval_count or 0
             done_reason = chunk.get("done_reason")
             break
 
@@ -637,6 +642,7 @@ async def _stream_thinking_state_machine(result):
         if done_reason in ("timeout", "length")
         else "end_turn",
         "output_tokens": output_tokens,
+        "input_tokens": input_tokens,
     }
 
 

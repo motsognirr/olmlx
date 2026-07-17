@@ -1522,6 +1522,10 @@ class ModelRegistry:
                         "Ignoring 'adapters' section: expected an object, got %s",
                         type(adapters_raw).__name__,
                     )
+            # Keys claimed by an explicit `:latest` form. If a file holds both
+            # a bare name and its tagged twin, the tagged entry wins regardless
+            # of order — matching resolve() and the on-disk _normalize_disk_keys.
+            tagged_mappings: set[str] = set()
             for k, v in raw.items():
                 normalized = self.normalize_name(k)
                 if isinstance(v, dict) and v.get("type") == "panel":
@@ -1529,13 +1533,22 @@ class ModelRegistry:
                         self._panels[normalized] = PanelConfig.from_entry(normalized, v)
                     except (ValueError, TypeError) as exc:
                         logger.warning("Skipping invalid panel entry %r: %s", k, exc)
-                        self._raw_unrecognized[k] = v
+                        self._raw_unrecognized[normalized] = v
+                    continue
+                if k != normalized and normalized in tagged_mappings:
+                    # Bare form colliding with an explicit `:latest` twin that
+                    # already won — drop the bare one (issue #619 review).
                     continue
                 try:
-                    self._mappings[k] = ModelConfig.from_entry(v)
+                    # Store under the normalized (`:latest`-tagged) key so the
+                    # mutators — which all normalize (remove/add_mapping) —
+                    # can find hand-edited untagged entries (issue #619).
+                    self._mappings[normalized] = ModelConfig.from_entry(v)
+                    if k == normalized:
+                        tagged_mappings.add(normalized)
                 except (ValueError, TypeError) as exc:
                     logger.warning("Skipping invalid models.json entry %r: %s", k, exc)
-                    self._raw_unrecognized[k] = v
+                    self._raw_unrecognized[normalized] = v
             self._validate_panels()
         if self._aliases_path.exists():
             try:
@@ -1777,6 +1790,37 @@ class ModelRegistry:
                 disk_data.pop("adapters", None)
             _atomic_write_json(disk_data, settings.models_config)
 
+    def _normalize_disk_keys(self, loaded: dict[str, Any]) -> dict[str, Any]:
+        """Normalize model keys of a loaded models.json to their ``:latest``
+        form so removal/overlay (which key by the normalized form) match
+        hand-edited untagged entries, instead of leaving a dangling entry or
+        writing a duplicate (issue #619). ``adapters`` is a reserved section
+        keyed by its colon-named children, not a model — leave it untouched.
+
+        Shared by both disk read-modify-write paths (``_save_mappings_locked``
+        and ``_save_adapters`` via ``_read_models_config_for_update``) so they
+        agree on the on-disk key form.
+
+        If a file holds both a bare name and its explicit ``:latest`` twin
+        (e.g. ``"foo"`` and ``"foo:latest"``), the two collapse to one key.
+        The tagged entry wins regardless of file order — matching ``resolve``,
+        which normalizes and so already returns the ``:latest`` entry — instead
+        of letting dict-iteration order silently pick a winner.
+        """
+        out: dict[str, Any] = {}
+        tagged: set[str] = set()  # keys claimed by an explicit `:latest` form
+        for dk, dv in loaded.items():
+            if dk == "adapters":
+                out[dk] = dv
+                continue
+            nk = self.normalize_name(dk)
+            if dk == nk:  # already tagged — always wins
+                out[nk] = dv
+                tagged.add(nk)
+            elif nk not in tagged:  # bare form — only if no tagged twin present
+                out[nk] = dv
+        return out
+
     def _read_models_config_for_update(self) -> dict[str, Any]:
         """Read models.json as a dict for a read-modify-write, or {} if absent.
 
@@ -1799,7 +1843,7 @@ class ModelRegistry:
                 f"Refusing to overwrite {settings.models_config}: existing "
                 f"file is not a JSON object (got {type(loaded).__name__})."
             )
-        return loaded
+        return self._normalize_disk_keys(loaded)
 
     def _save_mappings(self):
         with self._save_lock:
@@ -1842,7 +1886,9 @@ class ModelRegistry:
                     f"existing file is not a JSON object (got "
                     f"{type(loaded).__name__})."
                 )
-            disk_data = loaded
+            # Normalize on-disk keys (issue #619) — shared with the adapter
+            # save path so both agree on the `:latest`-tagged form.
+            disk_data = self._normalize_disk_keys(loaded)
             disk_read_ok = True
 
         if not disk_read_ok and self._mappings:
