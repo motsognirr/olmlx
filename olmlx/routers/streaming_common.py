@@ -165,6 +165,76 @@ def parse_buffered_output(
     )
 
 
+def validate_declared_tools(tools: list[dict[str, Any]] | None) -> None:
+    """Reject malformed tool definitions at the router boundary (issue #644).
+
+    ``Tool.function`` and its ``parameters`` are typed as free-shape
+    ``dict[str, Any]`` (project convention for JSON-passthrough fields), so
+    Pydantic does not validate their shape.  A client can therefore send a
+    tool whose ``parameters`` is not an object; left unchecked it crashes
+    ``fill_missing_required_args`` with an ``AttributeError`` deep in
+    post-parse — a 500 that lands *after* generation has already run (and,
+    for streaming, after the 200 has been sent).
+
+    Validate up front instead so the request fails fast with a clean 400,
+    mirroring the Anthropic surface (whose typed ``input_schema`` already
+    rejects a non-dict).  Raises ``ValueError``; the app's ``ValueError``
+    handler turns it into a 400 with the per-surface error envelope.
+
+    The validated shape is exactly what ``fill_missing_required_args``
+    consumes downstream: ``function.parameters`` **and** its ``required``
+    (walked with ``set(...)``) and ``properties`` (walked with
+    ``.items()``, and ``.get(...)`` on each required property's definition).
+    A non-dict / non-list at *any* of those levels crashes the same way, so
+    all of them are checked here rather than only the top ``parameters``
+    object.
+    """
+    if not tools:
+        return
+    for i, tool in enumerate(tools):
+        where = f"tools[{i}]"
+        if not isinstance(tool, dict):
+            raise ValueError(f"{where} must be an object")
+        func = tool.get("function")
+        # ``function`` is optional here (some callers pass bare-shaped tools);
+        # only a *present, non-dict* value is malformed.
+        if func is None:
+            continue
+        if not isinstance(func, dict):
+            raise ValueError(f"{where}.function must be an object")
+        params = func.get("parameters")
+        if params is None:
+            continue
+        if not isinstance(params, dict):
+            raise ValueError(f"{where}.function.parameters must be an object")
+        # ``required`` is walked with ``set(...)`` — a non-list (or a list
+        # with an unhashable element) would crash it; JSON Schema requires an
+        # array of property-name strings.
+        required = params.get("required", [])
+        if not isinstance(required, list) or not all(
+            isinstance(r, str) for r in required
+        ):
+            raise ValueError(
+                f"{where}.function.parameters.required must be an array of strings"
+            )
+        properties = params.get("properties")
+        if properties is None:
+            continue
+        if not isinstance(properties, dict):
+            raise ValueError(
+                f"{where}.function.parameters.properties must be an object"
+            )
+        # Only *required* property definitions are dereferenced downstream
+        # (``v.get("type")``), so only those must be objects — this avoids
+        # over-rejecting an unusual-but-harmless non-required property value.
+        for pname in required:
+            pdef = properties.get(pname)
+            if pdef is not None and not isinstance(pdef, dict):
+                raise ValueError(
+                    f"{where}.function.parameters.properties[{pname!r}] must be an object"
+                )
+
+
 def parse_model_output_post(
     text: str,
     has_tools: bool,

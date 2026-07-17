@@ -25,6 +25,9 @@ class TestEmbedRouter:
         assert data["model"] == "qwen3"
         assert data["embeddings"] == [[0.1, 0.2, 0.3]]
         assert "total_duration" in data
+        # ``generate_embeddings`` returns the real summed token count; the route
+        # must surface it as ``prompt_eval_count`` rather than discarding it.
+        assert data["prompt_eval_count"] == 1
 
     @pytest.mark.asyncio
     async def test_embed_list(self, app_client):
@@ -43,6 +46,7 @@ class TestEmbedRouter:
         assert resp.status_code == 200
         data = resp.json()
         assert len(data["embeddings"]) == 2
+        assert data["prompt_eval_count"] == 2
 
     @pytest.mark.asyncio
     async def test_embeddings_legacy(self, app_client):

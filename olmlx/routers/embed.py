@@ -18,7 +18,7 @@ async def embed(req: EmbedRequest, request: Request):
     texts = req.input if isinstance(req.input, list) else [req.input]
 
     with Timer() as t:
-        embeddings, _ = await generate_embeddings(
+        embeddings, total_tokens = await generate_embeddings(
             manager, req.model, texts, keep_alive=req.keep_alive
         )
 
@@ -26,6 +26,7 @@ async def embed(req: EmbedRequest, request: Request):
         model=req.model,
         embeddings=embeddings,
         total_duration=t.duration_ns,
+        prompt_eval_count=total_tokens,
     )
 
 

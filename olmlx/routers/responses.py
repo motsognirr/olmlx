@@ -14,6 +14,7 @@ from olmlx.routers.streaming_common import (
     BufferedModelOutput,
     collect_stream,
     parse_buffered_output,
+    validate_declared_tools,
 )
 from olmlx.routers.common import build_inference_options, resolve_openai_think
 from olmlx.routers.thinking_split import flush_split_thinking, split_thinking_parts
@@ -731,6 +732,12 @@ async def create_response(req: ResponsesRequest, request: Request):
         grammar_spec = _grammar_from_text_format(req.text)
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc))
+
+    # Reject malformed tool schemas before generation (a non-dict
+    # ``parameters`` would otherwise crash post-parse — see #644). Validates
+    # the converted (engine-nested) tools; raises ValueError → 400 via the
+    # app's ValueError handler, matching the OpenAI/Ollama chat surfaces.
+    validate_declared_tools(tools)
 
     if req.previous_response_id:
         conversation = _history_messages_from_store(req.previous_response_id)

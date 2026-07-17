@@ -940,3 +940,43 @@ class TestSDKShapeRegression:
             e for e in events if e["event"] == "response.function_call_arguments.done"
         )
         assert done["data"]["name"] == "f"
+
+
+class TestResponsesMalformedToolSchemaRejected:
+    """/v1/responses shares the fill_missing_required_args path (via
+    _convert_tools) and must reject a non-dict ``parameters`` with a clean
+    400 at the boundary — before generation — instead of crashing post-parse
+    (issue #644). No ``generate_chat`` mock: the request must fail before
+    dispatch."""
+
+    @pytest.mark.asyncio
+    async def test_non_streaming_returns_400(self, app_client):
+        resp = await app_client.post(
+            "/v1/responses",
+            json={
+                "model": "qwen3",
+                "input": "hi",
+                "tools": [
+                    {"type": "function", "name": "foo", "parameters": "not-an-object"}
+                ],
+            },
+        )
+        assert resp.status_code == 400
+        # OpenAI-shaped error envelope (Responses is under /v1/).
+        assert "parameters" in resp.json()["error"]["message"]
+
+    @pytest.mark.asyncio
+    async def test_streaming_returns_400(self, app_client):
+        resp = await app_client.post(
+            "/v1/responses",
+            json={
+                "model": "qwen3",
+                "input": "hi",
+                "stream": True,
+                "tools": [
+                    {"type": "function", "name": "foo", "parameters": "not-an-object"}
+                ],
+            },
+        )
+        assert resp.status_code == 400
+        assert "text/event-stream" not in resp.headers.get("content-type", "")

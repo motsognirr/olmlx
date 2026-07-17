@@ -13,11 +13,97 @@ from olmlx.routers.streaming_common import (
     buffer_stream,
     collect_stream,
     parse_buffered_output,
+    validate_declared_tools,
     with_keepalive_pings,
 )
 from olmlx.utils.timing import TimingStats
 
 PING = "event: ping\ndata: {}\n\n"
+
+
+class TestValidateDeclaredTools:
+    """Boundary validation of declared tool schemas (issue #644)."""
+
+    def test_none_and_empty_are_noops(self):
+        validate_declared_tools(None)
+        validate_declared_tools([])
+
+    def test_well_formed_tools_pass(self):
+        validate_declared_tools(
+            [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "foo",
+                        "parameters": {"type": "object", "properties": {}},
+                    },
+                }
+            ]
+        )
+
+    def test_missing_parameters_is_allowed(self):
+        # ``parameters`` is optional; absence is not malformed.
+        validate_declared_tools([{"type": "function", "function": {"name": "foo"}}])
+
+    def test_non_dict_parameters_raises(self):
+        with pytest.raises(ValueError, match=r"tools\[0\]\.function\.parameters"):
+            validate_declared_tools(
+                [{"type": "function", "function": {"name": "foo", "parameters": "x"}}]
+            )
+
+    def test_non_dict_function_raises(self):
+        with pytest.raises(ValueError, match=r"tools\[0\]\.function"):
+            validate_declared_tools([{"type": "function", "function": "x"}])
+
+    def test_non_dict_tool_raises(self):
+        with pytest.raises(ValueError, match=r"tools\[0\]"):
+            validate_declared_tools(["not-an-object"])  # type: ignore[list-item]
+
+    def test_index_is_reported(self):
+        with pytest.raises(ValueError, match=r"tools\[1\]"):
+            validate_declared_tools(
+                [
+                    {"type": "function", "function": {"name": "ok"}},
+                    {"type": "function", "function": {"name": "bad", "parameters": 3}},
+                ]
+            )
+
+    def _tool(self, params):
+        return [{"type": "function", "function": {"name": "foo", "parameters": params}}]
+
+    def test_non_dict_properties_raises(self):
+        # Would otherwise crash fill_missing_required_args at ``.items()``.
+        with pytest.raises(ValueError, match=r"parameters\.properties"):
+            validate_declared_tools(self._tool({"required": ["a"], "properties": "x"}))
+
+    def test_non_list_required_raises(self):
+        # Would otherwise crash at ``set(required)`` for a non-iterable.
+        with pytest.raises(ValueError, match=r"parameters\.required"):
+            validate_declared_tools(self._tool({"required": 3}))
+
+    def test_required_with_non_string_element_raises(self):
+        # An unhashable element would crash ``set(required)``.
+        with pytest.raises(ValueError, match=r"parameters\.required"):
+            validate_declared_tools(self._tool({"required": [{"nested": 1}]}))
+
+    def test_non_dict_required_property_value_raises(self):
+        # Would otherwise crash at ``v.get("type")`` for the required prop.
+        with pytest.raises(ValueError, match=r"properties\['a'\]"):
+            validate_declared_tools(
+                self._tool({"required": ["a"], "properties": {"a": "not-an-object"}})
+            )
+
+    def test_non_dict_value_on_non_required_property_is_allowed(self):
+        # Only *required* property definitions are dereferenced downstream, so
+        # a weird value on a non-required property must not be over-rejected.
+        validate_declared_tools(
+            self._tool({"required": ["a"], "properties": {"a": {}, "b": "whatever"}})
+        )
+
+    def test_missing_properties_with_required_is_allowed(self):
+        # fill_missing_required_args coalesces a missing ``properties`` to {},
+        # yielding no injection — not a crash, so not rejected.
+        validate_declared_tools(self._tool({"required": ["a"]}))
 
 
 async def _agen(chunks):
