@@ -28,6 +28,7 @@ from olmlx.routers.streaming_common import (
     parse_buffered_output,
     parse_model_output_post,
     sse_error_event,
+    validate_declared_tools,
 )
 from olmlx.routers.thinking_split import (
     flush_thinking_buffer,
@@ -320,6 +321,10 @@ async def openai_chat(req: OpenAIChatRequest, request: Request):
         req.max_completion_tokens,
     )
     manager = request.app.state.model_manager
+    # Reject malformed tool schemas before generation (a non-dict
+    # ``parameters`` would otherwise crash post-parse — see #644). Raises
+    # ValueError → 400 via the app's ValueError handler.
+    validate_declared_tools(req.tools)
     messages = [m.model_dump(exclude_none=True) for m in req.messages]
     # A malformed image content part (e.g. image_url with no url) is a client
     # error — surface as 422 rather than an uncaught 500.

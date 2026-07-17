@@ -165,6 +165,39 @@ def parse_buffered_output(
     )
 
 
+def validate_declared_tools(tools: list[dict[str, Any]] | None) -> None:
+    """Reject malformed tool definitions at the router boundary (issue #644).
+
+    ``Tool.function`` and its ``parameters`` are typed as free-shape
+    ``dict[str, Any]`` (project convention for JSON-passthrough fields), so
+    Pydantic does not validate their shape.  A client can therefore send a
+    tool whose ``parameters`` is not an object; left unchecked it crashes
+    ``fill_missing_required_args`` with an ``AttributeError`` deep in
+    post-parse — a 500 that lands *after* generation has already run (and,
+    for streaming, after the 200 has been sent).
+
+    Validate up front instead so the request fails fast with a clean 400,
+    mirroring the Anthropic surface (whose typed ``input_schema`` already
+    rejects a non-dict).  Raises ``ValueError``; the app's ``ValueError``
+    handler turns it into a 400 with the per-surface error envelope.
+    """
+    if not tools:
+        return
+    for i, tool in enumerate(tools):
+        if not isinstance(tool, dict):
+            raise ValueError(f"tools[{i}] must be an object")
+        func = tool.get("function")
+        # ``function`` is optional here (some callers pass bare-shaped tools);
+        # only a *present, non-dict* value is malformed.
+        if func is None:
+            continue
+        if not isinstance(func, dict):
+            raise ValueError(f"tools[{i}].function must be an object")
+        params = func.get("parameters")
+        if params is not None and not isinstance(params, dict):
+            raise ValueError(f"tools[{i}].function.parameters must be an object")
+
+
 def parse_model_output_post(
     text: str,
     has_tools: bool,

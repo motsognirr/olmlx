@@ -13,11 +13,60 @@ from olmlx.routers.streaming_common import (
     buffer_stream,
     collect_stream,
     parse_buffered_output,
+    validate_declared_tools,
     with_keepalive_pings,
 )
 from olmlx.utils.timing import TimingStats
 
 PING = "event: ping\ndata: {}\n\n"
+
+
+class TestValidateDeclaredTools:
+    """Boundary validation of declared tool schemas (issue #644)."""
+
+    def test_none_and_empty_are_noops(self):
+        validate_declared_tools(None)
+        validate_declared_tools([])
+
+    def test_well_formed_tools_pass(self):
+        validate_declared_tools(
+            [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "foo",
+                        "parameters": {"type": "object", "properties": {}},
+                    },
+                }
+            ]
+        )
+
+    def test_missing_parameters_is_allowed(self):
+        # ``parameters`` is optional; absence is not malformed.
+        validate_declared_tools([{"type": "function", "function": {"name": "foo"}}])
+
+    def test_non_dict_parameters_raises(self):
+        with pytest.raises(ValueError, match=r"tools\[0\]\.function\.parameters"):
+            validate_declared_tools(
+                [{"type": "function", "function": {"name": "foo", "parameters": "x"}}]
+            )
+
+    def test_non_dict_function_raises(self):
+        with pytest.raises(ValueError, match=r"tools\[0\]\.function"):
+            validate_declared_tools([{"type": "function", "function": "x"}])
+
+    def test_non_dict_tool_raises(self):
+        with pytest.raises(ValueError, match=r"tools\[0\]"):
+            validate_declared_tools(["not-an-object"])  # type: ignore[list-item]
+
+    def test_index_is_reported(self):
+        with pytest.raises(ValueError, match=r"tools\[1\]"):
+            validate_declared_tools(
+                [
+                    {"type": "function", "function": {"name": "ok"}},
+                    {"type": "function", "function": {"name": "bad", "parameters": 3}},
+                ]
+            )
 
 
 async def _agen(chunks):

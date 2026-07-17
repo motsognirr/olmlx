@@ -1199,3 +1199,40 @@ def test_chat_message_accepts_audio_field_and_dumps_it():
     m = Message(role="user", content="hi", audio=["a.wav"])
     dumped = m.model_dump(exclude_none=True)
     assert dumped["audio"] == ["a.wav"]
+
+
+class TestChatMalformedToolSchemaRejected:
+    """/api/chat must reject a non-dict ``function.parameters`` with a clean
+    400 at the boundary — before generation — instead of crashing post-parse
+    (issue #644). No ``generate_chat`` mock: the request must fail before
+    dispatch."""
+
+    BAD_TOOLS = [{"type": "function", "function": {"name": "foo", "parameters": "x"}}]
+
+    @pytest.mark.asyncio
+    async def test_non_streaming_returns_400(self, app_client):
+        resp = await app_client.post(
+            "/api/chat",
+            json={
+                "model": "qwen3",
+                "messages": [{"role": "user", "content": "hi"}],
+                "tools": self.BAD_TOOLS,
+                "stream": False,
+            },
+        )
+        assert resp.status_code == 400
+        # Ollama-shaped error envelope: {"error": "<msg>"}.
+        assert "parameters" in resp.json()["error"]
+
+    @pytest.mark.asyncio
+    async def test_streaming_returns_400(self, app_client):
+        resp = await app_client.post(
+            "/api/chat",
+            json={
+                "model": "qwen3",
+                "messages": [{"role": "user", "content": "hi"}],
+                "tools": self.BAD_TOOLS,
+                "stream": True,
+            },
+        )
+        assert resp.status_code == 400

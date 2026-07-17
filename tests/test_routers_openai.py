@@ -2072,3 +2072,44 @@ def test_normalize_splits_input_audio_into_audio_list():
     out = _normalize_multimodal_messages(messages)
     assert out[0]["content"] == "what is said?"
     assert out[0]["audio"] == ["data:audio/wav;base64,QQ=="]
+
+
+class TestMalformedToolSchemaRejected:
+    """A non-dict ``function.parameters`` must be rejected with a clean 400
+    at the boundary — before generation — instead of crashing post-parse
+    (issue #644). No ``generate_chat`` mock: the request must fail before
+    dispatch, so any call to the model would be a bug."""
+
+    BAD_TOOLS = [{"type": "function", "function": {"name": "foo", "parameters": "x"}}]
+
+    @pytest.mark.asyncio
+    async def test_non_streaming_returns_400(self, app_client):
+        resp = await app_client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "qwen3",
+                "messages": [{"role": "user", "content": "hi"}],
+                "tools": self.BAD_TOOLS,
+            },
+        )
+        assert resp.status_code == 400
+        body = resp.json()
+        # OpenAI-shaped error envelope.
+        assert "parameters" in body["error"]["message"]
+        assert body["error"]["type"] == "invalid_request_error"
+
+    @pytest.mark.asyncio
+    async def test_streaming_returns_400_before_any_bytes(self, app_client):
+        # The crash previously surfaced as an SSE error *after* a 200 was
+        # sent; boundary validation must reject before the stream opens.
+        resp = await app_client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "qwen3",
+                "messages": [{"role": "user", "content": "hi"}],
+                "tools": self.BAD_TOOLS,
+                "stream": True,
+            },
+        )
+        assert resp.status_code == 400
+        assert "text/event-stream" not in resp.headers.get("content-type", "")
