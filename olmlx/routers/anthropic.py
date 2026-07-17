@@ -15,8 +15,13 @@ from olmlx.engine.inference import (
     count_chat_tokens,
     generate_chat,
 )
-from olmlx.routers.common import build_inference_options, collect_content_parts
+from olmlx.routers.common import (
+    build_inference_options,
+    collect_content_parts,
+    resolve_tool_choice,
+)
 from olmlx.routers.streaming_common import (
+    KEEPALIVE_PING_INTERVAL,
     BufferedModelOutput,
     buffer_stream,
     parse_buffered_output,
@@ -87,7 +92,6 @@ def _resolve_anthropic_model(model: str) -> str:
 
 THINKING_CHUNK_SIZE = 1000
 TEXT_CHUNK_SIZE = 100
-KEEPALIVE_PING_INTERVAL = 5.0
 
 
 def _make_msg_id() -> str:
@@ -716,6 +720,12 @@ async def anthropic_messages(req: AnthropicMessagesRequest, request: Request):
     options = _build_options(req)
     tools = _convert_tools(req)
     has_tools = bool(tools)
+    # Honor tool_choice (issue #620): {"type":"none"} suppresses tools
+    # (guaranteed text answer); {"type":"any"} or a forced {"type":"tool"}
+    # selection raises ValueError → 400 rather than being silently ignored.
+    if not resolve_tool_choice(req.tool_choice):
+        tools = []
+        has_tools = False
     msg_id = _make_msg_id()
     logger.debug("Converted %d messages, %d tools", len(messages), len(tools or []))
 

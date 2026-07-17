@@ -23,6 +23,13 @@ from olmlx.engine.tool_parser import (
 
 logger = logging.getLogger(__name__)
 
+# Interval between keepalive pings emitted during the tools-mode buffering
+# window (issue #616). Every buffered surface (Anthropic SSE, OpenAI SSE,
+# Responses SSE) can generate for minutes before the first real byte; without
+# pings, SDK/proxy idle-read timeouts abort the request while the GPU keeps
+# burning. Shared here so all three surfaces agree on the cadence.
+KEEPALIVE_PING_INTERVAL = 5.0
+
 
 @dataclass
 class BufferedModelOutput:

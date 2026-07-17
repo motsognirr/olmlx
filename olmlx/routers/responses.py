@@ -11,12 +11,17 @@ from olmlx.engine.grammar import GrammarSpec, parse_response_format
 from olmlx.engine.inference import generate_chat
 from olmlx.engine.responses_state import get_store
 from olmlx.routers.streaming_common import (
+    KEEPALIVE_PING_INTERVAL,
     BufferedModelOutput,
-    collect_stream,
+    buffer_stream,
     parse_buffered_output,
     validate_declared_tools,
 )
-from olmlx.routers.common import build_inference_options, resolve_openai_think
+from olmlx.routers.common import (
+    build_inference_options,
+    resolve_openai_think,
+    resolve_tool_choice,
+)
 from olmlx.routers.thinking_split import flush_split_thinking, split_thinking_parts
 from olmlx.schemas.responses import ResponsesRequest, ResponsesResponse
 from olmlx.utils.images import normalize_image_block
@@ -374,7 +379,23 @@ async def _stream_response(
 
     async def _stream_tools_response():
         """Buffer the engine output, parse once, replay full semantic events."""
-        out: BufferedModelOutput = await collect_stream(result)
+        # Forward keepalive pings while the output buffers (issue #616): with
+        # tools declared a thinking model can generate for minutes before the
+        # first real event, and SSE comment lines (": ...") keep SDK/proxy
+        # idle-read timeouts from aborting the request mid-generation.
+        out = BufferedModelOutput()
+        async for item in buffer_stream(
+            result,
+            keepalive_interval=KEEPALIVE_PING_INTERVAL,
+            ping=": ping\n\n",
+        ):
+            if isinstance(item, BufferedModelOutput):
+                out = item
+            elif isinstance(item, str):
+                # Keepalive ping SSE comment. (cache_info dicts also yielded by
+                # buffer_stream carry no Responses-SSE payload and are dropped,
+                # as collect_stream discarded them.)
+                yield item
 
         thinking, visible_text, tool_uses = parse_buffered_output(
             out, tools, has_tools=True, fill_missing_args=True
@@ -738,6 +759,13 @@ async def create_response(req: ResponsesRequest, request: Request):
     # the converted (engine-nested) tools; raises ValueError → 400 via the
     # app's ValueError handler, matching the OpenAI/Ollama chat surfaces.
     validate_declared_tools(tools)
+
+    # Honor tool_choice (issue #620): "none" suppresses tools (guaranteed text
+    # answer); anything forced ("required", a {"type":"function"} selection)
+    # raises ValueError → 400 rather than being silently ignored. Dropping the
+    # tools here routes the request through the plain text path everywhere.
+    if not resolve_tool_choice(req.tool_choice):
+        tools = []
 
     if req.previous_response_id:
         conversation = _history_messages_from_store(req.previous_response_id)

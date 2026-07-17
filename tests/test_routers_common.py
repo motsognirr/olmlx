@@ -2,12 +2,58 @@
 
 import json
 
+import pytest
+
 from olmlx.routers.common import (
     build_inference_options,
     format_error,
     resolve_openai_think,
     resolve_think_flag,
+    resolve_tool_choice,
 )
+
+
+class TestResolveToolChoice:
+    """Issue #620: ``tool_choice`` must be honored (auto/none) or rejected,
+    never silently ignored."""
+
+    def test_none_value_defaults_to_auto(self):
+        # Absent tool_choice → tools honored (default auto behavior).
+        assert resolve_tool_choice(None) is True
+
+    def test_string_auto_honors_tools(self):
+        assert resolve_tool_choice("auto") is True
+
+    def test_string_none_suppresses_tools(self):
+        assert resolve_tool_choice("none") is False
+
+    def test_dict_auto_honors_tools(self):
+        # Anthropic-shaped ``{"type": "auto"}``.
+        assert resolve_tool_choice({"type": "auto"}) is True
+
+    def test_dict_none_suppresses_tools(self):
+        assert resolve_tool_choice({"type": "none"}) is False
+
+    def test_string_required_is_rejected(self):
+        with pytest.raises(ValueError, match="tool_choice"):
+            resolve_tool_choice("required")
+
+    def test_anthropic_any_is_rejected(self):
+        with pytest.raises(ValueError, match="tool_choice"):
+            resolve_tool_choice({"type": "any"})
+
+    def test_forced_function_is_rejected(self):
+        # OpenAI/Responses forced-function selection is not supported.
+        with pytest.raises(ValueError, match="tool_choice"):
+            resolve_tool_choice({"type": "function", "function": {"name": "f"}})
+
+    def test_anthropic_forced_tool_is_rejected(self):
+        with pytest.raises(ValueError, match="tool_choice"):
+            resolve_tool_choice({"type": "tool", "name": "f"})
+
+    def test_case_insensitive_string(self):
+        assert resolve_tool_choice("NONE") is False
+        assert resolve_tool_choice("Auto") is True
 
 
 class TestFormatError:
