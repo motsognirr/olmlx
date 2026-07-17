@@ -379,6 +379,14 @@ async def _stream_response(
 
     async def _stream_tools_response():
         """Buffer the engine output, parse once, replay full semantic events."""
+        # Emit response.created / response.in_progress up front — they carry no
+        # generation output — so the client sees the stream open immediately and
+        # any keepalive pings arrive *after* the mandatory first events, not
+        # before (mirrors the Anthropic surface's early message_start).
+        in_progress_resp = base_response("in_progress", [], None, None)
+        yield ev("response.created", {"response": in_progress_resp})
+        yield ev("response.in_progress", {"response": in_progress_resp})
+
         # Forward keepalive pings while the output buffers (issue #616): with
         # tools declared a thinking model can generate for minutes before the
         # first real event, and SSE comment lines (": ...") keep SDK/proxy
@@ -403,10 +411,6 @@ async def _stream_response(
         output_items = _build_output_items(thinking, visible_text, tool_uses)
         done_reason = out.done_reason
         stats = out.stats
-
-        in_progress_resp = base_response("in_progress", [], None, None)
-        yield ev("response.created", {"response": in_progress_resp})
-        yield ev("response.in_progress", {"response": in_progress_resp})
 
         for out_index, item in enumerate(output_items):
             yield ev(

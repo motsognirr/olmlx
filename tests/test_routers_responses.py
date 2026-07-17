@@ -940,7 +940,14 @@ class TestBufferedToolStreamKeepalive:
                 },
             )
         # SSE comment lines (": ...") are the protocol-legal keepalive.
-        assert any(line.startswith(": ") for line in resp.text.splitlines()), resp.text
+        lines = resp.text.splitlines()
+        ping_idx = next(i for i, ln in enumerate(lines) if ln.startswith(": "))
+        # response.created must be the first event; pings come *after* it, never
+        # before (a comment ahead of the mandatory first event trips strict SDKs).
+        created_idx = next(
+            i for i, ln in enumerate(lines) if ln == "event: response.created"
+        )
+        assert created_idx < ping_idx, resp.text
 
 
 class TestSDKShapeRegression:
