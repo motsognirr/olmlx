@@ -15,6 +15,7 @@ import mlx.core as mx
 
 from olmlx.engine.grammar import (
     GrammarSpec,
+    _sanitize_xgrammar_error,
     clear_caches,
     compile_for_tokenizer,
     drop_for_tokenizer,
@@ -141,6 +142,35 @@ class TestParseResponseFormat:
             parse_response_format(
                 {"type": "object", "properties": {"x": {"type": "bogus"}}}
             )
+
+    def test_sanitize_strips_leading_timestamp_and_path(self):
+        """The canonical xgrammar error layout is reduced to its actionable
+        tail with no timestamp and no source path."""
+        raw = (
+            "[09:48:54] /Users/runner/work/xgrammar/xgrammar/cpp/"
+            'json_schema_converter.cc:3109: Unsupported type "not-a-real-type"\n'
+        )
+        out = _sanitize_xgrammar_error(raw)
+        assert out == 'Unsupported type "not-a-real-type"'
+
+    def test_sanitize_strips_embedded_path_in_any_layout(self):
+        """Defense-in-depth: an absolute source path is stripped even when
+        it isn't behind the ``[HH:MM:SS]`` prefix, so an xgrammar
+        message-format change can't leak build paths to the client."""
+        raw = "/opt/homebrew/Cellar/xgrammar/cpp/grammar_parser.cpp:42: bad thing"
+        out = _sanitize_xgrammar_error(raw)
+        assert "/opt/homebrew" not in out
+        assert ".cpp:" not in out
+        assert "bad thing" in out
+
+    def test_sanitize_never_returns_a_bare_path(self):
+        """If sanitisation would strip the message down to nothing, fall back
+        to a generic string rather than leaking the raw path."""
+        raw = "/Users/runner/work/xgrammar/internal.cc:1:"
+        out = _sanitize_xgrammar_error(raw)
+        assert "/Users/runner" not in out
+        assert ".cc:" not in out
+        assert out  # non-empty
 
     def test_valid_nested_schema_passes_new_validation(self):
         """A well-formed nested schema must NOT be rejected by the added

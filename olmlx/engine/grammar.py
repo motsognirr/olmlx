@@ -342,11 +342,26 @@ def make_processor(
     return GrammarLogitsProcessor(compiled, vocab_size)
 
 
+_XGRAMMAR_TIMESTAMP_RE = re.compile(r"^\s*\[[^\]]*\]\s*")
+# An absolute source-file location (``/a/b/file.cc:123``, optional trailing
+# ``:``) anywhere in the message. Kept independent of the leading-timestamp
+# strip so a change to xgrammar's message layout can't leak a build path.
+_XGRAMMAR_SRC_LOCATION_RE = re.compile(r"/\S+\.(?:cc|cpp|cxx|hpp|h|c|py):\d+:?\s*")
+
+
 def _sanitize_xgrammar_error(msg: str) -> str:
-    """Strip xgrammar's ``[HH:MM:SS] /abs/path/file.cc:NNN:`` prefix so the
-    internal C++ build path/line is never forwarded to the client."""
-    cleaned = re.sub(r"^\s*\[[^\]]*\]\s*\S+:\d+:\s*", "", msg.strip())
-    return cleaned.strip() or msg.strip()
+    """Reduce an xgrammar error to its actionable tail without leaking the
+    internal C++ build path/line to the client.
+
+    xgrammar's canonical layout is ``[HH:MM:SS] /abs/path/file.cc:NNN: <detail>``,
+    but rather than depend on that exact shape we strip the leading timestamp
+    bracket *and* any absolute source-file location wherever it appears. If
+    nothing meaningful survives, fall back to a generic string — never the raw
+    message, which could itself be a bare path.
+    """
+    cleaned = _XGRAMMAR_TIMESTAMP_RE.sub("", msg.strip())
+    cleaned = _XGRAMMAR_SRC_LOCATION_RE.sub("", cleaned).strip()
+    return cleaned or "schema compilation failed"
 
 
 def _reject_invalid_json_schema(schema: Any) -> None:
