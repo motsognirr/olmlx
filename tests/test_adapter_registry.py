@@ -124,8 +124,11 @@ class TestAdapterPersistence:
             "base": "qwen3-8b",
             "hf_path": "acme/new-lora",
         }
-        # Base model entry is preserved alongside the adapters section.
-        assert saved["qwen3-8b"] == "Qwen/Qwen3-8B-MLX"
+        # Base model entry is preserved alongside the adapters section. The
+        # adapter save shares the model-save path's key normalization (#619),
+        # so the untagged `qwen3-8b` key is written in its `:latest` form.
+        assert saved["qwen3-8b:latest"] == "Qwen/Qwen3-8B-MLX"
+        assert "qwen3-8b" not in saved
 
     def test_add_adapter_then_reload(self, tmp_path, monkeypatch):
         reg, config_path = _load_registry(

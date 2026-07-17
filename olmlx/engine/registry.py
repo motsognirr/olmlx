@@ -1780,6 +1780,22 @@ class ModelRegistry:
                 disk_data.pop("adapters", None)
             _atomic_write_json(disk_data, settings.models_config)
 
+    def _normalize_disk_keys(self, loaded: dict[str, Any]) -> dict[str, Any]:
+        """Normalize model keys of a loaded models.json to their ``:latest``
+        form so removal/overlay (which key by the normalized form) match
+        hand-edited untagged entries, instead of leaving a dangling entry or
+        writing a duplicate (issue #619). ``adapters`` is a reserved section
+        keyed by its colon-named children, not a model — leave it untouched.
+
+        Shared by both disk read-modify-write paths (``_save_mappings_locked``
+        and ``_save_adapters`` via ``_read_models_config_for_update``) so they
+        agree on the on-disk key form.
+        """
+        return {
+            dk if dk == "adapters" else self.normalize_name(dk): dv
+            for dk, dv in loaded.items()
+        }
+
     def _read_models_config_for_update(self) -> dict[str, Any]:
         """Read models.json as a dict for a read-modify-write, or {} if absent.
 
@@ -1802,7 +1818,7 @@ class ModelRegistry:
                 f"Refusing to overwrite {settings.models_config}: existing "
                 f"file is not a JSON object (got {type(loaded).__name__})."
             )
-        return loaded
+        return self._normalize_disk_keys(loaded)
 
     def _save_mappings(self):
         with self._save_lock:
@@ -1845,15 +1861,9 @@ class ModelRegistry:
                     f"existing file is not a JSON object (got "
                     f"{type(loaded).__name__})."
                 )
-            # Normalize on-disk keys so removal/overlay (which key by the
-            # normalized `:latest` form) match hand-edited untagged entries,
-            # instead of leaving a dangling entry or writing a duplicate
-            # (issue #619). "adapters" is a reserved section keyed by its
-            # colon-named children, not a model — leave it untouched.
-            disk_data = {
-                dk if dk == "adapters" else self.normalize_name(dk): dv
-                for dk, dv in loaded.items()
-            }
+            # Normalize on-disk keys (issue #619) — shared with the adapter
+            # save path so both agree on the `:latest`-tagged form.
+            disk_data = self._normalize_disk_keys(loaded)
             disk_read_ok = True
 
         if not disk_read_ok and self._mappings:

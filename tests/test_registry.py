@@ -143,6 +143,26 @@ class TestModelRegistry:
         assert "adapters:latest" not in saved
         assert saved["adapters"] == {"base:adp": {"base": "foo", "adapter": "org/adp"}}
 
+    def test_adapter_save_also_normalizes_untagged_mapping_key(
+        self, tmp_path, monkeypatch
+    ):
+        """Issue #619: the adapter save path (_save_adapters) shares the same
+        disk-key normalization, so an untagged model key is not left raw on
+        disk depending on which save ran last."""
+        config_path = tmp_path / "models.json"
+        config_path.write_text(json.dumps({"foo": "org/foo-model"}))
+        monkeypatch.setattr("olmlx.engine.registry.settings.models_config", config_path)
+        reg = ModelRegistry()
+        reg.load()
+
+        reg.add_adapter_mapping("myadp", base="foo", hf_path="org/adapter")
+
+        saved = json.loads(config_path.read_text())
+        assert "foo:latest" in saved
+        assert "foo" not in saved
+        assert "adapters" in saved
+        assert "adapters:latest" not in saved
+
     def test_alias_priority_over_mapping(self, registry, tmp_path):
         registry._aliases_path = tmp_path / "aliases.json"
         registry._aliases["qwen3:latest"] = "custom/override"
