@@ -44,6 +44,20 @@ def _content_block_start_types(sse_text: str) -> list[str]:
     return types
 
 
+def _message_delta_usage(sse_text: str) -> dict:
+    """Usage dict from the `message_delta` SSE event (empty if none)."""
+    for line in sse_text.splitlines():
+        if not line.startswith("data:"):
+            continue
+        try:
+            payload = json.loads(line[5:])
+        except json.JSONDecodeError:
+            continue
+        if payload.get("type") == "message_delta":
+            return payload.get("usage", {})
+    return {}
+
+
 class TestConvertTools:
     def test_no_tools(self):
         req = AnthropicMessagesRequest(
@@ -755,6 +769,38 @@ class TestAnthropicEndpoint:
         assert "event: content_block_stop" in text
         assert "event: message_delta" in text
         assert "event: message_stop" in text
+
+    @pytest.mark.asyncio
+    async def test_streaming_reports_input_tokens(self, app_client):
+        """Issue #610: the non-tools streaming path must report the real
+        prompt token count in message_delta.usage, not a hardcoded 0."""
+
+        async def mock_stream(*args, **kwargs):
+            async def gen():
+                yield {"text": "Hello", "done": False}
+                yield {
+                    "text": "",
+                    "done": True,
+                    "stats": TimingStats(prompt_eval_count=17, eval_count=5),
+                }
+
+            return gen()
+
+        with patch("olmlx.routers.anthropic.generate_chat", side_effect=mock_stream):
+            resp = await app_client.post(
+                "/v1/messages",
+                json={
+                    "model": "qwen3",
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "max_tokens": 100,
+                    "stream": True,
+                },
+            )
+
+        assert resp.status_code == 200
+        usage = _message_delta_usage(resp.text)
+        assert usage["input_tokens"] == 17
+        assert usage["output_tokens"] == 5
 
     @pytest.mark.asyncio
     async def test_streaming_with_thinking(self, app_client):

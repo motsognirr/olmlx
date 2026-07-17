@@ -1529,13 +1529,16 @@ class ModelRegistry:
                         self._panels[normalized] = PanelConfig.from_entry(normalized, v)
                     except (ValueError, TypeError) as exc:
                         logger.warning("Skipping invalid panel entry %r: %s", k, exc)
-                        self._raw_unrecognized[k] = v
+                        self._raw_unrecognized[normalized] = v
                     continue
                 try:
-                    self._mappings[k] = ModelConfig.from_entry(v)
+                    # Store under the normalized (`:latest`-tagged) key so the
+                    # mutators — which all normalize (remove/add_mapping) —
+                    # can find hand-edited untagged entries (issue #619).
+                    self._mappings[normalized] = ModelConfig.from_entry(v)
                 except (ValueError, TypeError) as exc:
                     logger.warning("Skipping invalid models.json entry %r: %s", k, exc)
-                    self._raw_unrecognized[k] = v
+                    self._raw_unrecognized[normalized] = v
             self._validate_panels()
         if self._aliases_path.exists():
             try:
@@ -1842,7 +1845,15 @@ class ModelRegistry:
                     f"existing file is not a JSON object (got "
                     f"{type(loaded).__name__})."
                 )
-            disk_data = loaded
+            # Normalize on-disk keys so removal/overlay (which key by the
+            # normalized `:latest` form) match hand-edited untagged entries,
+            # instead of leaving a dangling entry or writing a duplicate
+            # (issue #619). "adapters" is a reserved section keyed by its
+            # colon-named children, not a model — leave it untouched.
+            disk_data = {
+                dk if dk == "adapters" else self.normalize_name(dk): dv
+                for dk, dv in loaded.items()
+            }
             disk_read_ok = True
 
         if not disk_read_ok and self._mappings:

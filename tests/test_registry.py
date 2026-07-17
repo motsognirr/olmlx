@@ -73,6 +73,76 @@ class TestModelRegistry:
         registry.remove("removable")
         assert registry.resolve("removable") is None
 
+    def test_load_normalizes_untagged_mapping_key(self, tmp_path, monkeypatch):
+        """Issue #619: a hand-edited untagged models.json key is normalized
+        to `<name>:latest` in-memory so mutators (which normalize) can find it."""
+        config_path = tmp_path / "models.json"
+        config_path.write_text(json.dumps({"foo": "org/foo-model"}))
+        monkeypatch.setattr("olmlx.engine.registry.settings.models_config", config_path)
+        reg = ModelRegistry()
+        reg.load()
+        assert "foo:latest" in reg._mappings
+        assert "foo" not in reg._mappings
+
+    def test_remove_untagged_mapping_deletes_from_disk(self, tmp_path, monkeypatch):
+        """Issue #619: removing a hand-edited untagged entry must drop it from
+        disk, not leave a dangling entry pointing at a deleted directory."""
+        config_path = tmp_path / "models.json"
+        config_path.write_text(json.dumps({"foo": "org/foo-model"}))
+        monkeypatch.setattr("olmlx.engine.registry.settings.models_config", config_path)
+        reg = ModelRegistry()
+        reg.load()
+        reg._aliases_path = tmp_path / "aliases.json"
+
+        reg.remove("foo")
+
+        assert reg.resolve("foo") is None
+        # And it must be gone on disk, so it doesn't reload on restart.
+        saved = json.loads(config_path.read_text())
+        assert "foo" not in saved
+        assert "foo:latest" not in saved
+
+    def test_readd_untagged_mapping_no_duplicate(self, tmp_path, monkeypatch):
+        """Issue #619: re-adding an untagged entry must overwrite the disk key
+        rather than create a duplicate `foo` + `foo:latest` pair."""
+        config_path = tmp_path / "models.json"
+        config_path.write_text(json.dumps({"foo": "org/foo-old"}))
+        monkeypatch.setattr("olmlx.engine.registry.settings.models_config", config_path)
+        reg = ModelRegistry()
+        reg.load()
+        reg._aliases_path = tmp_path / "aliases.json"
+
+        reg.add_mapping("foo", "org/foo-new")
+
+        saved = json.loads(config_path.read_text())
+        model_keys = [k for k in saved if k != "adapters"]
+        assert model_keys == ["foo:latest"]
+        assert saved["foo:latest"] == "org/foo-new"
+
+    def test_save_preserves_adapters_section(self, tmp_path, monkeypatch):
+        """Issue #619 guard: normalizing disk keys must not mangle the reserved
+        `adapters` section into `adapters:latest`."""
+        config_path = tmp_path / "models.json"
+        config_path.write_text(
+            json.dumps(
+                {
+                    "foo": "org/foo-model",
+                    "adapters": {"base:adp": {"base": "foo", "adapter": "org/adp"}},
+                }
+            )
+        )
+        monkeypatch.setattr("olmlx.engine.registry.settings.models_config", config_path)
+        reg = ModelRegistry()
+        reg.load()
+        reg._aliases_path = tmp_path / "aliases.json"
+
+        reg.add_mapping("bar", "org/bar-model")
+
+        saved = json.loads(config_path.read_text())
+        assert "adapters" in saved
+        assert "adapters:latest" not in saved
+        assert saved["adapters"] == {"base:adp": {"base": "foo", "adapter": "org/adp"}}
+
     def test_alias_priority_over_mapping(self, registry, tmp_path):
         registry._aliases_path = tmp_path / "aliases.json"
         registry._aliases["qwen3:latest"] = "custom/override"
