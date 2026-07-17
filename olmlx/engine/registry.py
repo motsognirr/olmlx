@@ -1522,6 +1522,10 @@ class ModelRegistry:
                         "Ignoring 'adapters' section: expected an object, got %s",
                         type(adapters_raw).__name__,
                     )
+            # Keys claimed by an explicit `:latest` form. If a file holds both
+            # a bare name and its tagged twin, the tagged entry wins regardless
+            # of order — matching resolve() and the on-disk _normalize_disk_keys.
+            tagged_mappings: set[str] = set()
             for k, v in raw.items():
                 normalized = self.normalize_name(k)
                 if isinstance(v, dict) and v.get("type") == "panel":
@@ -1531,11 +1535,17 @@ class ModelRegistry:
                         logger.warning("Skipping invalid panel entry %r: %s", k, exc)
                         self._raw_unrecognized[normalized] = v
                     continue
+                if k != normalized and normalized in tagged_mappings:
+                    # Bare form colliding with an explicit `:latest` twin that
+                    # already won — drop the bare one (issue #619 review).
+                    continue
                 try:
                     # Store under the normalized (`:latest`-tagged) key so the
                     # mutators — which all normalize (remove/add_mapping) —
                     # can find hand-edited untagged entries (issue #619).
                     self._mappings[normalized] = ModelConfig.from_entry(v)
+                    if k == normalized:
+                        tagged_mappings.add(normalized)
                 except (ValueError, TypeError) as exc:
                     logger.warning("Skipping invalid models.json entry %r: %s", k, exc)
                     self._raw_unrecognized[normalized] = v
@@ -1790,11 +1800,26 @@ class ModelRegistry:
         Shared by both disk read-modify-write paths (``_save_mappings_locked``
         and ``_save_adapters`` via ``_read_models_config_for_update``) so they
         agree on the on-disk key form.
+
+        If a file holds both a bare name and its explicit ``:latest`` twin
+        (e.g. ``"foo"`` and ``"foo:latest"``), the two collapse to one key.
+        The tagged entry wins regardless of file order — matching ``resolve``,
+        which normalizes and so already returns the ``:latest`` entry — instead
+        of letting dict-iteration order silently pick a winner.
         """
-        return {
-            dk if dk == "adapters" else self.normalize_name(dk): dv
-            for dk, dv in loaded.items()
-        }
+        out: dict[str, Any] = {}
+        tagged: set[str] = set()  # keys claimed by an explicit `:latest` form
+        for dk, dv in loaded.items():
+            if dk == "adapters":
+                out[dk] = dv
+                continue
+            nk = self.normalize_name(dk)
+            if dk == nk:  # already tagged — always wins
+                out[nk] = dv
+                tagged.add(nk)
+            elif nk not in tagged:  # bare form — only if no tagged twin present
+                out[nk] = dv
+        return out
 
     def _read_models_config_for_update(self) -> dict[str, Any]:
         """Read models.json as a dict for a read-modify-write, or {} if absent.

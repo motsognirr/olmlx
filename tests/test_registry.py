@@ -163,6 +163,35 @@ class TestModelRegistry:
         assert "adapters" in saved
         assert "adapters:latest" not in saved
 
+    @pytest.mark.parametrize(
+        "entries",
+        [
+            {"foo": "org/foo-bare", "foo:latest": "org/foo-tagged"},
+            {"foo:latest": "org/foo-tagged", "foo": "org/foo-bare"},
+        ],
+    )
+    def test_duplicate_bare_and_tagged_key_tagged_wins(
+        self, tmp_path, monkeypatch, entries
+    ):
+        """Issue #619 review: a file holding both `foo` and `foo:latest`
+        collapses to one entry — the explicitly-tagged one wins regardless of
+        file order (matching resolve()), not whichever iterates last."""
+        config_path = tmp_path / "models.json"
+        config_path.write_text(json.dumps(entries))
+        monkeypatch.setattr("olmlx.engine.registry.settings.models_config", config_path)
+        reg = ModelRegistry()
+        reg.load()
+        reg._aliases_path = tmp_path / "aliases.json"
+
+        # In-memory resolve is deterministic.
+        assert reg.resolve("foo").hf_path == "org/foo-tagged"
+
+        # And a save collapses the disk to the single tagged entry.
+        reg.add_mapping("other", "org/other")
+        saved = json.loads(config_path.read_text())
+        assert saved["foo:latest"] == "org/foo-tagged"
+        assert "foo" not in saved
+
     def test_alias_priority_over_mapping(self, registry, tmp_path):
         registry._aliases_path = tmp_path / "aliases.json"
         registry._aliases["qwen3:latest"] = "custom/override"
