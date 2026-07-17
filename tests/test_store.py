@@ -109,6 +109,10 @@ class TestExtractMetadata:
             "model_type": "qwen2",
             "hidden_size": 4096,
             "num_hidden_layers": 32,
+            "vocab_size": 151936,
+            "intermediate_size": 11008,
+            "num_attention_heads": 32,
+            "num_key_value_heads": 32,
         }
         (tmp_path / "config.json").write_text(json.dumps(config))
         meta = _extract_metadata(tmp_path)
@@ -130,6 +134,81 @@ class TestExtractMetadata:
         meta = _extract_metadata(tmp_path)
         # quantize_config.json is checked first, then config.json quantization overrides
         assert "bit" in meta["quantization_level"]
+
+    @staticmethod
+    def _parse_params(size: str) -> float:
+        """Parse a "494M" / "4.0B" parameter_size string into a raw count."""
+        assert size, "parameter_size was empty"
+        unit = size[-1]
+        value = float(size[:-1])
+        return value * {"M": 1e6, "B": 1e9}[unit]
+
+    def test_parameter_size_qwen2_dense_ballpark(self, tmp_path):
+        """Issue #642: the estimate must include the embedding matrix and the
+        real (gated) MLP width, not just ``hidden**2 * layers * 4``. Qwen2.5
+        -0.5B-Instruct has ~494M real parameters; the old formula reported
+        ~77M (6.4x too low)."""
+        # Real Qwen2.5-0.5B-Instruct config values.
+        config = {
+            "model_type": "qwen2",
+            "hidden_size": 896,
+            "num_hidden_layers": 24,
+            "vocab_size": 151936,
+            "intermediate_size": 4864,
+            "num_attention_heads": 14,
+            "num_key_value_heads": 2,
+            "tie_word_embeddings": True,
+        }
+        (tmp_path / "config.json").write_text(json.dumps(config))
+        params = self._parse_params(_extract_metadata(tmp_path)["parameter_size"])
+        assert 0.44e9 <= params <= 0.55e9, f"got {params:.3e}, want ~494M"
+
+    def test_parameter_size_qwen3_dense_gqa_ballpark(self, tmp_path):
+        """Qwen3-4B (GQA, head_dim != hidden/heads) has ~4.0B real params;
+        the old formula reported ~944M (4.3x too low)."""
+        config = {
+            "model_type": "qwen3",
+            "hidden_size": 2560,
+            "num_hidden_layers": 36,
+            "vocab_size": 151936,
+            "intermediate_size": 9728,
+            "num_attention_heads": 32,
+            "num_key_value_heads": 8,
+            "head_dim": 128,
+            "tie_word_embeddings": True,
+        }
+        (tmp_path / "config.json").write_text(json.dumps(config))
+        params = self._parse_params(_extract_metadata(tmp_path)["parameter_size"])
+        assert 3.5e9 <= params <= 4.5e9, f"got {params:.3e}, want ~4.0B"
+
+    def test_parameter_size_moe_reads_text_config(self, tmp_path):
+        """Newer MoE/hybrid configs nest the LM dims under ``text_config`` and
+        the total is dominated by the routed experts. Qwen3.6-35B-A3B
+        (256 experts) has ~35B total params; the estimator must read
+        ``text_config`` and sum all experts, not report the top-level nulls
+        as an empty size."""
+        text_config = {
+            "hidden_size": 2048,
+            "num_hidden_layers": 40,
+            "vocab_size": 248320,
+            "num_attention_heads": 16,
+            "num_key_value_heads": 2,
+            "head_dim": 256,
+            "num_experts": 256,
+            "moe_intermediate_size": 512,
+            "shared_expert_intermediate_size": 512,
+            "tie_word_embeddings": False,
+        }
+        config = {"model_type": "qwen3_5_moe", "text_config": text_config}
+        (tmp_path / "config.json").write_text(json.dumps(config))
+        params = self._parse_params(_extract_metadata(tmp_path)["parameter_size"])
+        assert 25e9 <= params <= 45e9, f"got {params:.3e}, want ~35B"
+
+    def test_parameter_size_missing_dims_stays_empty(self, tmp_path):
+        """A config with no usable dimensions yields an empty size rather than
+        a bogus number."""
+        (tmp_path / "config.json").write_text(json.dumps({"model_type": "mystery"}))
+        assert _extract_metadata(tmp_path)["parameter_size"] == ""
 
 
 class TestLocalPath:
