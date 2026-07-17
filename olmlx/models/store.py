@@ -91,7 +91,10 @@ def _estimate_param_count(cfg: dict) -> int | None:
         mlp = n_experts * 3 * hidden * moe_inter + hidden * n_experts
         shared_inter = get("shared_expert_intermediate_size") or 0
         if shared_inter:
-            n_shared = get("n_shared_experts") or 1
+            # ``get(..., 1)`` (not ``... or 1``) so an explicit
+            # ``n_shared_experts: 0`` is honored rather than treated as
+            # missing and forced to one shared expert.
+            n_shared = get("n_shared_experts", 1)
             mlp += n_shared * 3 * hidden * shared_inter
     else:
         inter = get("intermediate_size", 0) or 0
