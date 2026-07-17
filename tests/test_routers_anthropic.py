@@ -3237,7 +3237,7 @@ class TestToolChoiceHonored:
         blocks = resp.json()["content"]
         assert not any(b["type"] == "tool_use" for b in blocks)
         # Tools must not be forwarded to the engine when the client forced text.
-        assert mock_gen.call_args.kwargs["tools"] in (None, [])
+        assert mock_gen.call_args.kwargs["tools"] is None
 
     @pytest.mark.asyncio
     async def test_any_is_rejected_with_400(self, app_client):

@@ -2238,7 +2238,7 @@ class TestToolChoice:
                 },
             )
         # The engine must not receive the tools when the client forced text.
-        assert mock_gen.call_args.kwargs["tools"] in (None, [])
+        assert mock_gen.call_args.kwargs["tools"] is None
 
     @pytest.mark.asyncio
     async def test_auto_still_parses_tool_calls(self, app_client):

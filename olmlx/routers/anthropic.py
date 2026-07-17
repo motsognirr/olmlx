@@ -723,8 +723,10 @@ async def anthropic_messages(req: AnthropicMessagesRequest, request: Request):
     # Honor tool_choice (issue #620): {"type":"none"} suppresses tools
     # (guaranteed text answer); {"type":"any"} or a forced {"type":"tool"}
     # selection raises ValueError → 400 rather than being silently ignored.
+    # ``None`` (not ``[]``) matches _convert_tools' own no-tools value, so a
+    # suppressed request reaches the engine identically to one with no tools.
     if not resolve_tool_choice(req.tool_choice):
-        tools = []
+        tools = None
         has_tools = False
     msg_id = _make_msg_id()
     logger.debug("Converted %d messages, %d tools", len(messages), len(tools or []))

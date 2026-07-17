@@ -762,10 +762,11 @@ async def create_response(req: ResponsesRequest, request: Request):
 
     # Honor tool_choice (issue #620): "none" suppresses tools (guaranteed text
     # answer); anything forced ("required", a {"type":"function"} selection)
-    # raises ValueError → 400 rather than being silently ignored. Dropping the
-    # tools here routes the request through the plain text path everywhere.
+    # raises ValueError → 400 rather than being silently ignored. ``None`` (not
+    # ``[]``) matches _convert_tools' own no-tools value, so a suppressed
+    # request reaches the engine identically to one with no tools.
     if not resolve_tool_choice(req.tool_choice):
-        tools = []
+        tools = None
 
     if req.previous_response_id:
         conversation = _history_messages_from_store(req.previous_response_id)
