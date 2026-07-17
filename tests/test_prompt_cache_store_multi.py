@@ -256,3 +256,48 @@ def test_estimate_state_bytes_no_warning_for_empty_known_layouts(caplog):
     assert warnings == [], (
         f"empty known layouts must not warn, got: {[r.getMessage() for r in warnings]}"
     )
+
+
+def test_estimate_state_bytes_does_not_double_count_quant_state_slices():
+    """Issue #615: quantized KV caches (TurboQuant/Spectral/Shard, and stock
+    ``QuantizedKVCache``) return ``.state`` as *fresh slice objects*
+    (``self._key_indices[..., :offset, :]``) that view — but do not share
+    ``id()`` with — the full-capacity packed buffers already reachable from
+    ``__dict__``. The old ``id()``-dedup walk counted both the backing
+    buffer and its slice, inflating the estimate up to ~2x and firing the
+    ``ram_budget_bytes`` soft-eviction at roughly half the configured
+    budget. The estimator must count each real allocation once — i.e. the
+    full packed buffers, not the buffers *plus* their views."""
+    import mlx.core as mx
+    from olmlx.engine.prompt_cache.state import CachedPromptState
+    from olmlx.engine.prompt_cache.store import _estimate_state_bytes
+
+    class _QuantLike:
+        """Stand-in for a quant KV cache: full-capacity packed buffers in
+        __dict__, and a ``.state`` property that returns [:offset] slices
+        (distinct objects) — exactly the TurboQuant/Spectral/Shard shape."""
+
+        def __init__(self):
+            self.offset = 16
+            # Full-capacity packed buffers (what is actually allocated).
+            self._key_indices = mx.zeros((1, 4, 64, 4), dtype=mx.uint8)
+            self._value_indices = mx.zeros((1, 4, 64, 4), dtype=mx.uint8)
+
+        @property
+        def state(self):
+            # Fresh slice objects — distinct id() from the backing buffers.
+            return [
+                self._key_indices[..., : self.offset, :],
+                self._value_indices[..., : self.offset, :],
+            ]
+
+    layer = _QuantLike()
+    # Sanity: the slices really are distinct objects from the buffers.
+    assert id(layer.state[0]) != id(layer._key_indices)
+
+    state = CachedPromptState(tokens=[1], cache=[layer])
+    nbytes = _estimate_state_bytes(state)
+    expected = layer._key_indices.nbytes + layer._value_indices.nbytes
+    assert nbytes == expected, (
+        f"expected {expected} bytes (full packed buffers, counted once), got {nbytes}"
+    )

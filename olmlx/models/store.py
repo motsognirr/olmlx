@@ -40,6 +40,68 @@ def _strip_ollama_tag(hf_path: str) -> str:
     return hf_path
 
 
+def _estimate_param_count(cfg: dict) -> int | None:
+    """Estimate a model's total parameter count from its ``config.json``.
+
+    The previous heuristic (``hidden**2 * num_layers * 4``) omitted the
+    embedding/LM-head matrix (huge for ~152k-vocab tokenizers) and assumed a
+    fixed MLP width, undercounting real models by 4-6x (issue #642). This sums
+    the actual weight matrices instead:
+
+    * embeddings (``vocab * hidden``), counted twice when the LM head is untied,
+    * per-layer GQA attention (q/k/v/o projections, KV width scaled by the
+      key-value head ratio),
+    * per-layer MLP — the routed experts for MoE configs (which dominate the
+      total, e.g. Qwen3-235B-A22B), else a gated (SwiGLU) dense MLP.
+
+    Newer VLM/hybrid configs nest the LM dims under ``text_config``; values are
+    read from the top level first, then ``text_config``. Returns ``None`` when
+    the two load-bearing dims (``hidden_size``/``num_hidden_layers``) are
+    missing. The estimate targets the right order of magnitude (real Ollama
+    reports total params for GGUF), not exactness — GDN/linear-attention layers
+    and non-gated MLPs introduce small errors that experts/embeddings dwarf.
+    """
+    text_cfg = cfg.get("text_config")
+    text_cfg = text_cfg if isinstance(text_cfg, dict) else {}
+
+    def get(key, default=None):
+        val = cfg.get(key)
+        if val is None:
+            val = text_cfg.get(key)
+        return default if val is None else val
+
+    hidden = get("hidden_size", 0)
+    layers = get("num_hidden_layers", 0)
+    if not hidden or not layers:
+        return None
+
+    vocab = get("vocab_size", 0)
+    n_heads = get("num_attention_heads", 0) or 0
+    n_kv_heads = get("num_key_value_heads", n_heads) or n_heads
+    head_dim = get("head_dim") or (hidden // n_heads if n_heads else 0)
+
+    q_dim = n_heads * head_dim
+    kv_dim = n_kv_heads * head_dim
+    attn = hidden * q_dim + 2 * hidden * kv_dim + q_dim * hidden
+
+    n_experts = get("num_experts") or get("n_routed_experts") or 0
+    moe_inter = get("moe_intermediate_size") or 0
+    if n_experts and moe_inter:
+        # Gated experts (gate + up + down) plus the router gate.
+        mlp = n_experts * 3 * hidden * moe_inter + hidden * n_experts
+        shared_inter = get("shared_expert_intermediate_size") or 0
+        if shared_inter:
+            n_shared = get("n_shared_experts") or 1
+            mlp += n_shared * 3 * hidden * shared_inter
+    else:
+        inter = get("intermediate_size", 0) or 0
+        mlp = 3 * hidden * inter  # gated (SwiGLU) dense MLP
+
+    tie = get("tie_word_embeddings", True)
+    embeddings = vocab * hidden * (1 if tie else 2)
+    return embeddings + layers * (attn + mlp)
+
+
 def _extract_metadata(model_dir: Path) -> dict:
     """Extract model metadata from config.json if available."""
     config_path = model_dir / "config.json"
@@ -50,13 +112,10 @@ def _extract_metadata(model_dir: Path) -> dict:
             with open(config_path) as f:
                 cfg = json.load(f)
             meta["family"] = cfg.get("model_type", "")
-            # Estimate parameter size from hidden_size and num_layers
-            hidden = cfg.get("hidden_size", 0)
-            layers = cfg.get("num_hidden_layers", 0)
-            if hidden and layers:
-                params = hidden * hidden * layers * 4  # rough estimate
-                if params > 1e9:
-                    meta["parameter_size"] = f"{params / 1e9:.0f}B"
+            params = _estimate_param_count(cfg)
+            if params:
+                if params >= 1e9:
+                    meta["parameter_size"] = f"{params / 1e9:.1f}B"
                 else:
                     meta["parameter_size"] = f"{params / 1e6:.0f}M"
         except Exception:

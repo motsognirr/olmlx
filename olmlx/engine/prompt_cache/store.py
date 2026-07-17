@@ -112,47 +112,58 @@ def _estimate_state_bytes(state: CachedPromptState) -> int:
         if seen_attr:
             continue
         # Fallback path: walk every mlx array owned by the layer. Walking
-        # ``__dict__`` catches side buffers (e.g. TurboQuant's
-        # ``_key_dequant``) that aren't surfaced through ``.state``;
-        # walking ``.state`` covers layer types whose backing storage
-        # lives in a sub-container exposed only via the property
-        # (``ArraysCache``). Container types (tuple / list / dict) are
-        # traversed; ``id()`` dedup prevents double-counting the same
-        # underlying array when it appears in both views.
+        # ``__dict__`` catches both the packed KV buffers and side buffers
+        # (e.g. TurboQuant's ``_key_dequant``) — the full set of real
+        # allocations. Container types (tuple / list / dict) are traversed;
+        # ``id()`` dedup prevents double-counting the same underlying array
+        # when it appears more than once.
         seen_ids: set[int] = set()
-        stack: list[Any] = []
+
+        def _walk(roots: list[Any]) -> None:
+            nonlocal total
+            stack = list(roots)
+            while stack:
+                item = stack.pop()
+                if item is None:
+                    continue
+                if isinstance(item, (tuple, list)):
+                    stack.extend(item)
+                    continue
+                if isinstance(item, dict):
+                    stack.extend(item.values())
+                    continue
+                nbytes = getattr(item, "nbytes", None)
+                # Guard against non-array objects that happen to have an
+                # ``nbytes`` attribute by additionally requiring ``ndim``
+                # (which mx.array has, but ints / Dtype singletons / etc. do
+                # not).
+                ndim = getattr(item, "ndim", None)
+                if isinstance(nbytes, int) and ndim is not None:
+                    key = id(item)
+                    if key in seen_ids:
+                        continue
+                    seen_ids.add(key)
+                    total += nbytes
+
         if hasattr(layer, "__dict__"):
-            stack.extend(vars(layer).values())
+            _walk(list(vars(layer).values()))
         # ``_MISSING`` (not ``None``) so a present-but-empty ``.state``
         # still counts as a strategy match below. Note ``getattr`` with a
         # default also swallows a *property* that raises AttributeError —
         # e.g. a fresh KVCache, whose ``.state`` getter touches
         # ``self.keys.shape`` while ``keys`` is still None.
         state_attr = getattr(layer, "state", _MISSING)
-        if state_attr is not _MISSING:
-            stack.append(state_attr)
-        while stack:
-            item = stack.pop()
-            if item is None:
-                continue
-            if isinstance(item, (tuple, list)):
-                stack.extend(item)
-                continue
-            if isinstance(item, dict):
-                stack.extend(item.values())
-                continue
-            nbytes = getattr(item, "nbytes", None)
-            # Guard against non-array objects that happen to have an
-            # ``nbytes`` attribute by additionally requiring ``ndim``
-            # (which mx.array has, but ints / Dtype singletons / etc. do
-            # not).
-            ndim = getattr(item, "ndim", None)
-            if isinstance(nbytes, int) and ndim is not None:
-                key = id(item)
-                if key in seen_ids:
-                    continue
-                seen_ids.add(key)
-                total += nbytes
+        # ``.state`` is only consulted when the ``__dict__`` walk exposed no
+        # arrays — i.e. for layer types whose backing storage is reachable
+        # *only* via the property. For ``__dict__``-backed caches (the three
+        # quantized KV caches, stock ``QuantizedKVCache``, ``ArraysCache``)
+        # ``.state`` returns *views* over buffers already counted above; on
+        # the quant caches those views are fresh ``[..., :offset, :]`` slice
+        # objects with distinct ``id()``s, so counting them would
+        # double-count the packed footprint and fire the RAM-budget
+        # soft-eviction at ~half the configured budget (issue #615).
+        if not seen_ids and state_attr is not _MISSING:
+            _walk([state_attr])
         # No sizing strategy matched this layer's class: warn once per
         # class (issue #465). ``seen_ids`` non-empty means the __dict__ /
         # .state walk found at least one array, i.e. the layer was sized.
