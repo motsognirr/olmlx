@@ -15,6 +15,7 @@ import mlx.core as mx
 
 from olmlx.engine.grammar import (
     GrammarSpec,
+    _sanitize_xgrammar_error,
     clear_caches,
     compile_for_tokenizer,
     drop_for_tokenizer,
@@ -112,6 +113,77 @@ class TestParseResponseFormat:
     def test_unsupported_type_raises(self):
         with pytest.raises(ValueError, match="unsupported grammar format type"):
             parse_response_format(42)
+
+    def test_invalid_nested_json_schema_type_raises_clean_error(self):
+        """Issue #645: a schema whose (nested) ``type`` is not a real
+        JSON-Schema type is a client error — it must be rejected at parse
+        time with a clean ValueError, not crash the xgrammar compiler later
+        with a 500. The message must not leak xgrammar's internal C++ source
+        path/line."""
+        with pytest.raises(ValueError, match="invalid JSON schema") as exc_info:
+            parse_response_format(
+                {
+                    "type": "json_schema",
+                    "json_schema": {
+                        "name": "x",
+                        "schema": {"type": "not-a-real-type"},
+                    },
+                }
+            )
+        msg = str(exc_info.value)
+        assert ".cc:" not in msg  # no leaked C++ source location
+        assert "runner/work" not in msg  # no leaked build path
+        assert "not-a-real-type" in msg  # the actionable detail is preserved
+
+    def test_invalid_bare_ollama_schema_rejected_at_parse_time(self):
+        """The Ollama ``format`` path (a bare JSON Schema with
+        ``properties``) is validated too, not just the OpenAI shape."""
+        with pytest.raises(ValueError, match="invalid JSON schema"):
+            parse_response_format(
+                {"type": "object", "properties": {"x": {"type": "bogus"}}}
+            )
+
+    def test_sanitize_strips_leading_timestamp_and_path(self):
+        """The canonical xgrammar error layout is reduced to its actionable
+        tail with no timestamp and no source path."""
+        raw = (
+            "[09:48:54] /Users/runner/work/xgrammar/xgrammar/cpp/"
+            'json_schema_converter.cc:3109: Unsupported type "not-a-real-type"\n'
+        )
+        out = _sanitize_xgrammar_error(raw)
+        assert out == 'Unsupported type "not-a-real-type"'
+
+    def test_sanitize_strips_embedded_path_in_any_layout(self):
+        """Defense-in-depth: an absolute source path is stripped even when
+        it isn't behind the ``[HH:MM:SS]`` prefix, so an xgrammar
+        message-format change can't leak build paths to the client."""
+        raw = "/opt/homebrew/Cellar/xgrammar/cpp/grammar_parser.cpp:42: bad thing"
+        out = _sanitize_xgrammar_error(raw)
+        assert "/opt/homebrew" not in out
+        assert ".cpp:" not in out
+        assert "bad thing" in out
+
+    def test_sanitize_never_returns_a_bare_path(self):
+        """If sanitisation would strip the message down to nothing, fall back
+        to a generic string rather than leaking the raw path."""
+        raw = "/Users/runner/work/xgrammar/internal.cc:1:"
+        out = _sanitize_xgrammar_error(raw)
+        assert "/Users/runner" not in out
+        assert ".cc:" not in out
+        assert out  # non-empty
+
+    def test_valid_nested_schema_passes_new_validation(self):
+        """A well-formed nested schema must NOT be rejected by the added
+        validation (guard against false positives)."""
+        schema = {
+            "type": "object",
+            "properties": {"name": {"type": "string"}, "age": {"type": "integer"}},
+            "required": ["name"],
+        }
+        spec = parse_response_format(schema)
+        assert spec is not None
+        assert spec.kind == "json_schema"
+        assert spec.schema == schema
 
 
 class TestGrammarSpec:

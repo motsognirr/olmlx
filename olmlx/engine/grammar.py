@@ -21,6 +21,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import re
 import threading
 import weakref
 from dataclasses import dataclass
@@ -341,6 +342,51 @@ def make_processor(
     return GrammarLogitsProcessor(compiled, vocab_size)
 
 
+_XGRAMMAR_TIMESTAMP_RE = re.compile(r"^\s*\[[^\]]*\]\s*")
+# An absolute source-file location (``/a/b/file.cc:123``, optional trailing
+# ``:``) anywhere in the message. Kept independent of the leading-timestamp
+# strip so a change to xgrammar's message layout can't leak a build path.
+_XGRAMMAR_SRC_LOCATION_RE = re.compile(r"/\S+\.(?:cc|cpp|cxx|hpp|h|c|py):\d+:?\s*")
+
+
+def _sanitize_xgrammar_error(msg: str) -> str:
+    """Reduce an xgrammar error to its actionable tail without leaking the
+    internal C++ build path/line to the client.
+
+    xgrammar's canonical layout is ``[HH:MM:SS] /abs/path/file.cc:NNN: <detail>``,
+    but rather than depend on that exact shape we strip the leading timestamp
+    bracket *and* any absolute source-file location wherever it appears. If
+    nothing meaningful survives, fall back to a generic string — never the raw
+    message, which could itself be a bare path.
+    """
+    cleaned = _XGRAMMAR_TIMESTAMP_RE.sub("", msg.strip())
+    cleaned = _XGRAMMAR_SRC_LOCATION_RE.sub("", cleaned).strip()
+    return cleaned or "schema compilation failed"
+
+
+def _reject_invalid_json_schema(schema: Any) -> None:
+    """Validate *schema* eagerly so a malformed JSON Schema surfaces as a
+    clean client error at request-parse time instead of crashing xgrammar's
+    compiler mid-generation with a leaked-C++-path 500 (issue #645).
+
+    ``Grammar.from_json_schema`` runs the exact same schema→grammar
+    conversion the compiler does (``json_schema_converter``) but needs no
+    tokenizer, so it is a cheap, faithful pre-check. Skipped when xgrammar is
+    unavailable — grammar decoding is already inert in that case.
+    """
+    if xgr is None:
+        return
+    try:
+        xgr.Grammar.from_json_schema(schema)
+    except RuntimeError as exc:
+        # xgrammar raises RuntimeError (incl. InvalidJSONError subclasses)
+        # for unsupported types / malformed schemas — all client errors.
+        raise ValueError(
+            "invalid JSON schema in response_format: "
+            + _sanitize_xgrammar_error(str(exc))
+        ) from exc
+
+
 def parse_response_format(value: Any) -> GrammarSpec | None:
     """Normalize router-level input into a ``GrammarSpec`` or ``None``.
 
@@ -382,14 +428,17 @@ def parse_response_format(value: Any) -> GrammarSpec | None:
             schema = js.get("schema")
             if schema is None:
                 raise ValueError("response_format.json_schema.schema is required")
+            _reject_invalid_json_schema(schema)
             return GrammarSpec(kind="json_schema", schema=schema)
         # Ollama shape: ``format`` is itself a JSON Schema dict. Accept
         # only schemas with explicit JSON-Schema markers OR a ``type``
         # field whose value is a real JSON-Schema type (so an OpenAI-style
         # ``{"type": "image_url"}`` doesn't sneak through here).
         if any(k in value for k in ("properties", "$schema", "anyOf", "oneOf")):
+            _reject_invalid_json_schema(value)
             return GrammarSpec(kind="json_schema", schema=value)
         if value.get("type") in _JSON_SCHEMA_TYPES:
+            _reject_invalid_json_schema(value)
             return GrammarSpec(kind="json_schema", schema=value)
         raise ValueError(
             "unrecognized grammar format dict (need OpenAI response_format shape "

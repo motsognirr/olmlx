@@ -350,6 +350,46 @@ class TestOpenAIRouter:
         assert data["usage"]["completion_tokens"] == 20
 
     @pytest.mark.asyncio
+    async def test_non_streaming_empty_content_is_empty_string_not_null(
+        self, app_client
+    ):
+        """Issue #660: when a thinking model's reasoning consumes the whole
+        max_tokens budget before any visible text (and there are no tool
+        calls), ``message.content`` must be an empty string — matching the
+        streaming path and the OpenAI spec, which only sets ``content: null``
+        when ``tool_calls`` is present. A bare ``content: null`` with no
+        ``tool_calls`` is a state the real API never produces."""
+        stats = TimingStats(prompt_eval_count=15, eval_count=5)
+        mock_result = {
+            "text": "",
+            "done": True,
+            "done_reason": "length",
+            "stats": stats,
+            "thinking_expected": True,
+        }
+        with patch(
+            "olmlx.routers.openai.generate_chat", new_callable=AsyncMock
+        ) as mock_gen:
+            mock_gen.return_value = mock_result
+            resp = await app_client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "qwen3",
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "max_tokens": 5,
+                },
+            )
+
+        assert resp.status_code == 200
+        data = resp.json()
+        msg = data["choices"][0]["message"]
+        assert "content" in msg
+        assert msg["content"] == ""
+        assert msg["content"] is not None
+        assert not msg.get("tool_calls")
+        assert data["choices"][0]["finish_reason"] == "length"
+
+    @pytest.mark.asyncio
     async def test_chat_completions_streaming(self, app_client):
         async def mock_stream(*args, **kwargs):
             async def gen():
@@ -884,6 +924,30 @@ class TestResponseFormat:
         assert resp.status_code == 200
         messages = mock_gen.call_args[0][2]
         assert messages[0] == {"role": "system", "content": JSON_MODE_SYSTEM_MSG}
+
+    @pytest.mark.asyncio
+    async def test_invalid_json_schema_returns_4xx_not_500(self, app_client):
+        """Issue #645: an invalid JSON Schema in ``response_format`` must be
+        rejected before generation with a clean 4xx, not crash the xgrammar
+        compiler mid-request with a 500 that leaks the C++ source path."""
+        resp = await app_client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "qwen3",
+                "messages": [{"role": "user", "content": "give me data"}],
+                "response_format": {
+                    "type": "json_schema",
+                    "json_schema": {
+                        "name": "x",
+                        "schema": {"type": "not-a-real-type"},
+                    },
+                },
+            },
+        )
+        assert resp.status_code == 422
+        body = resp.text
+        assert ".cc:" not in body  # internal C++ source location not leaked
+        assert "runner/work" not in body
 
     @pytest.mark.asyncio
     async def test_json_mode_streaming(self, app_client):
