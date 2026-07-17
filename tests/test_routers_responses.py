@@ -1,5 +1,6 @@
 """Tests for olmlx.routers.responses and its schemas."""
 
+import asyncio
 import json
 from unittest.mock import AsyncMock, patch
 
@@ -860,6 +861,93 @@ class TestRetrieveDelete:
     async def test_delete_unknown_404(self, app_client):
         resp = await app_client.delete("/v1/responses/resp_unknown")
         assert resp.status_code == 404
+
+
+class TestToolChoiceHonored:
+    """Issue #620: on /v1/responses ``tool_choice`` was accepted and ignored.
+    ``"none"`` must suppress tool calls; forced values must 400."""
+
+    TOOLS = [{"type": "function", "name": "f", "parameters": {"type": "object"}}]
+    TOOL_OUTPUT = '<tool_call>{"name": "f", "arguments": {"x": 1}}</tool_call>'
+
+    @pytest.mark.asyncio
+    async def test_none_suppresses_function_call(self, app_client):
+        mock_result = {"text": self.TOOL_OUTPUT, "done": True, "stats": TimingStats()}
+        with patch(
+            "olmlx.routers.responses.generate_chat", new_callable=AsyncMock
+        ) as mock_gen:
+            mock_gen.return_value = mock_result
+            resp = await app_client.post(
+                "/v1/responses",
+                json={
+                    "model": "qwen3",
+                    "input": "go",
+                    "tools": self.TOOLS,
+                    "tool_choice": "none",
+                },
+            )
+        assert resp.status_code == 200
+        out = resp.json()["output"]
+        assert not any(it["type"] == "function_call" for it in out)
+        # Tools must not be forwarded to the engine when the client forced text.
+        assert mock_gen.call_args.kwargs["tools"] is None
+
+    @pytest.mark.asyncio
+    async def test_required_is_rejected_with_400(self, app_client):
+        resp = await app_client.post(
+            "/v1/responses",
+            json={
+                "model": "qwen3",
+                "input": "go",
+                "tools": self.TOOLS,
+                "tool_choice": "required",
+            },
+        )
+        assert resp.status_code == 400
+
+
+class TestBufferedToolStreamKeepalive:
+    """Issue #616: the Responses tools-mode buffered stream must emit keepalive
+    pings during generation instead of zero bytes until it finishes."""
+
+    @pytest.mark.asyncio
+    async def test_pings_emitted_during_slow_generation(self, app_client):
+        async def mock_stream(*args, **kwargs):
+            async def gen():
+                await asyncio.sleep(0.05)
+                yield {"text": "hi", "done": False}
+                yield {"text": "", "done": True, "stats": TimingStats()}
+
+            return gen()
+
+        with (
+            patch("olmlx.routers.responses.generate_chat", side_effect=mock_stream),
+            patch("olmlx.routers.responses.KEEPALIVE_PING_INTERVAL", 0.01),
+        ):
+            resp = await app_client.post(
+                "/v1/responses",
+                json={
+                    "model": "qwen3",
+                    "input": "go",
+                    "stream": True,
+                    "tools": [
+                        {
+                            "type": "function",
+                            "name": "f",
+                            "parameters": {"type": "object"},
+                        }
+                    ],
+                },
+            )
+        # SSE comment lines (": ...") are the protocol-legal keepalive.
+        lines = resp.text.splitlines()
+        ping_idx = next(i for i, ln in enumerate(lines) if ln.startswith(": "))
+        # response.created must be the first event; pings come *after* it, never
+        # before (a comment ahead of the mandatory first event trips strict SDKs).
+        created_idx = next(
+            i for i, ln in enumerate(lines) if ln == "event: response.created"
+        )
+        assert created_idx < ping_idx, resp.text
 
 
 class TestSDKShapeRegression:

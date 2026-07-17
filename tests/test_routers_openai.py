@@ -2177,3 +2177,161 @@ class TestMalformedToolSchemaRejected:
         )
         assert resp.status_code == 400
         assert "text/event-stream" not in resp.headers.get("content-type", "")
+
+
+class TestToolChoice:
+    """Issue #620: ``tool_choice`` was accepted then silently ignored on
+    ``/v1/chat/completions``. ``"none"`` must suppress tool calls (guaranteed
+    text answer); unsupported forced values must 400 rather than be ignored."""
+
+    TOOLS = [
+        {
+            "type": "function",
+            "function": {
+                "name": "search",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"q": {"type": "string"}},
+                },
+            },
+        }
+    ]
+    # Model output that WOULD parse into a tool call if tools were honored.
+    TOOL_OUTPUT = '<tool_call>{"name": "search", "arguments": {"q": "x"}}</tool_call>'
+
+    @pytest.mark.asyncio
+    async def test_none_suppresses_tool_calls_non_streaming(self, app_client):
+        mock_result = {"text": self.TOOL_OUTPUT, "done": True, "stats": TimingStats()}
+        with patch(
+            "olmlx.routers.openai.generate_chat", new_callable=AsyncMock
+        ) as mock_gen:
+            mock_gen.return_value = mock_result
+            resp = await app_client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "qwen3",
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "tools": self.TOOLS,
+                    "tool_choice": "none",
+                },
+            )
+        assert resp.status_code == 200
+        msg = resp.json()["choices"][0]["message"]
+        # tool_choice "none" → no tool_calls, the raw text is returned verbatim.
+        assert not msg.get("tool_calls")
+        assert resp.json()["choices"][0]["finish_reason"] == "stop"
+
+    @pytest.mark.asyncio
+    async def test_none_does_not_pass_tools_to_engine(self, app_client):
+        mock_result = {"text": "ok", "done": True, "stats": TimingStats()}
+        with patch(
+            "olmlx.routers.openai.generate_chat", new_callable=AsyncMock
+        ) as mock_gen:
+            mock_gen.return_value = mock_result
+            await app_client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "qwen3",
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "tools": self.TOOLS,
+                    "tool_choice": "none",
+                },
+            )
+        # The engine must not receive the tools when the client forced text.
+        assert mock_gen.call_args.kwargs["tools"] is None
+
+    @pytest.mark.asyncio
+    async def test_auto_still_parses_tool_calls(self, app_client):
+        mock_result = {"text": self.TOOL_OUTPUT, "done": True, "stats": TimingStats()}
+        with patch(
+            "olmlx.routers.openai.generate_chat", new_callable=AsyncMock
+        ) as mock_gen:
+            mock_gen.return_value = mock_result
+            resp = await app_client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "qwen3",
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "tools": self.TOOLS,
+                    "tool_choice": "auto",
+                },
+            )
+        assert resp.status_code == 200
+        assert resp.json()["choices"][0]["message"]["tool_calls"]
+
+    @pytest.mark.asyncio
+    async def test_required_is_rejected_with_400(self, app_client):
+        # No generate_chat mock: request must fail before dispatch.
+        resp = await app_client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "qwen3",
+                "messages": [{"role": "user", "content": "hi"}],
+                "tools": self.TOOLS,
+                "tool_choice": "required",
+            },
+        )
+        assert resp.status_code == 400
+        assert resp.json()["error"]["type"] == "invalid_request_error"
+
+    @pytest.mark.asyncio
+    async def test_forced_function_is_rejected_with_400(self, app_client):
+        resp = await app_client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "qwen3",
+                "messages": [{"role": "user", "content": "hi"}],
+                "tools": self.TOOLS,
+                "tool_choice": {"type": "function", "function": {"name": "search"}},
+            },
+        )
+        assert resp.status_code == 400
+
+
+class TestBufferedToolStreamKeepalive:
+    """Issue #616: the OpenAI tools-mode buffered stream must emit keepalive
+    pings during the (potentially minutes-long) generation window so idle-read
+    timeouts don't abort the request. Previously it sent zero bytes until the
+    whole generation finished."""
+
+    @pytest.mark.asyncio
+    async def test_pings_emitted_during_slow_generation(self):
+        import asyncio
+
+        from olmlx.routers.openai import _stream_openai_sse_with_tools
+
+        class SlowResult:
+            def __init__(self):
+                self._chunks = [
+                    {"text": "hello", "done": False},
+                    {"text": "", "done": True, "stats": TimingStats()},
+                ]
+                self._i = 0
+
+            def __aiter__(self):
+                return self
+
+            async def __anext__(self):
+                if self._i >= len(self._chunks):
+                    raise StopAsyncIteration
+                # Sleep longer than the (patched) ping interval so pings fire.
+                await asyncio.sleep(0.05)
+                chunk = self._chunks[self._i]
+                self._i += 1
+                return chunk
+
+            async def aclose(self):
+                pass
+
+        with patch("olmlx.routers.openai.KEEPALIVE_PING_INTERVAL", 0.01):
+            emitted = [
+                item
+                async for item in _stream_openai_sse_with_tools(
+                    SlowResult(), "id", "qwen3", 0, declared_tools=None
+                )
+            ]
+
+        # SSE comment lines (": ...") are the protocol-legal keepalive.
+        assert any(item.startswith(": ") for item in emitted), emitted
+        # And normal completion still happens.
+        assert any("[DONE]" in item for item in emitted)

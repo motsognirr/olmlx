@@ -3197,3 +3197,72 @@ def test_convert_messages_collects_audio_block():
     msgs = _convert_messages(req)
     user = [m for m in msgs if m["role"] == "user"][0]
     assert user["audio"] == ["data:audio/wav;base64,QQ=="]
+
+
+class TestToolChoiceHonored:
+    """Issue #620: on /v1/messages ``tool_choice`` was accepted and ignored.
+    ``{"type":"none"}`` must suppress tool calls; ``"any"``/forced ``"tool"``
+    must 400."""
+
+    TOOLS = [
+        {
+            "name": "search",
+            "description": "Search",
+            "input_schema": {
+                "type": "object",
+                "properties": {"q": {"type": "string"}},
+            },
+        }
+    ]
+    TOOL_OUTPUT = '<tool_call>{"name": "search", "arguments": {"q": "x"}}</tool_call>'
+
+    @pytest.mark.asyncio
+    async def test_none_suppresses_tool_use(self, app_client):
+        mock_result = {"text": self.TOOL_OUTPUT, "done": True, "stats": TimingStats()}
+        with patch(
+            "olmlx.routers.anthropic.generate_chat", new_callable=AsyncMock
+        ) as mock_gen:
+            mock_gen.return_value = mock_result
+            resp = await app_client.post(
+                "/v1/messages",
+                json={
+                    "model": "qwen3",
+                    "messages": [{"role": "user", "content": "search"}],
+                    "max_tokens": 100,
+                    "tools": self.TOOLS,
+                    "tool_choice": {"type": "none"},
+                },
+            )
+        assert resp.status_code == 200
+        blocks = resp.json()["content"]
+        assert not any(b["type"] == "tool_use" for b in blocks)
+        # Tools must not be forwarded to the engine when the client forced text.
+        assert mock_gen.call_args.kwargs["tools"] is None
+
+    @pytest.mark.asyncio
+    async def test_any_is_rejected_with_400(self, app_client):
+        resp = await app_client.post(
+            "/v1/messages",
+            json={
+                "model": "qwen3",
+                "messages": [{"role": "user", "content": "hi"}],
+                "max_tokens": 100,
+                "tools": self.TOOLS,
+                "tool_choice": {"type": "any"},
+            },
+        )
+        assert resp.status_code == 400
+
+    @pytest.mark.asyncio
+    async def test_forced_tool_is_rejected_with_400(self, app_client):
+        resp = await app_client.post(
+            "/v1/messages",
+            json={
+                "model": "qwen3",
+                "messages": [{"role": "user", "content": "hi"}],
+                "max_tokens": 100,
+                "tools": self.TOOLS,
+                "tool_choice": {"type": "tool", "name": "search"},
+            },
+        )
+        assert resp.status_code == 400

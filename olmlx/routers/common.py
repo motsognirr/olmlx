@@ -71,6 +71,43 @@ def resolve_openai_think(
     return None
 
 
+def resolve_tool_choice(tool_choice: str | dict[str, Any] | None) -> bool:
+    """Map a request ``tool_choice`` to whether tools are honored (issue #620).
+
+    Collapses the OpenAI/Responses form (a string ``"auto"``/``"none"``/…, or a
+    ``{"type": "function", …}`` forced selection) and the Anthropic form (a
+    ``{"type": "auto"|"none"|"any"|"tool"}`` object) into a single boolean:
+
+    - ``None`` / ``"auto"`` / ``{"type": "auto"}`` → ``True``: the model may
+      call tools and they are parsed out of the output (the prior, default
+      behavior).
+    - ``"none"`` / ``{"type": "none"}`` → ``False``: suppress tools — the
+      request runs as if none were declared, guaranteeing a text answer (the
+      standard way to force prose mid tool-loop).
+
+    Any other value — ``"required"``, Anthropic ``"any"``, or a forced
+    ``{"type": "function"|"tool", …}`` selection — cannot be honored (there is
+    no forced-tool decoding), so it raises :class:`ValueError` (→ 400 via the
+    app's handler) instead of being silently ignored, which is exactly the
+    divergence issue #620 reports.
+    """
+    if tool_choice is None:
+        return True
+    if isinstance(tool_choice, str):
+        value = tool_choice.strip().lower()
+    elif isinstance(tool_choice, dict):
+        value = tool_choice.get("type")
+    else:
+        raise ValueError("tool_choice must be a string or an object")
+    if value == "auto":
+        return True
+    if value == "none":
+        return False
+    raise ValueError(
+        f"tool_choice {value!r} is not supported; only 'auto' and 'none' are honored"
+    )
+
+
 def collect_content_parts(
     parts: Iterable[Any],
 ) -> tuple[list[str], list[str], list[str]]:

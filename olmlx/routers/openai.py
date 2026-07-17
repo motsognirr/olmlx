@@ -22,9 +22,12 @@ from olmlx.routers.common import (
     build_inference_options,
     collect_content_parts,
     resolve_openai_think,
+    resolve_tool_choice,
 )
 from olmlx.routers.streaming_common import (
-    collect_stream,
+    KEEPALIVE_PING_INTERVAL,
+    BufferedModelOutput,
+    buffer_stream,
     parse_buffered_output,
     parse_model_output_post,
     sse_error_event,
@@ -199,7 +202,24 @@ async def _stream_openai_sse_with_tools(
     4. Done:  delta={}, finish_reason="tool_calls"
     """
     try:
-        out = await collect_stream(result)
+        # Buffer the full output, but forward keepalive pings while it drains
+        # (issue #616). With tools declared, a thinking model can generate for
+        # minutes before the first real SSE byte; SSE comment lines (": ...")
+        # are the protocol-legal keepalive that keeps SDK/proxy idle-read
+        # timeouts from aborting the request mid-generation.
+        out = BufferedModelOutput()
+        async for item in buffer_stream(
+            result,
+            keepalive_interval=KEEPALIVE_PING_INTERVAL,
+            ping=": ping\n\n",
+        ):
+            if isinstance(item, BufferedModelOutput):
+                out = item
+            elif isinstance(item, str):
+                # Keepalive ping SSE comment. (cache_info dicts, also yielded
+                # by buffer_stream, carry no OpenAI-SSE payload and are dropped
+                # here just as collect_stream discarded them.)
+                yield item
         done_reason = out.done_reason
         _thinking, visible_text, tool_uses = parse_buffered_output(out, declared_tools)
         logger.debug(
@@ -325,6 +345,11 @@ async def openai_chat(req: OpenAIChatRequest, request: Request):
     # ``parameters`` would otherwise crash post-parse — see #644). Raises
     # ValueError → 400 via the app's ValueError handler.
     validate_declared_tools(req.tools)
+    # Honor tool_choice (issue #620): "none" suppresses tools (guaranteed text
+    # answer), "auto"/absent keeps them; anything forced ("required", a
+    # {"type":"function"} selection) raises ValueError → 400 rather than being
+    # silently ignored. ``effective_tools`` gates every downstream tools path.
+    effective_tools = req.tools if resolve_tool_choice(req.tool_choice) else None
     messages = [m.model_dump(exclude_none=True) for m in req.messages]
     # A malformed image content part (e.g. image_url with no url) is a client
     # error — surface as 422 rather than an uncaught 500.
@@ -388,7 +413,7 @@ async def openai_chat(req: OpenAIChatRequest, request: Request):
             req.model,
             messages,
             options,
-            tools=req.tools,
+            tools=effective_tools,
             stream=True,
             max_tokens=max_tokens,
             cache_id=cache_id,
@@ -396,14 +421,14 @@ async def openai_chat(req: OpenAIChatRequest, request: Request):
             grammar_spec=grammar_spec,
         )
 
-        if req.tools:
+        if effective_tools:
             return StreamingResponse(
                 _stream_openai_sse_with_tools(
                     result,
                     chat_id,
                     req.model,
                     created,
-                    declared_tools=req.tools,
+                    declared_tools=effective_tools,
                 ),
                 media_type="text/event-stream",
             )
@@ -431,7 +456,7 @@ async def openai_chat(req: OpenAIChatRequest, request: Request):
             req.model,
             messages,
             options,
-            tools=req.tools,
+            tools=effective_tools,
             stream=False,
             max_tokens=max_tokens,
             cache_id=cache_id,
@@ -449,11 +474,11 @@ async def openai_chat(req: OpenAIChatRequest, request: Request):
         )
         usage = OpenAIUsage.from_stats(result.get("stats"))
 
-        has_tools = bool(req.tools)
+        has_tools = bool(effective_tools)
         _thinking, visible_text, tool_uses = parse_model_output_post(
             parse_text,
             has_tools,
-            req.tools,
+            effective_tools,
             thinking_expected=bool(result.get("thinking_expected")),
         )
 
