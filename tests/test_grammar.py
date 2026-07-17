@@ -113,6 +113,48 @@ class TestParseResponseFormat:
         with pytest.raises(ValueError, match="unsupported grammar format type"):
             parse_response_format(42)
 
+    def test_invalid_nested_json_schema_type_raises_clean_error(self):
+        """Issue #645: a schema whose (nested) ``type`` is not a real
+        JSON-Schema type is a client error — it must be rejected at parse
+        time with a clean ValueError, not crash the xgrammar compiler later
+        with a 500. The message must not leak xgrammar's internal C++ source
+        path/line."""
+        with pytest.raises(ValueError, match="invalid JSON schema") as exc_info:
+            parse_response_format(
+                {
+                    "type": "json_schema",
+                    "json_schema": {
+                        "name": "x",
+                        "schema": {"type": "not-a-real-type"},
+                    },
+                }
+            )
+        msg = str(exc_info.value)
+        assert ".cc:" not in msg  # no leaked C++ source location
+        assert "runner/work" not in msg  # no leaked build path
+        assert "not-a-real-type" in msg  # the actionable detail is preserved
+
+    def test_invalid_bare_ollama_schema_rejected_at_parse_time(self):
+        """The Ollama ``format`` path (a bare JSON Schema with
+        ``properties``) is validated too, not just the OpenAI shape."""
+        with pytest.raises(ValueError, match="invalid JSON schema"):
+            parse_response_format(
+                {"type": "object", "properties": {"x": {"type": "bogus"}}}
+            )
+
+    def test_valid_nested_schema_passes_new_validation(self):
+        """A well-formed nested schema must NOT be rejected by the added
+        validation (guard against false positives)."""
+        schema = {
+            "type": "object",
+            "properties": {"name": {"type": "string"}, "age": {"type": "integer"}},
+            "required": ["name"],
+        }
+        spec = parse_response_format(schema)
+        assert spec is not None
+        assert spec.kind == "json_schema"
+        assert spec.schema == schema
+
 
 class TestGrammarSpec:
     def test_not_hashable(self):

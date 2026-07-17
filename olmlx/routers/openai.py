@@ -465,9 +465,14 @@ async def openai_chat(req: OpenAIChatRequest, request: Request):
             finish_reason = "length"
         else:
             finish_reason = "stop"
-        content = visible_text
+        # OpenAI spec: ``content`` is ``null`` ONLY when ``tool_calls`` is
+        # present; otherwise it is a (possibly empty) string. An empty
+        # ``visible_text`` with no tool call is legitimate — e.g. a thinking
+        # model whose reasoning consumed the whole ``max_tokens`` budget — and
+        # must serialize as ``""`` to match the streaming path (issue #660).
+        content: str | None = visible_text
         if not content:
-            content = None
+            content = None if tool_uses else ""
 
         resp = OpenAIChatResponse(
             id=chat_id,
