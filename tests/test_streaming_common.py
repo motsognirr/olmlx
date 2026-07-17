@@ -68,6 +68,43 @@ class TestValidateDeclaredTools:
                 ]
             )
 
+    def _tool(self, params):
+        return [{"type": "function", "function": {"name": "foo", "parameters": params}}]
+
+    def test_non_dict_properties_raises(self):
+        # Would otherwise crash fill_missing_required_args at ``.items()``.
+        with pytest.raises(ValueError, match=r"parameters\.properties"):
+            validate_declared_tools(self._tool({"required": ["a"], "properties": "x"}))
+
+    def test_non_list_required_raises(self):
+        # Would otherwise crash at ``set(required)`` for a non-iterable.
+        with pytest.raises(ValueError, match=r"parameters\.required"):
+            validate_declared_tools(self._tool({"required": 3}))
+
+    def test_required_with_non_string_element_raises(self):
+        # An unhashable element would crash ``set(required)``.
+        with pytest.raises(ValueError, match=r"parameters\.required"):
+            validate_declared_tools(self._tool({"required": [{"nested": 1}]}))
+
+    def test_non_dict_required_property_value_raises(self):
+        # Would otherwise crash at ``v.get("type")`` for the required prop.
+        with pytest.raises(ValueError, match=r"properties\['a'\]"):
+            validate_declared_tools(
+                self._tool({"required": ["a"], "properties": {"a": "not-an-object"}})
+            )
+
+    def test_non_dict_value_on_non_required_property_is_allowed(self):
+        # Only *required* property definitions are dereferenced downstream, so
+        # a weird value on a non-required property must not be over-rejected.
+        validate_declared_tools(
+            self._tool({"required": ["a"], "properties": {"a": {}, "b": "whatever"}})
+        )
+
+    def test_missing_properties_with_required_is_allowed(self):
+        # fill_missing_required_args coalesces a missing ``properties`` to {},
+        # yielding no injection — not a crash, so not rejected.
+        validate_declared_tools(self._tool({"required": ["a"]}))
+
 
 async def _agen(chunks):
     for chunk in chunks:
