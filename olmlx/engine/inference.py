@@ -3596,6 +3596,7 @@ async def _stream_completion(
         )
         timed_out = False
         stop_hit = False
+        stopped = False
 
         with (
             _tracing.span("decode") as _decode_span,
@@ -3639,6 +3640,13 @@ async def _stream_completion(
                                     yield {"text": token_part, "done": False}
                                 elif channel_filter.should_yield(token_part):
                                     yield {"text": token_part, "done": False}
+                            # Cancel the worker so it stops decoding past-stop
+                            # tokens into the shared prompt_cache — otherwise it
+                            # keeps mutating the very object we are about to
+                            # store by reference (#604). Mirrors the timeout
+                            # path's cancel below.
+                            stopped = True
+                            stream.cancel()
                             break
 
                     # Yield text only if the filter allows it (or no filter).
@@ -3711,15 +3719,26 @@ async def _stream_completion(
             )
             generation_complete = True
 
-            # Store cache state after successful generation
-            await _store_prompt_cache_after_generation(
-                lm,
-                gen_kwargs,
-                full_prompt_tokens,
-                generated_tokens,
-                stats.eval_count,
-                cache_id,
-            )
+            if stopped:
+                # Stop-sequence hit: the worker was cancelled mid-decode, so the
+                # live prompt_cache holds tokens past the stop that our
+                # generated_tokens metadata does not track. Storing it by
+                # reference would misalign the next cache hit (#604). Drop any
+                # entry for this cache_id (setup may have installed this same
+                # mutated object) and skip storage — mirrors the timeout path,
+                # which never stores. The prefix is re-prefilled next turn.
+                if full_prompt_tokens is not None:
+                    lm.prompt_cache_store.remove(cache_id)
+            else:
+                # Store cache state after successful generation
+                await _store_prompt_cache_after_generation(
+                    lm,
+                    gen_kwargs,
+                    full_prompt_tokens,
+                    generated_tokens,
+                    stats.eval_count,
+                    cache_id,
+                )
 
         # raw_text contains the complete unfiltered output (e.g. gpt-oss channel tokens).
         # It is only present in the done chunk when gpt-oss channel format was used,
@@ -3996,6 +4015,8 @@ async def _full_completion(
                     generated_tokens_out=generated_tokens if use_prompt_cache else None,
                     grammar_active=grammar_active,
                     deferred_prefill=deferred_prefill,
+                    stop_sequences=stop_sequences,
+                    thinking_expected=thinking_expected,
                 )
                 generation_complete = True
 
@@ -4089,6 +4110,8 @@ async def _full_completion_inner(
     generated_tokens_out: list[int] | None = None,
     grammar_active: bool = False,
     deferred_prefill: Callable[[threading.Event | None], None] | None = None,
+    stop_sequences: list[str] | None = None,
+    thinking_expected: bool = False,
 ) -> dict:
     audio_paths: list[str] = []
     _audio_temps: list[str] = []
@@ -4218,25 +4241,51 @@ async def _full_completion_inner(
             # can persist the produced token IDs alongside the prompt prefix.
             result = None
             text_parts = []
-            for response in mlx_lm.stream_generate(
+            # Feed a StopScanner so a stop-sequence match halts decoding at the
+            # earliest match instead of running on to max_tokens and truncating
+            # post-hoc — the latter wastes GPU time under the inference lock and
+            # stores post-stop tokens in the prompt cache (#613). The full text
+            # (including the stop marker) is kept so the caller's post-hoc
+            # truncate_at_stop still trims it and sets finish_reason.
+            stop_scanner = (
+                StopScanner(stop_sequences, thinking_aware=thinking_expected)
+                if stop_sequences
+                else None
+            )
+            mlx_gen = mlx_lm.stream_generate(
                 lm.model,
                 lm.tokenizer,
                 prompt=prompt,
                 max_tokens=max_tokens,
                 **gen_kwargs,
-            ):
-                text_parts.append(response.text)
-                if generated_tokens_out is not None:
-                    tok_id = getattr(response, "token", None)
-                    if tok_id is not None:
-                        generated_tokens_out.append(tok_id)
-                    else:
-                        logger.debug(
-                            "Skipping token with None ID at generation step %d "
-                            "(cache token sequence will be incomplete)",
-                            len(generated_tokens_out),
-                        )
-                result = response
+            )
+            try:
+                for response in mlx_gen:
+                    text_parts.append(response.text)
+                    if generated_tokens_out is not None:
+                        tok_id = getattr(response, "token", None)
+                        if tok_id is not None:
+                            generated_tokens_out.append(tok_id)
+                        else:
+                            logger.debug(
+                                "Skipping token with None ID at generation step %d "
+                                "(cache token sequence will be incomplete)",
+                                len(generated_tokens_out),
+                            )
+                    result = response
+                    if stop_scanner is not None:
+                        _, stop_hit = stop_scanner.feed(response.text or "")
+                        if stop_hit:
+                            break
+            finally:
+                # Close the generator explicitly on an early (stop) break so
+                # mlx-lm's wired_limit.__exit__ runs its generation-stream sync
+                # now, on this worker thread — mirrors CancellableStream._run.
+                # Guarded: mlx_lm.stream_generate returns a real generator, but
+                # tests may substitute a plain iterator with no close().
+                _close = getattr(mlx_gen, "close", None)
+                if callable(_close):
+                    _close()
             # Store full text on the result for downstream extraction
             if result is not None:
                 result = (result, "".join(text_parts))
