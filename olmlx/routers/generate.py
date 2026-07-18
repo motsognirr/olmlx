@@ -46,6 +46,8 @@ async def generate(req: GenerateRequest, request: Request):
             system=req.system if not req.raw else None,
             enable_thinking=enable_thinking,
             grammar_spec=grammar_spec,
+            context=req.context,
+            return_context=True,
         )
 
         think_state: dict = {}
@@ -81,6 +83,11 @@ async def generate(req: GenerateRequest, request: Request):
                     "done": True,
                     "done_reason": chunk.get("done_reason", "stop"),
                 }
+                # Ollama continuation context (#656): the terminal chunk carries
+                # the full prompt+generated token sequence for the client to
+                # pass back as `context` next turn.
+                if chunk.get("context") is not None:
+                    final["context"] = chunk["context"]
                 if stats:
                     final.update(stats.to_dict())
                 lines.append(json.dumps(final) + "\n")
@@ -116,6 +123,8 @@ async def generate(req: GenerateRequest, request: Request):
             system=req.system if not req.raw else None,
             enable_thinking=enable_thinking,
             grammar_spec=grammar_spec,
+            context=req.context,
+            return_context=True,
         )
         now = datetime.now(timezone.utc).isoformat()
         stats = result.get("stats")
@@ -148,6 +157,10 @@ async def generate(req: GenerateRequest, request: Request):
         }
         if thinking:
             response["thinking"] = thinking
+        # Ollama continuation context (#656): full prompt+generated token
+        # sequence for the client to pass back as `context` next turn.
+        if result.get("context") is not None:
+            response["context"] = result["context"]
         if stats:
             response.update(stats.to_dict())
         return response

@@ -279,6 +279,88 @@ class TestGenerateRouter:
         assert "created_at" in last_line
 
 
+class TestContextField:
+    """Ollama legacy ``context`` continuation (issue #656)."""
+
+    @pytest.mark.asyncio
+    async def test_request_context_forwarded_to_engine(self, app_client):
+        mock_result = {"text": "ok", "done": True, "stats": TimingStats()}
+        with patch(
+            "olmlx.routers.generate.generate_completion", new_callable=AsyncMock
+        ) as mock_gen:
+            mock_gen.return_value = mock_result
+            await app_client.post(
+                "/api/generate",
+                json={
+                    "model": "qwen3",
+                    "prompt": "Continue:",
+                    "context": [1, 2, 3],
+                    "stream": False,
+                },
+            )
+        _, kwargs = mock_gen.call_args
+        assert kwargs["context"] == [1, 2, 3]
+        assert kwargs["return_context"] is True
+
+    @pytest.mark.asyncio
+    async def test_non_streaming_response_includes_context(self, app_client):
+        mock_result = {
+            "text": "ok",
+            "done": True,
+            "context": [1, 2, 3, 4, 5],
+            "stats": TimingStats(),
+        }
+        with patch(
+            "olmlx.routers.generate.generate_completion", new_callable=AsyncMock
+        ) as mock_gen:
+            mock_gen.return_value = mock_result
+            resp = await app_client.post(
+                "/api/generate",
+                json={"model": "qwen3", "prompt": "Hi", "stream": False},
+            )
+        assert resp.status_code == 200
+        assert resp.json()["context"] == [1, 2, 3, 4, 5]
+
+    @pytest.mark.asyncio
+    async def test_streaming_final_frame_includes_context(self, app_client):
+        async def mock_stream(*args, **kwargs):
+            async def gen():
+                yield {"text": "hi", "done": False}
+                yield {
+                    "text": "",
+                    "done": True,
+                    "context": [7, 8, 9],
+                    "stats": TimingStats(),
+                }
+
+            return gen()
+
+        with patch(
+            "olmlx.routers.generate.generate_completion", side_effect=mock_stream
+        ):
+            resp = await app_client.post(
+                "/api/generate",
+                json={"model": "qwen3", "prompt": "Hi", "stream": True},
+            )
+        assert resp.status_code == 200
+        lines = [json.loads(x) for x in resp.text.strip().split("\n") if x.strip()]
+        assert lines[-1]["done"] is True
+        assert lines[-1]["context"] == [7, 8, 9]
+
+    @pytest.mark.asyncio
+    async def test_non_streaming_response_omits_context_when_absent(self, app_client):
+        mock_result = {"text": "ok", "done": True, "stats": TimingStats()}
+        with patch(
+            "olmlx.routers.generate.generate_completion", new_callable=AsyncMock
+        ) as mock_gen:
+            mock_gen.return_value = mock_result
+            resp = await app_client.post(
+                "/api/generate",
+                json={"model": "qwen3", "prompt": "Hi", "stream": False},
+            )
+        assert "context" not in resp.json()
+
+
 class TestFormatField:
     """Ollama ``format`` field maps to a GrammarSpec (issue #361)."""
 

@@ -934,6 +934,29 @@ def tokenize_for_cache(tokenizer: Any, prompt_text: str) -> list[int]:
     return tokenizer.encode(prompt_text, add_special_tokens=add_special)
 
 
+def build_context_input_tokens(
+    tokenizer: Any, prompt_text: str, context: list[int] | None
+) -> list[int]:
+    """Build the full input token sequence for Ollama ``/api/generate`` context.
+
+    Tokenizes *prompt_text* (via :func:`tokenize_for_cache`, so the ids match
+    what generation would produce for the string) and, when *context* is a
+    non-empty prior token sequence, prepends it — the legacy Ollama
+    stateless-continuation mechanism (issue #656).  A leading BOS on the fresh
+    prompt is dropped when *context* is supplied so the concatenated sequence
+    doesn't repeat the sequence-initial BOS (whether the BOS came from
+    ``add_special_tokens`` or from a chat template that emits it as literal
+    text — both surface as ``bos_token_id`` at position 0).
+    """
+    prompt_tokens = tokenize_for_cache(tokenizer, prompt_text)
+    if not context:
+        return prompt_tokens
+    bos_id = getattr(tokenizer, "bos_token_id", None)
+    if bos_id is not None and prompt_tokens and prompt_tokens[0] == bos_id:
+        prompt_tokens = prompt_tokens[1:]
+    return list(context) + prompt_tokens
+
+
 async def _acquire_inference_lock(timeout_override: float | None = None):
     """Acquire the inference lock with optional timeout.
 
@@ -1483,6 +1506,8 @@ async def generate_completion(
     system: str | None = None,
     enable_thinking: bool | None = None,
     grammar_spec: GrammarSpec | None = None,
+    context: list[int] | None = None,
+    return_context: bool = False,
 ) -> AsyncGenerator[dict, None] | dict:
     """Generate a text completion, streaming or not.
 
@@ -1491,6 +1516,16 @@ async def generate_completion(
     If *system* is provided, it becomes a ``{"role": "system"}`` message.
     This is needed for chat-only models (e.g. Nemotron-H) that require the
     template framing to produce meaningful output.
+
+    *context* / *return_context* implement Ollama ``/api/generate``'s legacy
+    stateless multi-turn continuation (issue #656).  When *return_context* is
+    True the (non-VLM) result carries a ``context`` key — the full token
+    sequence that was prefilled followed by every generated token id — so a
+    client can pass it back as *context* next turn.  A supplied *context* is
+    prepended as a raw token prefix to the tokenized prompt (bypassing no
+    template — the new turn is still templated/tokenized as usual, then
+    appended).  Both are ignored for VLMs, whose token ids can't represent
+    image patches.
     """
     stats = TimingStats()
 
@@ -1594,6 +1629,19 @@ async def generate_completion(
             else False
         )
 
+        # Ollama /api/generate context continuation (#656): tokenize the prompt,
+        # prepend any prior `context` tokens, and feed generation the exact token
+        # ids so the returned context is a faithful continuation prefix. Text
+        # models only — VLM token ids can't represent image patches, and the
+        # cache/token paths only replace a str prompt.
+        context_input_tokens: list[int] | None = None
+        if return_context and not lm.is_vlm and isinstance(prompt, str):
+            context_input_tokens = build_context_input_tokens(
+                lm.text_tokenizer, prompt, context
+            )
+            prompt = context_input_tokens
+        collect_generated_tokens = context_input_tokens is not None
+
         if stream:
             gen = _stream_completion(
                 lm,
@@ -1606,6 +1654,7 @@ async def generate_completion(
                 grammar_active=grammar_active,
                 adopt_pin=True,
                 thinking_expected=thinking_expected,
+                collect_generated_tokens=collect_generated_tokens,
             )
             # Ownership of the pin transfers to the wrapper; its finally
             # releases on any generator exit. Mark the flag for the outer
@@ -1614,6 +1663,8 @@ async def generate_completion(
             streamed = _release_pin_after_gen(gen, lm)
             if _tracing.enabled():
                 streamed = _trace_inference_gen(streamed, lm)
+            if context_input_tokens is not None:
+                streamed = _augment_stream_with_context(streamed, context_input_tokens)
             return _prepend_meta(
                 streamed,
                 {"thinking_expected": thinking_expected},
@@ -1638,8 +1689,14 @@ async def generate_completion(
                         grammar_active=grammar_active,
                         adopt_pin=True,
                         thinking_expected=thinking_expected,
+                        collect_generated_tokens=collect_generated_tokens,
                     )
                 result["thinking_expected"] = thinking_expected
+                if context_input_tokens is not None:
+                    # Full continuation context: everything prefilled followed
+                    # by every generated token id (#656).
+                    generated = result.pop("generated_tokens", [])
+                    result["context"] = context_input_tokens + generated
                 return result
             finally:
                 # Release exactly once on every exit path — success or
@@ -3348,6 +3405,7 @@ async def _stream_completion(
     tokenizer: Any = None,
     template_kwargs: dict | None = None,
     thinking_expected: bool = False,
+    collect_generated_tokens: bool = False,
 ) -> AsyncGenerator[dict, None]:
     # Continuous batching (docs/batching-plan.md): eligible requests join
     # the per-model batch instead of serializing on the inference lock.
@@ -3746,6 +3804,12 @@ async def _stream_completion(
         done_chunk: dict = {"text": "", "done": True, "stats": stats}
         if raw_text:
             done_chunk["raw_text"] = raw_text
+        if collect_generated_tokens:
+            # Surface the produced token ids so generate_completion can build
+            # the Ollama continuation context (#656). Already accumulated above
+            # for the prompt cache; expose a copy so a later cache-store trim
+            # can't mutate what the router forwards.
+            done_chunk["generated_tokens"] = list(generated_tokens)
         if timed_out:
             done_chunk["done_reason"] = "timeout"
         elif stop_hit:
@@ -3906,11 +3970,15 @@ async def _full_completion(
     tokenizer: Any = None,
     template_kwargs: dict | None = None,
     thinking_expected: bool = False,
+    collect_generated_tokens: bool = False,
 ) -> dict:
     # Continuous batching (plan §4 item 6): eligible non-streaming
     # requests internally consume the batched stream and aggregate —
     # stop sequences stay in gen_kwargs for the stream to handle.
-    if _batch_eligible(
+    # The batched path aggregates its internal stream and does not surface
+    # per-token ids; a context request (#656) skips it and takes the
+    # token-tracked path below so `generated_tokens` can be collected.
+    if not collect_generated_tokens and _batch_eligible(
         lm,
         gen_kwargs,
         max_tokens=max_tokens,
@@ -4012,13 +4080,22 @@ async def _full_completion(
                     images,
                     audio,
                     has_tools=has_tools,
-                    generated_tokens_out=generated_tokens if use_prompt_cache else None,
+                    generated_tokens_out=(
+                        generated_tokens
+                        if (use_prompt_cache or collect_generated_tokens)
+                        else None
+                    ),
                     grammar_active=grammar_active,
                     deferred_prefill=deferred_prefill,
                     stop_sequences=stop_sequences,
                     thinking_expected=thinking_expected,
                 )
                 generation_complete = True
+                if collect_generated_tokens:
+                    # Surface produced token ids for the Ollama continuation
+                    # context (#656); a copy so cache-store paths can't mutate
+                    # what the router forwards.
+                    result_dict["generated_tokens"] = list(generated_tokens)
 
                 # Report the full prompt size to the caller — when the
                 # cache path (flat or checkpoint) hands a suffix to mlx-lm,
@@ -4846,6 +4923,27 @@ async def _prepend_meta(
     try:
         yield meta
         async for chunk in stream:
+            yield chunk
+    finally:
+        await stream.aclose()
+
+
+async def _augment_stream_with_context(
+    stream: AsyncGenerator[dict, None],
+    input_tokens: list[int],
+) -> AsyncGenerator[dict, None]:
+    """Attach the Ollama continuation ``context`` to the terminal chunk (#656).
+
+    The engine's done chunk carries the generated token ids under
+    ``generated_tokens`` (present because generation was asked to collect
+    them); replace that with ``context`` = the prefilled *input_tokens*
+    followed by those generated ids, so the router can forward it verbatim.
+    """
+    try:
+        async for chunk in stream:
+            if chunk.get("done"):
+                generated = chunk.pop("generated_tokens", [])
+                chunk["context"] = input_tokens + generated
             yield chunk
     finally:
         await stream.aclose()
