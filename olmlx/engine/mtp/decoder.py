@@ -203,14 +203,20 @@ class MTPDecoder(SpecDecoderBase):
         one sub-chunk. ``speculative_stream_generate`` catches it for a
         clean, token-less stream exit.
         """
+        # Build the target cache *before* patching layer hooks (mirrors
+        # DFlash, #633): ``make_prompt_cache`` walks ``model.layers`` to pick
+        # a per-layer cache type by probing the layer object. Today it uses
+        # ``hasattr`` (which ``_LayerHook.__getattr__`` proxies through), but a
+        # future ``isinstance`` check would silently get the wrong cache type
+        # for a ``_LayerHook``-wrapped layer. Building the cache first
+        # decouples cache selection from the patch.
+        self._target_cache = make_prompt_cache(self._target)
+        self._draft_cache = self._draft.make_cache()
+
         # Hook the chosen target layer so its output is captured into
         # ``_hidden_storage[0]`` on every target forward.
         self._install_layer_hooks([self._target_layer_id], self._hidden_storage)
         self._bind_draft()
-
-        # Build fresh caches for both models.
-        self._target_cache = make_prompt_cache(self._target)
-        self._draft_cache = self._draft.make_cache()
 
         # (Classic ``SpeculativeDecoder.prefill`` resets ``_position_ids``
         # / ``_rope_deltas`` on the target here for mlx-vlm targets,

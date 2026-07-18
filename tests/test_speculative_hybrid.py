@@ -253,6 +253,25 @@ class TestLifecycle:
         dec.close()
         assert dec._gdn_capture is None
 
+    def test_reset_state_detaches_gdn_buffer(self):
+        """``_reset_state`` (run by the base ``step()`` on a mid-step
+        exception) must detach the decoder-lifetime GDN capture from any
+        buffer. Otherwise the class-level ``GatedDeltaNet.__call__`` patch
+        stays routed to a stale buffer and every subsequent GDN call — from
+        this or *any* other hybrid model — keeps appending, leaking memory
+        until the next prefill (#633).
+        """
+        gdn = _make_fake_gdn_cls()
+        target = _make_hybrid_model(gdn_cls=gdn)
+        draft = _make_hybrid_model(gdn_cls=gdn)
+        dec = SpeculativeDecoder(draft, target)
+        try:
+            dec._gdn_capture.use_buffer = MagicMock()
+            dec._reset_state()
+            dec._gdn_capture.use_buffer.assert_called_once_with(None)
+        finally:
+            dec.close()
+
     def test_del_swallows_exceptions(self):
         """__del__ runs during GC and must never raise."""
         gdn = _make_fake_gdn_cls()

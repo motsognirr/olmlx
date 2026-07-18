@@ -173,7 +173,6 @@ class DFlashDecoder(SpecDecoderBase):
             # target has no ``GatedDeltaNet`` submodule, so a separate
             # pre-check would just duplicate the same error.
             self._install_gdn_capture()
-            self._capture.use_buffer(self._capture_buffer)
 
         # Two-pass prefill avoids materialising the full [batch, N, vocab] logit
         # (the OOM path for large-vocab models on long contexts).
@@ -191,8 +190,20 @@ class DFlashDecoder(SpecDecoderBase):
             "target_layer_ids — check that the layer indices exist on "
             f"this model (got {target_layer_ids})."
         )
+        # GDN capture is suppressed across the (potentially long) prefix pass
+        # and re-enabled before the tail pass, mirroring MTP (#633): the
+        # patched GDN ``__call__`` *appends* per forward, so capturing every
+        # prompt position would pile activation-scale q/k/v/conv tensors into
+        # the buffer and hold them live until the first ``step()`` clears it —
+        # re-bloating exactly the memory the two-pass split bounds, on the
+        # hybrid GDN targets DFlash names as its primary use case. ``step()``
+        # only ever needs the verify window (it clears the buffer and
+        # re-captures before each rollback), so the prompt captures are never
+        # consumed. ``_capture`` is only set on hybrid GDN targets.
         if prompt.shape[1] > 1:
             prefix, last = prompt[:, :-1], prompt[:, -1:]
+            if self._capture is not None:
+                self._capture.use_buffer(None)
             self._target(prefix, cache=self._target_cache)  # output discarded
             captured_prefix = list(self._hidden_capture)
             if any(h is None for h in captured_prefix):
@@ -204,6 +215,8 @@ class DFlashDecoder(SpecDecoderBase):
             # Reset capture slots so the pass-2 None-check is independent.
             self._hidden_capture[:] = [None] * len(self._hidden_capture)
             _eval_cache(self._target_cache)
+            if self._capture is not None:
+                self._capture.use_buffer(self._capture_buffer)
             target_out = self._target(last, cache=self._target_cache)
             captured_last = list(self._hidden_capture)
             if any(h is None for h in captured_last):
@@ -213,6 +226,11 @@ class DFlashDecoder(SpecDecoderBase):
                 for p, q in zip(captured_prefix, captured_last)
             ]
         else:
+            # Single-token prompt: no long prefix to suppress, so the buffer
+            # must be active for this forward so step()'s rollback has the
+            # captured GDN state (mirrors MTP's single-token branch).
+            if self._capture is not None:
+                self._capture.use_buffer(self._capture_buffer)
             target_out = self._target(prompt, cache=self._target_cache)
             captured = list(self._hidden_capture)
             if any(h is None for h in captured):

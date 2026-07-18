@@ -645,6 +645,15 @@ class SpeculativeDecoder(SpecDecoderBase):
     # ------------------------------------------------------------------
 
     def _reset_state(self) -> None:
+        # Detach the decoder-lifetime GDN capture from any buffer. The base
+        # ``step()`` runs this on a mid-step exception, but the capture (and
+        # its class-level ``GatedDeltaNet.__call__`` patch) outlives the
+        # request; if the buffer stays routed, every subsequent GDN call —
+        # including *other* hybrid models' non-speculative inference sharing
+        # the patched class — keeps appending into the stale buffer, growing
+        # memory without bound until the next ``prefill`` (#633).
+        if self._gdn_capture is not None:
+            self._gdn_capture.use_buffer(None)
         self._target_cache = None
         self._draft_cache = None
         self._cache_seq_len = 0
@@ -944,12 +953,16 @@ class SpeculativeDecoder(SpecDecoderBase):
             align_logits = _logits(self._draft(last_draft, cache=self._draft_cache))
             mx.eval(align_logits)
 
-        # 5. Update state
+        # 5. Update state.
+        # The next pending token is definitionally ``accepted[-1]``:
+        # ``verify_draft_greedy`` already argmax'd ``verification_logits[
+        # num_accepted - 1]`` to produce it (a correction on partial accept,
+        # the bonus on full accept). Re-deriving it here forced a second
+        # ``mx.eval`` + ``.item()`` Metal round-trip per decode step for an
+        # identical result; take the shortcut PLD already documents.
         self._cache_seq_len += num_accepted
         assert num_accepted >= 1, "step(): _verify() must return at least 1 token"
-        self._last_target_logit = verification_logits[num_accepted - 1]
-        mx.eval(self._last_target_logit)
-        self._pending_token = int(mx.argmax(self._last_target_logit).item())
+        self._pending_token = int(accepted[-1])
 
         num_accepted_draft = self._update_acceptance_rate(num_accepted)
 
@@ -1442,6 +1455,12 @@ class PromptLookupDecoder(SpecDecoderBase):
             self.reset()
 
     def _reset_state(self) -> None:
+        # Detach the decoder-lifetime GDN capture from any buffer on reset —
+        # otherwise a mid-step exception leaves the class-level patch routed
+        # to a stale buffer that every later GDN call keeps growing (#633).
+        # See the classic decoder's ``_reset_state`` for the full rationale.
+        if self._gdn_capture is not None:
+            self._gdn_capture.use_buffer(None)
         self._target_cache = None
         self._cache_seq_len = 0
         self._pending_token = None
