@@ -142,6 +142,63 @@ class FakeTokenizer:
         return list(range(1, min(len(text) + 1, 20)))
 
 
+class TestEmbedNormalizer:
+    """Gemma-family models scale embeddings by sqrt(hidden_size) in the model
+    forward (not in embed_tokens). Streaming calibration must replicate that
+    scale or predictors train on hidden states ~sqrt(hidden_size)x too small
+    (#624)."""
+
+    @staticmethod
+    def _model(model_type):
+        class _Args:
+            pass
+
+        args = _Args()
+        if model_type is not None:
+            args.model_type = model_type
+
+        class _Model:
+            pass
+
+        m = _Model()
+        m.args = args
+        return m
+
+    @pytest.mark.parametrize(
+        "mt", ["gemma", "gemma2", "gemma3_text", "gemma3n", "gemma4_text"]
+    )
+    def test_gemma_family_gets_sqrt_hidden_scale(self, mt):
+        from olmlx.engine.flash.prepare import _embed_normalizer
+
+        m = self._model(mt)
+        assert _embed_normalizer(m, m, 2304) == pytest.approx(2304**0.5)
+
+    def test_non_gemma_is_identity(self):
+        from olmlx.engine.flash.prepare import _embed_normalizer
+
+        m = self._model("qwen3")
+        assert _embed_normalizer(m, m, 4096) == 1.0
+
+    def test_missing_model_type_is_identity(self):
+        from olmlx.engine.flash.prepare import _embed_normalizer
+
+        class _Bare:
+            pass
+
+        bare = _Bare()
+        assert _embed_normalizer(bare, bare, 4096) == 1.0
+
+    def test_inner_model_type_used_when_outer_missing(self):
+        from olmlx.engine.flash.prepare import _embed_normalizer
+
+        class _Bare:
+            pass
+
+        outer = _Bare()
+        inner = self._model("gemma3_text")
+        assert _embed_normalizer(outer, inner, 1152) == pytest.approx(1152**0.5)
+
+
 class TestNullifyModuleParams:
     def test_replaces_all_params_with_placeholders(self):
         """After nullification, all parameter arrays should be size 1."""

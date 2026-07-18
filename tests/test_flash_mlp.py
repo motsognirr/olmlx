@@ -490,6 +490,35 @@ class TestFlashModelWrapperShard:
         with pytest.raises(ValueError, match="n_kv_heads.*not divisible"):
             wrapper.shard(FakeGroup(rank=0, size=8))
 
+    def test_replace_mlps_rejects_unbundled_mlp_layer(self, tmp_path):
+        """A layer with an ``.mlp`` but no bundled weights (mixed dense/MoE
+        model — only dense FFN layers get bundled, but MoE blocks also expose
+        ``.mlp``) must fail at load with a clear error naming the mismatch,
+        not a cryptic ``KeyError`` mid-forward in ``_read_neuron_raw`` (#624).
+        """
+        from types import SimpleNamespace
+
+        from olmlx.engine.flash.flash_model import FlashConfig, FlashModelWrapper
+
+        dim, n_heads, n_kv_heads = 64, 8, 4
+        inter = 32
+        # Model has 3 layers with ``.mlp``, but the bundle covers only 2.
+        model = _FakeModel(dim, n_heads, n_kv_heads, num_layers=3)
+        flash_dir, _, _ = _make_bundled_model(
+            tmp_path, hidden=dim, inter=inter, num_layers=2
+        )
+        store = FlashWeightStore(flash_dir, num_io_threads=2, cache_budget_neurons=64)
+        # Enough predictors that the guard — not an IndexError — is what fires.
+        predictor_bank = SimpleNamespace(
+            predictors=[SparsityPredictor(dim, inter, rank=4) for _ in range(3)],
+        )
+        config = FlashConfig(hidden_size=dim, intermediate_size=inter, num_layers=2)
+        try:
+            with pytest.raises(RuntimeError, match="no bundled weights"):
+                FlashModelWrapper(model, predictor_bank, store, config)
+        finally:
+            store.close()
+
     def test_shard_raises_if_called_twice(self, wrapper_setup):
         """A retry after a *successful* shard() must say so — not claim a
         mid-loop failure that never happened."""

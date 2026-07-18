@@ -361,6 +361,25 @@ class _RecordingMLP(nn.Module):
         return result
 
 
+def _embed_normalizer(model: Any, inner: Any, hidden_size: int) -> float:
+    """Return the embedding scale a model applies in its forward pass.
+
+    Gemma-family models (gemma / gemma2 / gemma3_text / gemma3n /
+    gemma4_text) scale embeddings by ``sqrt(hidden_size)`` inside the model
+    forward — *not* inside ``embed_tokens``. Streaming calibration seeds
+    ``h = embed(input_ids)`` directly, so without replicating that scale the
+    predictors train on hidden states ~``sqrt(hidden_size)``x smaller than
+    the serving-time residual stream, dropping genuinely-active neurons from
+    the FFN output (quality corruption, #624). Non-Gemma models embed at
+    unit scale, so this returns ``1.0``.
+    """
+    for obj in (model, inner):
+        model_type = getattr(getattr(obj, "args", None), "model_type", None)
+        if isinstance(model_type, str) and model_type.startswith("gemma"):
+            return float(hidden_size) ** 0.5
+    return 1.0
+
+
 def _stream_record_activations(
     model_path: str,
     calibration_texts: list[str],
@@ -431,11 +450,18 @@ def _stream_record_activations(
 
     mx.eval(embed.parameters())
 
+    # Gemma-family models scale embeddings by sqrt(hidden_size) in the model
+    # forward; seeding calibration from a bare ``embed(...)`` would train the
+    # predictors on hidden states far too small vs serving time (#624).
+    embed_scale = _embed_normalizer(model, inner, hidden_size)
+
     hidden_states: list[mx.array | None] = []
     for text in calibration_texts:
         tokens = _encode_tokens(tokenizer, text)
         input_ids = mx.array([tokens])
         h = embed(input_ids)
+        if embed_scale != 1.0:
+            h = h * embed_scale
         mx.eval(h)
         hidden_states.append(h)
 

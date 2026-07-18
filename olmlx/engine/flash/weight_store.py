@@ -76,9 +76,27 @@ class PreallocatedNeuronBuffer:
     def num_used(self) -> int:
         return self._num_used
 
+    @property
+    def capacity(self) -> int:
+        """Maximum number of neurons the buffer can hold."""
+        return self._max
+
     def contains(self, neuron_idx: int) -> bool:
         with self._lock:
             return neuron_idx in self._neuron_to_slot
+
+    def touch(self, neuron_indices: list[int]) -> None:
+        """Mark the given cached neurons most-recently-used.
+
+        Absent neurons are ignored. Refreshing the LRU order of the neurons
+        needed for the current forward *before* inserting its missing batch
+        guarantees the inserts evict only unrequested neurons (#624) — safe
+        whenever the distinct request count does not exceed ``capacity``.
+        """
+        with self._lock:
+            for idx in neuron_indices:
+                if idx in self._access_order:
+                    self._access_order.move_to_end(idx)
 
     def insert(
         self,
@@ -167,6 +185,12 @@ class FlashWeightStore:
         self._layouts = self._load_layouts()
 
         if use_preallocated_buffer:
+            if cache_budget_neurons < 1:
+                raise ValueError(
+                    "flash_cache_budget_neurons must be >= 1 when "
+                    "flash_preallocated_buffer is enabled; a zero-capacity "
+                    f"buffer can hold no neurons (got {cache_budget_neurons})."
+                )
             for layer_idx, layout in self._layouts.items():
                 np_dtype = _NP_DTYPE[layout.dtype]
                 # Pass mx_dtype for reinterpretation when numpy can't represent
@@ -189,6 +213,16 @@ class FlashWeightStore:
         except Exception:
             self.close()
             raise
+
+    @property
+    def layer_indices(self) -> frozenset[int]:
+        """Layer indices with bundled FFN weights in ``flash_layout.json``.
+
+        A layer with an ``.mlp`` but no entry here has no bundled weights —
+        wrapping it with a ``FlashMLP`` would ``KeyError`` on the first
+        forward (mixed dense/MoE model, #624).
+        """
+        return frozenset(self._layouts.keys())
 
     def _load_layouts(self) -> dict[int, BundledLayerLayout]:
         config_path = self._flash_dir / "flash_layout.json"
@@ -285,9 +319,29 @@ class FlashWeightStore:
         """Load neurons using the preallocated buffer path.
 
         Determines cached/missing under the lock to prevent TOCTOU races,
-        then releases for I/O, then re-acquires for insert + read.
+        then releases for I/O, then re-acquires to touch-insert-read.
+
+        Before inserting the missing batch the requested neurons are touched
+        to most-recently-used, so the inserts evict only *unrequested*
+        neurons — this is what stops a requested-but-cached neuron from being
+        evicted mid-forward and then KeyError-ing in ``get_matrices`` (#624).
+        That guarantee only holds when the number of distinct requested
+        neurons does not exceed the buffer capacity, so reject that up front
+        with a clear error instead of failing cryptically later.
         """
         buf = self._buffers[layer_idx]
+
+        distinct = set(neuron_indices)
+        if len(distinct) > buf.capacity:
+            raise RuntimeError(
+                f"Flash preallocated-buffer layer {layer_idx} needs "
+                f"{len(distinct)} active neurons in one forward but the buffer "
+                f"holds only {buf.capacity} (flash_cache_budget_neurons). "
+                f"Increase flash_cache_budget_neurons to at least the "
+                f"active-neuron count, cap active neurons "
+                f"(flash_max_active_neurons), or disable "
+                f"flash_preallocated_buffer."
+            )
 
         # Determine missing under lock to prevent concurrent eviction
         with buf.lock:
@@ -305,15 +359,17 @@ class FlashWeightStore:
 
         # Insert under lock, then check for eviction races
         with buf.lock:
+            buf.touch(neuron_indices)
             for idx, (gate, up, down) in loaded.items():
                 buf.insert(idx, gate, up, down)
             _, still_missing = buf.get_cached_indices(neuron_indices)
             if not still_missing:
                 return buf.get_matrices(neuron_indices)
 
-        # Re-fetch evicted neurons outside the lock (rare path)
+        # Re-fetch neurons evicted by a concurrent forward (rare path)
         extra = {idx: self._read_neuron_raw(layer_idx, idx) for idx in still_missing}
         with buf.lock:
+            buf.touch(neuron_indices)
             for idx, (gate, up, down) in extra.items():
                 buf.insert(idx, gate, up, down)
             return buf.get_matrices(neuron_indices)
