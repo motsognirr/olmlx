@@ -235,12 +235,15 @@ class MetricsMiddleware(BaseHTTPMiddleware):
         metrics_mod.HTTP_IN_FLIGHT.inc()
         start = time.perf_counter()
         status_code = 500
-        response = None
-        try:
-            response = await call_next(request)
-            status_code = response.status_code
-            return response
-        finally:
+        recorded = False
+
+        def _record():
+            # Idempotent: called once — either from the body-iterator finalizer
+            # (normal streaming path) or the except branch (call_next raised).
+            nonlocal recorded
+            if recorded:
+                return
+            recorded = True
             metrics_mod.HTTP_IN_FLIGHT.dec()
             # Prefer the matched route template to bound cardinality; fall back
             # to a literal for unmatched paths (404 with no route).
@@ -249,7 +252,43 @@ class MetricsMiddleware(BaseHTTPMiddleware):
             metrics_mod.record_http_request(
                 label_path, request.method, status_code, time.perf_counter() - start
             )
+
+        try:
+            response = await call_next(request)
+        except BaseException:
+            _record()
+            raise
+        finally:
+            # surface_var only needs to guard this middleware's own frame:
+            # BaseHTTPMiddleware runs the inner app in a sub-task with a
+            # *copied* context, so resetting here does not clobber the value
+            # the streaming body sees (same reason RequestIDMiddleware resets
+            # in its finally). Keeping it here — rather than in the body
+            # finalizer — also avoids resetting a ContextVar Token from a
+            # different context than the one it was created in.
             surface_var.reset(surface_token)
+
+        status_code = response.status_code
+
+        # Defer HTTP_IN_FLIGHT.dec() and the duration histogram until the whole
+        # response body has streamed. With BaseHTTPMiddleware, ``call_next``
+        # returns at TTFT (when the inner app sends http.response.start), so
+        # recording in a plain ``finally`` would clock streaming responses —
+        # the dominant /api/chat and /v1/chat/completions workload — at ~TTFT
+        # and read in-flight as 0 during active generation (#635). Wrapping the
+        # body iterator records when the last chunk is sent. Buffered responses
+        # stream their single chunk immediately, so their timing is unchanged.
+        original_iterator = response.body_iterator
+
+        async def _instrumented_body():
+            try:
+                async for chunk in original_iterator:
+                    yield chunk
+            finally:
+                _record()
+
+        response.body_iterator = _instrumented_body()
+        return response
 
 
 class RootSpanMiddleware(BaseHTTPMiddleware):

@@ -1,6 +1,7 @@
 import logging
 import math
 import os
+from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Annotated, Literal
@@ -807,29 +808,78 @@ def warn_legacy_flash_env() -> None:
     )
 
 
-def _legacy_names_in_dotenv(names: tuple[str, ...]) -> set[str]:
-    """Return the subset of *names* present as keys in the project ``.env``.
+def _looks_quoted(value: str) -> bool:
+    """True if *value* is wrapped in matching single or double quotes.
 
-    Key membership only — ``warn_legacy_flash_env`` warns on presence
-    regardless of value, so values are never parsed.
+    Length >= 2 so a lone quote character doesn't count as its own pair
+    (and thus collapse to the empty string when the quotes are stripped).
     """
-    dotenv_path = Path(".env")
+    return len(value) >= 2 and (
+        (value.startswith('"') and value.endswith('"'))
+        or (value.startswith("'") and value.endswith("'"))
+    )
+
+
+def parse_dotenv_values(
+    names: Iterable[str], dotenv_path: Path | None = None
+) -> dict[str, str]:
+    """Return ``{name: value}`` for each of *names* present in the project
+    ``.env`` file (cwd-relative by default).
+
+    The single canonical ``.env`` parser: three legacy-forwarding helpers
+    (``_legacy_names_in_dotenv`` here, ``_legacy_speculative_values_in_dotenv``
+    and ``_legacy_kv_cache_quant_in_dotenv`` in ``cli``) used to hand-roll
+    this, and had drifted — the kv-quant variant re-checked for quotes after
+    stripping an inline comment while the speculative one did not, so
+    ``KEY="v" # note`` parsed differently across them (#635).
+
+    The format is a subset of pydantic-settings' own ``.env`` parser:
+    ``KEY=value`` lines (optionally ``export KEY=...``), ``#`` comments and
+    blank lines ignored, surrounding single/double quotes stripped. For an
+    *unquoted* value a trailing ``# comment`` is stripped and quotes are
+    re-checked (so ``KEY="v" # note`` → ``v``); a ``#`` *inside* quotes is
+    preserved. First occurrence of a key wins.
+    """
+    path = dotenv_path if dotenv_path is not None else Path(".env")
     try:
-        text = dotenv_path.read_text()
+        text = path.read_text()
     except (FileNotFoundError, OSError):
-        return set()
-    found: set[str] = set()
-    legacy = set(names)
+        return {}
+    wanted = set(names)
+    found: dict[str, str] = {}
     for raw_line in text.splitlines():
         line = raw_line.strip()
         if not line or line.startswith("#") or "=" not in line:
             continue
-        key = line.partition("=")[0].strip()
+        key, _, value = line.partition("=")
+        key = key.strip()
         if key.startswith("export "):
             key = key[len("export ") :].strip()
-        if key in legacy:
-            found.add(key)
+        if key not in wanted or key in found:
+            continue
+        value = value.strip()
+        is_quoted = _looks_quoted(value)
+        if not is_quoted:
+            # Strip a trailing inline comment from an unquoted value, then
+            # re-check for surrounding quotes — a quoted value only becomes
+            # syntactically quoted once its trailing ``# comment`` is gone.
+            comment_idx = value.find("#")
+            if comment_idx != -1:
+                value = value[:comment_idx].rstrip()
+                is_quoted = _looks_quoted(value)
+        if is_quoted:
+            value = value[1:-1]
+        found[key] = value
     return found
+
+
+def _legacy_names_in_dotenv(names: tuple[str, ...]) -> set[str]:
+    """Return the subset of *names* present as keys in the project ``.env``.
+
+    Key membership only — ``warn_legacy_flash_env`` warns on presence
+    regardless of value, so values are discarded here.
+    """
+    return set(parse_dotenv_values(names))
 
 
 def resolve_experimental(

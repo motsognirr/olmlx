@@ -44,8 +44,12 @@ def ensure_config():
     config_dir = settings.models_config.parent
     config_dir.mkdir(parents=True, exist_ok=True)
     if not settings.models_config.exists():
-        with open(settings.models_config, "w") as f:
-            json.dump(DEFAULT_MODELS, f, indent=2)
+        # Atomic temp-file-plus-rename: a crash mid-write must not leave a
+        # truncated models.json, which the strict loader would then
+        # hard-refuse to start on every subsequent run (#635).
+        from olmlx.engine.registry import _atomic_write_json
+
+        _atomic_write_json(DEFAULT_MODELS, settings.models_config)
         print(f"Created {settings.models_config} with example models")
 
 
@@ -151,51 +155,11 @@ def _legacy_speculative_values_in_dotenv() -> dict[str, str]:
     ``Settings.model_config`` declares ``env_file=".env"`` (cwd-relative);
     pydantic-settings reads it into Settings without touching
     ``os.environ``, so a shell-only scan would miss legacy values in the
-    file. The format accepted is a subset of pydantic-settings' own
-    ``.env`` parser: ``KEY=value`` lines (optionally ``export KEY=...``),
-    with ``#`` comments and blank lines ignored, and surrounding single
-    or double quotes stripped from the value.
+    file. Delegates to the single canonical ``.env`` parser (#635).
     """
-    dotenv_path = Path(".env")
-    try:
-        text = dotenv_path.read_text()
-    except (FileNotFoundError, OSError):
-        return {}
-    found: dict[str, str] = {}
-    legacy = set(_DEPRECATED_SPECULATIVE_ENV_VARS)
-    for raw_line in text.splitlines():
-        line = raw_line.strip()
-        if not line or line.startswith("#"):
-            continue
-        if "=" not in line:
-            continue
-        key, _, value = line.partition("=")
-        key = key.strip()
-        if key.startswith("export "):
-            key = key[len("export ") :].strip()
-        value = value.strip()
-        # Require length >= 2 so a literal single quote ``"`` doesn't
-        # collapse to the empty string.
-        is_quoted = len(value) >= 2 and (
-            (value.startswith('"') and value.endswith('"'))
-            or (value.startswith("'") and value.endswith("'"))
-        )
-        if is_quoted:
-            value = value[1:-1]
-        else:
-            # Strip inline ``# comment`` from unquoted values. Without
-            # this, a line like ``KEY=true  # enable`` would parse
-            # ``true  # enable``, which the boolean forwarder coerces
-            # to ``False`` — the opposite of intent. Limitation: an
-            # unquoted value containing a literal ``#`` (e.g. a path
-            # fragment) is silently truncated. Quote the value to
-            # disable this stripping.
-            comment_idx = value.find("#")
-            if comment_idx != -1:
-                value = value[:comment_idx].rstrip()
-        if key in legacy and key not in found:
-            found[key] = value
-    return found
+    from olmlx.config import parse_dotenv_values
+
+    return parse_dotenv_values(_DEPRECATED_SPECULATIVE_ENV_VARS)
 
 
 def _forward_legacy_speculative_env(
@@ -384,45 +348,14 @@ def _surface_legacy_speculative_env() -> None:
 
 def _legacy_kv_cache_quant_in_dotenv() -> str | None:
     """Return the value of ``OLMLX_EXPERIMENTAL_KV_CACHE_QUANT`` from the
-    project ``.env`` file, or None if not present or the file is unreadable."""
-    dotenv_path = Path(".env")
-    try:
-        text = dotenv_path.read_text()
-    except (FileNotFoundError, OSError):
-        return None
-    for raw_line in text.splitlines():
-        line = raw_line.strip()
-        if not line or line.startswith("#"):
-            continue
-        if "=" not in line:
-            continue
-        key, _, value = line.partition("=")
-        key = key.strip()
-        if key.startswith("export "):
-            key = key[len("export ") :].strip()
-        if key != "OLMLX_EXPERIMENTAL_KV_CACHE_QUANT":
-            continue
-        value = value.strip()
-        # Detect surrounding quotes first; a ``#`` inside quotes is
-        # preserved.  If no quotes are found, strip trailing inline
-        # comments and re-check — ``"turboquant:4" # comment`` has no
-        # terminating quote until the comment is removed.
-        is_quoted = len(value) >= 2 and (
-            (value.startswith('"') and value.endswith('"'))
-            or (value.startswith("'") and value.endswith("'"))
-        )
-        if not is_quoted:
-            comment_idx = value.find("#")
-            if comment_idx != -1:
-                value = value[:comment_idx].rstrip()
-                is_quoted = len(value) >= 2 and (
-                    (value.startswith('"') and value.endswith('"'))
-                    or (value.startswith("'") and value.endswith("'"))
-                )
-        if is_quoted:
-            value = value[1:-1]
-        return value
-    return None
+    project ``.env`` file, or None if not present or the file is unreadable.
+
+    Delegates to the single canonical ``.env`` parser (#635)."""
+    from olmlx.config import parse_dotenv_values
+
+    return parse_dotenv_values(("OLMLX_EXPERIMENTAL_KV_CACHE_QUANT",)).get(
+        "OLMLX_EXPERIMENTAL_KV_CACHE_QUANT"
+    )
 
 
 def _surface_legacy_kv_cache_quant_env() -> None:
@@ -1767,6 +1700,38 @@ def _create_store():
     return ModelStore(registry)
 
 
+def _resolve_and_download(model: str, *, download: bool = True):
+    """Resolve *model* to an hf_path and return ``(store, local_dir)``.
+
+    The single guarded resolve+download path shared by the prepare-family
+    subcommands (#630). Each used to inline this block with no error
+    handling, so a typo'd / offline / gated model name dumped a raw
+    ``huggingface_hub`` traceback; here a resolve/download failure prints a
+    clean message to stderr and exits 1 instead — matching ``cmd_models_pull``.
+
+    ``download=False`` (used by ``flash info``) returns the local path via
+    ``local_path`` without fetching. ``ModelsConfigError`` is re-raised so
+    ``cli_main``'s dedicated handler can report it (naming the file) rather
+    than collapsing it into a generic exit.
+    """
+    from olmlx.engine.registry import ModelsConfigError
+
+    try:
+        store = _create_store()
+        resolved = store.registry.resolve(model)
+        hf_path = resolved.hf_path if resolved is not None else model
+        if download:
+            local_dir = store.ensure_downloaded(hf_path)
+        else:
+            local_dir = store.local_path(hf_path)
+    except ModelsConfigError:
+        raise
+    except Exception as exc:
+        print(f"Error resolving {model!r}: {exc}", file=sys.stderr)
+        sys.exit(1)
+    return store, local_dir
+
+
 def _format_size(size_bytes: int) -> str:
     """Format byte size to human-readable string."""
     if size_bytes >= 1e9:
@@ -2607,10 +2572,7 @@ def cmd_spectral_prepare(args):
     """Prepare a model for spectral quant (eigenspectral calibration)."""
     _configure_logging()
 
-    store = _create_store()
-    _resolved = store.registry.resolve(args.model)
-    hf_path = _resolved.hf_path if _resolved is not None else args.model
-    local_dir = store.ensure_downloaded(hf_path)
+    _store, local_dir = _resolve_and_download(args.model)
     model_path = str(local_dir)
 
     print(f"Running spectral calibration for {args.model}...")
@@ -2643,10 +2605,7 @@ def cmd_shard_prepare(args):
     """Prepare a model for shard quant (per-head PCA-K + VQ-V calibration)."""
     _configure_logging()
 
-    store = _create_store()
-    _resolved = store.registry.resolve(args.model)
-    hf_path = _resolved.hf_path if _resolved is not None else args.model
-    local_dir = store.ensure_downloaded(hf_path)
+    _store, local_dir = _resolve_and_download(args.model)
     model_path = str(local_dir)
 
     print(f"Running shard calibration for {args.model}...")
@@ -2684,10 +2643,7 @@ def cmd_flash_prepare(args):
     # does not forward values).
     _warn_legacy_flash_env()
 
-    store = _create_store()
-    _resolved = store.registry.resolve(args.model)
-    hf_path = _resolved.hf_path if _resolved is not None else args.model
-    local_dir = store.ensure_downloaded(hf_path)
+    _store, local_dir = _resolve_and_download(args.model)
     model_path = str(local_dir)
 
     # Auto-detect MoE model
@@ -2760,10 +2716,7 @@ def cmd_dflash_precompute(args):
     """Precompute target hidden states for DFlash draft training."""
     _configure_logging()
 
-    store = _create_store()
-    _resolved = store.registry.resolve(args.model)
-    hf_path = _resolved.hf_path if _resolved is not None else args.model
-    local_dir = store.ensure_downloaded(hf_path)
+    _store, local_dir = _resolve_and_download(args.model)
     model_path = str(local_dir)
 
     target_layer_ids: list[int] | None = None
@@ -2882,10 +2835,7 @@ def cmd_dflash_prepare(args):
             "or the other."
         )
 
-    store = _create_store()
-    _resolved = store.registry.resolve(args.model)
-    hf_path = _resolved.hf_path if _resolved is not None else args.model
-    local_dir = store.ensure_downloaded(hf_path)
+    _store, local_dir = _resolve_and_download(args.model)
     model_path = str(local_dir)
 
     target_layer_ids: list[int] | None = None
@@ -2981,10 +2931,7 @@ def cmd_eagle_prepare(args):
             "deepest layer from the concatenated ladder)."
         )
 
-    store = _create_store()
-    _resolved = store.registry.resolve(args.model)
-    hf_path = _resolved.hf_path if _resolved is not None else args.model
-    local_dir = store.ensure_downloaded(hf_path)
+    _store, local_dir = _resolve_and_download(args.model)
     model_path = str(local_dir)
 
     print(f"Training EAGLE draft for {args.model}...")
@@ -3031,10 +2978,7 @@ def cmd_flash_info(args):
     # Warn about stale ``OLMLX_EXPERIMENTAL_FLASH*`` env vars (warn-only;
     # does not forward values).
     _warn_legacy_flash_env()
-    store = _create_store()
-    _resolved = store.registry.resolve(args.model)
-    hf_path = _resolved.hf_path if _resolved is not None else args.model
-    local_dir = store.local_path(hf_path)
+    _store, local_dir = _resolve_and_download(args.model, download=False)
 
     # Check for Flash-MoE first
     flash_moe_dir = local_dir / "flash_moe"
@@ -4014,5 +3958,14 @@ def cli_main():
             print(f"Error: {exc}", file=sys.stderr)
             sys.exit(1)
 
-    # Unknown subcommand — print help for the parent command
-    parser.parse_args([cmd, "--help"])
+    # Unknown or missing subcommand. Print the parent command's help to
+    # stderr (not stdout) and exit non-zero so scripts / CI don't read the
+    # no-op as success — ``parser.parse_args([cmd, "--help"])`` would print
+    # to stdout and exit 0 (#635).
+    subparser = None
+    for action in parser._actions:
+        if isinstance(action, argparse._SubParsersAction):
+            subparser = action.choices.get(cmd)
+            break
+    (subparser or parser).print_help(sys.stderr)
+    sys.exit(2)

@@ -739,3 +739,73 @@ class TestLegacyNamesInDotenv:
 
         monkeypatch.chdir(tmp_path)
         assert _legacy_names_in_dotenv(("OLMLX_EXPERIMENTAL_FLASH",)) == set()
+
+
+class TestParseDotenvValues:
+    """The single canonical ``.env`` value parser that the three legacy
+    dotenv helpers delegate to (#635)."""
+
+    def test_basic_assignment(self, monkeypatch, tmp_path):
+        from olmlx.config import parse_dotenv_values
+
+        monkeypatch.chdir(tmp_path)
+        (tmp_path / ".env").write_text("KEY=value\n")
+        assert parse_dotenv_values(("KEY",)) == {"KEY": "value"}
+
+    def test_export_prefix_stripped(self, monkeypatch, tmp_path):
+        from olmlx.config import parse_dotenv_values
+
+        monkeypatch.chdir(tmp_path)
+        (tmp_path / ".env").write_text("export KEY=value\n")
+        assert parse_dotenv_values(("KEY",)) == {"KEY": "value"}
+
+    def test_surrounding_quotes_stripped(self, monkeypatch, tmp_path):
+        from olmlx.config import parse_dotenv_values
+
+        monkeypatch.chdir(tmp_path)
+        (tmp_path / ".env").write_text('KEY="value"\n')
+        assert parse_dotenv_values(("KEY",)) == {"KEY": "value"}
+
+    def test_unquoted_inline_comment_stripped(self, monkeypatch, tmp_path):
+        from olmlx.config import parse_dotenv_values
+
+        monkeypatch.chdir(tmp_path)
+        (tmp_path / ".env").write_text("KEY=value  # note\n")
+        assert parse_dotenv_values(("KEY",)) == {"KEY": "value"}
+
+    def test_hash_inside_quotes_preserved(self, monkeypatch, tmp_path):
+        from olmlx.config import parse_dotenv_values
+
+        monkeypatch.chdir(tmp_path)
+        (tmp_path / ".env").write_text('KEY="a#b"\n')
+        assert parse_dotenv_values(("KEY",)) == {"KEY": "a#b"}
+
+    def test_quoted_value_with_trailing_comment(self, monkeypatch, tmp_path):
+        """``KEY="turboquant:4" # note`` — the divergence the three parsers
+        disagreed on. The comment must be stripped AND the now-terminating
+        quotes removed, so the value is the bare ``turboquant:4``."""
+        from olmlx.config import parse_dotenv_values
+
+        monkeypatch.chdir(tmp_path)
+        (tmp_path / ".env").write_text('KEY="turboquant:4" # note\n')
+        assert parse_dotenv_values(("KEY",)) == {"KEY": "turboquant:4"}
+
+    def test_first_occurrence_wins(self, monkeypatch, tmp_path):
+        from olmlx.config import parse_dotenv_values
+
+        monkeypatch.chdir(tmp_path)
+        (tmp_path / ".env").write_text("KEY=first\nKEY=second\n")
+        assert parse_dotenv_values(("KEY",)) == {"KEY": "first"}
+
+    def test_only_requested_names_returned(self, monkeypatch, tmp_path):
+        from olmlx.config import parse_dotenv_values
+
+        monkeypatch.chdir(tmp_path)
+        (tmp_path / ".env").write_text("KEY=value\nOTHER=x\n")
+        assert parse_dotenv_values(("KEY",)) == {"KEY": "value"}
+
+    def test_missing_file_returns_empty(self, monkeypatch, tmp_path):
+        from olmlx.config import parse_dotenv_values
+
+        monkeypatch.chdir(tmp_path)
+        assert parse_dotenv_values(("KEY",)) == {}

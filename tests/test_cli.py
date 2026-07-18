@@ -46,6 +46,29 @@ class TestEnsureConfig:
         data = json.loads(config_path.read_text())
         assert data == existing
 
+    def test_seed_write_is_atomic_on_crash(self, tmp_path, monkeypatch):
+        """A crash mid-seed must not leave a truncated models.json.
+
+        The strict loader hard-refuses every subsequent start on an
+        unparseable models.json, so a partial seed write would brick the
+        server. The atomic writer builds a temp file and renames, so a
+        failure mid-write leaves the target absent, not truncated (#635).
+        """
+        import olmlx.engine.registry as registry_mod
+
+        config_path = tmp_path / "models.json"
+        monkeypatch.setattr("olmlx.cli.settings.models_config", config_path)
+
+        def _boom(obj, fp, *args, **kwargs):
+            fp.write("{partial")  # write some bytes, then die like a crash
+            raise RuntimeError("crash mid-write")
+
+        monkeypatch.setattr(registry_mod.json, "dump", _boom)
+        with pytest.raises(RuntimeError):
+            ensure_config()
+        # Atomic write only ever exposed a temp file; the target is untouched.
+        assert not config_path.exists()
+
 
 def test_default_models_include_whisper():
     from olmlx.cli import DEFAULT_MODELS
@@ -144,6 +167,84 @@ class TestServiceInstall:
         captured = capsys.readouterr()
         assert "could not be loaded" in captured.err.lower()
         assert "Load failed" in captured.err
+
+
+class TestResolveAndDownload:
+    """The shared resolve+download helper for the prepare-family subcommands
+    (#630) — replaces six unguarded, copy-pasted blocks that dumped a raw
+    huggingface_hub traceback on a typo'd/offline/gated model name."""
+
+    def test_happy_path_returns_store_and_local_dir(self, monkeypatch, tmp_path):
+        from olmlx.cli import _resolve_and_download
+
+        mock_store = MagicMock()
+        resolved = MagicMock()
+        resolved.hf_path = "org/model"
+        mock_store.registry.resolve.return_value = resolved
+        mock_store.ensure_downloaded.return_value = tmp_path / "model"
+        monkeypatch.setattr("olmlx.cli._create_store", lambda: mock_store)
+
+        store, local_dir = _resolve_and_download("mymodel")
+        assert store is mock_store
+        assert local_dir == tmp_path / "model"
+        mock_store.ensure_downloaded.assert_called_once_with("org/model")
+
+    def test_unresolved_name_falls_back_to_the_raw_arg(self, monkeypatch, tmp_path):
+        from olmlx.cli import _resolve_and_download
+
+        mock_store = MagicMock()
+        mock_store.registry.resolve.return_value = None  # direct HF path
+        mock_store.ensure_downloaded.return_value = tmp_path / "model"
+        monkeypatch.setattr("olmlx.cli._create_store", lambda: mock_store)
+
+        _resolve_and_download("org/direct-path")
+        mock_store.ensure_downloaded.assert_called_once_with("org/direct-path")
+
+    def test_download_failure_exits_1_with_clean_stderr(self, monkeypatch, capsys):
+        from olmlx.cli import _resolve_and_download
+
+        mock_store = MagicMock()
+        mock_store.registry.resolve.return_value = None
+        mock_store.ensure_downloaded.side_effect = OSError(
+            "Repository Not Found for url: https://huggingface.co/not-a-model"
+        )
+        monkeypatch.setattr("olmlx.cli._create_store", lambda: mock_store)
+
+        with pytest.raises(SystemExit) as exc_info:
+            _resolve_and_download("not-a-model")
+        assert exc_info.value.code == 1
+        captured = capsys.readouterr()
+        assert captured.out == ""
+        assert "error" in captured.err.lower()
+        assert "not-a-model" in captured.err
+
+    def test_no_download_uses_local_path(self, monkeypatch, tmp_path):
+        from olmlx.cli import _resolve_and_download
+
+        mock_store = MagicMock()
+        resolved = MagicMock()
+        resolved.hf_path = "org/model"
+        mock_store.registry.resolve.return_value = resolved
+        mock_store.local_path.return_value = tmp_path / "model"
+        monkeypatch.setattr("olmlx.cli._create_store", lambda: mock_store)
+
+        store, local_dir = _resolve_and_download("mymodel", download=False)
+        assert local_dir == tmp_path / "model"
+        mock_store.local_path.assert_called_once_with("org/model")
+        mock_store.ensure_downloaded.assert_not_called()
+
+    def test_models_config_error_propagates_to_cli_main(self, monkeypatch):
+        from olmlx.cli import _resolve_and_download
+        from olmlx.engine.registry import ModelsConfigError
+
+        def _boom():
+            raise ModelsConfigError("bad models.json")
+
+        monkeypatch.setattr("olmlx.cli._create_store", _boom)
+        # Must NOT be swallowed into a generic exit(1) — cli_main has a
+        # dedicated clean-exit handler for this that names the file.
+        with pytest.raises(ModelsConfigError):
+            _resolve_and_download("mymodel")
 
 
 class TestServiceUninstall:
@@ -1676,17 +1777,22 @@ class TestCliMain:
         cli_main()
         mock_fn.assert_called_once()
 
-    def test_models_no_subcommand_shows_help(self, monkeypatch):
+    def test_models_no_subcommand_shows_help(self, monkeypatch, capsys):
+        # A command that requires a subcommand exits non-zero with help on
+        # stderr, so scripts / CI don't read the no-op as success (#635).
         monkeypatch.setattr("sys.argv", ["olmlx", "models"])
         with pytest.raises(SystemExit) as exc_info:
             cli_main()
-        assert exc_info.value.code == 0
+        assert exc_info.value.code == 2
+        captured = capsys.readouterr()
+        assert captured.out == ""
+        assert "usage" in captured.err.lower()
 
     def test_config_no_subcommand_shows_help(self, monkeypatch):
         monkeypatch.setattr("sys.argv", ["olmlx", "config"])
         with pytest.raises(SystemExit) as exc_info:
             cli_main()
-        assert exc_info.value.code == 0
+        assert exc_info.value.code == 2
 
     # --- Dispatch gaps: unregistered subcommand fallback paths ---
 
@@ -1694,13 +1800,13 @@ class TestCliMain:
         monkeypatch.setattr("sys.argv", ["olmlx", "service"])
         with pytest.raises(SystemExit) as exc_info:
             cli_main()
-        assert exc_info.value.code == 0
+        assert exc_info.value.code == 2
 
     def test_flash_no_subcommand_shows_help(self, monkeypatch):
         monkeypatch.setattr("sys.argv", ["olmlx", "flash"])
         with pytest.raises(SystemExit) as exc_info:
             cli_main()
-        assert exc_info.value.code == 0
+        assert exc_info.value.code == 2
 
     def test_flash_prepare_calls_handler(self, monkeypatch):
         monkeypatch.setattr("sys.argv", ["olmlx", "flash", "prepare", "some/model"])
@@ -1720,7 +1826,7 @@ class TestCliMain:
         monkeypatch.setattr("sys.argv", ["olmlx", "spectral"])
         with pytest.raises(SystemExit) as exc_info:
             cli_main()
-        assert exc_info.value.code == 0
+        assert exc_info.value.code == 2
 
     def test_spectral_prepare_calls_handler(self, monkeypatch):
         monkeypatch.setattr("sys.argv", ["olmlx", "spectral", "prepare", "some/model"])
@@ -1733,7 +1839,7 @@ class TestCliMain:
         monkeypatch.setattr("sys.argv", ["olmlx", "bench"])
         with pytest.raises(SystemExit) as exc_info:
             cli_main()
-        assert exc_info.value.code == 0
+        assert exc_info.value.code == 2
 
     def test_bench_run_calls_handler(self, monkeypatch):
         monkeypatch.setattr("sys.argv", ["olmlx", "bench", "run"])

@@ -1551,14 +1551,30 @@ class ModelRegistry:
                     self._raw_unrecognized[normalized] = v
             self._validate_panels()
         if self._aliases_path.exists():
+            # Unlike models.json (authoritative — a parse error blocks
+            # startup), aliases.json is rebuildable: warn and fall back to an
+            # empty table on any problem. Catch OSError too (a permissions
+            # error would otherwise propagate a raw traceback out of load()),
+            # and validate the parsed value is a dict — a valid-JSON non-dict
+            # (e.g. a list) would sail past json.load and only blow up later
+            # at ``self._aliases[normalized]`` in resolve() (#635).
             try:
                 with open(self._aliases_path) as f:
-                    self._aliases = json.load(f)
-            except json.JSONDecodeError as exc:
+                    loaded = json.load(f)
+            except (json.JSONDecodeError, OSError) as exc:
                 logger.warning(
-                    "Corrupted %s, ignoring aliases: %s",
+                    "Could not read %s, ignoring aliases: %s",
                     self._aliases_path,
                     exc,
+                )
+                loaded = {}
+            if isinstance(loaded, dict):
+                self._aliases = loaded
+            else:
+                logger.warning(
+                    "%s must contain a JSON object, got %s; ignoring aliases",
+                    self._aliases_path,
+                    type(loaded).__name__,
                 )
                 self._aliases = {}
 
