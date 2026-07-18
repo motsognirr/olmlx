@@ -300,7 +300,7 @@ class TestStepRollbackDispatch:
     def test_target_hybrid_calls_rollback_single(self):
         """Hybrid target + dense draft: target rollback uses
         rollback_single with accepted=num_accepted-1; draft falls
-        through to plain trim_prompt_cache."""
+        through to the rotating-aware _trim_recent_cache."""
         dec = self._make_decoder(target_hybrid=True, draft_hybrid=False)
         try:
             # Simulate post-prefill state.
@@ -319,7 +319,7 @@ class TestStepRollbackDispatch:
             # Patch rollback methods.
             dec._gdn_capture.rollback_single = MagicMock()
             dec._gdn_capture.rollback_autoregressive = MagicMock()
-            with patch("olmlx.engine.speculative.trim_prompt_cache") as trim_fn:
+            with patch("olmlx.engine.speculative._trim_recent_cache") as trim_fn:
                 dec.step()
             # Target rollback: single-forward, accepted=num_accepted-1=1, trim=λ+1-na=3
             dec._gdn_capture.rollback_single.assert_called_once_with(
@@ -328,9 +328,9 @@ class TestStepRollbackDispatch:
                 accepted=1,
                 trim=3,
             )
-            # Draft rollback: no GDN — falls through to trim_prompt_cache
+            # Draft rollback: no GDN — falls through to _trim_recent_cache
             dec._gdn_capture.rollback_autoregressive.assert_not_called()
-            # trim_prompt_cache called on draft only (target uses rollback_single)
+            # _trim_recent_cache called on draft only (target uses rollback_single)
             trim_fn.assert_called_once_with(dec._draft_cache, 2)
         finally:
             dec.close()
@@ -338,7 +338,7 @@ class TestStepRollbackDispatch:
     def test_draft_hybrid_calls_rollback_autoregressive(self):
         """Dense target + hybrid draft: draft uses
         rollback_autoregressive with num_steps=λ, num_keep_steps=
-        num_accepted; target falls through to plain trim_prompt_cache."""
+        num_accepted; target falls through to the rotating-aware _trim_recent_cache."""
         dec = self._make_decoder(target_hybrid=False, draft_hybrid=True)
         try:
             dec._pending_token = 1
@@ -352,7 +352,7 @@ class TestStepRollbackDispatch:
             dec._verify = MagicMock(return_value=[1])  # num_accepted=1
             dec._gdn_capture.rollback_single = MagicMock()
             dec._gdn_capture.rollback_autoregressive = MagicMock()
-            with patch("olmlx.engine.speculative.trim_prompt_cache") as trim_fn:
+            with patch("olmlx.engine.speculative._trim_recent_cache") as trim_fn:
                 dec.step()
             # Draft rollback: autoregressive, num_keep_steps=1, trim=λ-na=3
             dec._gdn_capture.rollback_autoregressive.assert_called_once_with(
@@ -363,7 +363,7 @@ class TestStepRollbackDispatch:
                 trim=3,
             )
             dec._gdn_capture.rollback_single.assert_not_called()
-            # Target trim via plain trim_prompt_cache (trim_target=4).
+            # Target trim via the rotating-aware _trim_recent_cache (trim_target=4).
             trim_fn.assert_called_once_with(dec._target_cache, 4)
         finally:
             dec.close()
@@ -392,10 +392,10 @@ class TestStepRollbackDispatch:
             dec._gdn_capture.rollback_autoregressive = MagicMock()
             # Avoid the align step's real forward by stubbing it.
             dec._draft = MagicMock(return_value=mx.zeros((1, 1, 50)))
-            with patch("olmlx.engine.speculative.trim_prompt_cache") as trim_fn:
+            with patch("olmlx.engine.speculative._trim_recent_cache") as trim_fn:
                 dec.step()
             # Full acceptance: trim_target=0, trim_draft<0 (clamped to 0).
-            # Neither rollback nor trim_prompt_cache should fire.
+            # Neither rollback nor _trim_recent_cache should fire.
             dec._gdn_capture.rollback_single.assert_not_called()
             dec._gdn_capture.rollback_autoregressive.assert_not_called()
             trim_fn.assert_not_called()
@@ -408,7 +408,7 @@ class TestStepRollbackDispatch:
     def test_both_hybrid_partial_acceptance(self):
         """The primary new scenario this PR enables — Qwen3.5+Qwen3.5
         with partial acceptance. BOTH rollback paths must fire with the
-        right args, no plain ``trim_prompt_cache`` call escapes to the
+        right args, no the rotating-aware ``_trim_recent_cache`` call escapes to the
         underlying hybrid caches."""
         dec = self._make_decoder(target_hybrid=True, draft_hybrid=True)
         try:
@@ -429,7 +429,7 @@ class TestStepRollbackDispatch:
             dec._target = MagicMock(return_value=target_logits)
             dec._gdn_capture.rollback_single = MagicMock()
             dec._gdn_capture.rollback_autoregressive = MagicMock()
-            with patch("olmlx.engine.speculative.trim_prompt_cache") as trim_fn:
+            with patch("olmlx.engine.speculative._trim_recent_cache") as trim_fn:
                 dec.step()
             # Partial acceptance: num_accepted=3, λ=4 → trim_target=2,
             # trim_draft=1.
@@ -446,7 +446,7 @@ class TestStepRollbackDispatch:
                 num_keep_steps=3,  # num_accepted
                 trim=1,  # λ - num_accepted
             )
-            # Crucially: plain ``trim_prompt_cache`` must NOT be called.
+            # Crucially: the rotating-aware ``_trim_recent_cache`` must NOT be called.
             # If it were, the hybrid caches' ArraysCache layers would
             # silently desync — exactly the bug this PR fixes.
             trim_fn.assert_not_called()

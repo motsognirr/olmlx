@@ -45,6 +45,11 @@ from typing import Any
 import mlx.core as mx
 import mlx.nn as nn
 
+try:  # mlx-lm is a hard runtime dep, but keep import-safe like speculative.py
+    from mlx_lm.models.cache import RotatingKVCache
+except ImportError:  # pragma: no cover - environments without mlx-lm
+    RotatingKVCache = None  # type: ignore[assignment,misc]
+
 from olmlx.engine.gdn_rollback import (
     GDNBuffer,
     GDNStateCapture,
@@ -53,6 +58,98 @@ from olmlx.engine.gdn_rollback import (
 from olmlx.utils import tracing as _tracing
 
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Rotating-aware cache trim (shared by every speculative decoder)
+# ---------------------------------------------------------------------------
+#
+# ``_trim_recent_cache`` reaches into ``RotatingKVCache._temporal_order`` and
+# ``._idx`` to reorder + slice the rotating buffer. These are private to mlx-lm
+# and may be renamed without a semver bump. Probe at import time so an
+# incompatible mlx-lm release fails fast (rather than mid-generation when a
+# decoder first hits a sliding-window cache). ``_temporal_order`` is a method
+# (class-level), but ``_idx`` is set in ``__init__`` (instance-level), so it
+# must be probed via a sentinel instance — and its semantic (integer
+# write-position counter that advances with ``update_and_fetch``) must hold
+# too, otherwise the trim writes a corrupt value back.
+def _probe_rotating_kv_privates() -> bool:
+    if RotatingKVCache is None or not hasattr(RotatingKVCache, "_temporal_order"):
+        return False
+    try:
+        c = RotatingKVCache(max_size=4, keep=0)
+        if not hasattr(c, "_idx"):
+            return False
+        if not isinstance(c._idx, int) or c._idx != 0:
+            return False
+        # One ``update_and_fetch`` should advance ``_idx`` by exactly the
+        # number of tokens written. If the semantic changed (e.g. it
+        # became a ring-buffer wrap counter or a bool flag), the trim
+        # math in ``_trim_recent_cache`` would silently corrupt state.
+        k = v = mx.zeros((1, 1, 1, 4))
+        c.update_and_fetch(k, v)
+        return isinstance(c._idx, int) and c._idx == 1
+    except Exception:
+        return False
+
+
+_HAS_ROTATING_KV_PRIVATES = _probe_rotating_kv_privates()
+
+
+def _trim_recent_cache(cache: list[Any], num_tokens: int) -> None:
+    """Trim trailing ``num_tokens`` from each layer's KV cache.
+
+    Special-cases ``RotatingKVCache`` (must reorder before slicing).
+    Skips entries with no ``trim`` method — the GDN rollback path
+    handles those separately.
+
+    Used in place of mlx-lm's ``trim_prompt_cache`` on the speculative
+    reject-rollback path: that helper is all-or-nothing and silently
+    no-ops once *any* rotating layer's window has filled
+    (``is_trimmable()`` is ``offset < max_size``), leaving rejected draft
+    tokens resident on sliding-window targets (#605).
+    """
+    if num_tokens <= 0:
+        return
+    for c in cache:
+        n = min(getattr(c, "offset", num_tokens), num_tokens)
+        if n <= 0:
+            continue
+        if (
+            RotatingKVCache is not None
+            and isinstance(c, RotatingKVCache)
+            and c.keys is not None
+        ):
+            if not _HAS_ROTATING_KV_PRIVATES:
+                raise RuntimeError(
+                    "Speculative decoding trims KV caches with rotating "
+                    "windows via the private mlx-lm API "
+                    "``RotatingKVCache._temporal_order`` / ``._idx``. The "
+                    "installed mlx-lm version no longer exposes them — pin "
+                    "a compatible version or file an olmlx bug to update "
+                    "the private-API access pattern."
+                )
+            # ``cache.offset`` is the *absolute* token counter mlx-lm
+            # passes to RoPE as the next-write base position — not the
+            # buffer size. A previous version set ``c.offset =
+            # actual_stored - n``, which threw away the absolute count
+            # and applied wrong RoPE positions to all subsequent
+            # writes for sliding-window targets that had already
+            # rotated. Decrementing ``c.offset`` by exactly ``n``
+            # preserves the absolute-position semantic. ``c._idx`` is
+            # the in-buffer write pointer; setting it to the new buffer
+            # length leaves ``update_and_fetch`` to grow / rotate the
+            # buffer normally on the next write.
+            actual_stored = min(c.offset, c.keys.shape[2])
+            n = min(n, actual_stored)
+            c.keys = c._temporal_order(c.keys)
+            c.values = c._temporal_order(c.values)
+            c.keys = c.keys[..., :-n, :]
+            c.values = c.values[..., :-n, :]
+            c.offset = c.offset - n
+            c._idx = c.keys.shape[2]
+        elif hasattr(c, "trim"):
+            c.trim(n)
 
 
 # ---------------------------------------------------------------------------

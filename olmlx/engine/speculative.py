@@ -37,6 +37,7 @@ from olmlx.engine.spec_decoder_base import (
     # Canonical home moved to spec_decoder_base (#467); re-exported here
     # for remaining importers (tests; the decoders verify via the base's
     # ``_verify_greedy`` instead).
+    _trim_recent_cache,
     verify_draft_greedy as verify_draft_greedy,
 )
 from olmlx.utils import tracing as _tracing
@@ -914,8 +915,12 @@ class SpeculativeDecoder(SpecDecoderBase):
                     accepted=num_accepted - 1,
                     trim=trim_target,
                 )
-            elif trim_prompt_cache is not None:
-                trim_prompt_cache(self._target_cache, trim_target)
+            else:
+                # Rotating-aware trim: mlx-lm's ``trim_prompt_cache`` is
+                # all-or-nothing and silently no-ops on sliding-window
+                # (``RotatingKVCache``) targets once the window fills,
+                # leaving rejected draft tokens resident (#605).
+                _trim_recent_cache(self._target_cache, trim_target)
 
         if trim_draft > 0:
             if self._draft_gdn_buffer is not None and self._gdn_capture is not None:
@@ -926,8 +931,8 @@ class SpeculativeDecoder(SpecDecoderBase):
                     num_keep_steps=num_accepted,
                     trim=trim_draft,
                 )
-            elif trim_prompt_cache is not None:
-                trim_prompt_cache(self._draft_cache, trim_draft)
+            else:
+                _trim_recent_cache(self._draft_cache, trim_draft)
 
         # On full acceptance, align draft cache with target cache.
         # ``use_buffer(None)`` was already called after the target
@@ -1638,9 +1643,10 @@ class PromptLookupDecoder(SpecDecoderBase):
                     trim=trim_target,
                 )
             else:
-                # ``trim_prompt_cache`` is guaranteed non-None here
-                # because ``__init__`` enforces it at construction.
-                trim_prompt_cache(self._target_cache, trim_target)
+                # Rotating-aware trim (see classic decoder / #605):
+                # mlx-lm's ``trim_prompt_cache`` no-ops on filled
+                # sliding-window caches, corrupting SWA targets.
+                _trim_recent_cache(self._target_cache, trim_target)
 
         # 5. Update state. The cache now contains the original prompt
         # plus the pending token plus the first (num_accepted - 1)

@@ -112,6 +112,51 @@ class TestSpeculativeDecoder:
         assert decoder._cache_seq_len == 3 + len(accepted)
         assert decoder._target_cache[0].offset == decoder._cache_seq_len
 
+    def test_cache_trimmed_on_rejection_sliding_window(self):
+        """Rejected draft tokens must be trimmed from a *filled* sliding-window
+        target cache. mlx-lm's ``trim_prompt_cache`` is all-or-nothing and
+        silently no-ops once a ``RotatingKVCache``'s window has rotated
+        (``is_trimmable()`` is ``offset < max_size``) — leaving rejected tokens
+        resident and corrupting subsequent generation (#605). The decoder must
+        use the rotating-aware trim instead.
+        """
+        from mlx_lm.models.cache import RotatingKVCache
+
+        from olmlx.engine.speculative import SpeculativeDecoder
+
+        vocab_size, hidden_size = 32, 16
+        draft = MockModel(vocab_size, hidden_size)
+        target = MockModel(vocab_size, hidden_size)
+        decoder = SpeculativeDecoder(
+            draft_model=draft,
+            target_model=target,
+            num_speculative_tokens=4,
+        )
+
+        prompt = mx.array([[1, 2, 3]])
+        decoder.prefill(prompt)
+
+        # Swap in filled sliding-window target caches whose window has already
+        # rotated (max_size == prompt length, so offset == max_size). mlx-lm's
+        # blind ``trim_prompt_cache`` no-ops on these.
+        seq = decoder._cache_seq_len
+        rotating = [RotatingKVCache(max_size=seq, keep=0) for _ in target.layers]
+        target(prompt, cache=rotating)
+        for c in rotating:
+            assert not c.is_trimmable(), "window must be full for the regression"
+        decoder._target_cache = rotating
+
+        # Force a partial rejection (accept 2 of 4 drafts) so a trim is required.
+        decoder._verify = lambda draft_tokens, _logits: list(draft_tokens[:2])
+
+        accepted, _ = decoder.step()
+
+        assert len(accepted) == 2
+        assert decoder._cache_seq_len == seq + 2
+        # Trim must have removed the rejected suffix; a no-op leaves the cache
+        # offset inflated past the committed length.
+        assert decoder._target_cache[0].offset == decoder._cache_seq_len
+
     def test_reset_clears_state(self, shared_decoder):
         prompt = mx.array([[1, 2, 3]])
         shared_decoder.prefill(prompt)
