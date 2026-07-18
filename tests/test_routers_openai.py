@@ -236,14 +236,15 @@ class TestStripThinkingStreaming:
         assert state["buffer"] == ""
 
     def test_default_detect_limit_unchanged_for_non_thinking(self):
-        """Without a router-supplied detect_limit, the legacy 200-char
-        threshold applies so non-thinking models stream progressively."""
-        # 280 chars of plain text — must exit detect phase under the default
+        """Without a router-supplied detect_limit / thinking_expected, a
+        non-thinking model streams progressively — now from the first chunk,
+        not just once the 200-char watermark is crossed (issue #659)."""
+        # 280 chars of plain text — every chunk surfaces immediately.
         chunks = [f"token_{i} " for i in range(40)]
         results = self._stream(chunks)
         non_empty = [r for r in results if r]
         assert len(non_empty) > 1, (
-            "Default detect_limit must keep non-thinking models progressive"
+            "Non-thinking models must stream progressively, not buffer"
         )
 
     def test_literal_close_think_preserved_when_thinking_not_expected(self):
@@ -297,8 +298,47 @@ class TestStripThinkingStreaming:
         assert "</think>" not in full
         assert full.strip() == "391"
 
+    def test_detect_flushes_first_chunk_immediately_when_not_thinking(self):
+        """Issue #659: with thinking not expected, the detect phase must not
+        withhold output up to the 200-char watermark.
 
-class TestOpenAIRouter:
+        A first chunk with no tag (and no partial open-tag tail) must be
+        emitted right away so streaming first-byte latency tracks per-token
+        decode time, not a fixed buffering window.
+        """
+        state: dict = {}
+        out = strip_thinking_streaming("The ocean is vast and deep.", state)
+        assert out == "The ocean is vast and deep.", (
+            f"detect phase buffered instead of streaming immediately: {out!r}"
+        )
+        # Once flushed with no pending tag, we are past detect.
+        assert state["phase"] == "passthrough"
+
+    def test_short_non_thinking_response_streams_incrementally(self):
+        """Issue #659: a response shorter than the 200-char detect watermark
+        must still stream chunk-by-chunk, not arrive as one buffered blob at
+        flush time."""
+        chunks = ["Bonjour! ", "Comment ", "allez-vous?"]
+        state: dict = {}
+        outs = [strip_thinking_streaming(c, state) for c in chunks]
+        # Every (tag-free) chunk surfaces immediately, before the final flush.
+        assert outs == ["Bonjour! ", "Comment ", "allez-vous?"], outs
+        assert flush_thinking_buffer(state) == ""
+
+    def test_detect_immediate_flush_holds_partial_open_tag_tail(self):
+        """Issue #659: flushing early in detect must still withhold a trailing
+        partial open-tag so a tag straddling the chunk boundary is recognized
+        on the next chunk (same guarantee the passthrough phase gives)."""
+        state: dict = {}
+        # First chunk ends mid-``<think>`` — the partial must be held back.
+        out = strip_thinking_streaming("Here you go: <thi", state)
+        assert out == "Here you go: ", f"partial open-tag not held: {out!r}"
+        assert state["buffer"] == "<thi"
+        # Completing the tag opens a thinking block; its body is stripped.
+        out2 = strip_thinking_streaming("nk>secret</think>done", state)
+        assert "secret" not in out2
+        assert out2.endswith("done")
+
     @pytest.mark.asyncio
     async def test_list_models(self, app_client):
         resp = await app_client.get("/v1/models")

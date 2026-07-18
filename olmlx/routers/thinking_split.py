@@ -29,11 +29,13 @@ _THINKING_PAIRS: tuple[tuple[str, str], ...] = (
 )
 
 # Maximum buffer size in the ``detect`` phase before giving up on finding a
-# (possibly orphaned) close tag and transitioning to ``passthrough``.  Sized
-# to let non-thinking models start streaming quickly while still catching the
-# orphaned ``</think>`` that a chat template may have pre-opened in the
-# prompt.  Callers that know thinking is incoming raise the window via
-# ``state["thinking_expected"]`` (or an explicit ``state["detect_limit"]``).
+# (possibly orphaned) close tag and transitioning to ``passthrough``.  This
+# only bounds the ``thinking_expected`` orphan-detection window: when thinking
+# is not expected the detect phase flushes immediately (issue #659), so a
+# non-thinking model never buffers up to this limit.  Callers that know
+# thinking is incoming raise the window via ``state["thinking_expected"]`` (or
+# an explicit ``state["detect_limit"]``) so a longer orphaned-``</think>``
+# preamble (that a chat template pre-opened in the prompt) is still caught.
 _STREAM_DETECT_LIMIT = 200
 
 
@@ -150,13 +152,22 @@ def split_thinking_parts(text: str, state: dict) -> list[tuple[str, str]]:
                 expected_close = paired_close
                 phase = "in_think"
             else:
-                if len(buf) > detect_limit:
+                # With no open tag pending, the detect phase only needs to
+                # keep accumulating while the orphan-close heuristic is armed
+                # (``thinking_expected``): the whole preamble before a possible
+                # orphaned ``</think>`` is thinking and must be withheld until
+                # that close tag appears (or the detect window fills).  When
+                # thinking is *not* expected the orphan-close branch above can
+                # never fire, so detect behaves exactly like passthrough — hold
+                # back only a trailing partial open-tag and flush the rest
+                # immediately, instead of buffering up to ``detect_limit``
+                # before releasing a single byte (issue #659).
+                if not thinking_expected or len(buf) > detect_limit:
                     # Hold back any partial open-tag suffix so a tag
                     # straddling the detect→passthrough transition is still
                     # recognized on the next chunk.  Close-tag partials are
-                    # deliberately not retained: this many bytes without a
-                    # tag means a non-thinking response, so a later close
-                    # tag is literal text.
+                    # deliberately not retained: a non-thinking response's
+                    # later close tag is literal text.
                     partial = _longest_open_tag_suffix(buf)
                     emit("content", buf[:-partial] if partial else buf)
                     buf = buf[-partial:] if partial else ""
