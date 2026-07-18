@@ -195,14 +195,21 @@ class EagleDecoder(SpecDecoderBase):
         sub-chunk loop to check between), and is an experimental strategy
         off the default path.
         """
+        # Build the target cache *before* patching layer hooks (mirrors
+        # DFlash, #633): ``make_prompt_cache`` walks ``model.layers`` to pick
+        # a per-layer cache type (sliding vs. full attention) by probing the
+        # layer object. Today it uses ``hasattr``, which ``_LayerHook.
+        # __getattr__`` proxies through, but a future ``isinstance`` check
+        # would silently get the wrong cache type for a ``_LayerHook``-wrapped
+        # layer. Building the cache first decouples cache selection from the
+        # patch.
+        self._target_cache = make_prompt_cache(self._target)
+        self._draft_cache = self._draft.make_cache()
+
         # Hook the chosen target layer so its output is captured into
         # ``_hidden_storage[0]`` on every target forward.
         self._install_layer_hooks([self._target_layer_id], self._hidden_storage)
         self._bind_draft()
-
-        # Build fresh caches for both models.
-        self._target_cache = make_prompt_cache(self._target)
-        self._draft_cache = self._draft.make_cache()
 
         # (Classic ``SpeculativeDecoder.prefill`` resets ``_position_ids``
         # / ``_rope_deltas`` on the target here for mlx-vlm targets,
@@ -259,24 +266,34 @@ class EagleDecoder(SpecDecoderBase):
         # prefill``'s try/reset, so the model is never left patched and
         # the ``_GDN_PATCH_LOCK`` never stays held.
         if not self._target_can_trim:
-            # Install the patch — must happen *before* the prompt
-            # forward so the patched ``__call__`` records the prompt's
-            # GDN state, which subsequent rollbacks may need to replay
-            # against. ``GDNStateCapture.__init__`` acquires
-            # ``_GDN_PATCH_LOCK``; ``reset()`` releases it via
-            # ``capture.close()``. ``_install_gdn_capture`` locates the
-            # GDN class, constructs the capture and a buffer
-            # pre-populated with the target's GDN modules in
-            # forward-pass order; activating the buffer makes subsequent
-            # forwards snapshot into it.
+            # Install the patch — must happen *before* the prompt forward
+            # so the patched ``__call__`` is in place. ``GDNStateCapture.
+            # __init__`` acquires ``_GDN_PATCH_LOCK``; ``reset()`` releases
+            # it via ``capture.close()``. ``_install_gdn_capture`` locates
+            # the GDN class and constructs the capture + a buffer
+            # pre-populated with the target's GDN modules in forward-pass
+            # order. The buffer is *not* activated here: see the two-pass
+            # block below.
             self._install_gdn_capture()
-            self._capture.use_buffer(self._capture_buffer)
 
         # Run the target on the prompt and capture its last-layer hidden.
         # Two-pass: prefix fills the KV cache without materialising the
         # full [batch, seq_len, vocab] logit; final single-token pass
         # produces a [1, 1, vocab] logit and refreshes the capture slot.
+        #
+        # GDN capture is suppressed across the (potentially long) prefix
+        # pass and re-enabled before the tail pass, mirroring MTP (#633):
+        # the patched GDN ``__call__`` *appends* per forward, so capturing
+        # every prompt position piles activation-scale q/k/v/conv tensors
+        # into the buffer and holds them live until the first ``step()``
+        # clears it. ``step()`` only needs the verify window — it clears the
+        # buffer and re-captures before each rollback — so the prompt
+        # captures are never consumed (the previous "rollbacks may replay
+        # against the prompt state" justification was incorrect). ``_capture``
+        # is only set on hybrid GDN targets.
         if prompt.shape[1] > 1:
+            if self._capture is not None:
+                self._capture.use_buffer(None)
             self._target(prompt[:, :-1], cache=self._target_cache)
             # Force the pass-1 hidden (if captured) before dropping the
             # slot reference, mirroring DFlash. Correctness does not
@@ -290,8 +307,12 @@ class EagleDecoder(SpecDecoderBase):
             # an active guard rather than dead code.
             self._hidden_storage[0] = None
             _eval_cache(self._target_cache)
+            if self._capture is not None:
+                self._capture.use_buffer(self._capture_buffer)
             target_out = self._target(prompt[:, -1:], cache=self._target_cache)
         else:
+            if self._capture is not None:
+                self._capture.use_buffer(self._capture_buffer)
             target_out = self._target(prompt, cache=self._target_cache)
         target_logits = _logits(target_out)
         captured = self._hidden_storage[0]

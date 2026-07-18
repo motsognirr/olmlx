@@ -3605,7 +3605,12 @@ async def _stream_completion(
                     and not lm.is_vlm
                 ):
                     spec_tokens = (
-                        lm.text_tokenizer.encode(prompt)
+                        # ``tokenize_for_cache`` replicates mlx-lm's BOS
+                        # heuristic; plain ``.encode`` (add_special_tokens=True)
+                        # would double the BOS on BOS-prefixed templates
+                        # (Llama 3 / Gemma / Mistral), diverging from the
+                        # non-speculative path (#633).
+                        tokenize_for_cache(lm.text_tokenizer, prompt)
                         if isinstance(prompt, str)
                         else list(prompt)
                     )
@@ -4267,7 +4272,10 @@ async def _full_completion_inner(
             )
 
             if isinstance(prompt, str):
-                prompt_tokens = lm.text_tokenizer.encode(prompt)
+                # BOS heuristic (see the buffered speculative path / #633):
+                # plain ``.encode`` would double the BOS on BOS-prefixed
+                # templates, diverging from the non-speculative path.
+                prompt_tokens = tokenize_for_cache(lm.text_tokenizer, prompt)
             else:
                 prompt_tokens = prompt
 
