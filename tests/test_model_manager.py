@@ -5323,7 +5323,15 @@ class TestEvictLruIfNeeded:
             side_effect=lambda n: f"{n}:latest"
         )
 
-        async def _abort_load(*_a, **_kw):
+        # ``_detect_model_kind`` is offloaded via ``asyncio.to_thread`` before
+        # the load (#614); let that call through (stub it fast, no network) and
+        # abort only the load itself.
+        manager._detect_model_kind = lambda hf_path: "text"  # type: ignore[method-assign]
+        real_to_thread = asyncio.to_thread
+
+        async def _abort_load(func, *a, **kw):
+            if func is manager._detect_model_kind:
+                return await real_to_thread(func, *a, **kw)
             raise RuntimeError("stop before load")
 
         monkeypatch.setattr("olmlx.engine.model_manager.asyncio.to_thread", _abort_load)

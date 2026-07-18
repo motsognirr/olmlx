@@ -263,7 +263,14 @@ async def _handle_glob(args: dict) -> str:
     pattern = args.get("pattern", "")
     path = args.get("path", ".")
 
-    matches = sorted(glob_module.glob(pattern, root_dir=path, recursive=True))
+    # A model-issued ``**/*`` over a large tree (or ``/``) would block the
+    # whole event loop — in server/agent mode that freezes every endpoint,
+    # not just this chat. Offload like the other file handlers (#614).
+    matches = sorted(
+        await asyncio.to_thread(
+            glob_module.glob, pattern, root_dir=path, recursive=True
+        )
+    )
     if not matches:
         return "No matches found."
 
