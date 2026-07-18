@@ -239,3 +239,49 @@ class TestDelegateTool:
         result = await tools.call_tool("delegate", {"goal": "sub"})
         assert isinstance(result, ToolError)
         assert result.is_user_error
+
+
+class TestServiceLifecycle:
+    """Run-lifecycle guards in AgentService (#622)."""
+
+    async def test_resume_rejects_concurrent_double_run(self, store):
+        from olmlx.engine.agent.orchestrator import AgentContext
+        from olmlx.engine.agent.service import _RunHandle
+
+        svc = _service(store, _finish_factory)
+        await store.create_run(run_id="r1", goal="G", model="m", config={})
+        await store.update_run("r1", status="interrupted")
+
+        # Simulate a run already being driven: a live handle whose task is not
+        # done. A second resume must be rejected rather than starting a second
+        # orchestrator on the same run.
+        async def _blocking():
+            await asyncio.Event().wait()
+
+        task = asyncio.create_task(_blocking())
+        ctx = AgentContext(run_id="r1", store=store)
+        svc._handles["r1"] = _RunHandle(
+            cancel_event=asyncio.Event(), context=ctx, task=task
+        )
+        try:
+            with pytest.raises(ValueError, match="already running"):
+                await svc.resume("r1")
+        finally:
+            task.cancel()
+
+    async def test_stream_events_terminates_for_interrupted_run(self, store):
+        svc = _service(store, _finish_factory)
+        await store.create_run(run_id="r1", goal="G", model="m", config={})
+        await store.append_event("r1", {"type": "token", "text": "hi"})
+        await store.update_run("r1", status="interrupted")
+
+        events: list = []
+
+        async def _collect():
+            async for ev in svc.stream_events("r1", poll_interval=0.01):
+                events.append(ev)
+
+        # Must terminate — an interrupted run's task produces no more events, so
+        # tailing it should not loop forever.
+        await asyncio.wait_for(_collect(), timeout=2.0)
+        assert any(e.get("type") == "token" for e in events)

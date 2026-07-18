@@ -42,7 +42,11 @@ class FakeSession:
         self._i += 1
         self.messages.append({"role": "user", "content": user_text})
         for msg in script.get("messages", []):
-            self.messages.append(msg)
+            # Append a fresh copy each turn — a real ChatSession produces new
+            # message objects per turn, and the orchestrator's stall signature
+            # now diffs by object identity (#622), so reusing one object would
+            # mask a legitimate identical-output stall.
+            self.messages.append(dict(msg))
         for event in script.get("events", []):
             yield event
         yield {"type": "done"}
@@ -274,6 +278,38 @@ class TestStall:
         assert result["reason"] == "stall"
         # iter1 sets baseline, iter2 +1, iter3 +2 == threshold.
         assert (await store.get_run("r1"))["iterations"] == 3
+
+    async def test_no_false_stall_when_history_truncated(self, store):
+        """When ``send_message`` rebinds ``messages`` to a shorter list
+        (memory truncation), a positional ``before`` slice would yield an
+        empty ``"[]"`` signature every iteration and falsely stall a run that
+        is making real progress. The identity-based diff must still see each
+        turn's distinct assistant output (#622).
+        """
+        await store.create_run(run_id="r1", goal="G", model="m", config={})
+
+        class TruncatingSession(FakeSession):
+            async def send_message(self, user_text):
+                self.prompts.append(user_text)
+                i = self._i
+                self._i += 1
+                # Simulate _check_memory_and_truncate: rebind messages to a
+                # fresh, shorter list — but with DISTINCT assistant content.
+                self.messages = [{"role": "system", "content": "summary"}]
+                self.messages.append({"role": "user", "content": user_text})
+                self.messages.append(_assistant(f"progress step {i}"))
+                yield {"type": "done"}
+
+        session = TruncatingSession([])
+        orch = Orchestrator(
+            session=session,
+            context=_ctx(store),
+            budgets=Budgets(max_iterations=5, stall_max_no_progress=2),
+        )
+        result = await orch.run()
+        # Must run to the iteration cap, NOT be killed as a stall.
+        assert result["reason"] != "stall"
+        assert (await store.get_run("r1"))["iterations"] == 5
 
 
 class TestResume:
