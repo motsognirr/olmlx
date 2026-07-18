@@ -230,6 +230,29 @@ class TestGlob:
         )
         assert "no matches" in result.lower() or result.strip() == ""
 
+    @pytest.mark.asyncio
+    async def test_glob_runs_off_event_loop(self, manager, tmp_path):
+        """A model-issued ``**/*`` over a large tree must not block the event
+        loop — the glob is offloaded to a worker thread (#614)."""
+        import threading
+
+        from olmlx.chat import builtin_tools
+
+        (tmp_path / "a.py").write_text("")
+        recorded: dict = {}
+        real_glob = builtin_tools.glob_module.glob
+
+        def _recording_glob(*args, **kwargs):
+            recorded["thread"] = threading.current_thread()
+            return real_glob(*args, **kwargs)
+
+        with patch.object(builtin_tools.glob_module, "glob", _recording_glob):
+            result = await manager.call_tool(
+                "glob", {"pattern": "*.py", "path": str(tmp_path)}
+            )
+        assert "a.py" in result
+        assert recorded["thread"] is not threading.main_thread()
+
 
 class TestGrep:
     @pytest.mark.asyncio

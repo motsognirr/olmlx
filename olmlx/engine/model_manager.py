@@ -1655,7 +1655,12 @@ class ModelManager(SpeculativeLoaderMixin):
                 weight_quant_str = model_config.resolved_weight_quant()
                 # Whisper models (issue #366) have no LLM KV cache — never
                 # apply KV-cache quantization / spectral calibration to them.
-                _model_kind = self._detect_model_kind(hf_path)
+                # ``_detect_model_kind`` can fall through to a blocking
+                # ``hf_hub_download(config.json)`` on first load of a
+                # not-yet-cached model; run it off the event loop so the whole
+                # server doesn't freeze for the round trip (#614). It is
+                # recomputed on the worker thread in ``_load_model`` anyway.
+                _model_kind = await asyncio.to_thread(self._detect_model_kind, hf_path)
                 if _model_kind in ("whisper", "tts", "reranker"):
                     kv_cache_quant = None
                     kv_eviction = None
