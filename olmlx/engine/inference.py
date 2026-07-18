@@ -4282,10 +4282,19 @@ async def _full_completion_inner(
                 # mlx-lm's wired_limit.__exit__ runs its generation-stream sync
                 # now, on this worker thread — mirrors CancellableStream._run.
                 # Guarded: mlx_lm.stream_generate returns a real generator, but
-                # tests may substitute a plain iterator with no close().
+                # tests may substitute a plain iterator with no close(). The
+                # close itself is wrapped like CancellableStream._run — GPU
+                # teardown (wired_limit sync) can raise, and an exception here
+                # would supersede a real in-flight error from the loop body.
                 _close = getattr(mlx_gen, "close", None)
                 if callable(_close):
-                    _close()
+                    try:
+                        _close()
+                    except Exception:
+                        logger.debug(
+                            "stream_generate close() failed during teardown",
+                            exc_info=True,
+                        )
             # Store full text on the result for downstream extraction
             if result is not None:
                 result = (result, "".join(text_parts))
