@@ -1,14 +1,18 @@
 """Tests for Ollama /api/generate legacy `context` continuation (issue #656)."""
 
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 from olmlx.engine.inference import (
     _augment_stream_with_context,
+    _full_completion_inner,
+    _stream_completion,
     build_context_input_tokens,
     generate_completion,
 )
+from olmlx.utils.timing import TimingStats
 
 
 class _FakeTokenizer:
@@ -169,6 +173,113 @@ class TestGenerateCompletionContext:
         assert "context" not in result
         _, kwargs = mock_full.call_args
         assert kwargs["collect_generated_tokens"] is False
+
+
+class TestContextCollectionGaps:
+    """Regressions for the speculative + batched context-collection gaps
+    (aider review on PR #673)."""
+
+    @pytest.mark.asyncio
+    async def test_speculative_branch_collects_generated_tokens(self, mock_manager):
+        """The non-streaming speculative path must populate
+        ``generated_tokens_out`` — otherwise ``/api/generate`` returns a
+        prompt-only context for speculative models."""
+        lm = mock_manager._loaded["qwen3:latest"]
+        # is_speculative derives from speculative_decoder; is_vlm/is_distributed
+        # default False on the fixture.
+        lm.speculative_decoder = MagicMock()
+        lm.text_tokenizer.eos_token_id = 999
+
+        fake_tokens = [
+            SimpleNamespace(
+                text="a",
+                token=101,
+                prompt_tokens=3,
+                generation_tokens=1,
+                prompt_tps=0.0,
+                generation_tps=0.0,
+            ),
+            SimpleNamespace(
+                text="b",
+                token=102,
+                prompt_tokens=3,
+                generation_tokens=2,
+                prompt_tps=0.0,
+                generation_tps=0.0,
+            ),
+        ]
+
+        def fake_spec_gen(*args, **kwargs):
+            yield from fake_tokens
+
+        async def fake_to_thread(fn, *a, **k):
+            return fn(*a, **k)
+
+        collector: list[int] = []
+        with (
+            patch(
+                "olmlx.engine.speculative_stream.speculative_stream_generate",
+                fake_spec_gen,
+            ),
+            patch("olmlx.engine.inference.mx", MagicMock()),
+            patch("olmlx.engine.inference.materialize_audio", return_value=([], [])),
+            patch(
+                "olmlx.engine.inference.asyncio.to_thread",
+                side_effect=fake_to_thread,
+            ),
+        ):
+            await _full_completion_inner(
+                lm,
+                [1, 2, 3],
+                max_tokens=8,
+                gen_kwargs={},
+                stats=TimingStats(),
+                generated_tokens_out=collector,
+            )
+        assert collector == [101, 102]
+
+    @pytest.mark.asyncio
+    async def test_stream_context_request_skips_batched_path(self, mock_manager):
+        """A streaming context request (collect_generated_tokens=True) must not
+        take the batched path, which never emits per-token ids — mirroring the
+        guard in _full_completion."""
+        lm = mock_manager._loaded["qwen3:latest"]
+
+        class _Sentinel(Exception):
+            pass
+
+        batched = MagicMock()
+
+        async def fake_batched(*args, **kwargs):
+            batched()
+            yield {"text": "batched", "done": False}
+
+        async def boom(*args, **kwargs):
+            raise _Sentinel
+
+        with (
+            patch("olmlx.engine.inference._batch_eligible", return_value=True),
+            patch("olmlx.engine.inference._stream_completion_batched", fake_batched),
+            patch("olmlx.engine.inference._enter_inference_lock", boom),
+        ):
+            # collect=False -> batched path taken (yields its sentinel chunk).
+            chunks = []
+            async for c in _stream_completion(
+                lm, "Hi", 5, {}, TimingStats(), collect_generated_tokens=False
+            ):
+                chunks.append(c)
+            assert chunks == [{"text": "batched", "done": False}]
+            assert batched.call_count == 1
+
+            # collect=True -> batched path skipped; proceeds to the real path
+            # (here stubbed to raise once past the guard).
+            batched.reset_mock()
+            with pytest.raises(_Sentinel):
+                async for _ in _stream_completion(
+                    lm, "Hi", 5, {}, TimingStats(), collect_generated_tokens=True
+                ):
+                    pass
+            assert batched.call_count == 0
 
 
 @pytest.mark.slow

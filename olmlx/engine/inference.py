@@ -1635,17 +1635,18 @@ async def generate_completion(
         # models only — VLM token ids can't represent image patches, and the
         # cache/token paths only replace a str prompt.
         context_input_tokens: list[int] | None = None
+        gen_prompt: str | list[int] = prompt
         if return_context and not lm.is_vlm and isinstance(prompt, str):
             context_input_tokens = build_context_input_tokens(
                 lm.text_tokenizer, prompt, context
             )
-            prompt = context_input_tokens
+            gen_prompt = context_input_tokens
         collect_generated_tokens = context_input_tokens is not None
 
         if stream:
             gen = _stream_completion(
                 lm,
-                prompt,
+                gen_prompt,
                 mt,
                 gen_kwargs,
                 stats,
@@ -1680,7 +1681,7 @@ async def generate_completion(
                 ):
                     result = await _full_completion(
                         lm,
-                        prompt,
+                        gen_prompt,
                         mt,
                         gen_kwargs,
                         stats,
@@ -3409,7 +3410,10 @@ async def _stream_completion(
 ) -> AsyncGenerator[dict, None]:
     # Continuous batching (docs/batching-plan.md): eligible requests join
     # the per-model batch instead of serializing on the inference lock.
-    if _batch_eligible(
+    # A context request (#656) skips it — the batched path aggregates its
+    # internal stream and never emits per-token ids, so it can't build the
+    # continuation context; mirrors the guard in `_full_completion`.
+    if not collect_generated_tokens and _batch_eligible(
         lm,
         gen_kwargs,
         max_tokens=max_tokens,
@@ -4280,6 +4284,14 @@ async def _full_completion_inner(
                 tokenizer=lm.text_tokenizer,
             ):
                 text_parts.append(response.text)
+                # Collect produced token ids for the Ollama continuation
+                # context (#656) — the speculative branch, unlike the mlx-lm
+                # branch above, otherwise never populates this and would return
+                # a prompt-only context for speculative models.
+                if generated_tokens_out is not None:
+                    tok_id = getattr(response, "token", None)
+                    if tok_id is not None:
+                        generated_tokens_out.append(tok_id)
                 result = response
             if result is not None:
                 result = (result, "".join(text_parts))
