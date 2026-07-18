@@ -226,6 +226,11 @@ class DFlashDecoder(SpecDecoderBase):
                 for p, q in zip(captured_prefix, captured_last)
             ]
         else:
+            # Single-token prompt: no long prefix to suppress, so the buffer
+            # must be active for this forward so step()'s rollback has the
+            # captured GDN state (mirrors MTP's single-token branch).
+            if self._capture is not None:
+                self._capture.use_buffer(self._capture_buffer)
             target_out = self._target(prompt, cache=self._target_cache)
             captured = list(self._hidden_capture)
             if any(h is None for h in captured):
