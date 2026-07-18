@@ -63,6 +63,10 @@ class VlmPromptCacheStore:
         self._capacity = max(int(capacity), 0)
         # Insertion-ordered dict as an LRU: first key is least-recently-used.
         self._entries: dict[str, Any] = {}
+        # Bumped by every bulk drop (``clear``) so an ``async_get`` whose disk
+        # restore was in flight across the drop can tell its result is stale
+        # and skip the re-insert (#618; mirrors PromptCacheStore).
+        self._evict_generation = 0
         # Cumulative reuse counters surfaced on /api/ps (acceptance criterion 1).
         self._hits = 0
         self._misses = 0
@@ -99,6 +103,8 @@ class VlmPromptCacheStore:
         the in-memory tier; the disk tier is reclaimed lazily by the cap.
         """
         self._entries.clear()
+        # Signal any in-flight async_get that its restore is now stale (#618).
+        self._evict_generation += 1
 
     def note_hit(self, reused_tokens: int) -> None:
         self._hits += 1
@@ -162,9 +168,23 @@ class VlmPromptCacheStore:
             return mem
         if not self._disk_enabled or not self.enabled():
             return None
+        gen_before = self._evict_generation
         loaded = await asyncio.to_thread(self._load_from_disk, cache_id)
         if loaded is None:
             return None
+        # If a bulk clear() (memory-pressure flush) landed during the await,
+        # the eviction was intentional — don't re-insert the stale disk copy
+        # and undo the flush. Leave the disk file intact for a later restore.
+        if self._evict_generation != gen_before:
+            return None
+        # Another coroutine may have inserted a fresher state for this id
+        # during the await; keep it and discard the stale disk load rather
+        # than let _insert_capture's pop() clobber it.
+        existing = self._entries.get(cache_id)
+        if existing is not None:
+            self._entries.pop(cache_id, None)  # refresh to MRU
+            self._entries[cache_id] = existing
+            return existing
         # Promote the restored entry; spill whatever it evicts.
         for over_id, over_state in self._insert_capture(cache_id, loaded):
             await self._spill(over_id, over_state)

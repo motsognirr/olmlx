@@ -612,13 +612,19 @@ class TestEagleDecoderPrefillStep:
         EagleDecoder(target_model=target, draft_model=draft, target_layer_id=n - 1)
 
     def test_draft_cache_growth_is_bounded_per_step(self):
-        """The draft cache must grow by exactly ``num_accepted - 1``
-        positions per ``step()`` — that's the cumulative output count.
-        A regression that skipped the draft trim (e.g. flipped
-        ``if trim > 0``) would let the cache grow by ``block_size``
-        per step instead, accumulating ``block_size - num_accepted``
-        extra positions every verify and blowing up memory on long
-        generations. Lock this in.
+        """The draft cache must grow by exactly ``num_accepted``
+        positions per ``step()`` — one entry per committed token, so the
+        draft's KV history and RoPE positions stay aligned with the
+        committed sequence (#617).
+
+        Two failure modes this pins:
+        - Skipping the draft trim (e.g. flipping ``if trim_draft > 0``)
+          lets the cache grow by ``block_size`` per step, accumulating
+          extra positions and blowing up memory on long generations.
+        - Over-trimming (the pre-#617 ``block_size + 1 - num_accepted``,
+          which kept only ``num_accepted - 1``) drops the last accepted
+          token's KV entry every step, compressing RoPE positions by one
+          per step and degrading acceptance cumulatively.
         """
         decoder, _, _ = _make_decoder(block_size=2)
         decoder.prefill(mx.array([[1, 2, 3]], dtype=mx.int32))
@@ -635,16 +641,41 @@ class TestEagleDecoderPrefillStep:
             accepted, _ = decoder.step()
             total_accepted += len(accepted)
 
-        # Net growth per step = num_accepted - 1 (see step()'s comment
-        # block on trim arithmetic). Cumulative offset growth after N
-        # steps = ``sum_i (num_accepted_i - 1)`` = total_accepted - N.
-        expected = total_accepted - steps
+        # Net growth per step = num_accepted (see step()'s comment block
+        # on trim arithmetic). Cumulative offset growth after N steps =
+        # ``sum_i num_accepted_i`` = total_accepted.
+        expected = total_accepted
         actual = _cache_offset() - baseline
         assert actual == expected, (
             f"draft cache offset grew by {actual} after {steps} steps "
             f"with {total_accepted} total accepted tokens; expected "
-            f"{expected}. Regression: the per-step trim no longer "
-            "matches ``num_accepted - 1``."
+            f"{expected}. Regression: the per-step draft trim no longer "
+            "keeps exactly ``num_accepted`` committed entries."
+        )
+
+    def test_full_acceptance_aligns_draft_cache(self, monkeypatch):
+        """On full acceptance (all block_size drafts + the bonus token
+        committed) the draft cache is one entry short of the committed
+        prefix, so ``step`` must run an align-forward to append the last
+        accepted draft token's KV (#617). Force full acceptance and assert
+        the draft cache grew by exactly num_accepted = block_size + 1.
+        """
+        decoder, _, _ = _make_decoder(block_size=3)
+        decoder.prefill(mx.array([[1, 2, 3]], dtype=mx.int32))
+        assert decoder._draft_cache is not None
+        baseline = decoder._draft_cache[0].offset
+
+        # Accept every draft plus a bonus token -> num_accepted = bs + 1.
+        monkeypatch.setattr(
+            decoder, "_verify_greedy", lambda drafts, logits: [*drafts, 7]
+        )
+        accepted, _ = decoder.step()
+        assert len(accepted) == decoder._block_size + 1  # full acceptance
+        grew = decoder._draft_cache[0].offset - baseline
+        assert grew == len(accepted), (
+            f"draft cache grew by {grew} on full acceptance; expected "
+            f"{len(accepted)} — the align-forward did not append the "
+            "last accepted draft token's KV entry."
         )
 
     def test_step_clears_hidden_storage_before_verify(self):
