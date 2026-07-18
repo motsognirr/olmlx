@@ -808,6 +808,18 @@ def warn_legacy_flash_env() -> None:
     )
 
 
+def _looks_quoted(value: str) -> bool:
+    """True if *value* is wrapped in matching single or double quotes.
+
+    Length >= 2 so a lone quote character doesn't count as its own pair
+    (and thus collapse to the empty string when the quotes are stripped).
+    """
+    return len(value) >= 2 and (
+        (value.startswith('"') and value.endswith('"'))
+        or (value.startswith("'") and value.endswith("'"))
+    )
+
+
 def parse_dotenv_values(
     names: Iterable[str], dotenv_path: Path | None = None
 ) -> dict[str, str]:
@@ -846,11 +858,7 @@ def parse_dotenv_values(
         if key not in wanted or key in found:
             continue
         value = value.strip()
-        # Require length >= 2 so a lone quote character doesn't collapse to "".
-        is_quoted = len(value) >= 2 and (
-            (value.startswith('"') and value.endswith('"'))
-            or (value.startswith("'") and value.endswith("'"))
-        )
+        is_quoted = _looks_quoted(value)
         if not is_quoted:
             # Strip a trailing inline comment from an unquoted value, then
             # re-check for surrounding quotes — a quoted value only becomes
@@ -858,10 +866,7 @@ def parse_dotenv_values(
             comment_idx = value.find("#")
             if comment_idx != -1:
                 value = value[:comment_idx].rstrip()
-                is_quoted = len(value) >= 2 and (
-                    (value.startswith('"') and value.endswith('"'))
-                    or (value.startswith("'") and value.endswith("'"))
-                )
+                is_quoted = _looks_quoted(value)
         if is_quoted:
             value = value[1:-1]
         found[key] = value
