@@ -3209,6 +3209,7 @@ class ModelManager(SpeculativeLoaderMixin):
         # them or every failed attempt permanently leaks num_layers fds + the
         # thread pools (#624).
         wrapped: Any = None
+        draft_model: Any = None
         try:
             # Load lookahead predictors if available (for speculative prefetching)
             lookahead_bank = None
@@ -3248,7 +3249,7 @@ class ModelManager(SpeculativeLoaderMixin):
                     "Loading draft model %s for speculative decoding",
                     flash_config.flash_speculative_draft_model,
                 )
-                draft_model, draft_tokenizer = load_model_with_strict_fallback(
+                draft_model, _draft_tokenizer = load_model_with_strict_fallback(
                     flash_config.flash_speculative_draft_model, lazy=False
                 )
 
@@ -3296,6 +3297,12 @@ class ModelManager(SpeculativeLoaderMixin):
                 weight_store.close()
             except Exception:
                 logger.exception("Error closing weight store after failed flash load")
+            # If the speculative branch loaded a draft model before failing
+            # (e.g. the vocab-mismatch raise), drop its reference and return
+            # its GPU weights to the pool promptly rather than waiting for GC.
+            if draft_model is not None:
+                del draft_model
+                mx.clear_cache()
             raise
 
     def _flash_moe_dir(self, hf_path: str) -> Path | None:
