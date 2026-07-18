@@ -461,24 +461,24 @@ class MTPDecoder(SpecDecoderBase):
         # caches grew by block_size+1 (target) and block_size (draft)
         # during this step. Trim them back to the accepted prefix.
         num_accepted = len(accepted)
-        # Target and draft caches trim by the same amount.
-        # - Target grew by block_size + 1; we keep num_accepted; trim
-        #   away (block_size + 1 - num_accepted).
-        # - Draft grew by block_size; we keep num_accepted - 1 (the
-        #   draft emits drafts, not the seed); trim away
-        #   (block_size - (num_accepted - 1)) = (block_size + 1 -
-        #   num_accepted).
-        # Both algebra paths land at the same value. Keep one
-        # variable so a future change to either side has to update
-        # the trim formula in one spot — two identically-computed
-        # variables would be a maintenance trap (e.g. EAGLE-2 tree
-        # speculation could change the draft accounting while target
-        # stays the same).
-        trim = (self._block_size + 1) - num_accepted
-        if trim > 0:
+        # Target and draft caches keep ``num_accepted`` committed entries
+        # each, but grew by different amounts, so they trim by different
+        # amounts (#617 — a single shared ``trim`` dropped the last
+        # accepted token's draft KV entry every step):
+        # - Target grew by block_size + 1 (verify fed [seed, D_1..D_bs]);
+        #   keep num_accepted; trim away (block_size + 1 - num_accepted).
+        # - Draft grew by block_size (loop fed [seed, D_1..D_{bs-1}]);
+        #   keep num_accepted; trim away (block_size - num_accepted). On
+        #   full acceptance (num_accepted == block_size + 1) that is -1:
+        #   the draft cache is one entry short of the committed prefix, so
+        #   an align-forward below feeds the last accepted draft token to
+        #   catch it up (mirrors speculative.py's classic decoder).
+        trim_target = (self._block_size + 1) - num_accepted
+        trim_draft = self._block_size - num_accepted
+        if trim_target > 0:
             if self._target_can_trim:
                 if trim_prompt_cache is not None:
-                    trim_prompt_cache(self._target_cache, trim)
+                    trim_prompt_cache(self._target_cache, trim_target)
             else:
                 # Hybrid linear-attention path. ``_capture`` was created
                 # in prefill; same control-flow invariant guards as
@@ -514,13 +514,27 @@ class MTPDecoder(SpecDecoderBase):
                     self._capture_buffer,
                     self._target_cache,
                     accepted=num_accepted - 1,
-                    trim=trim,
+                    trim=trim_target,
                 )
         # Draft cache trim — the draft is always a standard-attention
         # transformer with trim-able KVCache, so this path is the same
         # regardless of target architecture.
-        if trim_prompt_cache is not None and trim > 0:
-            trim_prompt_cache(self._draft_cache, trim)
+        if trim_prompt_cache is not None and trim_draft > 0:
+            trim_prompt_cache(self._draft_cache, trim_draft)
+        elif num_accepted > self._block_size:
+            # Full acceptance: the draft cache holds only block_size
+            # entries but all block_size drafts (plus the bonus token)
+            # were committed, so it is one entry short. Feed the last
+            # accepted draft token to append its KV — ``cur_hidden`` is
+            # the draft hidden that conditions it (the running hidden the
+            # loop left after producing ``draft_tokens[-1]``), matching
+            # how positions 1..block_size-1 were built. Mirrors the
+            # classic decoder's align-forward (speculative.py).
+            align_tok = mx.array([[draft_tokens[-1]]], dtype=mx.int32)
+            align_logits, _ = self._draft(
+                token_ids=align_tok, h_prev=cur_hidden, cache=self._draft_cache
+            )
+            mx.eval(align_logits)
 
         # New seed: the last accepted token, with target's hidden at
         # the corresponding position. captured spans positions

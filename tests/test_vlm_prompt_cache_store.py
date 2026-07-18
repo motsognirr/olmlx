@@ -170,6 +170,50 @@ async def test_empty_state_not_spilled(tmp_path):
     assert not a_file.exists()
 
 
+async def test_async_get_skips_reinsert_after_bulk_clear(tmp_path):
+    """A memory-pressure ``clear()`` during the threaded disk restore must
+    cancel the re-insert — otherwise the stale disk copy is written straight
+    back in, partly defeating the flush (#618). Mirrors the text store's
+    eviction-generation guard.
+    """
+    store = _disk_store(tmp_path, capacity=2)
+    disk_state = _filled_state([1, 2, 3])
+
+    def load_with_concurrent_clear(cid):
+        # Simulate ``clear()`` (the memory-pressure path) landing while the
+        # disk read is in flight: it bumps the eviction generation.
+        store._evict_generation += 1
+        return disk_state
+
+    store._load_from_disk = load_with_concurrent_clear
+    got = await store.async_get("a")
+    # The restore is abandoned: nothing re-enters memory.
+    assert got is None
+    assert store.get("a") is None
+    assert "a" not in store._entries
+
+
+async def test_async_get_keeps_fresher_concurrent_insert(tmp_path):
+    """If another coroutine inserts a fresher state for the same id during
+    the threaded disk restore, ``async_get`` must return that fresher entry
+    and discard the stale disk copy — not clobber it (#618)."""
+    store = _disk_store(tmp_path, capacity=2)
+    stale_disk = _filled_state([1, 2, 3])
+    fresher = _filled_state([1, 2, 3, 4, 5])
+
+    def load_with_concurrent_insert(cid):
+        # Simulate a fresher insert for the same id completing during the
+        # await (direct dict write bypasses the loop-thread assert, exactly
+        # as the text-store guard test bumps _evict_generation directly).
+        store._entries[cid] = fresher
+        return stale_disk
+
+    store._load_from_disk = load_with_concurrent_insert
+    got = await store.async_get("a")
+    assert got is fresher
+    assert store.get("a") is fresher
+
+
 async def test_cleanup_respects_byte_cap(tmp_path):
     # Cap below one entry's size → the oldest spilled file is reclaimed.
     store = _disk_store(tmp_path, capacity=1, max_bytes=1)

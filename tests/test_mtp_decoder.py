@@ -75,6 +75,61 @@ def test_mtp_prefill_then_step_produces_accepted_tokens():
     assert stats["steps"] == 1 and stats["block_size"] == 2
 
 
+def test_mtp_draft_cache_growth_is_bounded_per_step():
+    """The MTP draft cache must grow by exactly ``num_accepted`` positions
+    per ``step()`` — one entry per committed token, keeping the draft's KV
+    history and RoPE positions aligned with the committed sequence (#617).
+
+    The pre-#617 arithmetic trimmed ``block_size + 1 - num_accepted`` on the
+    draft cache (keeping only ``num_accepted - 1``), dropping the last
+    accepted token's KV entry every step and compressing RoPE positions by
+    one per step — cumulative acceptance-rate degradation on long runs.
+    """
+    decoder, _, _ = _make_mtp_decoder(block_size=2)
+    decoder.prefill(mx.array([[1, 2, 3]], dtype=mx.int32))
+    assert decoder._draft_cache is not None
+
+    def _cache_offset() -> int:
+        assert decoder._draft_cache is not None
+        return decoder._draft_cache[0].offset
+
+    baseline = _cache_offset()
+    steps = 3
+    total_accepted = 0
+    for _ in range(steps):
+        accepted, _ = decoder.step()
+        total_accepted += len(accepted)
+
+    expected = total_accepted
+    actual = _cache_offset() - baseline
+    assert actual == expected, (
+        f"MTP draft cache offset grew by {actual} after {steps} steps "
+        f"with {total_accepted} total accepted tokens; expected {expected}. "
+        "Regression: the per-step draft trim no longer keeps exactly "
+        "``num_accepted`` committed entries."
+    )
+
+
+def test_mtp_full_acceptance_aligns_draft_cache(monkeypatch):
+    """On full acceptance the MTP draft cache is one entry short of the
+    committed prefix, so ``step`` must run an align-forward to append the
+    last accepted draft token's KV (#617)."""
+    decoder, _, _ = _make_mtp_decoder(block_size=3)
+    decoder.prefill(mx.array([[1, 2, 3]], dtype=mx.int32))
+    assert decoder._draft_cache is not None
+    baseline = decoder._draft_cache[0].offset
+
+    monkeypatch.setattr(decoder, "_verify_greedy", lambda drafts, logits: [*drafts, 7])
+    accepted, _ = decoder.step()
+    assert len(accepted) == decoder._block_size + 1  # full acceptance
+    grew = decoder._draft_cache[0].offset - baseline
+    assert grew == len(accepted), (
+        f"MTP draft cache grew by {grew} on full acceptance; expected "
+        f"{len(accepted)} — the align-forward did not append the last "
+        "accepted draft token's KV entry."
+    )
+
+
 def test_mtp_step_before_prefill_raises():
     decoder, _, _ = _make_mtp_decoder()
     try:
