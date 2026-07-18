@@ -600,6 +600,20 @@ class SpeculativeDecoder(SpecDecoderBase):
                 self._draft_gdn_buffer = None
                 raise
 
+        # Tree speculation is unsupported on hybrid GatedDeltaNet models
+        # (#632): the tree attention mask is a (1,1,n,n) additive mask that
+        # GDN layers can't consume (they expect a (B,S) boolean mask), GDN
+        # recurrence can't honor per-branch tree isolation, and a depth-1
+        # sibling acceptance drives the draft rollback to
+        # ``num_keep_steps == 0``, which ``rollback_autoregressive`` rejects.
+        # Fall back to linear speculation, which is correct on GDN targets.
+        if self._use_tree and self._gdn_capture is not None:
+            logger.warning(
+                "Tree speculation (tree_width>=2) is not supported on hybrid "
+                "GatedDeltaNet models; falling back to linear speculation."
+            )
+            self._use_tree = False
+
     def close(self) -> None:
         """Release the GDN class-level monkey-patch (idempotent).
 
@@ -1151,6 +1165,16 @@ class SpeculativeDecoder(SpecDecoderBase):
         self._cache_seq_len += num_accepted
         assert num_accepted >= 1, "step(): _verify() must return at least 1 token"
         self._pending_token = int(mx.argmax(self._last_target_logit).item())
+
+        if used_sibling:
+            # The bonus at ``accepted[-1]`` was read from the tree forward at
+            # the sibling's flat, mispositioned-RoPE slot; the rebuild forward
+            # above recomputed the position-correct next-token logit into
+            # ``_last_target_logit``. Its argmax (== ``_pending_token``) is the
+            # token the target actually predicts after the sibling, so emit
+            # that instead — otherwise the client-visible token diverges from
+            # the token conditioning subsequent generation (#632).
+            accepted[-1] = self._pending_token
 
         num_accepted_draft = self._update_acceptance_rate(num_accepted)
 
