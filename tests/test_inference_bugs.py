@@ -867,3 +867,121 @@ class TestInferenceRefKeepAlive:
             f"Per-request keep_alive='1s' must win over default '5m', "
             f"got {real_lm.expires_at - time.time():.1f}s"
         )
+
+
+# ---------------------------------------------------------------------------
+# Bug #604: stop-sequence hit stores a live, still-mutating prompt cache
+# ---------------------------------------------------------------------------
+class TestStopSequenceCachePoisoning:
+    """On a stop-sequence hit, the streaming path must cancel the worker thread
+    and NOT store the still-mutating prompt cache by reference (issue #604)."""
+
+    @pytest.mark.asyncio
+    async def test_stop_cancels_worker_and_skips_cache_store(self, mock_manager):
+        from unittest.mock import AsyncMock, patch
+        from olmlx.engine.inference import generate_chat
+        from olmlx.utils.streaming import CancellableStream, StreamToken
+
+        lm = mock_manager._loaded["qwen3:latest"]
+        lm.tokenizer.apply_chat_template = MagicMock(return_value="prompt")
+        lm.tokenizer.bos_token = None
+        lm.tokenizer.encode = MagicMock(return_value=[10, 20, 30])
+
+        mock_stream = MagicMock(spec=CancellableStream)
+        mock_stream.drain_and_join = AsyncMock()
+        mock_stream._thread = None
+        # Worker emits two real tokens, the stop marker, then a buffered-ahead
+        # token it had already decoded into the shared cache before cancel.
+        tokens = [
+            StreamToken(
+                text="hel",
+                token=1,
+                prompt_tokens=3,
+                generation_tokens=1,
+                prompt_tps=100.0,
+                generation_tps=50.0,
+            ),
+            StreamToken(
+                text="lo ",
+                token=2,
+                prompt_tokens=3,
+                generation_tokens=2,
+                prompt_tps=100.0,
+                generation_tps=50.0,
+            ),
+            StreamToken(
+                text="STOP",
+                token=3,
+                prompt_tokens=3,
+                generation_tokens=3,
+                prompt_tps=100.0,
+                generation_tps=50.0,
+            ),
+            StreamToken(
+                text=" past",
+                token=4,
+                prompt_tokens=3,
+                generation_tokens=4,
+                prompt_tps=100.0,
+                generation_tps=50.0,
+            ),
+        ]
+        token_iter = iter(tokens)
+
+        async def anext_impl():
+            try:
+                return next(token_iter)
+            except StopIteration:
+                raise StopAsyncIteration
+
+        mock_stream.__aiter__ = lambda self: self
+        mock_stream.__anext__ = lambda self: anext_impl()
+
+        store_spy = AsyncMock()
+        remove_spy = MagicMock(wraps=lm.prompt_cache_store.remove)
+        lm.prompt_cache_store.remove = remove_spy
+
+        with (
+            patch("olmlx.engine.inference.mx", MagicMock()),
+            patch("olmlx.engine.inference.async_mlx_stream", return_value=mock_stream),
+            patch(
+                "olmlx.engine.inference.make_prompt_cache",
+                MagicMock(return_value=[MagicMock()]),
+            ),
+            patch(
+                "olmlx.engine.inference._store_prompt_cache_after_generation",
+                store_spy,
+            ),
+            patch("olmlx.engine.inference.settings") as mock_settings,
+        ):
+            mock_settings.prompt_cache = True
+            mock_settings.prompt_cache_max_tokens = 32768
+            mock_settings.default_keep_alive = "5m"
+            mock_settings.inference_timeout = None
+            mock_settings.memory_limit_fraction = 0.9
+            mock_settings.sync_mode = "full"
+
+            chunks = []
+            gen = await generate_chat(
+                mock_manager,
+                "qwen3",
+                [{"role": "user", "content": "hi"}],
+                options={"stop": ["STOP"]},
+                stream=True,
+                enable_thinking=False,
+            )
+            async for chunk in gen:
+                chunks.append(chunk)
+
+        # The worker must be cancelled the moment the stop sequence matched, so
+        # it stops decoding past-stop tokens into the shared cache.
+        mock_stream.cancel.assert_called()
+        # The still-mutating cache must NOT be persisted by reference (#604) —
+        # in the buggy code this store WAS awaited on stop.
+        store_spy.assert_not_awaited()
+        # Any stale/shared entry for this cache_id is dropped instead.
+        remove_spy.assert_called()
+        # The done chunk still reports the stop reason.
+        done = chunks[-1]
+        assert done.get("done") is True
+        assert done.get("done_reason") == "stop"

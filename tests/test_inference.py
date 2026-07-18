@@ -2623,6 +2623,94 @@ class TestFullCompletionInner:
         assert stats.prompt_eval_duration + stats.eval_duration <= stats.total_duration
 
     @pytest.mark.asyncio
+    async def test_stop_sequence_breaks_generation_early(self, mock_manager):
+        """Non-streaming generation must stop pulling tokens as soon as a stop
+        sequence matches, instead of decoding all the way to max_tokens and
+        truncating post-hoc (issue #613)."""
+        from types import SimpleNamespace
+        from olmlx.engine.inference import _full_completion_inner
+
+        lm = mock_manager._loaded["qwen3:latest"]
+
+        pulled: list[int] = []
+
+        def fake_stream_generate(model, tokenizer, prompt, max_tokens, **kw):
+            # "STOP" completes at index 2; indices >= 3 must never be produced
+            # if generation halts at the match.
+            texts = ["hel", "lo ", "STOP", " past-stop-A", " past-stop-B"]
+            for i, t in enumerate(texts):
+                pulled.append(i)
+                yield SimpleNamespace(
+                    text=t,
+                    token=100 + i,
+                    prompt_tokens=3,
+                    generation_tokens=i + 1,
+                    prompt_tps=100.0,
+                    generation_tps=50.0,
+                    finish_reason=None,
+                )
+
+        generated: list[int] = []
+        stats = TimingStats()
+        with (
+            patch("mlx_lm.stream_generate", fake_stream_generate),
+            patch("olmlx.engine.inference.mx", MagicMock()),
+        ):
+            result = await _full_completion_inner(
+                lm,
+                "prompt",
+                200,
+                {},
+                stats,
+                generated_tokens_out=generated,
+                stop_sequences=["STOP"],
+            )
+
+        # Generation halted at the STOP token — later tokens were never decoded.
+        assert pulled == [0, 1, 2]
+        # The stop-bearing token IDs are captured for the prompt cache; nothing
+        # past the stop leaks in.
+        assert generated == [100, 101, 102]
+        # Full text (including the stop marker) is returned so the caller's
+        # post-hoc truncate_at_stop can trim it and set finish_reason.
+        assert result["text"] == "hello STOP"
+
+    @pytest.mark.asyncio
+    async def test_no_stop_sequence_consumes_full_stream(self, mock_manager):
+        """Without a stop sequence, generation runs to natural completion —
+        the early-break path must not alter the default behavior (issue #613)."""
+        from types import SimpleNamespace
+        from olmlx.engine.inference import _full_completion_inner
+
+        lm = mock_manager._loaded["qwen3:latest"]
+        pulled: list[int] = []
+
+        def fake_stream_generate(model, tokenizer, prompt, max_tokens, **kw):
+            for i, t in enumerate(["a", "b", "c"]):
+                pulled.append(i)
+                yield SimpleNamespace(
+                    text=t,
+                    token=i,
+                    prompt_tokens=3,
+                    generation_tokens=i + 1,
+                    prompt_tps=100.0,
+                    generation_tps=50.0,
+                    finish_reason=None,
+                )
+
+        stats = TimingStats()
+        with (
+            patch("mlx_lm.stream_generate", fake_stream_generate),
+            patch("olmlx.engine.inference.mx", MagicMock()),
+        ):
+            result = await _full_completion_inner(
+                lm, "prompt", 200, {}, stats, stop_sequences=None
+            )
+
+        assert pulled == [0, 1, 2]
+        assert result["text"] == "abc"
+
+    @pytest.mark.asyncio
     async def test_length_finish_reason_propagated(self, mock_manager):
         """finish_reason='length' on the last GenerationResponse must be forwarded
         as done_reason='length' so all non-streaming routers can report max_tokens."""
