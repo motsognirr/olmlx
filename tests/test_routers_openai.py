@@ -2519,3 +2519,22 @@ class TestLogprobsRejected:
         )
         assert resp.status_code == 400
         assert "logprobs" in resp.text.lower()
+
+    @pytest.mark.asyncio
+    async def test_completions_logprobs_zero_allowed(self, app_client):
+        """``logprobs=0`` means "no logprobs" in the OpenAI completions API and
+        must not be rejected (only a positive count is a real request)."""
+        mock_result = {"text": "ok", "done": True, "stats": TimingStats()}
+        with patch(
+            "olmlx.routers.openai.generate_completion", new_callable=AsyncMock
+        ) as mock_gen:
+            mock_gen.return_value = mock_result
+            resp = await app_client.post(
+                "/v1/completions",
+                json={
+                    "model": "qwen3",
+                    "prompt": "hi",
+                    "logprobs": 0,
+                },
+            )
+        assert resp.status_code == 200

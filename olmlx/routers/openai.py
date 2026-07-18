@@ -569,8 +569,10 @@ async def openai_chat(req: OpenAIChatRequest, request: Request):
 async def openai_completions(req: OpenAICompletionRequest, request: Request):
     manager = request.app.state.model_manager
     # Neither logprobs nor echo are computed; reject rather than silently drop
-    # (issue #595).
-    if req.logprobs is not None:
+    # (issue #595). ``logprobs=0`` means "no logprobs" in the OpenAI completions
+    # API, so only a positive count is a real (unsupported) request — mirrors the
+    # chat endpoint's truthy check.
+    if req.logprobs:
         raise HTTPException(
             status_code=400,
             detail="logprobs is not supported by this server",
