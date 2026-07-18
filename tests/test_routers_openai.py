@@ -455,6 +455,38 @@ class TestStripThinkingStreaming:
         # Should contain data lines and end with [DONE]
         assert any("[DONE]" in line for line in lines)
 
+    async def test_streaming_role_only_in_first_delta(self, app_client):
+        # OpenAI emits ``role`` only on the first delta, not every chunk (#627).
+        async def mock_stream(*args, **kwargs):
+            async def gen():
+                yield {"text": "Hello", "done": False}
+                yield {"text": " world", "done": False}
+                yield {"text": "", "done": True, "stats": TimingStats()}
+
+            return gen()
+
+        with patch("olmlx.routers.openai.generate_chat", side_effect=mock_stream):
+            resp = await app_client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "qwen3",
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "stream": True,
+                },
+            )
+
+        deltas = []
+        for line in resp.text.splitlines():
+            if line.startswith("data: ") and "[DONE]" not in line:
+                payload = json.loads(line[len("data: ") :])
+                for ch in payload.get("choices", []):
+                    deltas.append(ch.get("delta", {}))
+        roles = [d for d in deltas if "role" in d]
+        assert len(roles) == 1, f"role must appear exactly once, got {len(roles)}"
+        # And it must be on the first content-bearing delta.
+        content_deltas = [d for d in deltas if "content" in d]
+        assert "role" in content_deltas[0]
+
     @pytest.mark.asyncio
     async def test_completions_non_streaming(self, app_client):
         mock_result = {
@@ -487,24 +519,54 @@ class TestStripThinkingStreaming:
 
     @pytest.mark.asyncio
     async def test_completions_list_prompt(self, app_client):
-        mock_result = {"text": "result", "done": True, "stats": TimingStats()}
-
+        # Multi-prompt must honor *every* entry (one choice each), not
+        # silently drop all but the first (#627).
         with patch(
             "olmlx.routers.openai.generate_completion", new_callable=AsyncMock
         ) as mock_gen:
-            mock_gen.return_value = mock_result
+            mock_gen.side_effect = [
+                {"text": "one", "done": True, "stats": TimingStats()},
+                {"text": "two", "done": True, "stats": TimingStats()},
+            ]
             resp = await app_client.post(
                 "/v1/completions",
-                json={
-                    "model": "qwen3",
-                    "prompt": ["first prompt", "second prompt"],
-                },
+                json={"model": "qwen3", "prompt": ["first prompt", "second prompt"]},
             )
 
         assert resp.status_code == 200
-        # Should use first prompt
-        call_args = mock_gen.call_args
-        assert call_args[1].get("prompt") is None or call_args[0][2] == "first prompt"
+        data = resp.json()
+        assert [c["index"] for c in data["choices"]] == [0, 1]
+        assert [c["text"] for c in data["choices"]] == ["one", "two"]
+        # Both prompts were forwarded, in order.
+        used = [call.args[2] for call in mock_gen.call_args_list]
+        assert used == ["first prompt", "second prompt"]
+
+    async def test_completions_strips_thinking(self, app_client):
+        # /v1/completions must strip <think> reasoning like /api/generate (#627).
+        with patch(
+            "olmlx.routers.openai.generate_completion", new_callable=AsyncMock
+        ) as mock_gen:
+            mock_gen.return_value = {
+                "text": "<think>secret reasoning</think>answer",
+                "done": True,
+                "stats": TimingStats(),
+            }
+            resp = await app_client.post(
+                "/v1/completions",
+                json={"model": "qwen3", "prompt": "hi"},
+            )
+
+        assert resp.status_code == 200
+        assert resp.json()["choices"][0]["text"] == "answer"
+
+    async def test_completions_streaming_multi_prompt_rejected(self, app_client):
+        # A multi-prompt streaming request would drop prompts; reject clearly.
+        resp = await app_client.post(
+            "/v1/completions",
+            json={"model": "qwen3", "prompt": ["a", "b"], "stream": True},
+        )
+        assert resp.status_code == 400
+        assert "single prompt" in resp.json()["error"]["message"]
 
     @pytest.mark.asyncio
     async def test_embeddings(self, app_client):
@@ -2578,3 +2640,30 @@ class TestLogprobsRejected:
                 },
             )
         assert resp.status_code == 200
+
+
+class TestErrorEnvelopes:
+    """Router-raised HTTPExceptions must be reshaped into the surface's
+    provider error envelope, not FastAPI's default {"detail": ...} (#627)."""
+
+    @pytest.mark.asyncio
+    async def test_openai_httpexception_gets_error_envelope(self, app_client):
+        from fastapi import HTTPException
+
+        with patch(
+            "olmlx.routers.openai.generate_chat", new_callable=AsyncMock
+        ) as mock_gen:
+            mock_gen.side_effect = HTTPException(status_code=422, detail="bad image")
+            resp = await app_client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "qwen3",
+                    "messages": [{"role": "user", "content": "hi"}],
+                },
+            )
+
+        assert resp.status_code == 422
+        data = resp.json()
+        assert "detail" not in data
+        assert data["error"]["message"] == "bad image"
+        assert data["error"]["type"] == "invalid_request_error"

@@ -66,6 +66,19 @@ def _make_id() -> str:
     return f"chatcmpl-{uuid.uuid4().hex[:8]}"
 
 
+def _strip_thinking_full(text: str) -> str:
+    """Strip ``<think>`` / channel reasoning blocks from a full completion.
+
+    ``/v1/completions`` is the one text-generation surface that used to leak
+    reasoning into ``text`` (#627); reuse the streaming stripper over the whole
+    string + flush so the result matches the streaming path and ``/api/generate``.
+    """
+    state: dict = {}
+    visible = strip_thinking_streaming(text, state)
+    visible += flush_thinking_buffer(state)
+    return visible
+
+
 def _to_openai_tool_calls(tool_uses: list[dict]) -> list[dict]:
     """Convert parsed tool_use blocks to OpenAI tool_calls format."""
     return [
@@ -120,7 +133,26 @@ async def _stream_openai_sse(
 
     think_state: dict = {}
     content_emitted = False
+    role_seen = False
     final_stats = None
+
+    def _role_once(choice: dict) -> dict:
+        # OpenAI emits ``role`` only on the first delta, not every content
+        # chunk (#627). ``format_content`` (chat path) carries a role on every
+        # chunk; strip it after the first. The completions path's formatter
+        # has no role, so this is a no-op there.
+        nonlocal role_seen
+        delta = choice.get("delta")
+        if isinstance(delta, dict) and "role" in delta:
+            if role_seen:
+                choice = {
+                    **choice,
+                    "delta": {k: v for k, v in delta.items() if k != "role"},
+                }
+            else:
+                role_seen = True
+        return choice
+
     try:
         async for chunk in result:
             if chunk.get("cache_info"):
@@ -141,7 +173,9 @@ async def _stream_openai_sse(
                 if strip_thinking:
                     flushed = flush_thinking_buffer(think_state)
                     if flushed:
-                        data = _envelope([_compact_choice(format_content(flushed))])
+                        data = _envelope(
+                            [_compact_choice(_role_once(format_content(flushed)))]
+                        )
                         yield f"data: {json.dumps(data)}\n\n"
                         content_emitted = True
                 # Issue #551: if thinking consumed the whole token budget, no
@@ -151,7 +185,7 @@ async def _stream_openai_sse(
                 # detectable. Scoped to the chat path (format_content carries a
                 # role); the completions path uses a text-shaped formatter.
                 if strip_thinking and not content_emitted:
-                    data = _envelope([_compact_choice(format_content(""))])
+                    data = _envelope([_compact_choice(_role_once(format_content("")))])
                     yield f"data: {json.dumps(data)}\n\n"
                     content_emitted = True
                 done_reason = chunk.get("done_reason")
@@ -184,7 +218,7 @@ async def _stream_openai_sse(
                     text = strip_thinking_streaming(text, think_state)
                 if not text:
                     continue
-                data = _envelope([_compact_choice(format_content(text))])
+                data = _envelope([_compact_choice(_role_once(format_content(text)))])
                 yield f"data: {json.dumps(data)}\n\n"
                 content_emitted = True
     except Exception as exc:
@@ -584,16 +618,26 @@ async def openai_completions(req: OpenAICompletionRequest, request: Request):
         )
     include_usage = bool(req.stream_options and req.stream_options.include_usage)
     options = _build_options(req)
-    prompt = req.prompt if isinstance(req.prompt, str) else req.prompt[0]
+    # ``prompt`` may be a list; honor every entry instead of silently using
+    # only ``prompt[0]`` (#627).
+    prompts = [req.prompt] if isinstance(req.prompt, str) else list(req.prompt)
     max_tokens = req.max_tokens or settings.default_max_tokens
     comp_id = f"cmpl-{uuid.uuid4().hex[:8]}"
     created = int(time.time())
 
     if req.stream:
+        # Streaming interleaves choices by index, which we don't implement;
+        # a multi-prompt streaming request would otherwise silently drop all
+        # but the first. Reject it explicitly rather than lose prompts.
+        if len(prompts) > 1:
+            raise ValueError(
+                "streaming completions support a single prompt; send prompts "
+                "individually or set stream=false for a multi-prompt request"
+            )
         result = await generate_completion(
             manager,
             req.model,
-            prompt,
+            prompts[0],
             options,
             stream=True,
             max_tokens=max_tokens,
@@ -608,34 +652,47 @@ async def openai_completions(req: OpenAICompletionRequest, request: Request):
                 "text_completion",
                 lambda text: {"index": 0, "text": text, "finish_reason": None},
                 lambda: {"index": 0, "text": "", "finish_reason": "stop"},
+                # Strip <think> reasoning like /api/generate and the chat path.
+                strip_thinking=True,
                 include_usage=include_usage,
             ),
             media_type="text/event-stream",
         )
     else:
-        result = await generate_completion(
-            manager,
-            req.model,
-            prompt,
-            options,
-            stream=False,
-            max_tokens=max_tokens,
-        )
-        usage = OpenAIUsage.from_stats(result.get("stats"))
-        return OpenAICompletionResponse(
-            id=comp_id,
-            created=created,
-            model=req.model,
-            choices=[
+        choices: list[OpenAICompletionChoice] = []
+        total_prompt = 0
+        total_completion = 0
+        for i, prompt in enumerate(prompts):
+            result = await generate_completion(
+                manager,
+                req.model,
+                prompt,
+                options,
+                stream=False,
+                max_tokens=max_tokens,
+            )
+            usage = OpenAIUsage.from_stats(result.get("stats"))
+            total_prompt += usage.prompt_tokens
+            total_completion += usage.completion_tokens
+            choices.append(
                 OpenAICompletionChoice(
-                    index=0,
-                    text=result.get("text", ""),
+                    index=i,
+                    text=_strip_thinking_full(result.get("text", "")),
                     finish_reason="length"
                     if result.get("done_reason") in ("timeout", "length")
                     else "stop",
                 )
-            ],
-            usage=usage,
+            )
+        return OpenAICompletionResponse(
+            id=comp_id,
+            created=created,
+            model=req.model,
+            choices=choices,
+            usage=OpenAIUsage(
+                prompt_tokens=total_prompt,
+                completion_tokens=total_completion,
+                total_tokens=total_prompt + total_completion,
+            ),
         )
 
 

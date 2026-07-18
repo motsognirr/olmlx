@@ -15,6 +15,7 @@ from olmlx.engine.inference import (
     count_chat_tokens,
     generate_chat,
 )
+from olmlx.engine.panel import panel_generate_chat
 from olmlx.routers.common import (
     build_inference_options,
     collect_content_parts,
@@ -157,6 +158,45 @@ def _strip_billing_headers(
     return filtered if filtered else None
 
 
+def _append_user_content_parts(messages: list[dict], content_parts: list[dict]) -> None:
+    """Flush accumulated user text/image/audio parts as one ``user`` message.
+
+    Called both before each interleaved ``tool_result`` and at the end of a
+    user turn so the client's block order is preserved (#627): a
+    ``[text, tool_result]`` turn stays user-then-tool instead of being
+    reordered to tool-then-user (which changes the KV-cache prefix for
+    interrupted tool-use turns).
+    """
+    if not content_parts:
+        return
+    # Shared part-type dispatch + image/audio normalization (#471);
+    # a malformed source raises ValueError → 422 at the endpoint.
+    text_parts, user_images, user_audio = collect_content_parts(content_parts)
+    if text_parts or user_images or user_audio:
+        user_msg: dict = {"role": "user", "content": " ".join(text_parts)}
+        if user_images:
+            user_msg["images"] = user_images
+        if user_audio:
+            user_msg["audio"] = user_audio
+        messages.append(user_msg)
+
+
+def _anthropic_stop_reason(done_reason: str | None, has_tools: bool) -> str:
+    """Map the engine's ``done_reason`` to an Anthropic ``stop_reason``.
+
+    The engine sets ``done_reason="stop"`` *only* on a client ``stop_sequences``
+    hit (natural EOS leaves it unset), so a match surfaces as Anthropic's
+    ``"stop_sequence"`` rather than being conflated with ``"end_turn"`` (#627).
+    """
+    if has_tools:
+        return "tool_use"
+    if done_reason in ("timeout", "length"):
+        return "max_tokens"
+    if done_reason == "stop":
+        return "stop_sequence"
+    return "end_turn"
+
+
 def _convert_messages(req: AnthropicMessagesRequest) -> list[dict]:
     """Convert Anthropic message format to internal chat format.
 
@@ -231,6 +271,10 @@ def _convert_messages(req: AnthropicMessagesRequest) -> list[dict]:
             content_parts: list[dict] = []
             for block in msg.content:
                 if block.type == "tool_result":
+                    # Flush any text/image/audio seen so far *before* the tool
+                    # message so the client's block order is preserved (#627).
+                    _append_user_content_parts(messages, content_parts)
+                    content_parts = []
                     result_content = ""
                     if isinstance(block.content, str):
                         result_content = block.content
@@ -252,16 +296,7 @@ def _convert_messages(req: AnthropicMessagesRequest) -> list[dict]:
                     )
                 else:
                     content_parts.append({"type": block.type, "text": block.text})
-            # Shared part-type dispatch + image/audio normalization (#471);
-            # a malformed source raises ValueError → 422 at the endpoint.
-            text_parts, user_images, user_audio = collect_content_parts(content_parts)
-            if text_parts or user_images or user_audio:
-                user_msg: dict = {"role": "user", "content": " ".join(text_parts)}
-                if user_images:
-                    user_msg["images"] = user_images
-                if user_audio:
-                    user_msg["audio"] = user_audio
-                messages.append(user_msg)
+            _append_user_content_parts(messages, content_parts)
 
     if system_parts:
         messages.insert(0, {"role": "system", "content": "\n\n".join(system_parts)})
@@ -481,12 +516,7 @@ async def _stream_buffered_with_tools(
         )
         block_idx += 1
 
-    if tool_uses:
-        stop_reason = "tool_use"
-    elif done_reason in ("timeout", "length"):
-        stop_reason = "max_tokens"
-    else:
-        stop_reason = "end_turn"
+    stop_reason = _anthropic_stop_reason(done_reason, bool(tool_uses))
     yield {
         "stop_reason": stop_reason,
         "output_tokens": output_tokens,
@@ -518,6 +548,7 @@ async def _stream_thinking_state_machine(result):
     split_state: dict = {}
     current: str | None = None  # open block type: None | "thinking" | "text"
     text_block_emitted = False
+    thinking_block_emitted = False
 
     def _close_current() -> list[str]:
         nonlocal block_idx, current
@@ -541,7 +572,7 @@ async def _stream_thinking_state_machine(result):
         at position zero must not produce an empty thinking block (issue
         #307 review round 10; the non-streaming path produces none).
         """
-        nonlocal current, text_block_emitted
+        nonlocal current, text_block_emitted, thinking_block_emitted
         if not fragment:
             return []
         # A whitespace-only *thinking* fragment must not open a thinking block.
@@ -571,6 +602,8 @@ async def _stream_thinking_state_machine(result):
             current = block_type
             if block_type == "text":
                 text_block_emitted = True
+            else:
+                thinking_block_emitted = True
         delta_type = f"{block_type}_delta"
         events.append(
             _sse(
@@ -627,7 +660,11 @@ async def _stream_thinking_state_machine(result):
     if current is not None:
         for event in _close_current():
             yield event
-    if not text_block_emitted:
+    # Emit a trailing empty text block only when *nothing* was emitted, so the
+    # wire shape still carries at least one block. A thinking-only response
+    # must stay [thinking] — the non-streaming and buffered-tools paths both
+    # suppress the empty text block when a thinking block exists (#627).
+    if not text_block_emitted and not thinking_block_emitted:
         yield _sse(
             "content_block_start",
             {
@@ -642,9 +679,7 @@ async def _stream_thinking_state_machine(result):
         block_idx += 1
 
     yield {
-        "stop_reason": "max_tokens"
-        if done_reason in ("timeout", "length")
-        else "end_turn",
+        "stop_reason": _anthropic_stop_reason(done_reason, False),
         "output_tokens": output_tokens,
         "input_tokens": input_tokens,
     }
@@ -711,6 +746,14 @@ async def anthropic_messages(req: AnthropicMessagesRequest, request: Request):
     )
     resolved_model = _resolve_anthropic_model(req.model)
     manager = request.app.state.model_manager
+    # Dispatch synthetic panels through the panel coordinator here too, so a
+    # panel advertised in /v1/models isn't a 400 "model not found" on this
+    # surface (#627). ``panel_generate_chat`` returns a generate_chat-shaped
+    # result, so the rest of this handler is unchanged.
+    registry = request.app.state.registry
+    dispatch = (
+        panel_generate_chat if registry.is_panel(resolved_model) else generate_chat
+    )
     # A malformed image content block is a client error — surface as 422
     # rather than an uncaught 500 (mirrors the OpenAI surface).
     try:
@@ -746,7 +789,7 @@ async def anthropic_messages(req: AnthropicMessagesRequest, request: Request):
             )
 
     if req.stream:
-        result = await generate_chat(
+        result = await dispatch(
             manager,
             resolved_model,
             messages,
@@ -885,7 +928,7 @@ async def anthropic_messages(req: AnthropicMessagesRequest, request: Request):
 
         return StreamingResponse(stream_sse(), media_type="text/event-stream")
     else:
-        result = await generate_chat(
+        result = await dispatch(
             manager,
             resolved_model,
             messages,
@@ -948,12 +991,7 @@ async def anthropic_messages(req: AnthropicMessagesRequest, request: Request):
             content_blocks.append(AnthropicContentBlock(type="text", text=""))
 
         done_reason = result.get("done_reason")
-        if tool_uses:
-            stop_reason = "tool_use"
-        elif done_reason in ("timeout", "length"):
-            stop_reason = "max_tokens"
-        else:
-            stop_reason = "end_turn"
+        stop_reason = _anthropic_stop_reason(done_reason, bool(tool_uses))
         usage = AnthropicUsage(
             input_tokens=stats.prompt_eval_count if stats else 0,
             output_tokens=stats.eval_count if stats else 0,
