@@ -1522,6 +1522,50 @@ class TestCorruptedJsonFiles:
         reg.load()
         assert reg._aliases == {}
 
+    def test_load_non_dict_aliases_json_ignored(self, tmp_path, monkeypatch):
+        """Valid-JSON-but-non-dict aliases.json must not be assigned raw.
+
+        A list of names is valid JSON, so ``json.load`` succeeds — but the
+        old code assigned it straight to ``self._aliases``, so ``resolve()``
+        would raise ``TypeError`` (``self._aliases[normalized]`` on a list)
+        on the *next request*, a 500 instead of a startup warning (#635).
+        """
+        config_path = tmp_path / "models.json"
+        config_path.write_text("{}")
+        aliases_path = tmp_path / "aliases.json"
+        aliases_path.write_text('["foo", "bar"]')
+        monkeypatch.setattr("olmlx.engine.registry.settings.models_config", config_path)
+        reg = ModelRegistry()
+        reg.load()
+        assert reg._aliases == {}
+        # resolve() must not raise TypeError for a plain name lookup.
+        assert reg.resolve("foo") is None
+
+    def test_load_unreadable_aliases_json_ignored(self, tmp_path, monkeypatch):
+        """An OSError reading aliases.json must warn-and-skip, not propagate.
+
+        aliases.json is rebuildable, so a permissions error should degrade to
+        an empty alias table rather than a raw traceback out of ``load()``
+        (#635).
+        """
+        config_path = tmp_path / "models.json"
+        config_path.write_text("{}")
+        aliases_path = tmp_path / "aliases.json"
+        aliases_path.write_text('{"a:latest": "b:latest"}')
+        monkeypatch.setattr("olmlx.engine.registry.settings.models_config", config_path)
+        reg = ModelRegistry()
+
+        real_open = open
+
+        def _raise_on_aliases(path, *args, **kwargs):
+            if str(path) == str(aliases_path):
+                raise PermissionError("denied")
+            return real_open(path, *args, **kwargs)
+
+        monkeypatch.setattr("builtins.open", _raise_on_aliases)
+        reg.load()  # must not raise
+        assert reg._aliases == {}
+
 
 class TestExtraKeysPreserved:
     """Unknown JSON keys in model config dicts must survive round-trips."""
