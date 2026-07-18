@@ -2335,3 +2335,187 @@ class TestBufferedToolStreamKeepalive:
         assert any(item.startswith(": ") for item in emitted), emitted
         # And normal completion still happens.
         assert any("[DONE]" in item for item in emitted)
+
+
+def _sse_data_chunks(text: str) -> list[dict]:
+    """Parse an SSE body into its JSON ``data:`` payloads (skipping [DONE])."""
+    chunks = []
+    for line in text.splitlines():
+        if not line.startswith("data: "):
+            continue
+        payload = line[len("data: ") :]
+        if payload.strip() == "[DONE]":
+            continue
+        chunks.append(json.loads(payload))
+    return chunks
+
+
+class TestStreamOptionsIncludeUsage:
+    """Issue #595: ``stream_options.include_usage`` must emit a final usage
+    chunk (choices=[], populated usage) before ``[DONE]`` — per the OpenAI
+    streaming spec — instead of being silently dropped."""
+
+    @pytest.mark.asyncio
+    async def test_chat_stream_emits_usage_chunk(self, app_client):
+        async def mock_stream(*args, **kwargs):
+            async def gen():
+                yield {"text": "Hi", "done": False}
+                yield {
+                    "text": "",
+                    "done": True,
+                    "stats": TimingStats(prompt_eval_count=5, eval_count=3),
+                }
+
+            return gen()
+
+        with patch("olmlx.routers.openai.generate_chat", side_effect=mock_stream):
+            resp = await app_client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "qwen3",
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "stream": True,
+                    "stream_options": {"include_usage": True},
+                },
+            )
+
+        assert resp.status_code == 200
+        chunks = _sse_data_chunks(resp.text)
+        usage_chunks = [c for c in chunks if c.get("usage")]
+        assert usage_chunks, "expected a usage chunk when include_usage=true"
+        final = usage_chunks[-1]
+        assert final["choices"] == []
+        assert final["usage"]["prompt_tokens"] == 5
+        assert final["usage"]["completion_tokens"] == 3
+        assert final["usage"]["total_tokens"] == 8
+
+    @pytest.mark.asyncio
+    async def test_chat_stream_no_usage_chunk_by_default(self, app_client):
+        async def mock_stream(*args, **kwargs):
+            async def gen():
+                yield {"text": "Hi", "done": False}
+                yield {
+                    "text": "",
+                    "done": True,
+                    "stats": TimingStats(prompt_eval_count=5, eval_count=3),
+                }
+
+            return gen()
+
+        with patch("olmlx.routers.openai.generate_chat", side_effect=mock_stream):
+            resp = await app_client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "qwen3",
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "stream": True,
+                },
+            )
+
+        assert resp.status_code == 200
+        chunks = _sse_data_chunks(resp.text)
+        assert all(c.get("usage") is None for c in chunks)
+
+    @pytest.mark.asyncio
+    async def test_completions_stream_emits_usage_chunk(self, app_client):
+        async def mock_stream(*args, **kwargs):
+            async def gen():
+                yield {"text": "Once", "done": False}
+                yield {
+                    "text": "",
+                    "done": True,
+                    "stats": TimingStats(prompt_eval_count=7, eval_count=2),
+                }
+
+            return gen()
+
+        with patch("olmlx.routers.openai.generate_completion", side_effect=mock_stream):
+            resp = await app_client.post(
+                "/v1/completions",
+                json={
+                    "model": "qwen3",
+                    "prompt": "Once upon a time",
+                    "stream": True,
+                    "stream_options": {"include_usage": True},
+                },
+            )
+
+        assert resp.status_code == 200
+        chunks = _sse_data_chunks(resp.text)
+        usage_chunks = [c for c in chunks if c.get("usage")]
+        assert usage_chunks, "expected a usage chunk when include_usage=true"
+        final = usage_chunks[-1]
+        assert final["choices"] == []
+        assert final["usage"]["prompt_tokens"] == 7
+        assert final["usage"]["completion_tokens"] == 2
+        assert final["usage"]["total_tokens"] == 9
+
+    @pytest.mark.asyncio
+    async def test_tools_stream_emits_usage_chunk(self):
+        from olmlx.routers.openai import _stream_openai_sse_with_tools
+
+        async def gen():
+            yield {"text": "no tool here", "done": False}
+            yield {
+                "text": "",
+                "done": True,
+                "stats": TimingStats(prompt_eval_count=4, eval_count=6),
+            }
+
+        class Result:
+            def __aiter__(self):
+                return gen()
+
+            async def aclose(self):
+                pass
+
+        emitted = [
+            item
+            async for item in _stream_openai_sse_with_tools(
+                Result(),
+                "id",
+                "qwen3",
+                0,
+                declared_tools=None,
+                include_usage=True,
+            )
+        ]
+        body = "".join(e for e in emitted if isinstance(e, str))
+        chunks = _sse_data_chunks(body)
+        usage_chunks = [c for c in chunks if c.get("usage")]
+        assert usage_chunks, "expected a usage chunk when include_usage=true"
+        final = usage_chunks[-1]
+        assert final["choices"] == []
+        assert final["usage"]["total_tokens"] == 10
+
+
+class TestLogprobsRejected:
+    """Issue #595: unsupported ``logprobs`` must be rejected with a clear 400
+    rather than silently dropped."""
+
+    @pytest.mark.asyncio
+    async def test_chat_logprobs_rejected(self, app_client):
+        resp = await app_client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "qwen3",
+                "messages": [{"role": "user", "content": "hi"}],
+                "logprobs": True,
+                "top_logprobs": 3,
+            },
+        )
+        assert resp.status_code == 400
+        assert "logprobs" in resp.text.lower()
+
+    @pytest.mark.asyncio
+    async def test_completions_logprobs_rejected(self, app_client):
+        resp = await app_client.post(
+            "/v1/completions",
+            json={
+                "model": "qwen3",
+                "prompt": "hi",
+                "logprobs": 3,
+            },
+        )
+        assert resp.status_code == 400
+        assert "logprobs" in resp.text.lower()

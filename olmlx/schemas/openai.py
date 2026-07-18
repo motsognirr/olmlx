@@ -50,6 +50,12 @@ class ResponseFormat(BaseModel):
         return self
 
 
+class StreamOptions(BaseModel):
+    """OpenAI ``stream_options`` object. Only ``include_usage`` is honored."""
+
+    include_usage: bool = False
+
+
 class OpenAIChatRequest(BaseModel):
     model: ModelName
     messages: list[OpenAIChatMessage]
@@ -57,6 +63,12 @@ class OpenAIChatRequest(BaseModel):
     top_p: float | None = Field(None, ge=0, le=1)
     n: int = Field(1, ge=1, le=1, description="Only n=1 is supported.")
     stream: bool = False
+    stream_options: StreamOptions | None = None
+    # Declared so the router can reject them explicitly (issue #595): olmlx does
+    # not compute per-token logprobs, so silently dropping these advertised a
+    # capability that doesn't exist. See the 400 raised in ``openai_chat``.
+    logprobs: bool | None = None
+    top_logprobs: int | None = Field(None, ge=0, le=20)
     stop: str | list[str] | None = None
     max_tokens: int | None = Field(None, ge=1)
     max_completion_tokens: int | None = Field(None, ge=1)
@@ -139,6 +151,11 @@ class OpenAICompletionRequest(BaseModel):
     top_p: float | None = Field(None, ge=0, le=1)
     n: int = Field(1, ge=1, le=1, description="Only n=1 is supported.")
     stream: bool = False
+    stream_options: StreamOptions | None = None
+    # Declared so the router can reject them explicitly (issue #595) rather than
+    # silently dropping them: olmlx computes neither logprobs nor echo.
+    logprobs: int | None = Field(None, ge=0, le=5)
+    echo: bool | None = None
     stop: str | list[str] | None = None
     max_tokens: int | None = Field(None, ge=1)
     presence_penalty: float | None = Field(None, ge=-2, le=2)

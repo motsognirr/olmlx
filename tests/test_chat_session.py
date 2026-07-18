@@ -1969,3 +1969,132 @@ class TestConsecutiveToolFailures:
 
         # Model should have seen the error and responded
         assert session.messages[-1]["content"] == "The tool crashed, sorry."
+
+
+def _assert_no_dangling_tool_calls(messages):
+    """Every assistant tool_calls id must have a matching role=tool result."""
+    result_ids = {m.get("tool_call_id") for m in messages if m.get("role") == "tool"}
+    for m in messages:
+        if m.get("role") == "assistant" and m.get("tool_calls"):
+            for tc in m["tool_calls"]:
+                assert tc["id"] in result_ids, (
+                    f"assistant tool_call {tc['id']} has no matching tool result: "
+                    f"{messages}"
+                )
+
+
+class TestDanglingToolCalls:
+    """Issue #623: no assistant message may advertise ``tool_calls`` without a
+    matching ``role: tool`` result — many chat templates reject the mismatch on
+    every later turn."""
+
+    @pytest.mark.asyncio
+    async def test_denied_question_result_is_appended(self):
+        """A denied ``question`` tool must still leave a tool-result message
+        (previously the question branch ``continue``d and dropped it)."""
+        mcp = MagicMock()
+        mcp.get_tools_for_chat.return_value = [
+            {"function": {"name": "question"}, "type": "function"}
+        ]
+        # Treated as a remote tool → the DENY policy applies and the result
+        # content is the blocked message, not a ``__question__:`` payload.
+        config = ToolSafetyConfig(tool_policies={"question": ToolPolicy.DENY})
+        policy = ToolSafetyPolicy(config, decider=AsyncMock(return_value=False))
+        session = _make_session(mcp=mcp, tool_safety=policy)
+        # Simulate the assistant turn that requested the question tool.
+        session.messages.append(
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "q_1",
+                        "type": "function",
+                        "function": {"name": "question", "arguments": "{}"},
+                    }
+                ],
+            }
+        )
+
+        tu = {"name": "question", "input": {}, "id": "q_1"}
+        async for _event in session._execute_tool_calls([tu]):
+            pass
+
+        tool_msgs = [m for m in session.messages if m.get("role") == "tool"]
+        assert len(tool_msgs) == 1
+        assert tool_msgs[0]["tool_call_id"] == "q_1"
+        _assert_no_dangling_tool_calls(session.messages)
+
+    @pytest.mark.asyncio
+    async def test_valid_question_still_emits_event_and_appends(self):
+        """The valid ``__question__:`` path keeps emitting the question event
+        and appends its result message (regression guard for the fix)."""
+        mcp = MagicMock()
+        mcp.get_tools_for_chat.return_value = [
+            {"function": {"name": "question"}, "type": "function"}
+        ]
+        mcp.call_tool = AsyncMock(
+            return_value='__question__:{"header": "h", "question": "pick one"}'
+        )
+        session = _make_session(mcp=mcp)
+
+        tu = {"name": "question", "input": {}, "id": "q_9"}
+        events = []
+        async for event in session._execute_tool_calls([tu]):
+            events.append(event)
+
+        question_events = [e for e in events if e.get("type") == "question"]
+        assert len(question_events) == 1
+        assert question_events[0]["question"] == "pick one"
+        tool_msgs = [m for m in session.messages if m.get("role") == "tool"]
+        assert len(tool_msgs) == 1
+
+    @pytest.mark.asyncio
+    async def test_repetition_stop_after_tool_call_strips_tool_calls(self):
+        """When repetition is detected after a complete <tool_call> block, the
+        stored assistant message must not advertise unexecuted tool_calls."""
+        mcp = self._read_file_mcp()
+        session = _make_session(mcp=mcp)
+
+        async def fake_generate(*args, **kwargs):
+            yield {
+                "text": '<tool_call>{"name": "read_file", "arguments": {"path": "/tmp/x"}}</tool_call>',
+                "done": False,
+            }
+            # Then the model loops on the same phrase → repetition detection
+            # cuts the turn short before _execute_tool_calls runs.
+            for _ in range(60):
+                yield {"text": "spam spam spam ", "done": False}
+            yield {"text": "", "done": True, "stats": MagicMock()}
+
+        with patch(
+            "olmlx.chat.session.generate_chat",
+            side_effect=lambda *a, **kw: fake_generate(),
+        ):
+            events = []
+            async for event in session.send_message("read it"):
+                events.append(event)
+
+        assert any(e["type"] == "repetition_detected" for e in events)
+        # The read_file tool must NOT have been executed.
+        assert not any(e["type"] == "tool_result" for e in events)
+        _assert_no_dangling_tool_calls(session.messages)
+
+    @staticmethod
+    def _read_file_mcp():
+        mcp = MagicMock()
+        mcp.get_tools_for_chat.return_value = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "read_file",
+                    "description": "Read a file",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"path": {"type": "string"}},
+                    },
+                },
+            }
+        ]
+        mcp.call_tool = AsyncMock(return_value="file contents here")
+        return mcp
