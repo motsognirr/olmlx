@@ -2656,7 +2656,10 @@ class TestErrorEnvelopes:
             mock_gen.side_effect = HTTPException(status_code=422, detail="bad image")
             resp = await app_client.post(
                 "/v1/chat/completions",
-                json={"model": "qwen3", "messages": [{"role": "user", "content": "hi"}]},
+                json={
+                    "model": "qwen3",
+                    "messages": [{"role": "user", "content": "hi"}],
+                },
             )
 
         assert resp.status_code == 422
