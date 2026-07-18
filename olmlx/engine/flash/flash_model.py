@@ -111,10 +111,28 @@ class FlashModelWrapper(nn.Module):
     ) -> None:
         """Replace each TransformerBlock.mlp with a FlashMLP."""
         layers = self._model.layers
+        bundled = weight_store.layer_indices
         replaced = 0
         for i, layer in enumerate(layers):
             if not hasattr(layer, "mlp"):
                 continue
+
+            if i not in bundled:
+                # The layer exposes an ``.mlp`` but has no bundled FFN weights.
+                # This happens on mixed dense/MoE models: the flash bundler
+                # only bundles dense FFN layers, but MoE blocks also satisfy
+                # ``hasattr(layer, "mlp")``. Wrapping it would KeyError in
+                # ``_read_neuron_raw`` on the first forward (#624). Fail at
+                # load with a clear, actionable message instead.
+                raise RuntimeError(
+                    f"Flash layer {i} has an MLP but no bundled weights in "
+                    f"flash_layout.json (bundled layers: "
+                    f"{sorted(bundled)}). This usually means a mixed "
+                    f"dense/MoE model was flash-prepared — only dense FFN "
+                    f"layers get bundled, but MoE blocks also expose an "
+                    f"``.mlp``. Flash (dense FFN offload) does not support "
+                    f"MoE layers; use flash-MoE for MoE models."
+                )
 
             flash_mlp = FlashMLP(
                 layer_idx=i,

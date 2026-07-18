@@ -3031,6 +3031,172 @@ class TestLoadWithModelTypeFallbackEosFix:
         assert json.loads((tmp_path / "config.json").read_text()) == original_cfg
 
 
+class TestFlashLoadFailureCleanup:
+    """A flash load that fails after the FlashWeightStore is constructed must
+    close it (and the wrapper's prefetcher) — otherwise every failed attempt
+    leaks per-layer fds + the store/prefetcher thread pools (#624)."""
+
+    def test_wrapper_build_failure_closes_weight_store(self, tmp_path, monkeypatch):
+        from types import SimpleNamespace
+
+        import olmlx.engine.flash.flash_model as fm
+        import olmlx.engine.flash.predictor as fp
+        import olmlx.engine.flash.prepare as fprep
+        import olmlx.engine.flash.weight_store as ws
+        import olmlx.engine.model_manager as mm
+
+        closed = {"store": 0}
+
+        class _SpyStore:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def close(self):
+                closed["store"] += 1
+
+        monkeypatch.setattr(ws, "FlashWeightStore", _SpyStore)
+        monkeypatch.setattr(
+            fp.PredictorBank, "load", classmethod(lambda cls, path: object())
+        )
+        monkeypatch.setattr(
+            fprep,
+            "load_model_with_strict_fallback",
+            lambda path, *, lazy: (object(), object()),
+        )
+        monkeypatch.setattr(mm, "detect_caps", lambda tok: TemplateCaps())
+
+        def _boom(*args, **kwargs):
+            raise RuntimeError("wrapper build failed")
+
+        monkeypatch.setattr(fm, "FlashModelWrapper", _boom)
+
+        flash_dir = tmp_path / "flash"
+        flash_dir.mkdir()
+        (flash_dir / "flash_layout.json").write_text(
+            json.dumps(
+                {
+                    "hidden_size": 16,
+                    "intermediate_size": 8,
+                    "num_layers": 1,
+                    "layers": {},
+                }
+            )
+        )
+
+        from olmlx.config import ExperimentalSettings
+
+        model_exp = ExperimentalSettings(_env_file=None)
+        flash_config = SimpleNamespace(
+            sparsity_threshold=0.5,
+            min_active_neurons=0,
+            max_active_neurons=0,
+            memory_budget_fraction=0.9,
+            prefetch=False,
+            flash_speculative=False,
+            flash_speculative_draft_model=None,
+            flash_speculative_tokens=4,
+        )
+
+        manager = ModelManager(MagicMock(), MagicMock())
+        with pytest.raises(RuntimeError, match="wrapper build failed"):
+            manager._load_flash_model(
+                "hf/model",
+                str(tmp_path),
+                flash_dir,
+                model_exp=model_exp,
+                flash_config=flash_config,
+            )
+        assert closed["store"] == 1, "weight store must be closed on failed load"
+
+    def test_speculative_vocab_mismatch_releases_draft_and_store(
+        self, tmp_path, monkeypatch
+    ):
+        """A speculative-flash failure *after* the draft model loads (vocab
+        mismatch) must close the store and drop the draft model's GPU weights
+        back to the pool — otherwise the draft leaks until GC (#624)."""
+        from types import SimpleNamespace
+
+        import olmlx.engine.flash.flash_model as fm
+        import olmlx.engine.flash.predictor as fp
+        import olmlx.engine.flash.prepare as fprep
+        import olmlx.engine.flash.weight_store as ws
+        import olmlx.engine.model_manager as mm
+
+        closed = {"store": 0, "clear_cache": 0}
+
+        class _SpyStore:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def close(self):
+                closed["store"] += 1
+
+        monkeypatch.setattr(ws, "FlashWeightStore", _SpyStore)
+        monkeypatch.setattr(
+            fp.PredictorBank, "load", classmethod(lambda cls, path: object())
+        )
+
+        def _fake_load(path, *, lazy):
+            if path == "draft/x":
+                return SimpleNamespace(args=SimpleNamespace(vocab_size=200)), object()
+            return object(), object()
+
+        monkeypatch.setattr(fprep, "load_model_with_strict_fallback", _fake_load)
+        monkeypatch.setattr(mm, "detect_caps", lambda tok: TemplateCaps())
+        # Wrapper succeeds with a vocab that mismatches the draft.
+        monkeypatch.setattr(
+            fm,
+            "FlashModelWrapper",
+            lambda *a, **k: SimpleNamespace(
+                args=SimpleNamespace(vocab_size=100), prefetcher=None
+            ),
+        )
+        monkeypatch.setattr(
+            mm.mx,
+            "clear_cache",
+            lambda: closed.__setitem__("clear_cache", closed["clear_cache"] + 1),
+        )
+
+        flash_dir = tmp_path / "flash"
+        flash_dir.mkdir()
+        (flash_dir / "flash_layout.json").write_text(
+            json.dumps(
+                {
+                    "hidden_size": 16,
+                    "intermediate_size": 8,
+                    "num_layers": 1,
+                    "layers": {},
+                }
+            )
+        )
+
+        from olmlx.config import ExperimentalSettings
+
+        model_exp = ExperimentalSettings(_env_file=None)
+        flash_config = SimpleNamespace(
+            sparsity_threshold=0.5,
+            min_active_neurons=0,
+            max_active_neurons=0,
+            memory_budget_fraction=0.9,
+            prefetch=False,
+            flash_speculative=True,
+            flash_speculative_draft_model="draft/x",
+            flash_speculative_tokens=4,
+        )
+
+        manager = ModelManager(MagicMock(), MagicMock())
+        with pytest.raises(ValueError, match="vocab_size"):
+            manager._load_flash_model(
+                "hf/model",
+                str(tmp_path),
+                flash_dir,
+                model_exp=model_exp,
+                flash_config=flash_config,
+            )
+        assert closed["store"] == 1, "weight store must be closed on failed load"
+        assert closed["clear_cache"] >= 1, "draft weights must be released to the pool"
+
+
 class TestExpiryChecker:
     @pytest.mark.asyncio
     async def test_expired_models_removed(self, registry, mock_store):

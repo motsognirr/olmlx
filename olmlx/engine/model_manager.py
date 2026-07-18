@@ -3203,66 +3203,107 @@ class ModelManager(SpeculativeLoaderMixin):
             use_preallocated_buffer=model_exp.flash_preallocated_buffer,
         )
 
-        # Load lookahead predictors if available (for speculative prefetching)
-        lookahead_bank = None
-        lookahead_path = flash_dir / "lookahead_predictors"
-        if flash_config.prefetch and lookahead_path.exists():
+        # ``FlashWeightStore.__init__`` opened one fd per layer and a thread
+        # pool; ``FlashModelWrapper`` adds a prefetcher pool. Any failure from
+        # here on (wrapper build, draft-model load, vocab mismatch) must close
+        # them or every failed attempt permanently leaks num_layers fds + the
+        # thread pools (#624).
+        wrapped: Any = None
+        draft_model: Any = None
+        try:
+            # Load lookahead predictors if available (for speculative prefetching)
+            lookahead_bank = None
+            lookahead_path = flash_dir / "lookahead_predictors"
+            if flash_config.prefetch and lookahead_path.exists():
+                try:
+                    lookahead_bank = LookaheadBank.load(lookahead_path)
+                    logger.info(
+                        "Loaded lookahead predictor bank from %s", lookahead_path
+                    )
+                except Exception:
+                    logger.warning(
+                        "Failed to load lookahead predictors, falling back to "
+                        "sparsity predictor",
+                        exc_info=True,
+                    )
+
+            # Wrap model — this replaces FFN layers and frees original weights
+            wrapped = FlashModelWrapper(
+                model,
+                predictor_bank,
+                weight_store,
+                runtime_flash_config,
+                lookahead_bank,
+            )
+
+            if flash_config.flash_speculative:
+                from olmlx.engine.flash.speculative import SpeculativeFlashDecoder
+
+                if not flash_config.flash_speculative_draft_model:
+                    raise ValueError(
+                        "flash_speculative requires flash_speculative_draft_model "
+                        "to be set (OLMLX_FLASH_SPECULATIVE_DRAFT_MODEL)"
+                    )
+
+                logger.info(
+                    "Loading draft model %s for speculative decoding",
+                    flash_config.flash_speculative_draft_model,
+                )
+                draft_model, _draft_tokenizer = load_model_with_strict_fallback(
+                    flash_config.flash_speculative_draft_model, lazy=False
+                )
+
+                # Verify vocab compatibility — a mismatch causes silent token ID errors
+                target_vocab = getattr(
+                    getattr(wrapped, "args", None), "vocab_size", None
+                )
+                draft_vocab = getattr(
+                    getattr(draft_model, "args", None), "vocab_size", None
+                )
+                if (
+                    target_vocab is not None
+                    and draft_vocab is not None
+                    and target_vocab != draft_vocab
+                ):
+                    raise ValueError(
+                        f"Draft model vocab_size ({draft_vocab}) does not match "
+                        f"target model vocab_size ({target_vocab}). "
+                        f"Speculative decoding requires matching vocabularies."
+                    )
+
+                decoder = SpeculativeFlashDecoder(
+                    draft_model=draft_model,
+                    target_model=wrapped,
+                    num_speculative_tokens=flash_config.flash_speculative_tokens,
+                    prefetcher=wrapped.prefetcher,
+                )
+                return wrapped, tokenizer, is_vlm, caps, decoder
+
+            return wrapped, tokenizer, is_vlm, caps, None
+        except Exception:
+            # Teardown in the same order as ``_close_loaded_model``: prefetcher
+            # before the weight store (prefetch tasks submit into the store's
+            # pool, so reversing the order references a closed store).
+            if wrapped is not None:
+                prefetcher = getattr(wrapped, "prefetcher", None)
+                if prefetcher is not None:
+                    try:
+                        prefetcher.close()
+                    except Exception:
+                        logger.exception(
+                            "Error closing prefetcher after failed flash load"
+                        )
             try:
-                lookahead_bank = LookaheadBank.load(lookahead_path)
-                logger.info("Loaded lookahead predictor bank from %s", lookahead_path)
+                weight_store.close()
             except Exception:
-                logger.warning(
-                    "Failed to load lookahead predictors, falling back to sparsity predictor",
-                    exc_info=True,
-                )
-
-        # Wrap model — this replaces FFN layers and frees original weights
-        wrapped = FlashModelWrapper(
-            model, predictor_bank, weight_store, runtime_flash_config, lookahead_bank
-        )
-
-        if flash_config.flash_speculative:
-            from olmlx.engine.flash.speculative import SpeculativeFlashDecoder
-
-            if not flash_config.flash_speculative_draft_model:
-                raise ValueError(
-                    "flash_speculative requires flash_speculative_draft_model to be set "
-                    "(OLMLX_FLASH_SPECULATIVE_DRAFT_MODEL)"
-                )
-
-            logger.info(
-                "Loading draft model %s for speculative decoding",
-                flash_config.flash_speculative_draft_model,
-            )
-            draft_model, draft_tokenizer = load_model_with_strict_fallback(
-                flash_config.flash_speculative_draft_model, lazy=False
-            )
-
-            # Verify vocabulary compatibility — a mismatch causes silent token ID errors
-            target_vocab = getattr(getattr(wrapped, "args", None), "vocab_size", None)
-            draft_vocab = getattr(
-                getattr(draft_model, "args", None), "vocab_size", None
-            )
-            if (
-                target_vocab is not None
-                and draft_vocab is not None
-                and target_vocab != draft_vocab
-            ):
-                raise ValueError(
-                    f"Draft model vocab_size ({draft_vocab}) does not match "
-                    f"target model vocab_size ({target_vocab}). "
-                    f"Speculative decoding requires matching vocabularies."
-                )
-
-            decoder = SpeculativeFlashDecoder(
-                draft_model=draft_model,
-                target_model=wrapped,
-                num_speculative_tokens=flash_config.flash_speculative_tokens,
-                prefetcher=wrapped.prefetcher,
-            )
-            return wrapped, tokenizer, is_vlm, caps, decoder
-
-        return wrapped, tokenizer, is_vlm, caps, None
+                logger.exception("Error closing weight store after failed flash load")
+            # If the speculative branch loaded a draft model before failing
+            # (e.g. the vocab-mismatch raise), drop its reference and return
+            # its GPU weights to the pool promptly rather than waiting for GC.
+            if draft_model is not None:
+                del draft_model
+                mx.clear_cache()
+            raise
 
     def _flash_moe_dir(self, hf_path: str) -> Path | None:
         """Return the flash-MoE directory for a model, if it exists."""
