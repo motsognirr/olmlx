@@ -9,6 +9,7 @@ from fastapi.responses import StreamingResponse
 from olmlx.config import settings
 from olmlx.engine.grammar import GrammarSpec, parse_response_format
 from olmlx.engine.inference import generate_chat
+from olmlx.engine.panel import panel_generate_chat
 from olmlx.engine.responses_state import get_store
 from olmlx.routers.streaming_common import (
     KEEPALIVE_PING_INTERVAL,
@@ -743,6 +744,10 @@ async def _stream_response(
 )
 async def create_response(req: ResponsesRequest, request: Request):
     manager = request.app.state.model_manager
+    # Dispatch synthetic panels through the panel coordinator here too, so an
+    # advertised panel isn't a 400 "model not found" on this surface (#627).
+    registry = request.app.state.registry
+    dispatch = panel_generate_chat if registry.is_panel(req.model) else generate_chat
     logger.info(
         "Responses request: model=%s stream=%s tools=%d prev=%s",
         req.model,
@@ -799,7 +804,7 @@ async def create_response(req: ResponsesRequest, request: Request):
     cache_id = (req.previous_response_id or response_id)[:256]
 
     if req.stream:
-        result = await generate_chat(
+        result = await dispatch(
             manager,
             req.model,
             engine_messages,
@@ -816,7 +821,7 @@ async def create_response(req: ResponsesRequest, request: Request):
             media_type="text/event-stream",
         )
 
-    result = await generate_chat(
+    result = await dispatch(
         manager,
         req.model,
         engine_messages,

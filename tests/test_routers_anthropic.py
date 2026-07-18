@@ -8,6 +8,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from olmlx.routers.anthropic import (
+    _anthropic_stop_reason,
     _build_options,
     _convert_messages,
     _convert_tools,
@@ -378,6 +379,47 @@ class TestConvertMessages:
         messages = _convert_messages(req)
         assert all(m["role"] != "system" for m in messages)
 
+    def test_mixed_text_and_tool_result_preserves_order(self):
+        """A user turn ``[text, tool_result]`` must stay user-then-tool, not
+        be reordered to tool-then-user (#627)."""
+        req = AnthropicMessagesRequest(
+            max_tokens=100,
+            model="test",
+            messages=[
+                AnthropicMessage(
+                    role="user",
+                    content=[
+                        AnthropicContentBlock(type="text", text="here is the result"),
+                        AnthropicContentBlock(
+                            type="tool_result",
+                            tool_use_id="tu_1",
+                            content="42",
+                        ),
+                    ],
+                ),
+            ],
+        )
+        messages = _convert_messages(req)
+        assert [m["role"] for m in messages] == ["user", "tool"]
+        assert messages[0]["content"] == "here is the result"
+        assert messages[1]["tool_call_id"] == "tu_1"
+
+
+class TestAnthropicStopReason:
+    def test_stop_sequence_hit_maps_to_stop_sequence(self):
+        # Engine sets done_reason="stop" only on a stop_sequences hit (#627).
+        assert _anthropic_stop_reason("stop", False) == "stop_sequence"
+
+    def test_natural_end_maps_to_end_turn(self):
+        assert _anthropic_stop_reason(None, False) == "end_turn"
+
+    def test_length_maps_to_max_tokens(self):
+        assert _anthropic_stop_reason("length", False) == "max_tokens"
+        assert _anthropic_stop_reason("timeout", False) == "max_tokens"
+
+    def test_tools_take_precedence(self):
+        assert _anthropic_stop_reason("stop", True) == "tool_use"
+
 
 class TestBuildOptions:
     def test_empty(self):
@@ -444,6 +486,64 @@ class TestAnthropicEndpoint:
         assert data["content"][0]["text"] == "Hello from MLX!"
         assert data["usage"]["input_tokens"] == 10
         assert data["usage"]["output_tokens"] == 20
+
+    @pytest.mark.asyncio
+    async def test_stop_sequence_hit_reports_stop_sequence(self, app_client):
+        # A client stop_sequences match (engine done_reason="stop") must report
+        # stop_reason "stop_sequence", not "end_turn" (#627).
+        stats = TimingStats(prompt_eval_count=5, eval_count=3)
+        with patch(
+            "olmlx.routers.anthropic.generate_chat", new_callable=AsyncMock
+        ) as mock_gen:
+            mock_gen.return_value = {
+                "text": "partial",
+                "done": True,
+                "done_reason": "stop",
+                "stats": stats,
+            }
+            resp = await app_client.post(
+                "/v1/messages",
+                json={
+                    "model": "qwen3",
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "max_tokens": 50,
+                    "stop_sequences": ["STOP"],
+                },
+            )
+        assert resp.status_code == 200
+        assert resp.json()["stop_reason"] == "stop_sequence"
+
+    @pytest.mark.asyncio
+    async def test_panel_model_dispatches_to_panel_coordinator(self, app_client):
+        # A synthetic panel advertised in /v1/models must be dispatchable on
+        # /v1/messages, not a 400 "model not found" (#627).
+        stats = TimingStats(prompt_eval_count=1, eval_count=1)
+        with (
+            patch(
+                "olmlx.routers.anthropic.panel_generate_chat", new_callable=AsyncMock
+            ) as mock_panel,
+            patch(
+                "olmlx.routers.anthropic.generate_chat", new_callable=AsyncMock
+            ) as mock_gen,
+            patch("olmlx.engine.registry.ModelRegistry.is_panel", return_value=True),
+        ):
+            mock_panel.return_value = {
+                "text": "panel answer",
+                "done": True,
+                "stats": stats,
+            }
+            resp = await app_client.post(
+                "/v1/messages",
+                json={
+                    "model": "my-panel",
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "max_tokens": 50,
+                },
+            )
+        assert resp.status_code == 200
+        assert resp.json()["content"][0]["text"] == "panel answer"
+        mock_panel.assert_called_once()
+        mock_gen.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_missing_max_tokens_returns_400(self, app_client):

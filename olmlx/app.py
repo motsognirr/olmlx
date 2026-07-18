@@ -11,6 +11,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
+from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.middleware.base import BaseHTTPMiddleware
 
 from olmlx.config import settings
@@ -325,6 +326,25 @@ class RootSpanMiddleware(BaseHTTPMiddleware):
             return response
 
 
+def _error_types_for_status(status_code: int) -> tuple[str, str, str]:
+    """Map an HTTP status to ``(anthropic_type, openai_type, openai_code)``.
+
+    Used to give a bare ``HTTPException`` a provider-shaped error envelope
+    consistent with the typed handlers below (#627).
+    """
+    if status_code == 401:
+        return ("authentication_error", "invalid_request_error", "authentication_error")
+    if status_code == 403:
+        return ("permission_error", "invalid_request_error", "permission_denied")
+    if status_code == 404:
+        return ("not_found_error", "invalid_request_error", "not_found")
+    if status_code == 429:
+        return ("rate_limit_error", "rate_limit_error", "rate_limit_exceeded")
+    if 400 <= status_code < 500:
+        return ("invalid_request_error", "invalid_request_error", "invalid_value")
+    return ("api_error", "server_error", "internal_error")
+
+
 def _make_error_response(
     path: str,
     status_code: int,
@@ -395,6 +415,32 @@ def create_app() -> FastAPI:
             "invalid_request_error",
             "invalid_value",
         )
+
+    @app.exception_handler(StarletteHTTPException)
+    async def http_exception_handler(request: Request, exc: StarletteHTTPException):
+        # Router-raised ``HTTPException``s (e.g. 422 for a malformed image
+        # block or bad response_format) would otherwise serialize as
+        # FastAPI's default ``{"detail": ...}``, which provider SDKs can't
+        # parse. Reshape into the surface's provider error envelope,
+        # preserving the status code and any carried headers (#627).
+        detail = exc.detail if isinstance(exc.detail, str) else str(exc.detail)
+        anthropic_type, openai_type, openai_code = _error_types_for_status(
+            exc.status_code
+        )
+        logger.warning(
+            "HTTPException %d on %s: %s", exc.status_code, request.url.path, detail
+        )
+        response = _make_error_response(
+            request.url.path,
+            exc.status_code,
+            detail,
+            anthropic_type,
+            openai_type,
+            openai_code,
+        )
+        for key, value in (exc.headers or {}).items():
+            response.headers[key] = value
+        return response
 
     @app.exception_handler(ValueError)
     async def value_error_handler(request: Request, exc: ValueError):
