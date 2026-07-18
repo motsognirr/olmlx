@@ -153,7 +153,14 @@ class Orchestrator:
 
                 prompt = goal if first else CONTINUATION_NUDGE
                 first = False
-                before = len(self.session.messages)
+                # Identify this turn's new messages by object identity, not a
+                # positional index: ``send_message`` may call
+                # ``_check_memory_and_truncate``, which rebinds
+                # ``session.messages`` to a shorter list. A stale ``before``
+                # index would then slice an empty/misaligned range, making the
+                # stall signature ``"[]"`` every iteration and falsely killing
+                # long runs as "stall" once truncation kicks in (#622).
+                before_ids = {id(m) for m in self.session.messages}
 
                 finished = False
                 summary = ""
@@ -170,7 +177,9 @@ class Orchestrator:
 
                 iterations += 1
                 runtime = elapsed()
-                new_messages = self.session.messages[before:]
+                new_messages = [
+                    m for m in self.session.messages if id(m) not in before_ids
+                ]
                 await self.store.append_checkpoint(
                     self.run_id, self.session.messages, iterations, tokens
                 )

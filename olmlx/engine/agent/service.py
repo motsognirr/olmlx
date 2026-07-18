@@ -163,6 +163,17 @@ class AgentService:
                 f"run {run_id} has status {run['status']!r}, not resumable "
                 f"(must be one of {sorted(RESUMABLE_STATUSES)})"
             )
+        # Guard against a concurrent double-resume: the persisted status check
+        # above can pass for two quick /resume calls before either transitions
+        # to 'running' inside the task, and both would ``_start`` — two
+        # orchestrators interleaving append_event/checkpoint seqs, double-
+        # spending tokens, and leaving the run uncancellable when the first
+        # task's finally pops the second's handle (#622). A live handle means a
+        # task is already driving this run; there is no ``await`` between this
+        # check and ``_start``, so the check-and-set is atomic on the loop.
+        existing = self._handles.get(run_id)
+        if existing is not None and (existing.task is None or not existing.task.done()):
+            raise ValueError(f"run {run_id} is already running")
         self._start(run, resume=True)
         return await self.store.get_run(run_id)
 
@@ -477,6 +488,10 @@ class AgentService:
         fully drained. Polling (rather than a pub/sub) keeps it decoupled from
         the run's task and trivially correct across reconnects.
         """
+        # Cap the idle poll interval so a long-lived running-but-quiet run
+        # doesn't hammer SQLite at 1/poll_interval Hz forever (#622).
+        max_poll_interval = 1.0
+        idle_rounds = 0
         last_seq = -1
         while True:
             events = await self.store.get_events(run_id, after_seq=last_seq)
@@ -488,11 +503,22 @@ class AgentService:
                 "finished",
                 "failed",
                 "cancelled",
+                # A paused/interrupted run's task is no longer producing events
+                # on this stream (a resume spawns a fresh task the client
+                # reconnects to), so stop tailing instead of polling forever
+                # (#622).
+                "paused",
+                "interrupted",
             )
             if terminal and not events:
                 return
-            if not events:
-                await asyncio.sleep(poll_interval)
+            if events:
+                idle_rounds = 0
+            else:
+                await asyncio.sleep(
+                    min(poll_interval * (2**idle_rounds), max_poll_interval)
+                )
+                idle_rounds += 1
 
     async def aclose(self) -> None:
         for handle in list(self._handles.values()):
