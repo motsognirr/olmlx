@@ -46,18 +46,16 @@ from olmlx.engine.gdn_rollback import (
     get_model_layers as _get_layers,
 )
 from olmlx.engine.eagle.draft_model import EagleDraftModel
-from olmlx.engine.spec_decoder_base import SpecDecoderBase
+from olmlx.engine.spec_decoder_base import SpecDecoderBase, _trim_recent_cache
 from olmlx.engine.speculative import _eval_cache
 
 try:
     from mlx_lm.models.cache import (
         can_trim_prompt_cache,
         make_prompt_cache,
-        trim_prompt_cache,
     )
 except ImportError:  # pragma: no cover - mlx-lm always installed in production
     make_prompt_cache = None  # type: ignore[assignment]
-    trim_prompt_cache = None  # type: ignore[assignment]
     can_trim_prompt_cache = None  # type: ignore[assignment]
 
 logger = logging.getLogger(__name__)
@@ -440,8 +438,13 @@ class EagleDecoder(SpecDecoderBase):
         trim_draft = self._block_size - num_accepted
         if trim_target > 0:
             if self._target_can_trim:
-                if trim_prompt_cache is not None:
-                    trim_prompt_cache(self._target_cache, trim_target)
+                # Rotating-aware trim: mlx-lm's ``trim_prompt_cache`` is
+                # all-or-nothing and silently no-ops on filled
+                # sliding-window (``RotatingKVCache``) targets, leaving
+                # rejected draft tokens resident and corrupting output
+                # (#605). ``_target_can_trim`` was frozen at prefill on the
+                # empty cache, so a rotating target reaches this branch.
+                _trim_recent_cache(self._target_cache, trim_target)
             else:
                 # Hybrid linear-attention path. ``_capture`` was created
                 # in prefill; same control-flow invariant guards as
@@ -482,8 +485,8 @@ class EagleDecoder(SpecDecoderBase):
         # Draft cache trim — the draft is always a standard-attention
         # transformer with trim-able KVCache, so this path is the same
         # regardless of target architecture.
-        if trim_prompt_cache is not None and trim_draft > 0:
-            trim_prompt_cache(self._draft_cache, trim_draft)
+        if trim_draft > 0:
+            _trim_recent_cache(self._draft_cache, trim_draft)
         elif num_accepted > self._block_size:
             # Full acceptance: the draft cache holds only block_size
             # entries but all block_size drafts (plus the bonus token)

@@ -853,17 +853,18 @@ class TestEagleDecoderGDNPath:
 
         monkeypatch.setattr(base_mod, "GDNStateCapture", _FakeCapture)
 
-        # ``trim_prompt_cache`` for target should NOT be called when
-        # we're in the GDN regime. Patch it to detect.
+        # The rotating-aware trim (``_trim_recent_cache``, #605) for the
+        # target should NOT be called when we're in the GDN regime — the
+        # rollback path handles it instead. Patch it to detect.
         target_trim_calls = {"count": 0}
-        original_trim = decoder_mod.trim_prompt_cache
+        original_trim = decoder_mod._trim_recent_cache
 
         def recording_trim(cache, n):
             target_trim_calls["count"] += 1
             if original_trim is not None:
                 original_trim(cache, n)
 
-        monkeypatch.setattr(decoder_mod, "trim_prompt_cache", recording_trim)
+        monkeypatch.setattr(decoder_mod, "_trim_recent_cache", recording_trim)
 
         decoder, _, _ = _make_decoder(block_size=2)
         decoder.prefill(mx.array([[1, 2, 3]], dtype=mx.int32))
