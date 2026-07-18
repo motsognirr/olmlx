@@ -218,6 +218,32 @@ class TestGDNDetection:
         ):
             SpeculativeDecoder(draft, target)
 
+    def test_tree_mode_disabled_on_hybrid_gdn_model(self):
+        """Tree speculation is unsupported on hybrid GatedDeltaNet models
+        (mask shape break, GDN recurrence can't honor tree isolation, and a
+        depth-1 sibling acceptance crashes the draft rollback). It must fall
+        back to linear speculation rather than crash mid-generation (#632).
+        """
+        gdn = _make_fake_gdn_cls()
+        target = _make_hybrid_model(gdn_cls=gdn)
+        draft = _make_hybrid_model(gdn_cls=gdn)
+        dec = SpeculativeDecoder(draft, target, tree_width=3)
+        try:
+            assert dec._gdn_capture is not None
+            assert dec._use_tree is False  # disabled despite tree_width >= 2
+        finally:
+            dec.close()
+
+    def test_tree_mode_stays_enabled_on_non_hybrid_model(self):
+        target = _make_hybrid_model(gdn_cls=None)
+        draft = _make_hybrid_model(gdn_cls=None)
+        dec = SpeculativeDecoder(draft, target, tree_width=3)
+        try:
+            assert dec._gdn_capture is None
+            assert dec._use_tree is True
+        finally:
+            dec.close()
+
 
 # ---------------------------------------------------------------------------
 # Lifecycle: close() and __del__
