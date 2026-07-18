@@ -983,22 +983,25 @@ class ChatSession:
                     import json
 
                     content = result_msg.get("content", "")
-                    if not isinstance(content, str) or not content.startswith(
-                        "__question__:"
-                    ):
-                        continue
-                    try:
-                        payload = json.loads(content[len("__question__:") :])
-                        yield {
-                            "type": "question",
-                            "header": payload.get("header", ""),
-                            "question": payload.get("question", ""),
-                            "options": payload.get("options"),
-                            "multiple": payload.get("multiple", False),
-                            "id": tu["id"],
-                        }
-                    except (json.JSONDecodeError, KeyError, TypeError):
-                        pass
+                    # Only a well-formed ``__question__:`` payload emits the
+                    # interactive question event. A denied/errored ``question``
+                    # (e.g. blocked by policy) carries a plain message instead —
+                    # it must still be appended as a tool result, or the
+                    # assistant's ``tool_calls`` entry is left unpaired and every
+                    # subsequent turn's template rejects the history (issue #623).
+                    if isinstance(content, str) and content.startswith("__question__:"):
+                        try:
+                            payload = json.loads(content[len("__question__:") :])
+                            yield {
+                                "type": "question",
+                                "header": payload.get("header", ""),
+                                "question": payload.get("question", ""),
+                                "options": payload.get("options"),
+                                "multiple": payload.get("multiple", False),
+                                "id": tu["id"],
+                            }
+                        except (json.JSONDecodeError, KeyError, TypeError):
+                            pass
                 self.messages.append(result_msg)
             else:
                 error_detail = "no result received"
@@ -1226,12 +1229,18 @@ class ChatSession:
             if parse_error is not None:
                 yield parse_error
 
-            # Build assistant message
+            # Build assistant message. Only advertise ``tool_calls`` when they
+            # will actually be executed below — a repetition-stop after a
+            # complete <tool_call> block breaks before ``_execute_tool_calls``
+            # runs, so storing the calls would leave them unpaired (no matching
+            # ``role: tool`` result) and corrupt the template on every later
+            # turn / resumed session (issue #623).
+            will_execute = bool(tool_uses) and not repetition_stopped
             assistant_msg: dict[str, Any] = {
                 "role": "assistant",
                 "content": visible_text,
             }
-            if tool_uses:
+            if will_execute:
                 assistant_msg["tool_calls"] = [
                     {
                         "id": tu["id"],
@@ -1245,7 +1254,7 @@ class ChatSession:
                 ]
             self.messages.append(assistant_msg)
 
-            if not tool_uses or repetition_stopped:
+            if not will_execute:
                 break
 
             turn_had_success = False

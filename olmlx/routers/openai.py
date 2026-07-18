@@ -90,18 +90,37 @@ async def _stream_openai_sse(
     format_content,
     format_done,
     strip_thinking=False,
+    include_usage=False,
 ):
     """Shared SSE streaming for OpenAI-compatible endpoints.
 
     format_content(text) -> choices[0] dict for content chunks
     format_done() -> choices[0] dict for the final chunk
+
+    When *include_usage* is set (OpenAI ``stream_options.include_usage``,
+    issue #595) every chunk carries ``usage: null`` and one extra chunk with
+    ``choices: []`` and a populated ``usage`` object is emitted before
+    ``[DONE]``.
     """
 
     def _compact_choice(choice: dict) -> dict:
         return {k: v for k, v in choice.items() if v is not None}
 
+    def _envelope(choices: list[dict]) -> dict:
+        data = {
+            "id": response_id,
+            "object": object_type,
+            "created": created,
+            "model": model,
+            "choices": choices,
+        }
+        if include_usage:
+            data["usage"] = None
+        return data
+
     think_state: dict = {}
     content_emitted = False
+    final_stats = None
     try:
         async for chunk in result:
             if chunk.get("cache_info"):
@@ -117,17 +136,12 @@ async def _stream_openai_sse(
                     think_state["detect_limit"] = INIT_ORPHAN_DETECT_LIMIT
                 continue
             if chunk.get("done"):
+                final_stats = chunk.get("stats")
                 # Flush any buffered content from thinking detection.
                 if strip_thinking:
                     flushed = flush_thinking_buffer(think_state)
                     if flushed:
-                        data = {
-                            "id": response_id,
-                            "object": object_type,
-                            "created": created,
-                            "model": model,
-                            "choices": [_compact_choice(format_content(flushed))],
-                        }
+                        data = _envelope([_compact_choice(format_content(flushed))])
                         yield f"data: {json.dumps(data)}\n\n"
                         content_emitted = True
                 # Issue #551: if thinking consumed the whole token budget, no
@@ -137,13 +151,7 @@ async def _stream_openai_sse(
                 # detectable. Scoped to the chat path (format_content carries a
                 # role); the completions path uses a text-shaped formatter.
                 if strip_thinking and not content_emitted:
-                    data = {
-                        "id": response_id,
-                        "object": object_type,
-                        "created": created,
-                        "model": model,
-                        "choices": [_compact_choice(format_content(""))],
-                    }
+                    data = _envelope([_compact_choice(format_content(""))])
                     yield f"data: {json.dumps(data)}\n\n"
                     content_emitted = True
                 done_reason = chunk.get("done_reason")
@@ -154,14 +162,21 @@ async def _stream_openai_sse(
                 )
                 done_choice = format_done()
                 done_choice["finish_reason"] = finish_reason
-                data = {
-                    "id": response_id,
-                    "object": object_type,
-                    "created": created,
-                    "model": model,
-                    "choices": [_compact_choice(done_choice)],
-                }
+                data = _envelope([_compact_choice(done_choice)])
                 yield f"data: {json.dumps(data)}\n\n"
+                # OpenAI stream_options.include_usage (issue #595): an extra
+                # chunk with empty choices and populated usage, right before
+                # [DONE].
+                if include_usage:
+                    usage_data = {
+                        "id": response_id,
+                        "object": object_type,
+                        "created": created,
+                        "model": model,
+                        "choices": [],
+                        "usage": OpenAIUsage.from_stats(final_stats).model_dump(),
+                    }
+                    yield f"data: {json.dumps(usage_data)}\n\n"
                 yield "data: [DONE]\n\n"
             else:
                 text = chunk.get("text", "")
@@ -169,13 +184,7 @@ async def _stream_openai_sse(
                     text = strip_thinking_streaming(text, think_state)
                 if not text:
                     continue
-                data = {
-                    "id": response_id,
-                    "object": object_type,
-                    "created": created,
-                    "model": model,
-                    "choices": [_compact_choice(format_content(text))],
-                }
+                data = _envelope([_compact_choice(format_content(text))])
                 yield f"data: {json.dumps(data)}\n\n"
                 content_emitted = True
     except Exception as exc:
@@ -187,7 +196,7 @@ async def _stream_openai_sse(
 
 
 async def _stream_openai_sse_with_tools(
-    result, response_id, model, created, declared_tools=None
+    result, response_id, model, created, declared_tools=None, include_usage=False
 ):
     """Buffer full output, parse tool calls, then emit OpenAI-compliant SSE.
 
@@ -233,15 +242,16 @@ async def _stream_openai_sse_with_tools(
 
         def _chunk(choices_0):
             choices_0_clean = {k: v for k, v in choices_0.items() if v is not None}
-            return json.dumps(
-                {
-                    "id": response_id,
-                    "object": "chat.completion.chunk",
-                    "created": created,
-                    "model": model,
-                    "choices": [{"index": 0, **choices_0_clean}],
-                }
-            )
+            payload = {
+                "id": response_id,
+                "object": "chat.completion.chunk",
+                "created": created,
+                "model": model,
+                "choices": [{"index": 0, **choices_0_clean}],
+            }
+            if include_usage:
+                payload["usage"] = None
+            return json.dumps(payload)
 
         if tool_uses:
             tool_calls = _to_openai_tool_calls(tool_uses)
@@ -280,6 +290,19 @@ async def _stream_openai_sse_with_tools(
                 yield f"data: {_chunk({'delta': {'content': visible_text}, 'finish_reason': None})}\n\n"
             fr = "length" if done_reason in ("timeout", "length") else "stop"
             yield f"data: {_chunk({'delta': {}, 'finish_reason': fr})}\n\n"
+
+        # OpenAI stream_options.include_usage (issue #595): final usage chunk
+        # with empty choices before [DONE].
+        if include_usage:
+            usage_payload = {
+                "id": response_id,
+                "object": "chat.completion.chunk",
+                "created": created,
+                "model": model,
+                "choices": [],
+                "usage": OpenAIUsage.from_stats(out.stats).model_dump(),
+            }
+            yield f"data: {json.dumps(usage_payload)}\n\n"
 
         yield "data: [DONE]\n\n"
     except Exception as exc:
@@ -341,6 +364,15 @@ async def openai_chat(req: OpenAIChatRequest, request: Request):
         req.max_completion_tokens,
     )
     manager = request.app.state.model_manager
+    # olmlx does not compute per-token logprobs. Reject rather than silently
+    # drop (issue #595) so clients that need them get a clear error instead of
+    # a 200 with missing data.
+    if req.logprobs:
+        raise HTTPException(
+            status_code=400,
+            detail="logprobs is not supported by this server",
+        )
+    include_usage = bool(req.stream_options and req.stream_options.include_usage)
     # Reject malformed tool schemas before generation (a non-dict
     # ``parameters`` would otherwise crash post-parse — see #644). Raises
     # ValueError → 400 via the app's ValueError handler.
@@ -429,6 +461,7 @@ async def openai_chat(req: OpenAIChatRequest, request: Request):
                     req.model,
                     created,
                     declared_tools=effective_tools,
+                    include_usage=include_usage,
                 ),
                 media_type="text/event-stream",
             )
@@ -447,6 +480,7 @@ async def openai_chat(req: OpenAIChatRequest, request: Request):
                 },
                 lambda: {"index": 0, "delta": {}, "finish_reason": "stop"},
                 strip_thinking=True,
+                include_usage=include_usage,
             ),
             media_type="text/event-stream",
         )
@@ -534,6 +568,21 @@ async def openai_chat(req: OpenAIChatRequest, request: Request):
 )
 async def openai_completions(req: OpenAICompletionRequest, request: Request):
     manager = request.app.state.model_manager
+    # Neither logprobs nor echo are computed; reject rather than silently drop
+    # (issue #595). ``logprobs=0`` means "no logprobs" in the OpenAI completions
+    # API, so only a positive count is a real (unsupported) request — mirrors the
+    # chat endpoint's truthy check.
+    if req.logprobs:
+        raise HTTPException(
+            status_code=400,
+            detail="logprobs is not supported by this server",
+        )
+    if req.echo:
+        raise HTTPException(
+            status_code=400,
+            detail="echo is not supported by this server",
+        )
+    include_usage = bool(req.stream_options and req.stream_options.include_usage)
     options = _build_options(req)
     prompt = req.prompt if isinstance(req.prompt, str) else req.prompt[0]
     max_tokens = req.max_tokens or settings.default_max_tokens
@@ -559,6 +608,7 @@ async def openai_completions(req: OpenAICompletionRequest, request: Request):
                 "text_completion",
                 lambda text: {"index": 0, "text": text, "finish_reason": None},
                 lambda: {"index": 0, "text": "", "finish_reason": "stop"},
+                include_usage=include_usage,
             ),
             media_type="text/event-stream",
         )
