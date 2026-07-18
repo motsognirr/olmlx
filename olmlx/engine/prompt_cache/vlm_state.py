@@ -178,12 +178,11 @@ class VlmPromptCacheStore:
         if self._evict_generation != gen_before:
             return None
         # Another coroutine may have inserted a fresher state for this id
-        # during the await; keep it and discard the stale disk load rather
-        # than let _insert_capture's pop() clobber it.
-        existing = self._entries.get(cache_id)
+        # during the await; keep it (get() refreshes it to MRU) and discard
+        # the stale disk load rather than let _insert_capture's pop() clobber
+        # it.
+        existing = self.get(cache_id)
         if existing is not None:
-            self._entries.pop(cache_id, None)  # refresh to MRU
-            self._entries[cache_id] = existing
             return existing
         # Promote the restored entry; spill whatever it evicts.
         for over_id, over_state in self._insert_capture(cache_id, loaded):
