@@ -165,7 +165,14 @@ async def _lifespan_inner(app: FastAPI):
         if agent_service is not None:
             await agent_service.startup()
     except Exception:
-        await manager.stop()
+        # Each rollback step is independently guarded: if manager.stop() raises
+        # (e.g. a Metal cache-flush failure), the collector unregister must
+        # still run, or the duplicate-collector poison this handler exists to
+        # prevent would come right back on the next create_app().
+        try:
+            await manager.stop()
+        except Exception:
+            logger.exception("manager.stop() failed during failed-startup rollback")
         collector = getattr(app.state, "metrics_collector", None)
         if collector is not None:
             try:
