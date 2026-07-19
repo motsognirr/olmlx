@@ -2816,6 +2816,7 @@ dependencies = [
     { name = "mlx-lm" },
     { name = "mlx-vlm" },
     { name = "mlx-whisper" },
+    { name = "numba" },
     { name = "prometheus-client" },
     { name = "pydantic" },
     { name = "pydantic-settings" },
@@ -2827,7 +2828,6 @@ dependencies = [
 
 [package.optional-dependencies]
 audio = [
-    { name = "en-core-web-sm" },
     { name = "misaki", extra = ["en"] },
     { name = "mlx-audio" },
 ]
@@ -2839,7 +2839,6 @@ search = [
     { name = "ddgs" },
 ]
 voice = [
-    { name = "en-core-web-sm" },
     { name = "misaki", extra = ["en"] },
     { name = "mlx-audio" },
     { name = "sounddevice" },
@@ -2848,6 +2847,7 @@ voice = [
 [package.dev-dependencies]
 dev = [
     { name = "datasets" },
+    { name = "en-core-web-sm" },
     { name = "httpx" },
     { name = "matplotlib" },
     { name = "openai" },
@@ -2863,7 +2863,6 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "ddgs", marker = "extra == 'search'", specifier = ">=9.0" },
-    { name = "en-core-web-sm", marker = "extra == 'audio'", url = "https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.8.0/en_core_web_sm-3.8.0-py3-none-any.whl" },
     { name = "fastapi", specifier = ">=0.104" },
     { name = "huggingface-hub", specifier = ">=0.20" },
     { name = "jinja2", specifier = ">=3.0" },
@@ -2874,6 +2873,7 @@ requires-dist = [
     { name = "mlx-lm", specifier = ">=0.31.3,<0.32" },
     { name = "mlx-vlm", specifier = ">=0.6.4,<0.7" },
     { name = "mlx-whisper", specifier = ">=0.4.3" },
+    { name = "numba", specifier = ">=0.60" },
     { name = "olmlx", extras = ["audio"], marker = "extra == 'voice'" },
     { name = "opentelemetry-exporter-otlp-proto-http", marker = "extra == 'otel'", specifier = ">=1.27" },
     { name = "opentelemetry-sdk", marker = "extra == 'otel'", specifier = ">=1.27" },
@@ -2891,6 +2891,7 @@ provides-extras = ["search", "otel", "audio", "voice"]
 [package.metadata.requires-dev]
 dev = [
     { name = "datasets", specifier = ">=3.0" },
+    { name = "en-core-web-sm", url = "https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.8.0/en_core_web_sm-3.8.0-py3-none-any.whl" },
     { name = "httpx", specifier = ">=0.28.1" },
     { name = "matplotlib", specifier = ">=3.9" },
     { name = "openai", specifier = ">=1.66" },

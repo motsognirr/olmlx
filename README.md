@@ -10,14 +10,27 @@ Drop-in Ollama API replacement powered by Apple's [MLX](https://github.com/ml-ex
 
 ## Install
 
-### Option 1: Global install (recommended)
+### Option 1: Install from PyPI (recommended)
+
+Requires Apple Silicon — the MLX backend is arm64-only.
 
 ```bash
-# Install globally — no clone needed
-uv tool install git+ssh://git@github.com/motsognirr/olmlx.git
+# With uv (recommended) — installs an isolated tool, Python handled for you
+uv tool install olmlx
+
+# ...or with pipx
+pipx install olmlx
 
 # Start the server
 olmlx
+```
+
+Upgrade later with `uv tool upgrade olmlx` (or `pipx upgrade olmlx`).
+
+To install the latest unreleased version straight from git instead:
+
+```bash
+uv tool install git+https://github.com/motsognirr/olmlx.git
 ```
 
 On first run, `~/.olmlx/models.json` is created with example model mappings.
@@ -31,6 +44,32 @@ uv run olmlx
 ```
 
 The server starts on `http://localhost:11434` — the same default port as Ollama.
+
+### Optional extras
+
+Text-to-speech (`/v1/audio/speech`, `olmlx chat --voice`) ships in the `audio`
+extra; the `voice` extra adds microphone capture on top.
+
+Kokoro's English text processing also needs the spaCy `en_core_web_sm` model,
+which is **not on PyPI** (spaCy distributes its models as GitHub-release
+wheels), so it is not pulled in automatically. Because `uv tool` / `pipx`
+installs are isolated, the model has to go **into the same environment** as
+olmlx — a bare `python -m spacy download` would target the wrong interpreter.
+Install it alongside the extra:
+
+```bash
+# uv — install the extra and the spaCy model into olmlx's isolated tool env
+uv tool install "olmlx[audio]" \
+  --with "en_core_web_sm @ https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.8.0/en_core_web_sm-3.8.0-py3-none-any.whl"
+
+# ...or with pipx — install the extra, then inject the model into its venv
+pipx install "olmlx[audio]"
+pipx inject olmlx "https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.8.0/en_core_web_sm-3.8.0-py3-none-any.whl"
+```
+
+Swap `audio` for `voice` to also get push-to-talk mic capture. Source installs
+(`uv sync`) provision the model automatically — no extra step. Without it, the
+first `/v1/audio/speech` request fails with a spaCy load error.
 
 ## CLI
 

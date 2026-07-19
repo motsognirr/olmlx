@@ -2,7 +2,18 @@
 name = "olmlx"
 version = "0.1.0"
 description = "Ollama API-compatible server using Apple MLX for inference"
+readme = "README.md"
 requires-python = ">=3.11"
+license = "MIT"
+license-files = ["LICENSE"]
+classifiers = [
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Operating System :: MacOS",
+    "Environment :: GPU",
+    "Intended Audience :: Developers",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
 dependencies = [
     "fastapi>=0.104",
     "uvicorn[standard]>=0.24",
@@ -42,6 +53,13 @@ dependencies = [
     "rich>=13.0",
     "xgrammar>=0.2.1",
     "mlx-whisper>=0.4.3",
+    # numba is a transitive dep (mlx-whisper -> numba -> llvmlite). Without a
+    # floor, a fresh resolve of the *published wheel* (which ships no uv.lock)
+    # backtracks to numba 0.53.1 / llvmlite 0.36.0, which only build on Python
+    # <3.10 and hard-fail `pip install olmlx` on 3.11/3.12. The floor keeps
+    # resolution in the Python-3.11+-compatible region. Declared directly so it
+    # travels in wheel metadata (uv.lock does not reach PyPI users).
+    "numba>=0.60",
     "prometheus-client>=0.20",
 ]
 
@@ -64,13 +82,15 @@ audio = [
     # processing; without it /v1/audio/speech raises ImportError at generate
     # time. The [en] extra pulls the English pipeline (spacy etc.). Issue #367.
     "misaki[en]>=0.9.4",
-    # misaki.en calls spacy.load("en_core_web_sm") at generate time. spaCy's
-    # runtime auto-download does NOT become importable in-process, so a fresh
-    # `uv sync` would otherwise 500 on the first /v1/audio/speech request.
-    # The wheel (3.8.x matches the locked spaCy 3.8.x) is pinned via
-    # [tool.uv.sources] below so it's present after sync; bump in lockstep with
-    # spaCy's major.minor. Issue #367.
-    "en-core-web-sm",
+    # NOTE: misaki.en also needs the spaCy model `en_core_web_sm` at generate
+    # time. It is NOT declared here: spaCy models are not on PyPI (distributed
+    # as GitHub-release wheels), so a bare `en-core-web-sm` Requires-Dist is
+    # unresolvable for `pip install "olmlx[audio]"`. The [tool.uv.sources] URL
+    # override only applies to `uv` — it does not travel in published wheel
+    # metadata. Dev installs get it via the `dev` dependency-group below;
+    # end users installing `[audio]` from PyPI must fetch it once with:
+    #   python -m spacy download en_core_web_sm
+    # (documented in the README audio/voice setup section). Issue #367.
 ]
 # Terminal voice chat (`olmlx chat --voice`, #444): mic capture + playback via
 # PortAudio, plus the TTS stack it speaks through (self-referential extra).
@@ -108,4 +128,9 @@ dev = [
     "pyright>=1.1.380",
     "openai>=1.66",
     "ruff>=0.9",
+    # spaCy English model for Kokoro TTS (#367). Lives here (not in the [audio]
+    # extra) so `uv sync` provisions it for dev via the [tool.uv.sources] URL
+    # override, without emitting an unresolvable Requires-Dist into the
+    # published wheel. End users get it via `python -m spacy download`.
+    "en-core-web-sm",
 ]
