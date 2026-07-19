@@ -431,9 +431,15 @@ class TurboQuantKVCache(_BaseCache):
         new = cls.__new__(cls)
         memo[id(self)] = new
         for k, v in self.__dict__.items():
-            if k == "_dequant_dtype":
-                # mx.Dtype is an immutable singleton; share by reference
-                # because the default pickle-based deepcopy would fail.
+            if k in ("_dequant_dtype", "rotation_key", "rotation_value"):
+                # ``_dequant_dtype`` is an immutable mx.Dtype singleton (the
+                # default pickle-based deepcopy would fail). ``rotation_key`` /
+                # ``rotation_value`` are immutable per-layer calibration
+                # constants (each two DxD float32 matrices + ``matrix_T``) that
+                # are never mutated — deep-copying them into every checkpoint
+                # snapshot wasted RAM and double-charged the prompt-cache RAM
+                # budget via ``_estimate_state_bytes`` (#634). Share by
+                # reference; safe exactly like ``_dequant_dtype``.
                 new.__dict__[k] = v
             else:
                 new.__dict__[k] = copy.deepcopy(v, memo)

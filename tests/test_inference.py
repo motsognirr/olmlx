@@ -4472,6 +4472,24 @@ class TestEstimateKvCacheBytes:
         assert tq2_result < fp16_result
         assert fp16_result / tq2_result == pytest.approx(256 / 36, rel=0.01)
 
+    def test_shard_reduces_estimate(self):
+        """ShardQuant KV cache must reduce the estimate too — before #634 it
+        was ignored, so shard-quant models were estimated at full fp16 and
+        503'd long prompts that would actually fit.
+        """
+        model = self._make_model(
+            num_hidden_layers=80,
+            num_attention_heads=64,
+            num_key_value_heads=8,
+            head_dim=128,
+            hidden_size=8192,
+        )
+        fp16_result = estimate_kv_cache_bytes(model, 37000)
+        shard_result = estimate_kv_cache_bytes(model, 37000, kv_cache_quant="shard:4")
+        assert shard_result < fp16_result
+        # Same conservative packed formula as turboquant: 256 → 68 bytes.
+        assert fp16_result / shard_result == pytest.approx(256 / 68, rel=0.01)
+
     def test_turboquant_none_unchanged(self):
         """Passing kv_cache_quant=None should give the same result as no arg."""
         model = self._make_model()

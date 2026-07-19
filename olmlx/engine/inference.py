@@ -832,6 +832,15 @@ def estimate_kv_cache_bytes(
             # Conservative estimate using avg_bits (actual varies per head)
             sq_per_entry = head_dim // (8 // quant_bits) + 4
             _tq_ratio = sq_per_entry / fp16_per_entry
+        elif method == "shard":
+            # ShardQuant: PCA-basis-projected packed indices + float32 norm.
+            # Rank truncation makes the real footprint smaller than this, so
+            # the turboquant-style estimate is a safe upper bound — but still
+            # far below fp16. Without it, shard-quant models were estimated at
+            # full fp16 KV size, 503-ing long prompts that would actually fit
+            # (#634).
+            shard_per_entry = head_dim // (8 // quant_bits) + 4
+            _tq_ratio = shard_per_entry / fp16_per_entry
 
     # Try layer introspection for NAS/variable-attention/hybrid models.
     # ``args_owner`` was set above to the component whose args we resolved
@@ -2530,6 +2539,12 @@ async def _kv_cache_preflight_check(
                 estimate_tokens = cache_read_tokens + num_prefill_tokens
                 if full_prompt_tokens is not None and not lm.is_vlm:
                     result.prompt = full_prompt_tokens
+                    # The trimmed cache was just dropped and the full prompt
+                    # restored for a fresh re-prefill, so the prefix reuse the
+                    # caller would otherwise report never happens — reset the
+                    # counts to reflect the full re-prefill (#634).
+                    result.cache_read_tokens = 0
+                    result.cache_creation_tokens = len(full_prompt_tokens)
             estimate_total = estimate_tokens + max_tokens
             kv_bytes = estimate_kv_cache_bytes(
                 lm.model,

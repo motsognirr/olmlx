@@ -227,7 +227,11 @@ class PromptCacheStore:
     def _disk_file_path(self, cache_id: str) -> Path:
         """Return the disk file path for a given cache_id."""
         safe_name = re.sub(r"[^\w\-.]", "_", cache_id) or "_default"
-        return self._disk_dir() / f"{safe_name}.safetensors"
+        # Append a short hash of the *raw* cache_id so distinct ids that
+        # sanitize to the same string (e.g. "agent/1" and "agent_1") don't
+        # collide onto one file and silently overwrite each other's spill (#634).
+        digest = hashlib.sha1(cache_id.encode("utf-8")).hexdigest()[:12]
+        return self._disk_dir() / f"{safe_name}-{digest}.safetensors"
 
     def _save_to_disk(self, cache_id: str, state: CachedPromptState) -> None:
         """Save a cache entry to disk."""

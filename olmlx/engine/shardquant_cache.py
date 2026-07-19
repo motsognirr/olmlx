@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
+import copy
 from pathlib import Path
 from typing import Any
 
@@ -282,6 +283,38 @@ class ShardKVCache(_BaseCache):
         if len(parts_k) == 1:
             return parts_k[0], parts_v[0]
         return mx.concatenate(parts_k, axis=2), mx.concatenate(parts_v, axis=2)
+
+    #: Immutable per-layer calibration constants — shared by reference in
+    #: ``__deepcopy__`` instead of duplicated into every checkpoint snapshot.
+    _SHARED_CONSTANTS = frozenset(
+        {"k_basis", "k_codebook", "v_rotation", "v_codebooks", "k_mean"}
+    )
+
+    def __deepcopy__(self, memo):
+        """Deep-copy hook for the checkpoint snapshot path.
+
+        The default ``copy.deepcopy`` duplicates the read-only calibration
+        constants (``k_basis`` is ``(H, D, D)`` — ~512 KB/layer, ~16 MB per
+        32-layer snapshot — plus the V codebooks / rotation), and
+        ``_estimate_state_bytes`` then charges each duplicate against the
+        prompt-cache RAM budget per stored entry (#634). They are never mutated
+        (only read in ``shard_compress_*``), so share them by reference and
+        deep-copy only the mutable packed buffers. Eager-eval owned arrays first
+        so the snapshot is thread-safe regardless of where it is later consumed
+        (the #284 Metal-stream hazard), mirroring ``TurboQuantKVCache``.
+        """
+        owned = [v for v in self.__dict__.values() if isinstance(v, mx.array)]
+        if owned:
+            mx.eval(owned)
+        cls = type(self)
+        new = cls.__new__(cls)
+        memo[id(self)] = new
+        for k, v in self.__dict__.items():
+            if k in self._SHARED_CONSTANTS:
+                new.__dict__[k] = v
+            else:
+                new.__dict__[k] = copy.deepcopy(v, memo)
+        return new
 
     @property
     def state(self):

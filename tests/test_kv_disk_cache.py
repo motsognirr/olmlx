@@ -378,8 +378,9 @@ class TestPromptCacheStoreEvictAllToDisk:
         )
         disk_dir = tmp_path / "test-model"
         disk_dir.mkdir(parents=True)
-        (disk_dir / "a.safetensors").write_bytes(b"x" * 80)
-        (disk_dir / "b.safetensors").write_bytes(b"x" * 80)
+        # Write via _disk_file_path so remove("a") finds the same (hashed) name.
+        store._disk_file_path("a").write_bytes(b"x" * 80)
+        store._disk_file_path("b").write_bytes(b"x" * 80)
         # Prime the metric by running cleanup.
         store._cleanup_disk()
         assert store.metrics.bytes_on_disk == 160

@@ -27,6 +27,7 @@ cleanup bounds disk use. Remaining v1 limits: no radix-takeover, no KV-quant.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import re
@@ -49,6 +50,15 @@ logger = logging.getLogger(__name__)
 
 def _safe_name(name: str) -> str:
     return re.sub(r"[^\w\-.]", "_", name) or "_default"
+
+
+def _safe_cache_id_name(cache_id: str) -> str:
+    # Append a short hash of the raw cache_id so distinct ids that sanitize to
+    # the same string (e.g. "agent/1" and "agent_1") don't collide onto one
+    # file and silently overwrite each other's spill (#634). Only the per-id
+    # filename needs this — the model-name dir is stable per store.
+    digest = hashlib.sha1(cache_id.encode("utf-8")).hexdigest()[:12]
+    return f"{_safe_name(cache_id)}-{digest}"
 
 
 class VlmPromptCacheStore:
@@ -225,7 +235,7 @@ class VlmPromptCacheStore:
         return self._disk_path / _safe_name(self._model_name)
 
     def _disk_file_path(self, cache_id: str) -> Path:
-        return self._disk_dir() / f"{_safe_name(cache_id)}.safetensors"
+        return self._disk_dir() / f"{_safe_cache_id_name(cache_id)}.safetensors"
 
     def _save_to_disk(self, cache_id: str, state: Any) -> None:
         """Serialize one PromptCacheState to disk. Best-effort: a save failure

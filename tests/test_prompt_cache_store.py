@@ -208,3 +208,15 @@ class TestTake:
         store.set("a", _make_state(1))
         await store.async_take("a")
         assert unlinked == [store._disk_file_path("a")]
+
+    def test_disk_file_path_distinct_ids_do_not_collide(self, tmp_path):
+        """cache_ids that sanitize to the same string (e.g. "agent/1" and
+        "agent_1") must map to different disk files, not silently overwrite
+        each other's spill (#634)."""
+        store = PromptCacheStore(max_slots=4, disk_path=tmp_path, model_name="m")
+        paths = {
+            store._disk_file_path(cid) for cid in ("agent/1", "agent_1", "agent:1")
+        }
+        assert len(paths) == 3
+        # Same id is still stable (round-trips to the same file).
+        assert store._disk_file_path("agent/1") == store._disk_file_path("agent/1")
