@@ -405,5 +405,3 @@ class DFlashDecoder(SpecDecoderBase):
         self._stats_accepted_draft += accepted_drafts
 
         return accepted, self._block_size
-
-
