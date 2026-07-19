@@ -183,8 +183,19 @@ def _get_compiler(tokenizer: Any, vocab_size: int) -> Any:
         cached = _live_value(_compiler_cache.get(key), tokenizer)
         if cached is not None:
             return cached
-        info = xgr.TokenizerInfo.from_huggingface(tokenizer, vocab_size=vocab_size)
-        compiler = xgr.GrammarCompiler(info, max_threads=4)
+    # Build OUTSIDE the lock: ``from_huggingface`` + ``GrammarCompiler`` walk
+    # the full vocabulary (the heaviest step) and would otherwise serialize
+    # every concurrent structured-output request — including ones for
+    # *unrelated* tokenizers — behind this single mutex (#634). The
+    # duplicate-build race is harmless: compilers for the same tokenizer are
+    # equivalent, so the loser of the race just discards its result — the same
+    # losers-discard reconciliation ``_compile_cache`` uses.
+    info = xgr.TokenizerInfo.from_huggingface(tokenizer, vocab_size=vocab_size)
+    compiler = xgr.GrammarCompiler(info, max_threads=4)
+    with _compiler_cache_lock:
+        cached = _live_value(_compiler_cache.get(key), tokenizer)
+        if cached is not None:
+            return cached
         _sweep_dead_entries_locked(_compiler_cache)
         ref = _make_ref(tokenizer)
         if ref is not None:

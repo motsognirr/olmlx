@@ -268,6 +268,16 @@ class TestShardKVCacheStateAndCopy:
         _feed(cache, 40)
         assert not any(isinstance(v, mx.Dtype) for v in cache.__dict__.values())
 
+    def test_deepcopy_shares_calibration_constants(self):
+        """The immutable per-layer calibration constants must be shared by
+        reference in a snapshot, not duplicated (k_basis is (H, D, D)) — that
+        wasted RAM and double-charged the prompt-cache budget (#634)."""
+        cache = _make_cache()
+        _feed(cache, 40)
+        snap = copy.deepcopy(cache)
+        for attr in ("k_basis", "k_codebook", "v_rotation", "v_codebooks"):
+            assert getattr(snap, attr) is getattr(cache, attr), attr
+
 
 class TestMakeShardCache:
     def _calib_entry(self, D=16, H=2, bits=4):

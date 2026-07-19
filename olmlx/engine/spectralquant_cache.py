@@ -11,6 +11,8 @@ import logging
 from pathlib import Path
 from typing import Any
 
+import copy
+
 import mlx.core as mx
 
 from mlx_lm.models.cache import KVCache, _BaseCache, create_attention_mask
@@ -210,6 +212,43 @@ class SpectralQuantKVCache(_BaseCache):
             dtype=input_dtype,
         )
         return k_full[..., : self.offset, :], v_full[..., : self.offset, :]
+
+    #: Immutable per-layer calibration constants — shared by reference in
+    #: ``__deepcopy__`` instead of duplicated into every checkpoint snapshot.
+    _SHARED_CONSTANTS = frozenset(
+        {
+            "rotation_key",
+            "rotation_value",
+            "codebook_sem_key",
+            "codebook_tail_key",
+            "codebook_sem_value",
+            "codebook_tail_value",
+        }
+    )
+
+    def __deepcopy__(self, memo):
+        """Deep-copy hook for the checkpoint snapshot path.
+
+        The default ``copy.deepcopy`` duplicates the read-only rotation
+        matrices + codebooks into every stored entry, which
+        ``_estimate_state_bytes`` then charges against the prompt-cache RAM
+        budget per entry (#634). They are never mutated (only read in
+        ``spectral_quantize``), so share them by reference and deep-copy only
+        the mutable packed buffers. Eager-eval owned arrays first for
+        cross-thread safety (#284), mirroring ``TurboQuantKVCache``.
+        """
+        owned = [v for v in self.__dict__.values() if isinstance(v, mx.array)]
+        if owned:
+            mx.eval(owned)
+        cls = type(self)
+        new = cls.__new__(cls)
+        memo[id(self)] = new
+        for k, v in self.__dict__.items():
+            if k in self._SHARED_CONSTANTS:
+                new.__dict__[k] = v
+            else:
+                new.__dict__[k] = copy.deepcopy(v, memo)
+        return new
 
     @property
     def state(self):

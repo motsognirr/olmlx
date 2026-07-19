@@ -27,6 +27,7 @@ cleanup bounds disk use. Remaining v1 limits: no radix-takeover, no KV-quant.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import re
@@ -48,7 +49,12 @@ logger = logging.getLogger(__name__)
 
 
 def _safe_name(name: str) -> str:
-    return re.sub(r"[^\w\-.]", "_", name) or "_default"
+    # Append a short hash of the raw name so distinct ids that sanitize to the
+    # same string (e.g. "agent/1" and "agent_1") don't collide onto one file
+    # and silently overwrite each other's spill (#634).
+    safe = re.sub(r"[^\w\-.]", "_", name) or "_default"
+    digest = hashlib.sha1(name.encode("utf-8")).hexdigest()[:12]
+    return f"{safe}-{digest}"
 
 
 class VlmPromptCacheStore:
