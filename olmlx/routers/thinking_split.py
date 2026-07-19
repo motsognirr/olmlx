@@ -111,6 +111,7 @@ def split_thinking_parts(text: str, state: dict) -> list[tuple[str, str]]:
     parts: list[tuple[str, str]] = []
     phase = state.get("phase", "detect")
     expected_close = state.get("expected_close", "")
+    pending_strip = bool(state.get("pending_strip"))
     thinking_expected = bool(state.get("thinking_expected"))
     detect_limit = int(
         state.get(
@@ -144,8 +145,9 @@ def split_thinking_parts(text: str, state: dict) -> list[tuple[str, str]]:
                     "split_thinking_parts: orphaned %r at byte %d", close_tag, close_idx
                 )
                 emit("thinking", buf[:close_idx])
-                buf = buf[close_idx + len(close_tag) :].lstrip("\n")
+                buf = buf[close_idx + len(close_tag) :]
                 phase = "passthrough"
+                pending_strip = True
             elif open_idx != -1:
                 emit("content", buf[:open_idx])
                 buf = buf[open_idx + len(open_tag) :]
@@ -186,11 +188,24 @@ def split_thinking_parts(text: str, state: dict) -> list[tuple[str, str]]:
                     buf = buf[-hold:]
                 break
             emit("thinking", buf[:end])
-            buf = buf[end + len(expected_close) :].lstrip("\n")
+            buf = buf[end + len(expected_close) :]
             expected_close = ""
             phase = "passthrough"
+            pending_strip = True
 
         else:  # passthrough
+            if pending_strip:
+                # A thinking block just closed (possibly in a prior chunk).
+                # The model emits trailing ``\n`` after ``</think>`` that the
+                # non-streaming path strips over the whole completion; strip
+                # it here too (issue #686).  Newlines may span chunks, so the
+                # flag persists until a non-newline byte is seen — an all-
+                # newline buffer keeps it armed for the next chunk.
+                stripped = buf.lstrip("\n")
+                pending_strip = not stripped
+                buf = stripped
+                if not buf:
+                    break
             open_idx, open_tag, paired_close = _find_earliest_open(buf)
             if open_idx == -1:
                 longest_partial = _longest_open_tag_suffix(buf)
@@ -209,6 +224,7 @@ def split_thinking_parts(text: str, state: dict) -> list[tuple[str, str]]:
     state["buffer"] = buf
     state["phase"] = phase
     state["expected_close"] = expected_close
+    state["pending_strip"] = pending_strip
     return parts
 
 
@@ -241,6 +257,7 @@ def flush_split_thinking(state: dict) -> tuple[str, str]:
     state["buffer"] = ""
     state["phase"] = "detect"
     state["expected_close"] = ""
+    state["pending_strip"] = False
     state["thinking_expected"] = False
     if not buf:
         return "", ""

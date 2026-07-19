@@ -60,6 +60,31 @@ class TestSplitThinkingStreaming:
         assert content == prefix + "vis"
         assert thinking == "hidden"
 
+    def test_newlines_after_close_in_later_chunk_stripped(self):
+        """Issue #686: the ``\\n\\n`` a model emits after ``</think>`` arrives
+        in a *separate* chunk from the close tag.  The streamed content must
+        strip it to match the non-streaming path (which strips over the whole
+        completion at once), not leak a leading ``\\n\\n``."""
+        state: dict = {}
+        content = ""
+        for chunk in ["<think>reasoning</think>", "\n\n", "answer"]:
+            _, c = split_thinking_streaming(chunk, state)
+            content += c
+        c = flush_split_thinking(state)[1]
+        content += c
+        assert content == "answer"
+
+    def test_newlines_after_close_split_across_boundary_stripped(self):
+        """Issue #686: newlines split across the close-tag boundary (one in
+        the closing chunk, one in the next) are all stripped."""
+        state: dict = {}
+        content = ""
+        for chunk in ["<think>reasoning</think>\n", "\nanswer"]:
+            _, c = split_thinking_streaming(chunk, state)
+            content += c
+        content += flush_split_thinking(state)[1]
+        assert content == "answer"
+
     def test_detect_limit_state_override_honored(self):
         """An explicit ``state["detect_limit"]`` overrides the default so
         callers can widen (or narrow) the detect window."""
@@ -830,6 +855,52 @@ class TestChatRouter:
         assert "</think>" not in content
         assert "</think>" not in thinking
         assert content.strip() == "391"
+
+    @pytest.mark.asyncio
+    async def test_chat_streaming_no_leading_newline_after_think_across_chunks(
+        self, app_client
+    ):
+        """Issue #686: end-to-end through the ``/api/chat`` streaming surface,
+        the ``</think>`` close tag and the trailing ``\\n\\n`` arrive in
+        *separate* chunks (as a real model emits them).  The assembled
+        ``message.content`` must not leak a leading newline — parity with the
+        non-streaming response, which strips it.  Asserts exact content (no
+        ``.strip()``) so a regression in the caller's state threading is
+        caught, not just in the splitter unit."""
+
+        async def mock_stream(*args, **kwargs):
+            async def gen():
+                yield {"thinking_expected": True}
+                yield {"text": "<think>reasoning", "done": False}
+                yield {"text": "</think>", "done": False}
+                yield {"text": "\n\n", "done": False}
+                yield {"text": "9 × 6 = 54.", "done": False}
+                yield {"text": "", "done": True, "stats": TimingStats()}
+
+            return gen()
+
+        with patch("olmlx.routers.chat.generate_chat", side_effect=mock_stream):
+            resp = await app_client.post(
+                "/api/chat",
+                json={
+                    "model": "qwen3",
+                    "messages": [{"role": "user", "content": "9*6"}],
+                    "stream": True,
+                },
+            )
+
+        assert resp.status_code == 200
+        content = ""
+        thinking = ""
+        for line in resp.text.strip().split("\n"):
+            if not line.strip():
+                continue
+            msg = json.loads(line).get("message", {})
+            content += msg.get("content", "")
+            thinking += msg.get("thinking", "") or ""
+
+        assert content == "9 × 6 = 54."
+        assert thinking == "reasoning"
 
     @pytest.mark.asyncio
     async def test_chat_streaming_orphan_preamble_over_limit_leaks_to_content(
