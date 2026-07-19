@@ -54,6 +54,7 @@ class TestPromptsList:
             "instruction",
             "multi-turn",
             "long-context",
+            "agentic",
         ):
             assert expected in cats, f"Missing category {expected}"
 
@@ -69,3 +70,20 @@ class TestPromptsList:
         multi = [p for p in PROMPTS if p.category == "multi-turn"]
         assert len(multi) > 0
         assert len(multi[0].messages) >= 3
+
+    def test_agentic_prompt_exists_and_is_large(self):
+        agentic = [p for p in PROMPTS if p.category == "agentic"]
+        assert len(agentic) == 1
+        p = agentic[0]
+        assert p.name == "agentic-69k"
+        # System message must carry tool definitions (the segment that creates
+        # the message boundary #503 cares about).
+        assert p.messages[0]["role"] == "system"
+        assert "tool" in p.messages[0]["content"].lower()
+        # Multi-turn agentic transcript.
+        assert len(p.messages) >= 3
+        # ~69k tokens at <= 4 chars/token -> >= 240k chars total content.
+        total_chars = sum(len(m["content"]) for m in p.messages)
+        assert total_chars >= 240_000, total_chars
+        # Small decode budget so prefill dominates the sample.
+        assert p.max_tokens <= 64

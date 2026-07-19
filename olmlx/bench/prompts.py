@@ -27,6 +27,30 @@ _LONG_CONTEXT_BODY = (
     _LONG_CONTEXT_PARAGRAPH * (70_000 // len(_LONG_CONTEXT_PARAGRAPH) + 1)
 )[:70_000]
 
+# Deterministic agentic "repo context" block — a realistic mix of code, diffs,
+# and tool output, repeated and truncated to a fixed length. Content variety
+# does not change prefill cost; determinism across runs does. Sized so the full
+# conversation is ~69k tokens (the agentic prefill case from #503), i.e.
+# ~276k chars at the ~4 chars/token the long-context prompt already assumes.
+_AGENTIC_CONTEXT_UNIT = (
+    "def handle_request(req: Request) -> Response:\n"
+    "    # Validate, dispatch, and record metrics for one inbound call.\n"
+    "    ctx = build_context(req.headers, req.body)\n"
+    "    if not ctx.authorized:\n"
+    "        raise PermissionError(f'unauthorized: {ctx.principal!r}')\n"
+    "    result = dispatch(ctx, req.route)\n"
+    "    METRICS.observe('request', ctx.route, result.status)\n"
+    "    return Response(status=result.status, body=result.payload)\n"
+    "\n"
+    "TOOL CALL: read_file(path='engine/router.py', start=1, end=40)\n"
+    "TOOL RESULT: 40 lines returned; router dispatches on req.route via a\n"
+    "  registry populated at import time; see register_route() below.\n"
+    "\n"
+)
+_AGENTIC_BODY = (_AGENTIC_CONTEXT_UNIT * (276_000 // len(_AGENTIC_CONTEXT_UNIT) + 1))[
+    :276_000
+]
+
 
 @dataclass(frozen=True)
 class BenchPrompt:
@@ -150,5 +174,41 @@ PROMPTS: list[BenchPrompt] = [
             },
         ],
         max_tokens=64,
+    ),
+    BenchPrompt(
+        name="agentic-69k",
+        category="agentic",
+        messages=[
+            {
+                "role": "system",
+                "content": (
+                    "You are a coding agent. You have these tools: "
+                    "read_file(path, start, end), write_file(path, content), "
+                    "run_bash(cmd), grep(pattern, path). Call one tool per turn "
+                    "and wait for its result before the next.\n\n"
+                    "Repository context follows:\n"
+                    f"{_AGENTIC_BODY}"
+                ),
+            },
+            {
+                "role": "user",
+                "content": "Trace how an inbound request reaches dispatch().",
+            },
+            {
+                "role": "assistant",
+                "content": (
+                    "I'll start by reading the router.\n"
+                    "TOOL CALL: read_file(path='engine/router.py', start=1, end=40)"
+                ),
+            },
+            {
+                "role": "user",
+                "content": (
+                    "TOOL RESULT: router dispatches on req.route via a registry "
+                    "populated at import time. Now summarize the path in one line."
+                ),
+            },
+        ],
+        max_tokens=32,
     ),
 ]

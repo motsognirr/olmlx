@@ -394,6 +394,47 @@ class TestChunkedPrefill:
         assert max(draft.calls) <= _PREFILL_CHUNK
         assert max(target.calls) <= _PREFILL_CHUNK
 
+    def test_prefill_records_lane_breakdown(self):
+        """SpeculativeDecoder.prefill populates _last_prefill_breakdown with
+        per-lane timings and covered/fresh token counts.
+
+        Routed through the segmented/cache-reuse path (``cache_slots > 0`` +
+        a ``segmented`` prompt) because that is the only path that calls
+        ``_drive_spec_prefill`` — ``_prefill_impl``'s no-``segmented``
+        fallback prefills target/draft directly via ``_prefill_last_logit``/
+        ``_chunked_prefill`` and never reaches it. This mirrors production:
+        ``speculative_stream.py`` always passes ``segmented`` and the
+        default ``speculative_cache_slots`` config is 2 (reuse enabled), so
+        real traffic exercises this same path.
+        """
+        from olmlx.engine.prompt_cache.checkpoint import Segment, SegmentedPrompt
+        from olmlx.engine.speculative import _PREFILL_CHUNK, SpeculativeDecoder
+
+        draft = _RecordingModel(MockModel(32, 16))
+        target = _RecordingModel(MockModel(32, 16))
+        decoder = SpeculativeDecoder(
+            draft_model=draft,
+            target_model=target,
+            num_speculative_tokens=2,
+            cache_slots=2,
+        )
+        n = _PREFILL_CHUNK * 2 + 5
+        # Single segment spanning the whole prompt: boundary_offsets() == [n],
+        # which is not an *interior* boundary, so the "deepest is None"
+        # single-pass branch of _drive_spec_prefill runs (same chunking as
+        # test_draft_prefill_chunks_long_prompt above).
+        seg = SegmentedPrompt(segments=[Segment(tokens=[0] * n, role="user")])
+        decoder.prefill(mx.array([seg.flatten()], dtype=mx.int32), segmented=seg)
+
+        bd = decoder._last_prefill_breakdown
+        assert bd["fresh_tokens"] == n
+        assert bd["covered_tokens"] == 0
+        assert bd["n_lanes"] == 2
+        assert bd["target_lane_ns"] >= 0
+        assert bd["draft_lane_ns"] >= 0
+        # 2 full prefix chunks + a remainder chunk + the pass-2 last-token forward.
+        assert bd["n_target_chunks"] >= 3
+
 
 class _CausalAttention:
     """Minimal scaled-dot-product attention over a real KV cache.

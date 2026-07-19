@@ -41,6 +41,25 @@ from olmlx.utils.streaming import CancellableStream, StreamToken
 from olmlx.utils.timing import TimingStats
 
 
+@pytest.fixture
+def otel_memory_exporter():
+    """Install tracing with an in-memory span exporter; tear down after."""
+    from opentelemetry.sdk.trace import TracerProvider
+    from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+    from opentelemetry.sdk.trace.export.in_memory_span_exporter import (
+        InMemorySpanExporter,
+    )
+
+    from olmlx.utils import tracing
+
+    provider = TracerProvider()
+    exporter = InMemorySpanExporter()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    tracing.install_test_provider(provider)
+    yield tracing, exporter
+    tracing.shutdown_tracing()
+
+
 class TestDeriveTimingStats:
     """Unit tests for _derive_timing_stats — the helper that converts
     mlx-lm's rates + a wall-clock fallback into Ollama-convention durations."""
@@ -2218,6 +2237,54 @@ class TestGenerateCompletion:
             done_stats.prompt_eval_duration + done_stats.eval_duration
             <= done_stats.total_duration
         )
+
+    @pytest.mark.asyncio
+    async def test_streaming_ttft_span_is_measured(
+        self, mock_manager, otel_memory_exporter
+    ):
+        """decode span's ttft_ns reflects real time-to-first-token, not the
+        rate-reconstructed heuristic. A 30ms pre-first-token sleep must show up
+        as ttft_ns >= 20ms even though prompt_tps is huge (heuristic ~5us)."""
+        _tracing, exporter = otel_memory_exporter
+        mock_mx = MagicMock()
+
+        tok = StreamToken(
+            text="Hi",
+            token=1,
+            prompt_tokens=5,
+            generation_tokens=1,
+            prompt_tps=1_000_000.0,  # heuristic prefill ~= 5us
+            generation_tps=1_000_000.0,
+        )
+        state = {"first": True}
+
+        async def anext_impl():
+            if state["first"]:
+                state["first"] = False
+                await asyncio.sleep(0.03)  # 30ms of "prefill"
+                return tok
+            raise StopAsyncIteration
+
+        mock_stream = MagicMock(spec=CancellableStream)
+        mock_stream.drain_and_join = AsyncMock()
+        mock_stream._thread = None
+        mock_stream.__aiter__ = lambda self: self
+        mock_stream.__anext__ = lambda self: anext_impl()
+
+        with patch("olmlx.engine.inference.mx", mock_mx):
+            with patch(
+                "olmlx.engine.inference.async_mlx_stream", return_value=mock_stream
+            ):
+                gen = await generate_completion(
+                    mock_manager, "qwen3", "Hello", stream=True
+                )
+                async for _ in gen:
+                    pass
+
+        decode_spans = [s for s in exporter.get_finished_spans() if s.name == "decode"]
+        assert decode_spans, "decode span was not recorded"
+        ttft_ns = dict(decode_spans[0].attributes)["ttft_ns"]
+        assert ttft_ns >= 20_000_000, f"ttft_ns {ttft_ns} looks heuristic, not measured"
 
     @pytest.mark.asyncio
     async def test_streaming_prepends_thinking_expected_meta(self, mock_manager):

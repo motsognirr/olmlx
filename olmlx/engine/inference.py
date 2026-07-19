@@ -3687,11 +3687,15 @@ async def _stream_completion(
         ):
             with Timer() as eval_timer:
                 inf_start = time.monotonic()
+                prefill_start_ns = time.perf_counter_ns()
+                ttft_measured_ns: int | None = None
                 token = None
                 stop_scanner = StopScanner(
                     stop_sequences, thinking_aware=thinking_expected
                 )
                 async for token in stream:
+                    if ttft_measured_ns is None:
+                        ttft_measured_ns = time.perf_counter_ns() - prefill_start_ns
                     # Always accumulate for prompt cache (raw stream, not filtered)
                     stats.eval_count = token.generation_tokens
                     # Report the full prompt size to the caller — when the
@@ -3782,12 +3786,31 @@ async def _stream_completion(
                 {
                     "eval_count": stats.eval_count,
                     "decode_tok_s": _metrics._decode_tps(stats),
-                    "ttft_ns": stats.prompt_eval_duration,
+                    "ttft_ns": (
+                        ttft_measured_ns
+                        if ttft_measured_ns is not None
+                        else stats.prompt_eval_duration
+                    ),
+                    "ttft_measured": ttft_measured_ns is not None,
                     "cache_hit": bool(full_prompt_tokens)
                     and token is not None
                     and (token.prompt_tokens or 0) < len(full_prompt_tokens),
                 }
             )
+            if ttft_measured_ns is not None and token is not None:
+                _fresh = token.prompt_tokens or 0
+                _full = (
+                    len(full_prompt_tokens)
+                    if full_prompt_tokens is not None
+                    else _fresh
+                )
+                logger.info(
+                    "prefill %.2fs (fresh %d/%d tok, cache-covered %d)",
+                    ttft_measured_ns / 1e9,
+                    _fresh,
+                    _full,
+                    max(0, _full - _fresh),
+                )
 
         stats.total_duration = total_timer.duration_ns
         if not timed_out:
