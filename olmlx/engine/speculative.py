@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import logging
 import threading
+import time
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -402,6 +403,7 @@ def _drive_spec_prefill(
     lanes: list[tuple[Any, list]],
     cancel_event: threading.Event | None,
     on_boundary: Any,
+    breakdown: dict[str, int] | None = None,
 ) -> mx.array:
     """Forward each ``(model, cache)`` lane over ``flat[already_covered:]`` and
     return ``lanes[0]`` (the target)'s last-position logit (lazy).
@@ -435,17 +437,28 @@ def _drive_spec_prefill(
         if already_covered < b < n:
             deepest = b
 
+    target_model = lanes[0][0]
+    _acc = {"target_ns": 0, "draft_ns": 0, "target_chunks": 0}
+
     def _arr(start: int, end: int) -> mx.array:
         return mx.array(flat[start:end], dtype=mx.int32)[None, :]
 
     def _fill(model: Any, cache: list, start: int, end: int) -> None:
+        is_target = model is target_model
         pos = start
         while pos < end:
             if cancel_event is not None and cancel_event.is_set():
                 raise PrefillCancelled()
             stop = min(pos + _PREFILL_CHUNK, end)
+            _t0 = time.perf_counter_ns()
             model(_arr(pos, stop), cache=cache)
             _eval_cache(cache)
+            _dt = time.perf_counter_ns() - _t0
+            if is_target:
+                _acc["target_ns"] += _dt
+                _acc["target_chunks"] += 1
+            else:
+                _acc["draft_ns"] += _dt
             mx.clear_cache()
             pos = stop
 
@@ -453,16 +466,35 @@ def _drive_spec_prefill(
         # Fill [start, end-1] (logits discarded — keeps lm_head out of the eval
         # graph over the prefix), then forward the final token for the seeding
         # logit (``_prefill_last_logit`` semantics).
-        target_model, target_cache = lanes[0]
-        _fill(target_model, target_cache, start, end - 1)
+        target_model_, target_cache = lanes[0]
+        _fill(target_model_, target_cache, start, end - 1)
         if cancel_event is not None and cancel_event.is_set():
             raise PrefillCancelled()
-        return _logits(target_model(_arr(end - 1, end), cache=target_cache))[0, -1, :]
+        _t0 = time.perf_counter_ns()
+        _out = _logits(target_model_(_arr(end - 1, end), cache=target_cache))[0, -1, :]
+        _acc["target_ns"] += time.perf_counter_ns() - _t0
+        _acc["target_chunks"] += 1
+        return _out
+
+    def _record() -> None:
+        if breakdown is not None:
+            breakdown.update(
+                {
+                    "covered_tokens": already_covered,
+                    "fresh_tokens": n - already_covered,
+                    "target_lane_ns": _acc["target_ns"],
+                    "draft_lane_ns": _acc["draft_ns"],
+                    "n_target_chunks": _acc["target_chunks"],
+                    "n_lanes": len(lanes),
+                }
+            )
 
     if deepest is None:
         for model, cache in lanes[1:]:
             _fill(model, cache, already_covered, n)
-        return _target_last_logit(already_covered, n)
+        result = _target_last_logit(already_covered, n)
+        _record()
+        return result
 
     # Chunk 1: uncovered prefix up to the deepest interior boundary (all lanes).
     for model, cache in lanes:
@@ -472,7 +504,9 @@ def _drive_spec_prefill(
     # captures the seeding logit at the final position.
     for model, cache in lanes[1:]:
         _fill(model, cache, deepest, n)
-    return _target_last_logit(deepest, n)
+    result = _target_last_logit(deepest, n)
+    _record()
+    return result
 
 
 class SpeculativeDecoder(SpecDecoderBase):
@@ -840,6 +874,7 @@ class SpeculativeDecoder(SpecDecoderBase):
             ],
             cancel_event=cancel_event,
             on_boundary=lambda boundary: self._store_snapshot(flat[:boundary]),
+            breakdown=self._last_prefill_breakdown,
         )
 
     def _store_snapshot(self, tokens: list[int]) -> None:
@@ -1614,6 +1649,7 @@ class PromptLookupDecoder(SpecDecoderBase):
             lanes=[(self._target, self._target_cache)],
             cancel_event=cancel_event,
             on_boundary=lambda boundary: self._store_snapshot(flat[:boundary]),
+            breakdown=self._last_prefill_breakdown,
         )
         self._cache_seq_len = n
         self._last_reused_tokens = already_covered

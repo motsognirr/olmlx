@@ -316,6 +316,11 @@ class SpecDecoderBase(abc.ABC):
         self._stats_proposed: int = 0
         self._stats_accepted_draft: int = 0
 
+        # Per-request prefill breakdown, populated by strategies that route
+        # through _drive_spec_prefill; surfaced on the spec.prefill span and
+        # read after _prefill_impl returns. Empty for strategies that don't.
+        self._last_prefill_breakdown: dict[str, int] = {}
+
         # Quant descriptor of the target the draft was trained against.
         # Set by subclasses from the draft config's target_quant field.
         self._target_quant: str = ""
@@ -355,10 +360,10 @@ class SpecDecoderBase(abc.ABC):
             "spec.prefill",
             strategy=self._strategy_label,
             prompt_tokens=int(prompt.shape[-1]),
-        ):
+        ) as _sp:
             self.reset()
             try:
-                return self._prefill_impl(
+                first = self._prefill_impl(
                     prompt, segmented=segmented, cancel_event=cancel_event
                 )
             except Exception:
@@ -366,6 +371,16 @@ class SpecDecoderBase(abc.ABC):
                 # errors per step so the caller sees the original error.
                 self.reset()
                 raise
+            if self._last_prefill_breakdown:
+                _sp.set_attributes(
+                    {k: int(v) for k, v in self._last_prefill_breakdown.items()}
+                )
+                logger.debug(
+                    "spec prefill breakdown [%s]: %s",
+                    self._strategy_label,
+                    self._last_prefill_breakdown,
+                )
+            return first
 
     def step(self) -> tuple[list[int], int]:
         """One speculative decoding step: draft, verify, trim.
@@ -430,6 +445,7 @@ class SpecDecoderBase(abc.ABC):
         self._stats_steps = 0
         self._stats_proposed = 0
         self._stats_accepted_draft = 0
+        self._last_prefill_breakdown = {}
         self._reset_state()
 
     def close(self) -> None:
