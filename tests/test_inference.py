@@ -60,6 +60,53 @@ def otel_memory_exporter():
     tracing.shutdown_tracing()
 
 
+class TestPrefillCoverage:
+    """Unit tests for _prefill_coverage — (covered, fresh, cache_hit) for the
+    prefill summary. Covered must come from the cache-reuse decision
+    (cache_read_tokens), NOT mlx-lm's post-hoc token.prompt_tokens, which
+    reports 1 on the checkpoint/deferred-prefill path (#503 findings)."""
+
+    def test_cold_checkpoint_path_counts_all_fresh(self):
+        # The bug: on a cold hybrid-GDN prefill mlx-lm reports prompt_tokens=1,
+        # but the cache was empty (cache_read_tokens=0) and all 69445 tokens
+        # were freshly prefilled. Must be (0, 69445, False) — NOT (0, 1, True).
+        from olmlx.engine.inference import _prefill_coverage
+
+        covered, fresh, hit = _prefill_coverage(
+            cache_read_tokens=0,
+            cache_creation_tokens=69445,
+            full_prompt_tokens=[0] * 69445,
+            stream_prompt_tokens=1,
+        )
+        assert (covered, fresh, hit) == (0, 69445, False)
+
+    def test_warm_checkpoint_path_counts_reused_prefix(self):
+        from olmlx.engine.inference import _prefill_coverage
+
+        covered, fresh, hit = _prefill_coverage(
+            cache_read_tokens=69444,
+            cache_creation_tokens=1,
+            full_prompt_tokens=[0] * 69445,
+            stream_prompt_tokens=1,
+        )
+        assert (covered, fresh, hit) == (69444, 1, True)
+
+    def test_no_cache_falls_back_to_stream_prompt_tokens(self):
+        # No prompt cache: full_prompt_tokens is None and cache counts are 0,
+        # so the real prompt size is mlx-lm's stream count (accurate on that
+        # flat path). covered=0, no hit.
+        from olmlx.engine.inference import _prefill_coverage
+
+        assert _prefill_coverage(0, 0, None, 42) == (0, 42, False)
+
+    def test_vlm_path_uses_cache_counts_when_full_is_none(self):
+        # VLM: full_prompt_tokens is None (text count misses image patches) but
+        # cache_read/creation come from mlx_vlm and are accurate.
+        from olmlx.engine.inference import _prefill_coverage
+
+        assert _prefill_coverage(10, 90, None, 5) == (10, 90, True)
+
+
 class TestDeriveTimingStats:
     """Unit tests for _derive_timing_stats — the helper that converts
     mlx-lm's rates + a wall-clock fallback into Ollama-convention durations."""
