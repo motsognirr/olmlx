@@ -46,8 +46,12 @@ from olmlx.engine.gdn_rollback import (
     get_model_layers as _get_layers,
 )
 from olmlx.engine.eagle.draft_model import EagleDraftModel
-from olmlx.engine.spec_decoder_base import SpecDecoderBase, _trim_recent_cache
-from olmlx.engine.speculative import _eval_cache
+from olmlx.engine.spec_decoder_base import (
+    SpecDecoderBase,
+    _logits,
+    _trim_recent_cache,
+)
+from olmlx.engine.speculative import PrefillCancelled, _chunked_prefill, _eval_cache
 
 try:
     from mlx_lm.models.cache import (
@@ -59,11 +63,6 @@ except ImportError:  # pragma: no cover - mlx-lm always installed in production
     can_trim_prompt_cache = None  # type: ignore[assignment]
 
 logger = logging.getLogger(__name__)
-
-
-def _logits(out: Any) -> mx.array:
-    # mlx-vlm wraps logits in a dataclass; mlx-lm returns the raw array.
-    return getattr(out, "logits", out)
 
 
 class EagleDecoder(SpecDecoderBase):
@@ -294,7 +293,20 @@ class EagleDecoder(SpecDecoderBase):
         if prompt.shape[1] > 1:
             if self._capture is not None:
                 self._capture.use_buffer(None)
-            self._target(prompt[:, :-1], cache=self._target_cache)
+            # Pass 1 is sub-chunked (mirrors MTP / classic / PLD, #628): a
+            # single forward over a long prefix forces ``lm_head`` over every
+            # position — a [1, seq-1, vocab] tensor that exceeds Metal's
+            # single-buffer limit and 500s ~38k-token prompts. ``_chunked_prefill``
+            # bounds peak activation memory to one sub-chunk (KV-cached
+            # attention is chunking-invariant, so the cache state is identical)
+            # and honours ``cancel_event`` at each sub-chunk boundary, so a
+            # client disconnect interrupts the prefill.
+            _chunked_prefill(
+                self._target,
+                prompt[:, :-1],
+                self._target_cache,
+                cancel_event=cancel_event,
+            )
             # Force the pass-1 hidden (if captured) before dropping the
             # slot reference, mirroring DFlash. Correctness does not
             # require it today — _eval_cache transitively materialises
@@ -309,6 +321,8 @@ class EagleDecoder(SpecDecoderBase):
             _eval_cache(self._target_cache)
             if self._capture is not None:
                 self._capture.use_buffer(self._capture_buffer)
+            if cancel_event is not None and cancel_event.is_set():
+                raise PrefillCancelled()
             target_out = self._target(prompt[:, -1:], cache=self._target_cache)
         else:
             if self._capture is not None:

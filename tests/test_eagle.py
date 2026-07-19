@@ -12,6 +12,8 @@ Covers:
 
 from __future__ import annotations
 
+import threading
+
 import mlx.core as mx
 import mlx.nn as nn
 import pytest
@@ -893,3 +895,53 @@ class TestEagleDecoderGDNPath:
         decoder.reset()
         # close should fire on reset
         assert captured_calls["close"] == 1
+
+
+class TestEagleDecoderChunkedPrefill:
+    """Pass-1 of ``prefill`` must sub-chunk the prefix and honour
+    ``cancel_event`` — mirrors the MTP decoder (#628). A single un-chunked
+    forward over a long prefix materialises ``lm_head`` over every position
+    (a ``[1, seq-1, vocab]`` tensor) which OOMs Metal's single-buffer limit
+    on long agentic prompts."""
+
+    def test_prefill_subchunks_long_prefix(self, monkeypatch):
+        from olmlx.engine import speculative
+
+        monkeypatch.setattr(speculative, "_PREFILL_CHUNK", 4)
+
+        decoder, target, _ = _make_decoder()
+
+        seq_lens: list[int] = []
+        orig_call = type(target).__call__
+
+        def recording_call(self, input_ids, cache=None):
+            seq_lens.append(input_ids.shape[1])
+            return orig_call(self, input_ids, cache=cache)
+
+        monkeypatch.setattr(type(target), "__call__", recording_call)
+
+        prompt = mx.arange(1, 21, dtype=mx.int32)[None, :]  # (1, 20)
+        decoder.prefill(prompt)
+
+        # No single target forward may span more than one sub-chunk's worth
+        # of prefix tokens; the trailing single-token pass-2 forward is
+        # allowed.
+        assert seq_lens, "target was never called"
+        assert max(seq_lens) <= 4, f"un-chunked prefix forward: {seq_lens}"
+        assert seq_lens[-1] == 1, f"pass-2 should be a single token: {seq_lens}"
+
+    def test_prefill_honors_cancel_event(self):
+        """A cancel_event set before prefill aborts with PrefillCancelled
+        and leaves the decoder reset (caches dropped, target un-patched)."""
+        from olmlx.engine.speculative import PrefillCancelled
+
+        decoder, _, _ = _make_decoder()
+        cancel = threading.Event()
+        cancel.set()
+
+        prompt = mx.arange(1, 21, dtype=mx.int32)[None, :]
+        with pytest.raises(PrefillCancelled):
+            decoder.prefill(prompt, cancel_event=cancel)
+
+        assert decoder._target_cache is None
+        assert decoder._patched is False

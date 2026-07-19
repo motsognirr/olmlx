@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import logging
 import threading
-from typing import Any, cast
+from typing import Any
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -20,7 +20,7 @@ except ImportError:  # pragma: no cover — mlx-lm is always available at runtim
     trim_prompt_cache = None
 
 from olmlx.engine.gdn_rollback import find_gdn_class, get_model_layers
-from olmlx.engine.spec_decoder_base import SpecDecoderBase
+from olmlx.engine.spec_decoder_base import SpecDecoderBase, _logits
 from olmlx.engine.speculative import PrefillCancelled
 
 logger = logging.getLogger(__name__)
@@ -58,10 +58,6 @@ _LM_HEAD_PATHS: tuple[tuple[str, ...], ...] = (
     ("model", "lm_head"),
     ("language_model", "model", "lm_head"),
 )
-
-
-def _logits(out: Any) -> mx.array:
-    return cast(mx.array, getattr(out, "logits", out))
 
 
 def _eval_cache(cache: list) -> None:
