@@ -136,25 +136,53 @@ async def _lifespan_inner(app: FastAPI):
     )
     manager.start_expiry_checker()
 
-    settings.models_dir.mkdir(parents=True, exist_ok=True)
+    # Everything from here to ``yield`` acquires resources whose teardown lives
+    # in the post-``yield`` shutdown block — which never runs if startup raises.
+    # Roll back on failure so a failed startup doesn't orphan the expiry task or
+    # leave the stats collector registered in the module-level REGISTRY (which
+    # would poison every later create_app() with a duplicate-collector error,
+    # e.g. across tests in one process) — #626.
+    try:
+        settings.models_dir.mkdir(parents=True, exist_ok=True)
 
-    app.state.registry = registry
-    app.state.model_manager = manager
-    app.state.model_store = store
+        app.state.registry = registry
+        app.state.model_manager = manager
+        app.state.model_store = store
 
-    # Lazy gauge/counter collector reads the manager at scrape time.
-    stats_collector = metrics_mod.OlmlxStatsCollector(manager)
-    metrics_mod.REGISTRY.register(stats_collector)
-    app.state.metrics_collector = stats_collector
+        # Lazy gauge/counter collector reads the manager at scrape time.
+        stats_collector = metrics_mod.OlmlxStatsCollector(manager)
+        metrics_mod.REGISTRY.register(stats_collector)
+        app.state.metrics_collector = stats_collector
 
-    # Autonomous agent (#445): recover crash-orphaned runs at startup. The
-    # service itself is built in create_app() (gated on agent_enabled) so the
-    # routes exist without a lifespan; this only runs the async startup scan.
-    agent_service = (
-        getattr(app.state, "agent_service", None) if settings.agent_enabled else None
-    )
-    if agent_service is not None:
-        await agent_service.startup()
+        # Autonomous agent (#445): recover crash-orphaned runs at startup. The
+        # service itself is built in create_app() (gated on agent_enabled) so
+        # the routes exist without a lifespan; this only runs the async scan.
+        agent_service = (
+            getattr(app.state, "agent_service", None)
+            if settings.agent_enabled
+            else None
+        )
+        if agent_service is not None:
+            await agent_service.startup()
+    except Exception:
+        # Each rollback step is independently guarded: if manager.stop() raises
+        # (e.g. a Metal cache-flush failure), the collector unregister must
+        # still run, or the duplicate-collector poison this handler exists to
+        # prevent would come right back on the next create_app().
+        try:
+            await manager.stop()
+        except Exception:
+            logger.exception("manager.stop() failed during failed-startup rollback")
+        collector = getattr(app.state, "metrics_collector", None)
+        if collector is not None:
+            try:
+                metrics_mod.REGISTRY.unregister(collector)
+            except Exception:
+                logger.debug(
+                    "Failed to unregister collector on failed startup",
+                    exc_info=True,
+                )
+        raise
 
     logger.info("olmlx server started on %s:%d", settings.host, settings.port)
     yield

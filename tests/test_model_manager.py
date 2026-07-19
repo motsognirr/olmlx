@@ -520,6 +520,54 @@ class TestModelManager:
         await mock_manager.stop()
         assert mock_manager._loaded == {}
 
+    async def test_stop_closes_resident_models(self, mock_manager):
+        """stop() must close still-resident models, not just clear the dict —
+        otherwise Flash pools / whisper holder / batch schedulers leak (#626)."""
+        closed: list[str] = []
+        mock_manager._close_loaded_model = lambda lm: closed.append(lm.name)  # type: ignore[assignment]
+        resident = [lm.name for lm in mock_manager._loaded.values()]
+        assert resident  # precondition: at least one model loaded
+        await mock_manager.stop()
+        assert mock_manager._loaded == {}
+        assert closed == resident
+
+    def test_pop_lru_evictees_closes_partial_on_failure(
+        self, registry, mock_store, monkeypatch
+    ):
+        """When eviction pops some victims then fails (all remaining models in
+        use), the already-popped victims must be closed, not leaked (#626)."""
+        monkeypatch.setattr("olmlx.engine.model_manager.settings.max_loaded_models", 1)
+        manager = ModelManager(registry, mock_store)
+        closed: list[str] = []
+        manager._close_loaded_model = lambda lm: closed.append(lm.name)  # type: ignore[assignment]
+
+        active = LoadedModel(
+            name="active:latest",
+            hf_path="a/repo",
+            model=MagicMock(),
+            tokenizer=MagicMock(),
+            template_caps=TemplateCaps(),
+        )
+        active.acquire_ref()  # pinned — cannot be evicted
+        idle = LoadedModel(
+            name="idle:latest",
+            hf_path="b/repo",
+            model=MagicMock(),
+            tokenizer=MagicMock(),
+            template_caps=TemplateCaps(),
+            loaded_at=time.time() - 100,
+        )
+        manager._loaded["active:latest"] = active
+        manager._loaded["idle:latest"] = idle
+
+        with pytest.raises(RuntimeError, match="in use"):
+            manager._pop_lru_evictees()
+
+        # The idle victim was popped then closed; the active one stays resident.
+        assert closed == ["idle:latest"]
+        assert "idle:latest" not in manager._loaded
+        assert "active:latest" in manager._loaded
+
     @pytest.mark.asyncio
     async def test_stop_cancels_pending_cleanups(self, mock_manager):
         """stop() cancels and clears pending cleanup tasks."""

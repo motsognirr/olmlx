@@ -658,3 +658,74 @@ class TestRequestIDFormatter:
         result = formatter.format(record)
         assert "Processing request" in result
         assert "[abc12345]" not in result
+
+
+class TestLifespanRollback:
+    @pytest.mark.asyncio
+    async def test_failed_startup_unregisters_collector(
+        self, registry, mock_store, monkeypatch, tmp_path
+    ):
+        """A startup that fails after the stats collector is registered must
+        unregister it (and stop the manager), so a later create_app()/lifespan
+        doesn't hit a duplicate-collector error against the module-level
+        REGISTRY (#626)."""
+        from unittest.mock import AsyncMock
+
+        from olmlx.app import create_app, lifespan
+
+        monkeypatch.setattr("olmlx.app.settings.models_dir", tmp_path / "m")
+
+        # First startup fails inside the agent scan (after the collector is
+        # registered).
+        app = create_app()
+        monkeypatch.setattr("olmlx.app.settings.agent_enabled", True)
+        failing = MagicMock()
+        failing.startup = AsyncMock(side_effect=RuntimeError("startup boom"))
+        app.state.agent_service = failing
+
+        with pytest.raises(RuntimeError, match="startup boom"):
+            async with lifespan(app):
+                pass
+
+        # A second, clean startup must succeed — the first must not have left a
+        # collector registered.
+        monkeypatch.setattr("olmlx.app.settings.agent_enabled", False)
+        app2 = create_app()
+        async with lifespan(app2):
+            pass
+
+    @pytest.mark.asyncio
+    async def test_failed_startup_unregisters_collector_even_if_stop_fails(
+        self, registry, mock_store, monkeypatch, tmp_path
+    ):
+        """The rollback must unregister the collector even if manager.stop()
+        raises (e.g. a Metal flush failure) — otherwise the duplicate-collector
+        poison comes right back on the next create_app() (#626)."""
+        from unittest.mock import AsyncMock
+
+        from olmlx.app import create_app, lifespan
+
+        monkeypatch.setattr("olmlx.app.settings.models_dir", tmp_path / "m")
+        # stop() fails only on the first call (the rollback); the second run's
+        # clean shutdown succeeds.
+        monkeypatch.setattr(
+            "olmlx.engine.model_manager.ModelManager.stop",
+            AsyncMock(side_effect=[RuntimeError("stop boom")] + [None] * 10),
+        )
+
+        app = create_app()
+        monkeypatch.setattr("olmlx.app.settings.agent_enabled", True)
+        failing = MagicMock()
+        failing.startup = AsyncMock(side_effect=RuntimeError("startup boom"))
+        app.state.agent_service = failing
+
+        with pytest.raises(RuntimeError, match="startup boom"):
+            async with lifespan(app):
+                pass
+
+        # A second, clean startup must still succeed — the collector was
+        # unregistered despite stop() raising during the rollback.
+        monkeypatch.setattr("olmlx.app.settings.agent_enabled", False)
+        app2 = create_app()
+        async with lifespan(app2):
+            pass
