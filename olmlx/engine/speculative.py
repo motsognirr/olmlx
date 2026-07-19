@@ -15,7 +15,7 @@ import threading
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, field
-from typing import Any, cast
+from typing import Any
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -36,7 +36,10 @@ from olmlx.engine.spec_decoder_base import (
     SpecDecoderBase,
     # Canonical home moved to spec_decoder_base (#467); re-exported here
     # for remaining importers (tests; the decoders verify via the base's
-    # ``_verify_greedy`` instead).
+    # ``_verify_greedy`` instead). ``_logits`` joined them in #628 (was
+    # defined identically in four decoder modules); still re-exported here
+    # for proxy_tuning and the speculative/lookahead tests.
+    _logits as _logits,
     _trim_recent_cache,
     verify_draft_greedy as verify_draft_greedy,
 )
@@ -264,12 +267,6 @@ def _spec_reuse_decision(
     if already_covered <= 0 or already_covered >= prompt_len:
         return (False, 0)
     return (True, already_covered)
-
-
-def _logits(out: Any) -> mx.array:
-    # mlx-vlm's language_model returns LanguageModelOutput(logits=...);
-    # mlx-lm models return a raw mx.array.
-    return cast(mx.array, getattr(out, "logits", out))
 
 
 def _eval_cache(cache: list) -> None:

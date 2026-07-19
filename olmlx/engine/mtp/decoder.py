@@ -50,7 +50,7 @@ from olmlx.engine.gdn_rollback import (
     get_model_layers as _get_layers,
 )
 from olmlx.engine.mtp.draft_model import MTPDraftModel
-from olmlx.engine.spec_decoder_base import SpecDecoderBase
+from olmlx.engine.spec_decoder_base import SpecDecoderBase, _logits
 from olmlx.engine.speculative import (
     PrefillCancelled,
     _chunked_prefill,
@@ -68,11 +68,6 @@ except ImportError:  # pragma: no cover - mlx-lm always installed in production
     can_trim_prompt_cache = None  # type: ignore[assignment]
 
 logger = logging.getLogger(__name__)
-
-
-def _logits(out: Any) -> mx.array:
-    # mlx-vlm wraps logits in a dataclass; mlx-lm returns the raw array.
-    return getattr(out, "logits", out)
 
 
 class MTPDecoder(SpecDecoderBase):

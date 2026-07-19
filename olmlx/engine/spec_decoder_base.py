@@ -254,6 +254,16 @@ def verify_draft_greedy(
     return accepted
 
 
+def _logits(out: Any) -> mx.array:
+    """Unwrap a forward pass's logits.
+
+    mlx-vlm's ``language_model`` returns a ``LanguageModelOutput(logits=...)``
+    dataclass; mlx-lm models return the raw ``mx.array``. Shared by every
+    speculative decoder (was defined identically in five modules, #628).
+    """
+    return getattr(out, "logits", out)
+
+
 def _strategy_label_for(cls: type) -> str:
     """Tracing/metrics ``strategy`` label for a decoder class, reusing the
     metrics class→label map (classic/pld/dflash/eagle/mtp/self)."""

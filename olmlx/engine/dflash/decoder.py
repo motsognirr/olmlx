@@ -45,6 +45,7 @@ from olmlx.engine.spec_decoder_base import (
     # classic/PLD/EAGLE share the same rotating-aware trim.
     _HAS_ROTATING_KV_PRIVATES as _HAS_ROTATING_KV_PRIVATES,
     _LayerHook as _LayerHook,
+    _logits,
     _patch_model as _patch_model,
     _probe_rotating_kv_privates as _probe_rotating_kv_privates,
     _trim_recent_cache as _trim_recent_cache,
@@ -406,6 +407,3 @@ class DFlashDecoder(SpecDecoderBase):
         return accepted, self._block_size
 
 
-def _logits(out: Any) -> mx.array:
-    """Unwrap mlx-vlm ``LanguageModelOutput`` if needed."""
-    return getattr(out, "logits", out)
