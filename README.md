@@ -10,14 +10,27 @@ Drop-in Ollama API replacement powered by Apple's [MLX](https://github.com/ml-ex
 
 ## Install
 
-### Option 1: Global install (recommended)
+### Option 1: Install from PyPI (recommended)
+
+Requires Apple Silicon — the MLX backend is arm64-only.
 
 ```bash
-# Install globally — no clone needed
-uv tool install git+ssh://git@github.com/motsognirr/olmlx.git
+# With uv (recommended) — installs an isolated tool, Python handled for you
+uv tool install olmlx
+
+# ...or with pipx
+pipx install olmlx
 
 # Start the server
 olmlx
+```
+
+Upgrade later with `uv tool upgrade olmlx` (or `pipx upgrade olmlx`).
+
+To install the latest unreleased version straight from git instead:
+
+```bash
+uv tool install git+https://github.com/motsognirr/olmlx.git
 ```
 
 On first run, `~/.olmlx/models.json` is created with example model mappings.
