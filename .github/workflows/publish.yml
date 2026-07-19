@@ -20,9 +20,9 @@
 # NOTE: keep the git tag in lockstep with `version` in pyproject.toml — the tag
 # only triggers the run; the version published is whatever the wheel declares.
 #
-# Action SHA pinning: checkout / upload-artifact are pinned to match the SHAs
-# already vetted in ci.yml. download-artifact and gh-action-pypi-publish are on
-# release tags below; pin them to SHAs before merging to match repo convention.
+# Action SHA pinning: all actions are pinned to full commit SHAs (checkout /
+# upload-artifact reuse the SHAs already vetted in ci.yml). download-artifact is
+# pinned to v4.x to match the v4 artifact format that upload-artifact writes.
 
 name: Publish
 
@@ -71,11 +71,11 @@ jobs:
     permissions:
       id-token: write # OIDC token for trusted publishing
     steps:
-      - uses: actions/download-artifact@v4 # TODO: pin to SHA before merge
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: dist
           path: dist/
-      - uses: pypa/gh-action-pypi-publish@release/v1 # TODO: pin to SHA before merge
+      - uses: pypa/gh-action-pypi-publish@ba38be9e461d3875417946c167d0b5f3d385a247 # v1.14.1
         with:
           repository-url: https://test.pypi.org/legacy/
 
@@ -88,8 +88,8 @@ jobs:
     permissions:
       id-token: write # OIDC token for trusted publishing
     steps:
-      - uses: actions/download-artifact@v4 # TODO: pin to SHA before merge
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: dist
           path: dist/
-      - uses: pypa/gh-action-pypi-publish@release/v1 # TODO: pin to SHA before merge
+      - uses: pypa/gh-action-pypi-publish@ba38be9e461d3875417946c167d0b5f3d385a247 # v1.14.1
