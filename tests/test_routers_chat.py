@@ -60,6 +60,31 @@ class TestSplitThinkingStreaming:
         assert content == prefix + "vis"
         assert thinking == "hidden"
 
+    def test_newlines_after_close_in_later_chunk_stripped(self):
+        """Issue #686: the ``\\n\\n`` a model emits after ``</think>`` arrives
+        in a *separate* chunk from the close tag.  The streamed content must
+        strip it to match the non-streaming path (which strips over the whole
+        completion at once), not leak a leading ``\\n\\n``."""
+        state: dict = {}
+        content = ""
+        for chunk in ["<think>reasoning</think>", "\n\n", "answer"]:
+            _, c = split_thinking_streaming(chunk, state)
+            content += c
+        c = flush_split_thinking(state)[1]
+        content += c
+        assert content == "answer"
+
+    def test_newlines_after_close_split_across_boundary_stripped(self):
+        """Issue #686: newlines split across the close-tag boundary (one in
+        the closing chunk, one in the next) are all stripped."""
+        state: dict = {}
+        content = ""
+        for chunk in ["<think>reasoning</think>\n", "\nanswer"]:
+            _, c = split_thinking_streaming(chunk, state)
+            content += c
+        content += flush_split_thinking(state)[1]
+        assert content == "answer"
+
     def test_detect_limit_state_override_honored(self):
         """An explicit ``state["detect_limit"]`` overrides the default so
         callers can widen (or narrow) the detect window."""
