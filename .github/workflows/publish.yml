@@ -1,0 +1,95 @@
+# Publish olmlx to (Test)PyPI via trusted publishing (OIDC — no API token).
+#
+# One-time setup before this works (see the checklist in the PR/README):
+#   1. Create GitHub environments named `testpypi` and `pypi`
+#      (Settings -> Environments), optionally with required reviewers.
+#   2. Register a "pending publisher" on each index so OIDC is trusted:
+#        PyPI:     https://pypi.org/manage/account/publishing/
+#        TestPyPI: https://test.pypi.org/manage/account/publishing/
+#      Values:  PyPI project name = olmlx
+#               Owner              = motsognirr
+#               Repository         = olmlx
+#               Workflow name      = publish.yml
+#               Environment        = pypi   (and testpypi for the TestPyPI form)
+#
+# Usage:
+#   - Validate first: Actions -> "Publish" -> Run workflow  => TestPyPI.
+#   - Release: push a version tag matching pyproject `version`, e.g.
+#         git tag v0.1.0 && git push origin v0.1.0     => PyPI.
+#
+# NOTE: keep the git tag in lockstep with `version` in pyproject.toml — the tag
+# only triggers the run; the version published is whatever the wheel declares.
+#
+# Action SHA pinning: checkout / upload-artifact are pinned to match the SHAs
+# already vetted in ci.yml. download-artifact and gh-action-pypi-publish are on
+# release tags below; pin them to SHAs before merging to match repo convention.
+
+name: Publish
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      target:
+        description: "Publish target (manual runs only ever go to TestPyPI)"
+        type: choice
+        options: [testpypi]
+        default: testpypi
+
+permissions:
+  contents: read
+
+concurrency:
+  group: publish-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build distributions
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Install uv
+        run: curl -LsSf https://astral.sh/uv/install.sh | sh
+      - name: Build wheel + sdist
+        run: uv build
+      - name: Validate metadata
+        run: uvx twine check dist/*
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: dist
+          path: dist/
+          if-no-files-found: error
+
+  publish-testpypi:
+    name: Publish to TestPyPI
+    needs: build
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    environment: testpypi
+    permissions:
+      id-token: write # OIDC token for trusted publishing
+    steps:
+      - uses: actions/download-artifact@v4 # TODO: pin to SHA before merge
+        with:
+          name: dist
+          path: dist/
+      - uses: pypa/gh-action-pypi-publish@release/v1 # TODO: pin to SHA before merge
+        with:
+          repository-url: https://test.pypi.org/legacy/
+
+  publish-pypi:
+    name: Publish to PyPI
+    needs: build
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write # OIDC token for trusted publishing
+    steps:
+      - uses: actions/download-artifact@v4 # TODO: pin to SHA before merge
+        with:
+          name: dist
+          path: dist/
+      - uses: pypa/gh-action-pypi-publish@release/v1 # TODO: pin to SHA before merge

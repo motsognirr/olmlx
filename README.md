@@ -32,6 +32,28 @@ uv run olmlx
 
 The server starts on `http://localhost:11434` — the same default port as Ollama.
 
+### Optional extras
+
+Text-to-speech (`/v1/audio/speech`, `olmlx chat --voice`) ships in the `audio`
+extra; the `voice` extra adds microphone capture on top:
+
+```bash
+uv tool install "olmlx[audio]"    # Kokoro TTS
+uv tool install "olmlx[voice]"    # + push-to-talk mic capture
+```
+
+Kokoro's English text processing needs the spaCy `en_core_web_sm` model, which
+is **not on PyPI** (spaCy distributes its models as GitHub-release wheels), so
+it is not pulled in automatically. Fetch it once after installing the extra —
+otherwise the first `/v1/audio/speech` request fails with a spaCy load error:
+
+```bash
+python -m spacy download en_core_web_sm
+```
+
+(Installs from source with `uv sync` provision this automatically; the manual
+step is only needed for `pip`/`uv tool` installs of the published package.)
+
 ## CLI
 
 ```bash
