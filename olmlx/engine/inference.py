@@ -3402,6 +3402,42 @@ async def _stream_completion_batched(
                 )
 
 
+def _prefill_coverage(
+    cache_read_tokens: int,
+    cache_creation_tokens: int,
+    full_prompt_tokens: list[int] | None,
+    stream_prompt_tokens: int | None,
+) -> tuple[int, int, bool]:
+    """Return ``(covered, fresh, cache_hit)`` for the prefill summary.
+
+    ``covered`` is the number of prompt tokens served from the prompt cache;
+    ``fresh`` is the number actually prefilled this turn; ``cache_hit`` is True
+    iff any prefix was reused.
+
+    ``covered`` comes from ``cache_read_tokens`` — the reuse-decision count set
+    at cache setup — **not** mlx-lm's post-hoc ``token.prompt_tokens``. On the
+    hybrid-GDN checkpoint / deferred-prefill path the prefill is driven outside
+    mlx-lm's stream, so ``token.prompt_tokens`` reports 1 regardless of how many
+    tokens were freshly prefilled; using it mis-attributed a cold 69k prefill as
+    a cache hit (#503 Phase 0 findings).
+
+    ``full_prompt_tokens`` is the authoritative total when known (text paths).
+    When it is ``None`` (VLM — the text count misses image-patch expansion; or
+    the no-cache path) the total is recovered from the cache counts, falling
+    back to mlx-lm's ``stream_prompt_tokens`` (accurate on the flat no-cache
+    path, where mlx-lm prefills the whole prompt itself).
+    """
+    covered = max(0, cache_read_tokens)
+    if full_prompt_tokens is not None:
+        total = len(full_prompt_tokens)
+    elif cache_read_tokens or cache_creation_tokens:
+        total = cache_read_tokens + cache_creation_tokens
+    else:
+        total = stream_prompt_tokens or 0
+    fresh = max(0, total - covered)
+    return covered, fresh, covered > 0
+
+
 async def _stream_completion(
     lm: LoadedModel,
     prompt: str | list[int],
@@ -3779,9 +3815,17 @@ async def _stream_completion(
             )
             # ttft_ns: the prefill forward runs lazily inside the stream's
             # first iteration (worker thread), so the prefill *span* can't time
-            # it; surface the measured prefill duration here instead. cache_hit:
-            # mlx re-prefilled fewer tokens than the full prompt → a prefix was
-            # served from the prompt cache.
+            # it; surface the measured prefill duration here instead. covered /
+            # cache_hit come from the cache-reuse decision (cache_read_tokens),
+            # not mlx-lm's token.prompt_tokens — which reports 1 on the
+            # checkpoint/deferred-prefill path and mis-attributes a cold prefill
+            # as a hit (#503 Phase 0 findings).
+            _covered, _fresh, _cache_hit = _prefill_coverage(
+                cache_read_tokens,
+                cache_creation_tokens,
+                full_prompt_tokens,
+                getattr(token, "prompt_tokens", None) if token is not None else None,
+            )
             _decode_span.set_attributes(
                 {
                     "eval_count": stats.eval_count,
@@ -3792,24 +3836,16 @@ async def _stream_completion(
                         else stats.prompt_eval_duration
                     ),
                     "ttft_measured": ttft_measured_ns is not None,
-                    "cache_hit": bool(full_prompt_tokens)
-                    and token is not None
-                    and (token.prompt_tokens or 0) < len(full_prompt_tokens),
+                    "cache_hit": _cache_hit,
                 }
             )
             if ttft_measured_ns is not None and token is not None:
-                _fresh = token.prompt_tokens or 0
-                _full = (
-                    len(full_prompt_tokens)
-                    if full_prompt_tokens is not None
-                    else _fresh
-                )
                 logger.info(
                     "prefill %.2fs (fresh %d/%d tok, cache-covered %d)",
                     ttft_measured_ns / 1e9,
                     _fresh,
-                    _full,
-                    max(0, _full - _fresh),
+                    _covered + _fresh,
+                    _covered,
                 )
 
         stats.total_duration = total_timer.duration_ns

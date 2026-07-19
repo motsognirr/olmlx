@@ -60,6 +60,53 @@ def otel_memory_exporter():
     tracing.shutdown_tracing()
 
 
+class TestPrefillCoverage:
+    """Unit tests for _prefill_coverage — (covered, fresh, cache_hit) for the
+    prefill summary. Covered must come from the cache-reuse decision
+    (cache_read_tokens), NOT mlx-lm's post-hoc token.prompt_tokens, which
+    reports 1 on the checkpoint/deferred-prefill path (#503 findings)."""
+
+    def test_cold_checkpoint_path_counts_all_fresh(self):
+        # The bug: on a cold hybrid-GDN prefill mlx-lm reports prompt_tokens=1,
+        # but the cache was empty (cache_read_tokens=0) and all 69445 tokens
+        # were freshly prefilled. Must be (0, 69445, False) — NOT (0, 1, True).
+        from olmlx.engine.inference import _prefill_coverage
+
+        covered, fresh, hit = _prefill_coverage(
+            cache_read_tokens=0,
+            cache_creation_tokens=69445,
+            full_prompt_tokens=[0] * 69445,
+            stream_prompt_tokens=1,
+        )
+        assert (covered, fresh, hit) == (0, 69445, False)
+
+    def test_warm_checkpoint_path_counts_reused_prefix(self):
+        from olmlx.engine.inference import _prefill_coverage
+
+        covered, fresh, hit = _prefill_coverage(
+            cache_read_tokens=69444,
+            cache_creation_tokens=1,
+            full_prompt_tokens=[0] * 69445,
+            stream_prompt_tokens=1,
+        )
+        assert (covered, fresh, hit) == (69444, 1, True)
+
+    def test_no_cache_falls_back_to_stream_prompt_tokens(self):
+        # No prompt cache: full_prompt_tokens is None and cache counts are 0,
+        # so the real prompt size is mlx-lm's stream count (accurate on that
+        # flat path). covered=0, no hit.
+        from olmlx.engine.inference import _prefill_coverage
+
+        assert _prefill_coverage(0, 0, None, 42) == (0, 42, False)
+
+    def test_vlm_path_uses_cache_counts_when_full_is_none(self):
+        # VLM: full_prompt_tokens is None (text count misses image patches) but
+        # cache_read/creation come from mlx_vlm and are accurate.
+        from olmlx.engine.inference import _prefill_coverage
+
+        assert _prefill_coverage(10, 90, None, 5) == (10, 90, True)
+
+
 class TestDeriveTimingStats:
     """Unit tests for _derive_timing_stats — the helper that converts
     mlx-lm's rates + a wall-clock fallback into Ollama-convention durations."""
@@ -2285,6 +2332,82 @@ class TestGenerateCompletion:
         assert decode_spans, "decode span was not recorded"
         ttft_ns = dict(decode_spans[0].attributes)["ttft_ns"]
         assert ttft_ns >= 20_000_000, f"ttft_ns {ttft_ns} looks heuristic, not measured"
+
+    @pytest.mark.asyncio
+    async def test_streaming_cache_hit_attr_uses_reuse_offset_not_stream_count(
+        self, mock_manager, otel_memory_exporter
+    ):
+        """Wiring guard (#503): on the checkpoint/deferred-prefill path mlx-lm
+        reports token.prompt_tokens == 1, so the decode-span cache_hit must come
+        from the cache-reuse offset (cache_read_tokens=0 here → cold miss), not
+        that count. Before the fix this logged fresh 1/N and cache_hit=True on a
+        cold cache."""
+        # Drive _stream_completion directly with use_prompt_cache=True — the
+        # entry points gate that flag differently, and this is the exact
+        # function whose wiring changed.
+        from olmlx.engine.inference import _CacheSetupResult, _stream_completion
+        from olmlx.utils.timing import TimingStats
+
+        _tracing, exporter = otel_memory_exporter
+        mock_mx = MagicMock()
+        lm = mock_manager._loaded["qwen3:latest"]
+
+        # Deferred-prefill path: mlx-lm reports only the 1-token seeding forward.
+        tok = StreamToken(
+            text="Hi",
+            token=1,
+            prompt_tokens=1,
+            generation_tokens=1,
+            prompt_tps=1000.0,
+            generation_tps=1000.0,
+        )
+        token_iter = iter([tok])
+
+        async def anext_impl():
+            try:
+                return next(token_iter)
+            except StopIteration:
+                raise StopAsyncIteration
+
+        mock_stream = MagicMock(spec=CancellableStream)
+        mock_stream.drain_and_join = AsyncMock()
+        mock_stream._thread = None
+        mock_stream.__aiter__ = lambda self: self
+        mock_stream.__anext__ = lambda self: anext_impl()
+
+        # Cold cache: 100-token prompt, 0 reused (cache_read_tokens=0).
+        cs = _CacheSetupResult(
+            prompt=[0] * 100,
+            cache_read_tokens=0,
+            cache_creation_tokens=100,
+            full_prompt_tokens=[0] * 100,
+            cache_setup_done=True,
+        )
+
+        setup_mock = AsyncMock(return_value=cs)
+        with (
+            patch("olmlx.engine.inference.mx", mock_mx),
+            patch("olmlx.engine.inference._setup_prompt_cache", setup_mock),
+            patch(
+                "olmlx.engine.inference._store_prompt_cache_after_generation",
+                AsyncMock(),
+            ),
+            patch("olmlx.engine.inference.async_mlx_stream", return_value=mock_stream),
+        ):
+            gen = _stream_completion(
+                lm, "Hi", 8, {}, TimingStats(), use_prompt_cache=True
+            )
+            async for _ in gen:
+                pass
+
+        # Guard against a vacuous pass: the crafted cold-cache cs must actually
+        # have driven the code path (else cache_hit would be False trivially).
+        setup_mock.assert_awaited()
+        decode_spans = [s for s in exporter.get_finished_spans() if s.name == "decode"]
+        assert decode_spans, "decode span was not recorded"
+        attrs = dict(decode_spans[0].attributes)
+        # Cold miss: 0 tokens reused despite mlx-lm reporting prompt_tokens=1.
+        assert attrs["cache_hit"] is False
 
     @pytest.mark.asyncio
     async def test_streaming_prepends_thinking_expected_meta(self, mock_manager):
