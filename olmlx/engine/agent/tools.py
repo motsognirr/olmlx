@@ -19,7 +19,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from olmlx.chat.builtin_tools import BuiltinToolManager
 from olmlx.chat.config import ChatConfig
@@ -159,9 +159,13 @@ _EXCLUDED_BUILTINS = frozenset({"question"})
 class AgentToolManager(BuiltinToolManager):
     """Builtin tools plus the agent's control tools, bound to an AgentContext."""
 
-    def __init__(self, config: ChatConfig, context: "AgentContext"):
+    def __init__(self, config: ChatConfig, context: "AgentContext", skills: Any = None):
         super().__init__(config)
         self._context = context
+        # The live SkillManager (when the agent rides a ChatSession), so a
+        # ``create_skill`` mid-run is immediately usable via ``use_skill``
+        # (#636). None in tests / bare tool-manager use.
+        self._skills = skills
         self._agent_defs: list[dict] = [
             _FINISH_DEF,
             _REMEMBER_DEF,
@@ -245,13 +249,24 @@ class AgentToolManager(BuiltinToolManager):
         description = str(arguments.get("description", "")).strip()
         body = str(arguments.get("body", ""))
         try:
-            path = await asyncio.to_thread(
-                write_skill_file,
-                self._config.skills_dir,
-                name,
-                description,
-                body,
-            )
+            if self._skills is not None:
+                # Route through the live SkillManager so the new skill is
+                # registered in-memory and an immediate ``use_skill`` finds it,
+                # not just written to disk for the next run to reload (#636).
+                # This is also SkillManager.create_skill's only production
+                # caller (was otherwise dead code).
+                skill = await asyncio.to_thread(
+                    self._skills.create_skill, name, description, body
+                )
+                path = skill.path
+            else:
+                path = await asyncio.to_thread(
+                    write_skill_file,
+                    self._config.skills_dir,
+                    name,
+                    description,
+                    body,
+                )
         except ValueError as exc:
             return ToolError(
                 message=f"Invalid skill: {exc}",

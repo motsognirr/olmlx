@@ -44,6 +44,10 @@ CONTINUATION_NUDGE = (
 #: streamed chunk ≈ one token under mlx-lm streaming.
 _TOKEN_EVENT_TYPES = frozenset({"token", "thinking_token"})
 
+#: How many buffered token events to accumulate before a batched SQLite flush
+#: (#636). Small enough that live SSE tailers see near-real-time output.
+_TOKEN_FLUSH_BATCH = 16
+
 
 class _Session(Protocol):
     messages: list[dict]
@@ -164,16 +168,36 @@ class Orchestrator:
 
                 finished = False
                 summary = ""
+                # Buffer high-frequency token events and flush them in batches,
+                # rather than paying an ``asyncio.to_thread`` + SQLite round-trip
+                # per token (which throttled generation to thread-pool rate,
+                # #636). Ordered events (tool_call/result/status) flush the
+                # buffer first so SSE replay preserves order, then persist
+                # immediately for prompt live delivery.
+                token_buffer: list[dict] = []
+
+                async def _flush_tokens() -> None:
+                    nonlocal token_buffer
+                    if token_buffer:
+                        await self.store.append_events(self.run_id, token_buffer)
+                        token_buffer = []
+
                 async for event in self.session.send_message(prompt):
-                    await self.store.append_event(self.run_id, event)
                     etype = event.get("type")
                     if etype in _TOKEN_EVENT_TYPES:
+                        token_buffer.append(event)
                         tokens += 1
-                    elif etype == "tool_call" and event.get("name") == "finish":
+                        if len(token_buffer) >= _TOKEN_FLUSH_BATCH:
+                            await _flush_tokens()
+                        continue
+                    await _flush_tokens()
+                    await self.store.append_event(self.run_id, event)
+                    if etype == "tool_call" and event.get("name") == "finish":
                         finished = True
                         args = event.get("arguments")
                         if isinstance(args, dict):
                             summary = str(args.get("summary", "")).strip()
+                await _flush_tokens()
 
                 iterations += 1
                 runtime = elapsed()

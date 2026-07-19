@@ -980,8 +980,6 @@ class ChatSession:
             if r:
                 result_msg = r["message"]
                 if tu["name"] == "question":
-                    import json
-
                     content = result_msg.get("content", "")
                     # Only a well-formed ``__question__:`` payload emits the
                     # interactive question event. A denied/errored ``question``

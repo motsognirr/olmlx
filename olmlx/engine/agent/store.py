@@ -320,6 +320,34 @@ class AgentStore:
     async def append_event(self, run_id: str, event: dict[str, Any]) -> int:
         return await asyncio.to_thread(self._append_event, run_id, event)
 
+    async def append_events(self, run_id: str, events: list[dict[str, Any]]) -> None:
+        """Persist a batch of events in a single thread-hop + transaction.
+
+        The orchestrator buffers high-frequency token events and flushes them
+        here so generation isn't throttled to one ``asyncio.to_thread`` +
+        SQLite round-trip *per token* (#636).
+        """
+        if not events:
+            return
+        await asyncio.to_thread(self._append_events, run_id, events)
+
+    def _append_events(self, run_id: str, events: list[dict[str, Any]]) -> None:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT COALESCE(MAX(seq) + 1, 0) AS seq FROM events WHERE run_id = ?",
+                (run_id,),
+            ).fetchone()
+            seq = int(row["seq"])
+            now = time.time()
+            self._conn.executemany(
+                "INSERT INTO events (run_id, seq, type, data, created_at) "
+                "VALUES (?, ?, ?, ?, ?)",
+                [
+                    (run_id, seq + i, str(e.get("type", "")), json.dumps(e), now)
+                    for i, e in enumerate(events)
+                ],
+            )
+
     def _append_event(self, run_id: str, event: dict[str, Any]) -> int:
         with self._lock:
             row = self._conn.execute(

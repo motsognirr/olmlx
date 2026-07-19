@@ -71,16 +71,28 @@ class WindowManager:
         self._dirty[layer_idx] = False
         return self._cached_window[layer_idx]
 
-    def update(self, layer_idx: int, active_indices: mx.array) -> None:
-        """Record newly activated neurons for this token."""
+    def update(
+        self,
+        layer_idx: int,
+        active_indices: mx.array,
+        active_list: list[int] | None = None,
+    ) -> None:
+        """Record newly activated neurons for this token.
+
+        ``active_list`` lets the caller pass an already-computed
+        ``active_indices.tolist()`` so this doesn't re-eval + re-convert the
+        same array a second time per layer per token (#636).
+        """
         if layer_idx not in self._history:
             if self._budget_neurons is not None:
                 self._history[layer_idx] = deque()
             else:
                 self._history[layer_idx] = deque(maxlen=self.window_size)
             self._cached_window[layer_idx] = set()
-        mx.eval(active_indices)
-        self._history[layer_idx].append(set(active_indices.tolist()))
+        if active_list is None:
+            mx.eval(active_indices)
+            active_list = active_indices.tolist()
+        self._history[layer_idx].append(set(active_list))
         self._dirty[layer_idx] = True
 
         # Enforce max window size for dynamic mode
@@ -182,7 +194,9 @@ class FlashMLP(nn.Module):
         # Update window before submit — update calls mx.eval internally,
         # and submit enqueues prediction to a background thread whose
         # mx.eval must not overlap with the main thread's mx.eval.
-        self.window_manager.update(self.layer_idx, predicted)
+        self.window_manager.update(
+            self.layer_idx, predicted, active_list=predicted_list
+        )
 
         # Start prefetch for the NEXT layer before blocking on current I/O.
         # Uses flat_x (pre-MLP hidden state) as an approximate signal for

@@ -880,6 +880,18 @@ class TestInjectToolsIntoSystem:
         result = _inject_tools_into_system(messages, tools)
         assert "direct_tool" in result[0]["content"]
 
+    def test_system_message_with_none_content_does_not_crash(self):
+        """A system message with content=None (permitted by OpenAIChatMessage)
+        must not 500 on the string concat (#636)."""
+        messages = [
+            {"role": "system", "content": None},
+            {"role": "user", "content": "hi"},
+        ]
+        tools = [{"name": "s", "description": "d", "parameters": {}}]
+        result = _inject_tools_into_system(messages, tools)
+        assert result[0]["role"] == "system"
+        assert "s" in result[0]["content"]
+
 
 class TestAddNativeToolHint:
     def test_appends_hint_when_function_pattern_present(self):

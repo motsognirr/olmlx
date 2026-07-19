@@ -41,10 +41,14 @@ def _inject_tools_into_system(messages: list[dict], tools: list[dict]) -> list[d
 
     messages = list(messages)  # shallow copy
     if messages and messages[0].get("role") == "system":
-        messages[0] = {
-            **messages[0],
-            "content": messages[0]["content"] + "\n\n" + tool_block,
-        }
+        # ``content`` may be None (OpenAIChatMessage permits it for system
+        # messages) or a non-string (multimodal parts) — coerce to "" so the
+        # concat doesn't 500 (#636). Mirrors ``_add_native_tool_hint``'s guard.
+        existing = messages[0].get("content")
+        if not isinstance(existing, str):
+            existing = ""
+        new_content = f"{existing}\n\n{tool_block}" if existing else tool_block
+        messages[0] = {**messages[0], "content": new_content}
     else:
         messages.insert(0, {"role": "system", "content": tool_block})
     return messages
