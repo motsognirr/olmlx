@@ -87,11 +87,23 @@ class MCPClientManager:
         """
         attempts = max(max_attempts if max_attempts is not None else 3, 1)
         for name, server_cfg in config.items():
+            transport = server_cfg.get("transport")
+            if transport not in ("stdio", "sse"):
+                # Previously an unknown transport matched neither branch and
+                # the loop ``break``d as if the connection had succeeded — no
+                # log, no error, zero tools discovered (#636). Surface it.
+                logger.warning(
+                    "Skipping MCP server %r: unknown transport %r "
+                    "(expected 'stdio' or 'sse')",
+                    name,
+                    transport,
+                )
+                continue
             for attempt in range(attempts):
                 try:
-                    if server_cfg["transport"] == "stdio":
+                    if transport == "stdio":
                         await self._connect_stdio(name, server_cfg)
-                    elif server_cfg["transport"] == "sse":
+                    else:  # "sse" — validated above
                         await self._connect_sse(name, server_cfg)
                     break
                 except Exception as exc:

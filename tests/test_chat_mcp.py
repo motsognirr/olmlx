@@ -94,3 +94,17 @@ class TestMCPToolRouting:
         assert "Unknown tool" in result.message
         assert result.tool_name == "nonexistent"
         assert result.is_user_error is True
+
+
+class TestConnectAll:
+    @pytest.mark.asyncio
+    async def test_unknown_transport_skipped_with_warning(self, caplog):
+        """An unknown transport must be logged and skipped, not silently
+        treated as a successful connection with zero tools (#636)."""
+        import logging
+
+        mgr = MCPClientManager()
+        with caplog.at_level(logging.WARNING, logger="olmlx.chat.mcp_client"):
+            await mgr.connect_all({"srv": {"transport": "grpc"}})
+        assert "unknown transport" in caplog.text.lower()
+        assert mgr.get_tools_for_chat() == []

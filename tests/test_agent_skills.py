@@ -109,6 +109,22 @@ class TestCreateSkillTool:
         persisted = await context.store.get_skill("git-bisect")
         assert persisted["source_run"] == "r1"
 
+    async def test_create_skill_registers_in_live_manager(self, context, tmp_path):
+        """create_skill routed through the live SkillManager must register the
+        skill in-memory so an immediate use_skill finds it, not just write it to
+        disk for the next run's reload (#636)."""
+        config = ChatConfig(model_name="m", skills_dir=tmp_path / "skills")
+        skills = SkillManager(tmp_path / "skills")
+        skills.load()
+        tools = AgentToolManager(config, context, skills=skills)
+        await context.store.create_run(run_id="r1", goal="g", model="m", config={})
+        assert skills.get_skill("new-skill") is None
+        await tools.call_tool(
+            "create_skill",
+            {"name": "new-skill", "description": "d", "body": "Body."},
+        )
+        assert skills.get_skill("new-skill") is not None
+
     async def test_malformed_name_rejected(self, tools, context):
         await context.store.create_run(run_id="r1", goal="g", model="m", config={})
         result = await tools.call_tool(

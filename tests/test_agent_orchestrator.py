@@ -312,6 +312,37 @@ class TestStall:
         assert (await store.get_run("r1"))["iterations"] == 5
 
 
+class TestTokenBatching:
+    async def test_token_events_batched_and_ordered(self, store):
+        """Token events are buffered and flushed in a batch, but must still be
+        persisted before the following ordered event so SSE replay preserves
+        order (#636)."""
+        await store.create_run(run_id="r1", goal="G", model="m", config={})
+        turn = {
+            "events": [
+                {"type": "token", "text": "a"},
+                {"type": "token", "text": "b"},
+                {
+                    "type": "tool_call",
+                    "name": "finish",
+                    "arguments": {"summary": "done"},
+                    "id": "t1",
+                },
+            ],
+            "messages": [_assistant("x")],
+        }
+        session = FakeSession([turn])
+        orch = Orchestrator(session=session, context=_ctx(store), budgets=Budgets())
+        await orch.run()
+        events = await store.get_events("r1")
+        types = [e["type"] for e in events]
+        assert types.count("token") == 2
+        # Both tokens land before the tool_call.
+        assert max(i for i, t in enumerate(types) if t == "token") < types.index(
+            "tool_call"
+        )
+
+
 class TestResume:
     async def test_resume_rehydrates_messages_and_counters(self, store):
         await store.create_run(run_id="r1", goal="G", model="m", config={})

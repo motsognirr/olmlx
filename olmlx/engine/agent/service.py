@@ -301,7 +301,9 @@ class AgentService:
         # offered to this one (the self-improving loop's read side).
         skills = SkillManager(config.skills_dir)
         skills.load()
-        builtin = AgentToolManager(config, context)
+        # Pass the live SkillManager so a mid-run create_skill registers into
+        # it and is immediately usable via use_skill (#636).
+        builtin = AgentToolManager(config, context, skills=skills)
         # Gate the mutating/exec builtins per policy; every other tool stays
         # ALLOW so the agent still runs autonomously. AUTO routes through an LLM
         # safety judge (fail-closed); "deny" blocks outright; "allow" trusts.
