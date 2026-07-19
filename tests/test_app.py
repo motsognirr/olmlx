@@ -658,3 +658,38 @@ class TestRequestIDFormatter:
         result = formatter.format(record)
         assert "Processing request" in result
         assert "[abc12345]" not in result
+
+
+class TestLifespanRollback:
+    @pytest.mark.asyncio
+    async def test_failed_startup_unregisters_collector(
+        self, registry, mock_store, monkeypatch, tmp_path
+    ):
+        """A startup that fails after the stats collector is registered must
+        unregister it (and stop the manager), so a later create_app()/lifespan
+        doesn't hit a duplicate-collector error against the module-level
+        REGISTRY (#626)."""
+        from unittest.mock import AsyncMock
+
+        from olmlx.app import create_app, lifespan
+
+        monkeypatch.setattr("olmlx.app.settings.models_dir", tmp_path / "m")
+
+        # First startup fails inside the agent scan (after the collector is
+        # registered).
+        app = create_app()
+        monkeypatch.setattr("olmlx.app.settings.agent_enabled", True)
+        failing = MagicMock()
+        failing.startup = AsyncMock(side_effect=RuntimeError("startup boom"))
+        app.state.agent_service = failing
+
+        with pytest.raises(RuntimeError, match="startup boom"):
+            async with lifespan(app):
+                pass
+
+        # A second, clean startup must succeed — the first must not have left a
+        # collector registered.
+        monkeypatch.setattr("olmlx.app.settings.agent_enabled", False)
+        app2 = create_app()
+        async with lifespan(app2):
+            pass

@@ -1044,7 +1044,15 @@ class ModelManager(SpeculativeLoaderMixin):
             if drained:
                 await self._flush_metal()
         self._pending_load_tasks.clear()
+        # Close all still-resident models before dropping them — otherwise
+        # Flash prefetcher/weight-store executors (threads + per-layer fds),
+        # batch schedulers, and the whisper ModelHolder strong reference leak
+        # (#626). ``stop()`` is the documented lifecycle exit (used by tests and
+        # any embedding of the manager); process exit only masks this in prod.
+        resident = list(self._loaded.values())
         self._loaded.clear()
+        if resident:
+            await self._close_evictees(resident)
 
     def _resolve_keep_alive(self, keep_alive: int | str | None) -> float | None:
         """Parse keep_alive, falling back to the global default."""
@@ -1258,6 +1266,21 @@ class ModelManager(SpeculativeLoaderMixin):
                 if v.active_refs == 0 and v._adapter_child_refs == 0
             }
             if not evictable:
+                # Close the victims already popped this call before bailing —
+                # they're gone from ``_loaded`` and would otherwise leak their
+                # prefetcher/weight-store pools (threads + fds) + disk cache +
+                # grammar-cache drops, since the caller never receives the list
+                # to close (#626). A synchronous close under the lock is fine on
+                # this hard-failure path (nothing can be loaded anyway).
+                for victim in evictees:
+                    try:
+                        self._close_loaded_model(victim)
+                    except Exception:
+                        logger.warning(
+                            "Error closing evictee %s during failed eviction",
+                            victim.name,
+                            exc_info=True,
+                        )
                 raise RuntimeError(
                     "All loaded models are in use, cannot evict to load a new model"
                 )
@@ -1386,6 +1409,7 @@ class ModelManager(SpeculativeLoaderMixin):
         # resident across our awaits (download + off-thread build); once the
         # adapter is registered, ``_adapter_child_refs`` takes over the pinning.
         base_lm = await self.ensure_loaded(cfg.base, keep_alive=keep_alive, pin=True)
+        evictees: list[LoadedModel] = []
         try:
             self._reject_adapter_base(base_lm)
 
@@ -1411,7 +1435,6 @@ class ModelManager(SpeculativeLoaderMixin):
             )
             expires = time.time() + ka if ka is not None else None
 
-            evictees: list[LoadedModel] = []
             async with self._lock:
                 # Another coroutine may have loaded the same adapter during our
                 # awaits — discard our build and return theirs.
@@ -1459,6 +1482,15 @@ class ModelManager(SpeculativeLoaderMixin):
                     base_in_loaded._adapter_child_refs += 1
                 if pin:
                     lm.acquire_ref()
+        except BaseException:
+            # A failure after the evictees were popped (LoadedModel build, the
+            # lock block exiting abnormally, cancellation) must still close them
+            # — they're gone from _loaded and would otherwise leak their
+            # prefetcher/weight-store pools + disk cache. ``ensure_loaded``'s
+            # own exception handling does this; the adapter path must too (#626).
+            if evictees:
+                await self._close_evictees(evictees)
+            raise
         finally:
             # Release the temporary base pin; the child-ref now keeps it alive.
             base_lm.release_ref()
