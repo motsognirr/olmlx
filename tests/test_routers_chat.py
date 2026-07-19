@@ -857,6 +857,52 @@ class TestChatRouter:
         assert content.strip() == "391"
 
     @pytest.mark.asyncio
+    async def test_chat_streaming_no_leading_newline_after_think_across_chunks(
+        self, app_client
+    ):
+        """Issue #686: end-to-end through the ``/api/chat`` streaming surface,
+        the ``</think>`` close tag and the trailing ``\\n\\n`` arrive in
+        *separate* chunks (as a real model emits them).  The assembled
+        ``message.content`` must not leak a leading newline — parity with the
+        non-streaming response, which strips it.  Asserts exact content (no
+        ``.strip()``) so a regression in the caller's state threading is
+        caught, not just in the splitter unit."""
+
+        async def mock_stream(*args, **kwargs):
+            async def gen():
+                yield {"thinking_expected": True}
+                yield {"text": "<think>reasoning", "done": False}
+                yield {"text": "</think>", "done": False}
+                yield {"text": "\n\n", "done": False}
+                yield {"text": "9 × 6 = 54.", "done": False}
+                yield {"text": "", "done": True, "stats": TimingStats()}
+
+            return gen()
+
+        with patch("olmlx.routers.chat.generate_chat", side_effect=mock_stream):
+            resp = await app_client.post(
+                "/api/chat",
+                json={
+                    "model": "qwen3",
+                    "messages": [{"role": "user", "content": "9*6"}],
+                    "stream": True,
+                },
+            )
+
+        assert resp.status_code == 200
+        content = ""
+        thinking = ""
+        for line in resp.text.strip().split("\n"):
+            if not line.strip():
+                continue
+            msg = json.loads(line).get("message", {})
+            content += msg.get("content", "")
+            thinking += msg.get("thinking", "") or ""
+
+        assert content == "9 × 6 = 54."
+        assert thinking == "reasoning"
+
+    @pytest.mark.asyncio
     async def test_chat_streaming_orphan_preamble_over_limit_leaks_to_content(
         self, app_client
     ):
