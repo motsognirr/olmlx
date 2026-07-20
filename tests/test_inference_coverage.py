@@ -27,6 +27,7 @@ import pytest
 import olmlx.engine.inference as _inf_mod
 from olmlx.engine.inference import (
     _add_native_tool_hint,
+    _build_generate_kwargs,
     _convert_tool_messages_to_responses,
     _full_completion,
     _get_chat_template_text,
@@ -249,6 +250,67 @@ class TestMergeDefaultOptions:
         merged["temperature"] = 999
         assert defaults == {"temperature": 0.7}
         assert request == {"top_k": 5}
+
+
+# --------------------------------------------------------------------------- #
+# _apply_sampling_defaults (Ollama-parity sampling defaults, #646)             #
+# --------------------------------------------------------------------------- #
+class TestApplySamplingDefaults:
+    def test_defaults_applied_when_all_omitted(self, monkeypatch):
+        monkeypatch.setattr(_inf_mod.settings, "sampling_defaults_enabled", True)
+        monkeypatch.setattr(_inf_mod.settings, "default_temperature", 0.8)
+        monkeypatch.setattr(_inf_mod.settings, "default_top_p", 0.9)
+        monkeypatch.setattr(_inf_mod.settings, "default_top_k", 40)
+        monkeypatch.setattr(_inf_mod.settings, "default_repeat_penalty", 1.1)
+        monkeypatch.setattr(_inf_mod.settings, "default_repeat_last_n", 64)
+        assert _inf_mod._apply_sampling_defaults({}) == {
+            "temperature": 0.8,
+            "top_p": 0.9,
+            "top_k": 40,
+            "repeat_penalty": 1.1,
+            "repeat_last_n": 64,
+        }
+
+    def test_request_value_overrides_default(self, monkeypatch):
+        monkeypatch.setattr(_inf_mod.settings, "sampling_defaults_enabled", True)
+        monkeypatch.setattr(_inf_mod.settings, "default_temperature", 0.8)
+        monkeypatch.setattr(_inf_mod.settings, "default_repeat_penalty", 1.1)
+        merged = _inf_mod._apply_sampling_defaults(
+            {"temperature": 0.1, "repeat_penalty": 1.5}
+        )
+        # Explicit values win; unspecified keys still get the default.
+        assert merged["temperature"] == 0.1
+        assert merged["repeat_penalty"] == 1.5
+        assert merged["top_p"] == _inf_mod.settings.default_top_p
+
+    def test_explicit_greedy_zero_temperature_preserved(self, monkeypatch):
+        # A client that deliberately requests greedy (temperature=0) must keep
+        # it — 0 is a real value, not "unset".
+        monkeypatch.setattr(_inf_mod.settings, "sampling_defaults_enabled", True)
+        monkeypatch.setattr(_inf_mod.settings, "default_temperature", 0.8)
+        merged = _inf_mod._apply_sampling_defaults({"temperature": 0})
+        assert merged["temperature"] == 0
+
+    def test_disabled_returns_input_unchanged(self, monkeypatch):
+        monkeypatch.setattr(_inf_mod.settings, "sampling_defaults_enabled", False)
+        assert _inf_mod._apply_sampling_defaults({}) == {}
+        assert _inf_mod._apply_sampling_defaults({"top_k": 5}) == {"top_k": 5}
+
+    def test_does_not_mutate_input(self, monkeypatch):
+        monkeypatch.setattr(_inf_mod.settings, "sampling_defaults_enabled", True)
+        req = {"temperature": 0.2}
+        _inf_mod._apply_sampling_defaults(req)
+        assert req == {"temperature": 0.2}
+
+    def test_builds_sampler_and_repeat_penalty_processor(self, monkeypatch):
+        # End-to-end with the real kwargs builder: the defaults must produce a
+        # sampler (temperature present) AND a repeat-penalty logits processor —
+        # the combination that breaks the #646 degenerate runaway.
+        monkeypatch.setattr(_inf_mod.settings, "sampling_defaults_enabled", True)
+        merged = _inf_mod._apply_sampling_defaults({})
+        kwargs = _build_generate_kwargs(merged, is_vlm=False)
+        assert "sampler" in kwargs
+        assert kwargs.get("logits_processors")
 
 
 # --------------------------------------------------------------------------- #

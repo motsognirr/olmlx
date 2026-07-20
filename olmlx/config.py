@@ -212,6 +212,24 @@ class Settings(BaseSettings):
     # every router (Ollama, OpenAI chat/completions, Responses) so the
     # fallback is configured in one place rather than hardcoded per route.
     default_max_tokens: Annotated[int, Field(gt=0)] = 512
+
+    # Ollama-parity default sampling params (#646). When a request (and the
+    # model's own defaults) leave a sampling param unset, olmlx would otherwise
+    # decode greedily with no repetition penalty — on weaker models, greedy + a
+    # JSON grammar (which removes the natural end-of-sequence escape) walks
+    # deterministically into unbounded repetition and runs to max_tokens. Real
+    # Ollama applies these server-side defaults even when the client omits them,
+    # which prevents the degeneration. Set ``sampling_defaults_enabled=false``
+    # to restore the historical greedy-by-default behaviour; the individual
+    # values are tunable (e.g. ``OLMLX_DEFAULT_REPEAT_PENALTY``). An explicit
+    # per-request or per-model value always overrides these.
+    sampling_defaults_enabled: bool = True
+    default_temperature: Annotated[float, Field(ge=0)] = 0.8
+    default_top_p: Annotated[float, Field(gt=0, le=1)] = 0.9
+    default_top_k: Annotated[int, Field(ge=0)] = 40
+    default_repeat_penalty: Annotated[float, Field(gt=0)] = 1.1
+    default_repeat_last_n: Annotated[int, Field(ge=0)] = 64
+
     cors_origins: list[str] = ["http://localhost:*", "http://127.0.0.1:*"]
     anthropic_models: dict[str, str] = {}
 
