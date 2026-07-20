@@ -1209,7 +1209,7 @@ def _merge_default_options(defaults: dict | None, request: dict | None) -> dict:
     return {**(defaults or {}), **(request or {})}
 
 
-def _apply_sampling_defaults(options: dict) -> dict:
+def _apply_sampling_defaults(options: dict, *, is_distributed: bool = False) -> dict:
     """Layer Ollama-parity sampling defaults *under* already-merged options.
 
     olmlx otherwise decodes greedily with no repetition penalty when a request
@@ -1227,11 +1227,17 @@ def _apply_sampling_defaults(options: dict) -> dict:
     (greedy), which is a real value, not "unset".  Gated by
     ``settings.sampling_defaults_enabled`` so the historical greedy-by-default
     behaviour is one setting away.  Does not mutate *options*.
+
+    Skipped for distributed models: ``_build_generate_kwargs`` folds these into
+    a ``sampler`` callable + ``logits_processors``, which ``broadcast_inference``
+    cannot ``json.dumps`` to the workers — injecting them would crash *every*
+    distributed request (grammar is already rejected on that path, so the
+    defaults have no benefit there anyway).
     """
     # Identity check, not truthiness (mirrors ``_batch_eligible``): tests patch
     # ``inference.settings`` with a MagicMock whose every attribute is truthy,
     # which must never inject MagicMock sampling values into ``make_sampler``.
-    if settings.sampling_defaults_enabled is not True:
+    if is_distributed or settings.sampling_defaults_enabled is not True:
         return options
     defaults = {
         "temperature": settings.default_temperature,
@@ -1656,8 +1662,11 @@ async def generate_completion(
         merged_options = _merge_default_options(lm.default_options, options)
         # Layer Ollama-parity sampling defaults under the merged options so a
         # request with no sampling params doesn't decode greedily into a
-        # degenerate max_tokens runaway (#646). Explicit values still win.
-        merged_options = _apply_sampling_defaults(merged_options)
+        # degenerate max_tokens runaway (#646). Explicit values still win;
+        # skipped for distributed (the built sampler can't cross the broadcast).
+        merged_options = _apply_sampling_defaults(
+            merged_options, is_distributed=lm.is_distributed
+        )
         gen_kwargs = _build_generate_kwargs(merged_options, is_vlm=lm.is_vlm)
         mt = gen_kwargs.pop("max_tokens", max_tokens)
 
@@ -4847,8 +4856,11 @@ async def generate_chat(
         merged_options = _merge_default_options(lm.default_options, options)
         # Layer Ollama-parity sampling defaults under the merged options so a
         # request with no sampling params doesn't decode greedily into a
-        # degenerate max_tokens runaway (#646). Explicit values still win.
-        merged_options = _apply_sampling_defaults(merged_options)
+        # degenerate max_tokens runaway (#646). Explicit values still win;
+        # skipped for distributed (the built sampler can't cross the broadcast).
+        merged_options = _apply_sampling_defaults(
+            merged_options, is_distributed=lm.is_distributed
+        )
         gen_kwargs = _build_generate_kwargs(merged_options, is_vlm=lm.is_vlm)
         mt = gen_kwargs.pop("max_tokens", max_tokens)
 

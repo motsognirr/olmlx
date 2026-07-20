@@ -296,6 +296,20 @@ class TestApplySamplingDefaults:
         assert _inf_mod._apply_sampling_defaults({}) == {}
         assert _inf_mod._apply_sampling_defaults({"top_k": 5}) == {"top_k": 5}
 
+    def test_distributed_skips_defaults(self, monkeypatch):
+        # Distributed models must NOT get the defaults: _build_generate_kwargs
+        # folds them into a sampler/logits_processors callable that
+        # broadcast_inference cannot json.dumps to the workers — injecting them
+        # would crash every distributed request.
+        monkeypatch.setattr(_inf_mod.settings, "sampling_defaults_enabled", True)
+        assert _inf_mod._apply_sampling_defaults({}, is_distributed=True) == {}
+        # The resulting gen_kwargs must stay JSON-serializable.
+        import json
+
+        merged = _inf_mod._apply_sampling_defaults({}, is_distributed=True)
+        kwargs = _build_generate_kwargs(merged, is_vlm=False)
+        json.dumps(kwargs)  # must not raise
+
     def test_does_not_mutate_input(self, monkeypatch):
         monkeypatch.setattr(_inf_mod.settings, "sampling_defaults_enabled", True)
         req = {"temperature": 0.2}
