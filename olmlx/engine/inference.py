@@ -1209,6 +1209,46 @@ def _merge_default_options(defaults: dict | None, request: dict | None) -> dict:
     return {**(defaults or {}), **(request or {})}
 
 
+def _apply_sampling_defaults(options: dict, *, is_distributed: bool = False) -> dict:
+    """Layer Ollama-parity sampling defaults *under* already-merged options.
+
+    olmlx otherwise decodes greedily with no repetition penalty when a request
+    (and the model's own defaults) leave the sampling params unset.  On weaker
+    models that combination — greedy + a JSON grammar, which removes the natural
+    end-of-sequence escape — walks deterministically into unbounded repetition
+    and runs to ``max_tokens`` (#646).  Real Ollama applies these defaults
+    server-side even when the client omits them, which prevents the
+    degeneration; matching that here closes the gap for every surface that
+    routes through ``generate_chat`` / ``generate_completion`` (Ollama and
+    OpenAI alike).
+
+    The defaults are layered *under* ``options`` so an explicit per-request or
+    per-model value always wins — including a deliberate ``temperature=0``
+    (greedy), which is a real value, not "unset".  Gated by
+    ``settings.sampling_defaults_enabled`` so the historical greedy-by-default
+    behaviour is one setting away.  Does not mutate *options*.
+
+    Skipped for distributed models: ``_build_generate_kwargs`` folds these into
+    a ``sampler`` callable + ``logits_processors``, which ``broadcast_inference``
+    cannot ``json.dumps`` to the workers — injecting them would crash *every*
+    distributed request (grammar is already rejected on that path, so the
+    defaults have no benefit there anyway).
+    """
+    # Identity check, not truthiness (mirrors ``_batch_eligible``): tests patch
+    # ``inference.settings`` with a MagicMock whose every attribute is truthy,
+    # which must never inject MagicMock sampling values into ``make_sampler``.
+    if is_distributed or settings.sampling_defaults_enabled is not True:
+        return options
+    defaults = {
+        "temperature": settings.default_temperature,
+        "top_p": settings.default_top_p,
+        "top_k": settings.default_top_k,
+        "repeat_penalty": settings.default_repeat_penalty,
+        "repeat_last_n": settings.default_repeat_last_n,
+    }
+    return {**defaults, **options}
+
+
 def _build_generate_kwargs(options: dict | None, is_vlm: bool = False) -> dict:
     """Convert Ollama options dict to mlx_lm/mlx_vlm generate kwargs.
 
@@ -1620,6 +1660,13 @@ async def generate_completion(
                     prompt = f"{system}\n\n{prompt}"
 
         merged_options = _merge_default_options(lm.default_options, options)
+        # Layer Ollama-parity sampling defaults under the merged options so a
+        # request with no sampling params doesn't decode greedily into a
+        # degenerate max_tokens runaway (#646). Explicit values still win;
+        # skipped for distributed (the built sampler can't cross the broadcast).
+        merged_options = _apply_sampling_defaults(
+            merged_options, is_distributed=lm.is_distributed
+        )
         gen_kwargs = _build_generate_kwargs(merged_options, is_vlm=lm.is_vlm)
         mt = gen_kwargs.pop("max_tokens", max_tokens)
 
@@ -4807,6 +4854,13 @@ async def generate_chat(
             logger.debug("Prompt (last 2000 chars): %s", prompt[-2000:])
 
         merged_options = _merge_default_options(lm.default_options, options)
+        # Layer Ollama-parity sampling defaults under the merged options so a
+        # request with no sampling params doesn't decode greedily into a
+        # degenerate max_tokens runaway (#646). Explicit values still win;
+        # skipped for distributed (the built sampler can't cross the broadcast).
+        merged_options = _apply_sampling_defaults(
+            merged_options, is_distributed=lm.is_distributed
+        )
         gen_kwargs = _build_generate_kwargs(merged_options, is_vlm=lm.is_vlm)
         mt = gen_kwargs.pop("max_tokens", max_tokens)
 
