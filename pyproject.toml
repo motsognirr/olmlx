@@ -49,7 +49,11 @@ dependencies = [
     # itself never imports it. torchvision is gone entirely: transformers 5.x
     # auto-falls-back to its PIL image-processor backend when torchvision is
     # absent (every VLM ships both variants), so the VLM path keeps working.
-    "mcp>=1.0",
+    # Floor bumped to 1.28.1 for GHSA-vj7q-gjh5-988w / CVE-2026-59950: the
+    # WebSocket server transport in earlier releases skips Host/Origin
+    # validation (DNS-rebinding exposure). olmlx uses the MCP client, but the
+    # floor keeps the vulnerable server transport out of the resolved tree.
+    "mcp>=1.28.1",
     "rich>=13.0",
     "xgrammar>=0.2.1",
     "mlx-whisper>=0.4.3",
