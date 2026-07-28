@@ -14,6 +14,11 @@ class ToolCall(BaseModel):
     function: ToolCallFunction
 
 
+# Allow-list mirrors the role branches handled in engine/chat_templating.py;
+# unknown roles would render to nothing in common chat templates.
+_VALID_ROLES = frozenset({"system", "user", "assistant", "tool"})
+
+
 class Message(BaseModel):
     role: str
     content: str = Field("", max_length=1_000_000)
@@ -21,6 +26,13 @@ class Message(BaseModel):
     images: list[str] | None = None
     audio: list[str] | None = None
     tool_calls: list[ToolCall] | None = None
+
+    @field_validator("role")
+    @classmethod
+    def validate_role(cls, v: str) -> str:
+        if v not in _VALID_ROLES:
+            raise ValueError(f"role must be one of {sorted(_VALID_ROLES)}, got {v!r}")
+        return v
 
 
 class Tool(BaseModel):
