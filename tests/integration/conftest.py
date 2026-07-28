@@ -2,6 +2,7 @@
 
 import json
 from dataclasses import dataclass, field
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -219,8 +220,21 @@ def mock_mlx_primitives(request, monkeypatch):
     )
     # _find_common_prefix is pure Python — let it run unpatched
 
-    # HuggingFace download
-    _start("huggingface_hub.snapshot_download", MagicMock(return_value="/tmp/fake"))
+    # HuggingFace download — a successful real download materializes files,
+    # and ensure_downloaded() verifies config.json exists (#695), so the
+    # default mock must write one into the requested local_dir.
+    def _fake_snapshot_download(repo_id=None, local_dir=None, **kwargs):
+        if local_dir is not None:
+            target = Path(local_dir)
+            target.mkdir(parents=True, exist_ok=True)
+            (target / "config.json").write_text("{}")
+            return str(target)
+        return "/tmp/fake"
+
+    _start(
+        "huggingface_hub.snapshot_download",
+        MagicMock(side_effect=_fake_snapshot_download),
+    )
 
     # Memory functions — patch mx on the utils.memory module for Metal memory,
     # but patch get_system_memory_bytes directly to avoid @functools.cache poisoning

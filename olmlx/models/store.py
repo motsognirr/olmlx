@@ -338,6 +338,17 @@ class ModelStore:
             # resume on retry.  The .downloading marker keeps is_downloaded()
             # safe either way.
             snapshot_download(repo_id=hf_path, local_dir=str(local_dir))
+            # huggingface_hub silently no-ops on a 404 (logs a warning and
+            # returns the empty local_dir), so "didn't raise" is not proof of
+            # success (#695). Verify the download actually produced model
+            # files BEFORE clearing the marker — is_downloaded() must stay
+            # False so the empty dir is never surfaced by list_local()/show().
+            if not (local_dir / "config.json").exists():
+                raise FileNotFoundError(
+                    f"Download of '{hf_path}' produced no model files "
+                    "(no config.json) — the repo may not exist or the "
+                    "download failed"
+                )
             try:
                 marker.unlink(missing_ok=True)
             except OSError:

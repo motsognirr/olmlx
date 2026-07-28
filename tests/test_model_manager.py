@@ -1604,6 +1604,18 @@ class TestLoadModel:
         local_dir.mkdir(parents=True, exist_ok=True)
         (local_dir / "config.json").write_text("{}")
 
+    def _fake_download(self, mock_store, hf_path):
+        """side_effect for snapshot_download that writes a fake config.json.
+
+        ensure_downloaded() rejects downloads that produce no files (#695),
+        so success-path tests must simulate real file materialization.
+        """
+
+        def _download(**kwargs):
+            self._pre_download(mock_store, hf_path)
+
+        return _download
+
     def test_load_text_model(self, registry, mock_store):
         manager = self._make_manager(registry, mock_store)
         self._pre_download(mock_store, "test/path")
@@ -2030,7 +2042,10 @@ class TestLoadModel:
         mock_mlx_lm.load.return_value = (mock_model, mock_tokenizer)
 
         with patch.object(manager, "_detect_model_kind", return_value="text"):
-            with patch("huggingface_hub.snapshot_download") as mock_dl:
+            with patch(
+                "huggingface_hub.snapshot_download",
+                side_effect=self._fake_download(mock_store, "test/path"),
+            ) as mock_dl:
                 with patch.dict("sys.modules", {"mlx_lm": mock_mlx_lm}):
                     manager._load_model("test/path")
 
@@ -2065,7 +2080,10 @@ class TestLoadModel:
         mock_mlx_lm.load.return_value = (mock_model, mock_tokenizer)
 
         with patch.object(manager, "_detect_model_kind", return_value="text"):
-            with patch("huggingface_hub.snapshot_download"):
+            with patch(
+                "huggingface_hub.snapshot_download",
+                side_effect=self._fake_download(mock_store, "test/path"),
+            ):
                 with patch.dict("sys.modules", {"mlx_lm": mock_mlx_lm}):
                     manager._load_model("test/path")
 
@@ -2092,7 +2110,10 @@ class TestLoadModel:
             return original_unlink(self_path, **kwargs)
 
         with patch.object(manager, "_detect_model_kind", return_value="text"):
-            with patch("huggingface_hub.snapshot_download"):
+            with patch(
+                "huggingface_hub.snapshot_download",
+                side_effect=self._fake_download(mock_store, "test/path"),
+            ):
                 with patch.dict("sys.modules", {"mlx_lm": mock_mlx_lm}):
                     with patch.object(Path, "unlink", unlink_that_fails_on_downloading):
                         model, tok, is_vlm, caps, _ = manager._load_model("test/path")

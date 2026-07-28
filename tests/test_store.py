@@ -15,6 +15,22 @@ from olmlx.models.store import (
 )
 
 
+def _fake_download_for(store: ModelStore, hf_path: str):
+    """side_effect for snapshot_download that writes a fake config.json.
+
+    A bare no-op MagicMock mirrors the real huggingface_hub 404 behavior
+    (no files written), which ensure_downloaded() now rejects (#695) — so
+    success-path tests must simulate a download that produced files.
+    """
+
+    def _download(**kwargs):
+        local_dir = store.local_path(hf_path)
+        local_dir.mkdir(parents=True, exist_ok=True)
+        (local_dir / "config.json").write_text("{}")
+
+    return _download
+
+
 class TestRegisterSpeculativeDraft:
     """ModelStore.register_speculative_draft persists curated draft config (#514)."""
 
@@ -324,7 +340,10 @@ class TestModelStore:
     async def test_pull(self, mock_store, tmp_path):
         from unittest.mock import patch
 
-        with patch("huggingface_hub.snapshot_download"):
+        with patch(
+            "huggingface_hub.snapshot_download",
+            side_effect=_fake_download_for(mock_store, "Qwen/Qwen3-8B-MLX"),
+        ):
             events = []
             async for event in mock_store.pull("qwen3"):
                 events.append(event)
@@ -344,7 +363,10 @@ class TestModelStore:
         models_json = tmp_path / "models.json"
         monkeypatch.setattr("olmlx.engine.registry.settings.models_config", models_json)
 
-        with patch("huggingface_hub.snapshot_download"):
+        with patch(
+            "huggingface_hub.snapshot_download",
+            side_effect=_fake_download_for(mock_store, "Qwen/Qwen3-8B-MLX"),
+        ):
             async for _ in mock_store.pull("qwen3"):
                 pass
 
@@ -375,7 +397,10 @@ class TestModelStore:
     async def test_pull_hf_path_direct(self, mock_store, tmp_path):
         from unittest.mock import patch
 
-        with patch("huggingface_hub.snapshot_download"):
+        with patch(
+            "huggingface_hub.snapshot_download",
+            side_effect=_fake_download_for(mock_store, "org/some-model"),
+        ):
             events = []
             async for event in mock_store.pull("org/some-model"):
                 events.append(event)
@@ -411,7 +436,10 @@ class TestModelStore:
         """On successful download, .downloading marker is removed."""
         from unittest.mock import patch
 
-        with patch("huggingface_hub.snapshot_download"):
+        with patch(
+            "huggingface_hub.snapshot_download",
+            side_effect=_fake_download_for(mock_store, "Qwen/Qwen3-8B-MLX"),
+        ):
             async for _ in mock_store.pull("qwen3"):
                 pass
 
@@ -434,7 +462,10 @@ class TestModelStore:
             return original_unlink(self_path, **kwargs)
 
         with (
-            patch("huggingface_hub.snapshot_download"),
+            patch(
+                "huggingface_hub.snapshot_download",
+                side_effect=_fake_download_for(mock_store, "Qwen/Qwen3-8B-MLX"),
+            ),
             patch.object(Path, "unlink", unlink_that_fails_on_downloading),
         ):
             events = []
@@ -452,6 +483,29 @@ class TestModelStore:
         with pytest.raises(ValueError, match="not found"):
             async for _ in mock_store.pull("totally_unknown"):
                 pass
+
+    @pytest.mark.asyncio
+    async def test_pull_raises_when_download_produces_no_files(self, mock_store):
+        """Pull of a nonexistent repo must fail, not yield success (#695).
+
+        huggingface_hub silently no-ops on a 404 (logs a warning, returns the
+        empty local_dir), so pull() must not write a manifest or yield a
+        success event for an empty directory.
+        """
+        from unittest.mock import patch
+
+        with patch("huggingface_hub.snapshot_download"):
+            events = []
+            with pytest.raises(FileNotFoundError, match="Qwen/Qwen3-8B-MLX"):
+                async for event in mock_store.pull("qwen3"):
+                    events.append(event)
+
+        statuses = [e["status"] for e in events]
+        assert "success" not in statuses
+        # No manifest — a phantom entry must not surface in list_local().
+        local_dir = mock_store.local_path("Qwen/Qwen3-8B-MLX")
+        assert not (local_dir / "manifest.json").exists()
+        assert mock_store.list_local() == []
 
 
 class TestConcurrentPull:
@@ -540,13 +594,34 @@ class TestEnsureDownloaded:
         """Downloads model and removes .downloading marker on success."""
         from unittest.mock import patch
 
-        with patch("huggingface_hub.snapshot_download"):
+        with patch(
+            "huggingface_hub.snapshot_download",
+            side_effect=_fake_download_for(mock_store, "Qwen/Qwen3-8B-MLX"),
+        ):
             result = mock_store.ensure_downloaded("Qwen/Qwen3-8B-MLX")
 
         local_dir = mock_store.local_path("Qwen/Qwen3-8B-MLX")
         assert result == local_dir
         assert local_dir.exists()
         assert not (local_dir / ".downloading").exists()
+
+    def test_raises_when_download_produces_no_files(self, mock_store):
+        """A no-op snapshot_download (real hub 404 behavior) must raise (#695).
+
+        The installed huggingface_hub logs a warning and returns the empty
+        local_dir on a 404 instead of raising, so 'didn't raise' is not proof
+        of success — verify config.json actually materialized.
+        """
+        from unittest.mock import patch
+
+        with patch("huggingface_hub.snapshot_download"):
+            with pytest.raises(FileNotFoundError, match="Qwen/Qwen3-8B-MLX"):
+                mock_store.ensure_downloaded("Qwen/Qwen3-8B-MLX")
+
+        # Marker must survive so the empty dir is never treated as downloaded.
+        local_dir = mock_store.local_path("Qwen/Qwen3-8B-MLX")
+        assert (local_dir / ".downloading").exists()
+        assert not mock_store.is_downloaded("Qwen/Qwen3-8B-MLX")
 
     def test_keeps_partial_dir_on_failure(self, mock_store):
         """Partial directory is kept for resume on download failure."""
@@ -576,7 +651,10 @@ class TestEnsureDownloaded:
             return original_unlink(self_path, **kwargs)
 
         with (
-            patch("huggingface_hub.snapshot_download"),
+            patch(
+                "huggingface_hub.snapshot_download",
+                side_effect=_fake_download_for(mock_store, "Qwen/Qwen3-8B-MLX"),
+            ),
             patch.object(Path, "unlink", unlink_that_fails_on_downloading),
         ):
             result = mock_store.ensure_downloaded("Qwen/Qwen3-8B-MLX")
