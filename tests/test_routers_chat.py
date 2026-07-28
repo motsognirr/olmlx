@@ -1217,6 +1217,21 @@ class TestEmptyMessagesRejected:
         assert "empty" in body
 
 
+class TestUnknownRoleRejected:
+    @pytest.mark.asyncio
+    async def test_api_chat_rejects_unknown_role(self, app_client):
+        resp = await app_client.post(
+            "/api/chat",
+            json={
+                "model": "qwen3",
+                "messages": [{"role": "bogus_role", "content": "hi"}],
+            },
+        )
+        assert resp.status_code == 400
+        body = resp.text.lower()
+        assert "role" in body
+
+
 class TestXCacheIDHeader:
     @pytest.mark.asyncio
     async def test_header_passed_to_generate_chat(self, app_client):

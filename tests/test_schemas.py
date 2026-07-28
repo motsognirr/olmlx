@@ -223,6 +223,10 @@ class TestChatSchemas:
         with pytest.raises(ValidationError, match="messages"):
             ChatRequest(model="test", messages=[])
 
+    def test_message_rejects_unknown_role(self):
+        with pytest.raises(ValidationError, match="role"):
+            Message(role="bogus_role", content="x")
+
     def test_chat_request_think_defaults_none(self):
         req = ChatRequest(model="test", messages=[Message(role="user", content="hi")])
         assert req.think is None
