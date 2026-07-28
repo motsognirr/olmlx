@@ -31,7 +31,7 @@ from olmlx.models.manifest import ModelManifest
 class TestEnsureConfig:
     def test_creates_dir_and_models_json(self, tmp_path, monkeypatch):
         config_path = tmp_path / "subdir" / "models.json"
-        monkeypatch.setattr("olmlx.cli.settings.models_config", config_path)
+        monkeypatch.setattr("olmlx.config.settings.models_config", config_path)
         ensure_config()
         assert config_path.exists()
         data = json.loads(config_path.read_text())
@@ -41,7 +41,7 @@ class TestEnsureConfig:
         config_path = tmp_path / "models.json"
         existing = {"custom:latest": "some/model"}
         config_path.write_text(json.dumps(existing))
-        monkeypatch.setattr("olmlx.cli.settings.models_config", config_path)
+        monkeypatch.setattr("olmlx.config.settings.models_config", config_path)
         ensure_config()
         data = json.loads(config_path.read_text())
         assert data == existing
@@ -57,7 +57,7 @@ class TestEnsureConfig:
         import olmlx.engine.registry as registry_mod
 
         config_path = tmp_path / "models.json"
-        monkeypatch.setattr("olmlx.cli.settings.models_config", config_path)
+        monkeypatch.setattr("olmlx.config.settings.models_config", config_path)
 
         def _boom(obj, fp, *args, **kwargs):
             fp.write("{partial")  # write some bytes, then die like a crash
@@ -81,7 +81,7 @@ def test_default_models_include_whisper():
 
 class TestBuildPlist:
     def test_plist_structure(self, monkeypatch):
-        monkeypatch.setattr("olmlx.cli.shutil.which", lambda _: "/usr/local/bin/olmlx")
+        monkeypatch.setattr("shutil.which", lambda _: "/usr/local/bin/olmlx")
         plist = _build_plist()
         assert plist["Label"] == PLIST_LABEL
         assert plist["ProgramArguments"] == ["/usr/local/bin/olmlx"]
@@ -91,13 +91,13 @@ class TestBuildPlist:
         assert "StandardErrorPath" in plist
 
     def test_plist_fallback_to_python(self, monkeypatch):
-        monkeypatch.setattr("olmlx.cli.shutil.which", lambda _: None)
-        monkeypatch.setattr("olmlx.cli.sys.executable", "/usr/bin/python3")
+        monkeypatch.setattr("shutil.which", lambda _: None)
+        monkeypatch.setattr("sys.executable", "/usr/bin/python3")
         plist = _build_plist()
         assert plist["ProgramArguments"] == ["/usr/bin/python3", "-m", "olmlx"]
 
     def test_plist_forwards_env_vars(self, monkeypatch):
-        monkeypatch.setattr("olmlx.cli.shutil.which", lambda _: "/usr/local/bin/olmlx")
+        monkeypatch.setattr("shutil.which", lambda _: "/usr/local/bin/olmlx")
         monkeypatch.setenv("OLMLX_PORT", "9999")
         plist = _build_plist()
         assert plist["EnvironmentVariables"]["OLMLX_PORT"] == "9999"
@@ -105,7 +105,7 @@ class TestBuildPlist:
     def test_plist_filters_secret_env_vars(self, monkeypatch):
         # Secrets must never be persisted into the cleartext launchd plist
         # (~/Library/LaunchAgents is readable by any local process). #454/#2
-        monkeypatch.setattr("olmlx.cli.shutil.which", lambda _: "/usr/local/bin/olmlx")
+        monkeypatch.setattr("shutil.which", lambda _: "/usr/local/bin/olmlx")
         monkeypatch.setenv("OLMLX_PORT", "9999")
         monkeypatch.setenv("OLMLX_DISTRIBUTED_SECRET", "topsecret")
         monkeypatch.setenv("OLMLX_HF_TOKEN", "hf_xxx")
@@ -129,13 +129,13 @@ class TestBuildPlist:
 class TestServiceInstall:
     def test_install_creates_plist_and_loads(self, tmp_path, monkeypatch):
         plist_path = tmp_path / "com.dpalmqvist.olmlx.plist"
-        monkeypatch.setattr("olmlx.cli.PLIST_PATH", plist_path)
+        monkeypatch.setattr("olmlx.cli.service.PLIST_PATH", plist_path)
         monkeypatch.setattr(
-            "olmlx.cli.settings.models_config", tmp_path / "models.json"
+            "olmlx.config.settings.models_config", tmp_path / "models.json"
         )
-        monkeypatch.setattr("olmlx.cli.shutil.which", lambda _: "/usr/local/bin/olmlx")
+        monkeypatch.setattr("shutil.which", lambda _: "/usr/local/bin/olmlx")
         mock_run = MagicMock()
-        monkeypatch.setattr("olmlx.cli.subprocess.run", mock_run)
+        monkeypatch.setattr("subprocess.run", mock_run)
         cmd_service_install(None)
         assert plist_path.exists()
         with open(plist_path, "rb") as f:
@@ -150,16 +150,16 @@ class TestServiceInstall:
 
     def test_install_handles_launchctl_failure(self, tmp_path, monkeypatch, capsys):
         plist_path = tmp_path / "com.dpalmqvist.olmlx.plist"
-        monkeypatch.setattr("olmlx.cli.PLIST_PATH", plist_path)
+        monkeypatch.setattr("olmlx.cli.service.PLIST_PATH", plist_path)
         monkeypatch.setattr(
-            "olmlx.cli.settings.models_config", tmp_path / "models.json"
+            "olmlx.config.settings.models_config", tmp_path / "models.json"
         )
-        monkeypatch.setattr("olmlx.cli.shutil.which", lambda _: "/usr/local/bin/olmlx")
+        monkeypatch.setattr("shutil.which", lambda _: "/usr/local/bin/olmlx")
 
         def failing_run(*args, **kwargs):
             raise subprocess.CalledProcessError(1, "launchctl", stderr="Load failed")
 
-        monkeypatch.setattr("olmlx.cli.subprocess.run", failing_run)
+        monkeypatch.setattr("subprocess.run", failing_run)
         with pytest.raises(SystemExit) as exc_info:
             cmd_service_install(None)
         assert exc_info.value.code == 1
@@ -182,7 +182,7 @@ class TestResolveAndDownload:
         resolved.hf_path = "org/model"
         mock_store.registry.resolve.return_value = resolved
         mock_store.ensure_downloaded.return_value = tmp_path / "model"
-        monkeypatch.setattr("olmlx.cli._create_store", lambda: mock_store)
+        monkeypatch.setattr("olmlx.cli.models_cmd._create_store", lambda: mock_store)
 
         store, local_dir = _resolve_and_download("mymodel")
         assert store is mock_store
@@ -195,7 +195,7 @@ class TestResolveAndDownload:
         mock_store = MagicMock()
         mock_store.registry.resolve.return_value = None  # direct HF path
         mock_store.ensure_downloaded.return_value = tmp_path / "model"
-        monkeypatch.setattr("olmlx.cli._create_store", lambda: mock_store)
+        monkeypatch.setattr("olmlx.cli.models_cmd._create_store", lambda: mock_store)
 
         _resolve_and_download("org/direct-path")
         mock_store.ensure_downloaded.assert_called_once_with("org/direct-path")
@@ -208,7 +208,7 @@ class TestResolveAndDownload:
         mock_store.ensure_downloaded.side_effect = OSError(
             "Repository Not Found for url: https://huggingface.co/not-a-model"
         )
-        monkeypatch.setattr("olmlx.cli._create_store", lambda: mock_store)
+        monkeypatch.setattr("olmlx.cli.models_cmd._create_store", lambda: mock_store)
 
         with pytest.raises(SystemExit) as exc_info:
             _resolve_and_download("not-a-model")
@@ -226,7 +226,7 @@ class TestResolveAndDownload:
         resolved.hf_path = "org/model"
         mock_store.registry.resolve.return_value = resolved
         mock_store.local_path.return_value = tmp_path / "model"
-        monkeypatch.setattr("olmlx.cli._create_store", lambda: mock_store)
+        monkeypatch.setattr("olmlx.cli.models_cmd._create_store", lambda: mock_store)
 
         store, local_dir = _resolve_and_download("mymodel", download=False)
         assert local_dir == tmp_path / "model"
@@ -240,7 +240,7 @@ class TestResolveAndDownload:
         def _boom():
             raise ModelsConfigError("bad models.json")
 
-        monkeypatch.setattr("olmlx.cli._create_store", _boom)
+        monkeypatch.setattr("olmlx.cli.models_cmd._create_store", _boom)
         # Must NOT be swallowed into a generic exit(1) — cli_main has a
         # dedicated clean-exit handler for this that names the file.
         with pytest.raises(ModelsConfigError):
@@ -251,9 +251,9 @@ class TestServiceUninstall:
     def test_uninstall_removes_plist(self, tmp_path, monkeypatch):
         plist_path = tmp_path / "com.dpalmqvist.olmlx.plist"
         plist_path.write_text("dummy")
-        monkeypatch.setattr("olmlx.cli.PLIST_PATH", plist_path)
+        monkeypatch.setattr("olmlx.cli.service.PLIST_PATH", plist_path)
         mock_run = MagicMock()
-        monkeypatch.setattr("olmlx.cli.subprocess.run", mock_run)
+        monkeypatch.setattr("subprocess.run", mock_run)
         cmd_service_uninstall(None)
         assert not plist_path.exists()
         mock_run.assert_called_once_with(
@@ -263,9 +263,9 @@ class TestServiceUninstall:
 
     def test_uninstall_no_plist(self, tmp_path, monkeypatch, capsys):
         plist_path = tmp_path / "com.dpalmqvist.olmlx.plist"
-        monkeypatch.setattr("olmlx.cli.PLIST_PATH", plist_path)
+        monkeypatch.setattr("olmlx.cli.service.PLIST_PATH", plist_path)
         mock_run = MagicMock()
-        monkeypatch.setattr("olmlx.cli.subprocess.run", mock_run)
+        monkeypatch.setattr("subprocess.run", mock_run)
         cmd_service_uninstall(None)
         mock_run.assert_not_called()
         assert "No plist found" in capsys.readouterr().out
@@ -276,14 +276,14 @@ class TestServiceStatus:
         mock_result = MagicMock(
             returncode=0, stdout="PID\tStatus\tLabel\n123\t0\tcom.dpalmqvist.olmlx"
         )
-        monkeypatch.setattr("olmlx.cli.subprocess.run", lambda *a, **kw: mock_result)
+        monkeypatch.setattr("subprocess.run", lambda *a, **kw: mock_result)
         cmd_service_status(None)
         out = capsys.readouterr().out
         assert "is loaded" in out
 
     def test_status_not_loaded(self, monkeypatch, capsys):
         mock_result = MagicMock(returncode=1, stdout="")
-        monkeypatch.setattr("olmlx.cli.subprocess.run", lambda *a, **kw: mock_result)
+        monkeypatch.setattr("subprocess.run", lambda *a, **kw: mock_result)
         cmd_service_status(None)
         out = capsys.readouterr().out
         assert "is not loaded" in out
@@ -471,11 +471,11 @@ class TestBuildParser:
         monkeypatch.setattr(_settings, "speculative_draft_model", None)
         monkeypatch.setattr(_settings, "speculative_tokens", None)
         monkeypatch.setattr(
-            "olmlx.cli._audit_speculative_config",
+            "olmlx.cli.serve._audit_speculative_config",
             lambda registry=None: ([], [], [], [], False),
         )
         monkeypatch.setattr(
-            "olmlx.cli._models_with_promoted_keys_in_experimental", lambda: []
+            "olmlx.cli.serve._models_with_promoted_keys_in_experimental", lambda: []
         )
 
         parser = build_parser()
@@ -507,11 +507,11 @@ class TestBuildParser:
         monkeypatch.setattr(_settings, "speculative_tokens", None)
         # Stub out registry-walking helpers so the test is hermetic.
         monkeypatch.setattr(
-            "olmlx.cli._audit_speculative_config",
+            "olmlx.cli.serve._audit_speculative_config",
             lambda registry=None: ([], [], [], [], False),
         )
         monkeypatch.setattr(
-            "olmlx.cli._models_with_promoted_keys_in_experimental", lambda: []
+            "olmlx.cli.serve._models_with_promoted_keys_in_experimental", lambda: []
         )
         monkeypatch.delenv("OLMLX_SPECULATIVE", raising=False)
         monkeypatch.delenv("OLMLX_SPECULATIVE_DRAFT_MODEL", raising=False)
@@ -550,11 +550,11 @@ class TestBuildParser:
         monkeypatch.setattr(_settings, "speculative_draft_model", None)
         monkeypatch.setattr(_settings, "speculative_tokens", None)
         monkeypatch.setattr(
-            "olmlx.cli._audit_speculative_config",
+            "olmlx.cli.serve._audit_speculative_config",
             lambda registry=None: ([], [], [], [], False),
         )
         monkeypatch.setattr(
-            "olmlx.cli._models_with_promoted_keys_in_experimental", lambda: []
+            "olmlx.cli.serve._models_with_promoted_keys_in_experimental", lambda: []
         )
         monkeypatch.delenv("OLMLX_SPECULATIVE_TOKENS", raising=False)
         # 0 fails Field(gt=0) on assignment.
@@ -577,11 +577,11 @@ class TestBuildParser:
         monkeypatch.setattr(_settings, "speculative_draft_model", "new/draft")
         monkeypatch.setattr(_settings, "speculative_tokens", 4)
         monkeypatch.setattr(
-            "olmlx.cli._audit_speculative_config",
+            "olmlx.cli.serve._audit_speculative_config",
             lambda registry=None: ([], [], [], [], False),
         )
         monkeypatch.setattr(
-            "olmlx.cli._models_with_promoted_keys_in_experimental", lambda: []
+            "olmlx.cli.serve._models_with_promoted_keys_in_experimental", lambda: []
         )
         # The new env var is set in os.environ; legacy is also set.
         monkeypatch.setenv("OLMLX_SPECULATIVE_DRAFT_MODEL", "new/draft")
@@ -605,11 +605,11 @@ class TestBuildParser:
         monkeypatch.setattr(_settings, "speculative_draft_model", None)
         monkeypatch.setattr(_settings, "speculative_tokens", 4)
         monkeypatch.setattr(
-            "olmlx.cli._audit_speculative_config",
+            "olmlx.cli.serve._audit_speculative_config",
             lambda registry=None: ([], [], [], [], False),
         )
         monkeypatch.setattr(
-            "olmlx.cli._models_with_promoted_keys_in_experimental", lambda: []
+            "olmlx.cli.serve._models_with_promoted_keys_in_experimental", lambda: []
         )
         # Mimic "user explicitly set OLMLX_SPECULATIVE_TOKENS=4 (the
         # default) in their shell". Settings already has the default,
@@ -642,11 +642,11 @@ class TestBuildParser:
         monkeypatch.setattr(_settings, "speculative_draft_model", "x/draft")
         monkeypatch.setattr(_settings, "speculative_tokens", 4)
         monkeypatch.setattr(
-            "olmlx.cli._audit_speculative_config",
+            "olmlx.cli.serve._audit_speculative_config",
             lambda registry=None: ([], [], [], [], False),
         )
         monkeypatch.setattr(
-            "olmlx.cli._models_with_promoted_keys_in_experimental", lambda: []
+            "olmlx.cli.serve._models_with_promoted_keys_in_experimental", lambda: []
         )
         monkeypatch.delenv("OLMLX_SPECULATIVE", raising=False)
         monkeypatch.setenv("OLMLX_EXPERIMENTAL_SPECULATIVE", "true")
@@ -672,11 +672,11 @@ class TestBuildParser:
         monkeypatch.setattr(_settings, "speculative_draft_model", "dotenv/draft")
         monkeypatch.setattr(_settings, "speculative_tokens", 4)
         monkeypatch.setattr(
-            "olmlx.cli._audit_speculative_config",
+            "olmlx.cli.serve._audit_speculative_config",
             lambda registry=None: ([], [], [], [], False),
         )
         monkeypatch.setattr(
-            "olmlx.cli._models_with_promoted_keys_in_experimental", lambda: []
+            "olmlx.cli.serve._models_with_promoted_keys_in_experimental", lambda: []
         )
         monkeypatch.delenv("OLMLX_SPECULATIVE_DRAFT_MODEL", raising=False)
         monkeypatch.setenv("OLMLX_EXPERIMENTAL_SPECULATIVE_DRAFT_MODEL", "legacy/draft")
@@ -697,11 +697,11 @@ class TestBuildParser:
         monkeypatch.setattr(_settings, "speculative", False)
         monkeypatch.setattr(_settings, "speculative_draft_model", None)
         monkeypatch.setattr(
-            "olmlx.cli._audit_speculative_config",
+            "olmlx.cli.serve._audit_speculative_config",
             lambda registry=None: ([], [], [], [], False),
         )
         monkeypatch.setattr(
-            "olmlx.cli._models_with_promoted_keys_in_experimental", lambda: []
+            "olmlx.cli.serve._models_with_promoted_keys_in_experimental", lambda: []
         )
         monkeypatch.setenv("OLMLX_EXPERIMENTAL_SPECULATIVE", "true")
         monkeypatch.setenv(
@@ -725,11 +725,11 @@ class TestBuildParser:
         monkeypatch.setattr(_settings, "speculative", False)
         monkeypatch.setattr(_settings, "speculative_draft_model", None)
         monkeypatch.setattr(
-            "olmlx.cli._audit_speculative_config",
+            "olmlx.cli.serve._audit_speculative_config",
             lambda registry=None: (["bad/model:latest"], [], [], [], False),
         )
         monkeypatch.setattr(
-            "olmlx.cli._models_with_promoted_keys_in_experimental", lambda: []
+            "olmlx.cli.serve._models_with_promoted_keys_in_experimental", lambda: []
         )
         parser = build_parser()
         args = parser.parse_args(["serve"])
@@ -809,11 +809,11 @@ class TestBuildParser:
         monkeypatch.setattr(_settings, "speculative", False)
         monkeypatch.setattr(_settings, "speculative_draft_model", "global/draft")
         monkeypatch.setattr(
-            "olmlx.cli._audit_speculative_config",
+            "olmlx.cli.serve._audit_speculative_config",
             lambda registry=None: ([], [], [], [], False),
         )
         monkeypatch.setattr(
-            "olmlx.cli._models_with_promoted_keys_in_experimental", lambda: []
+            "olmlx.cli.serve._models_with_promoted_keys_in_experimental", lambda: []
         )
         parser = build_parser()
         args = parser.parse_args(["serve"])
@@ -854,11 +854,11 @@ class TestBuildParser:
         monkeypatch.setattr(_settings, "speculative", False)
         monkeypatch.setattr(_settings, "speculative_draft_model", None)
         monkeypatch.setattr(
-            "olmlx.cli._audit_speculative_config",
+            "olmlx.cli.serve._audit_speculative_config",
             lambda registry=None: (["m:latest"], [], ["m:latest"], [], False),
         )
         monkeypatch.setattr(
-            "olmlx.cli._models_with_promoted_keys_in_experimental", lambda: []
+            "olmlx.cli.serve._models_with_promoted_keys_in_experimental", lambda: []
         )
         parser = build_parser()
         args = parser.parse_args(["serve"])
@@ -882,11 +882,11 @@ class TestBuildParser:
         monkeypatch.setattr(_settings, "speculative", False)
         monkeypatch.setattr(_settings, "speculative_draft_model", None)
         monkeypatch.setattr(
-            "olmlx.cli._audit_speculative_config",
+            "olmlx.cli.serve._audit_speculative_config",
             lambda registry=None: ([], [], ["flash/model:latest"], [], False),
         )
         monkeypatch.setattr(
-            "olmlx.cli._models_with_promoted_keys_in_experimental", lambda: []
+            "olmlx.cli.serve._models_with_promoted_keys_in_experimental", lambda: []
         )
         parser = build_parser()
         args = parser.parse_args(["serve"])
@@ -906,11 +906,11 @@ class TestBuildParser:
         monkeypatch.setattr(_settings, "speculative", False)
         monkeypatch.setattr(_settings, "speculative_draft_model", None)
         monkeypatch.setattr(
-            "olmlx.cli._audit_speculative_config",
+            "olmlx.cli.serve._audit_speculative_config",
             lambda registry=None: ([], ["dormant/model:latest"], [], [], False),
         )
         monkeypatch.setattr(
-            "olmlx.cli._models_with_promoted_keys_in_experimental", lambda: []
+            "olmlx.cli.serve._models_with_promoted_keys_in_experimental", lambda: []
         )
         parser = build_parser()
         args = parser.parse_args(["serve"])
@@ -1589,14 +1589,14 @@ class TestBuildParser:
         # registry / file system. Mirrors the pattern used by the other
         # ``_apply_serve_overrides`` tests in this class.
         monkeypatch.setattr(
-            "olmlx.cli._audit_speculative_config",
+            "olmlx.cli.serve._audit_speculative_config",
             lambda registry=None: ([], [], [], [], False),
         )
         monkeypatch.setattr(
-            "olmlx.cli._models_with_promoted_keys_in_experimental", lambda: []
+            "olmlx.cli.serve._models_with_promoted_keys_in_experimental", lambda: []
         )
         monkeypatch.setattr(
-            "olmlx.cli._audit_per_model_flash_in_distributed",
+            "olmlx.cli.serve._audit_per_model_flash_in_distributed",
             lambda registry=None: None,
         )
 
@@ -1612,14 +1612,14 @@ class TestBuildParser:
         from olmlx.config import settings as _settings
 
         monkeypatch.setattr(
-            "olmlx.cli._audit_speculative_config",
+            "olmlx.cli.serve._audit_speculative_config",
             lambda registry=None: ([], [], [], [], False),
         )
         monkeypatch.setattr(
-            "olmlx.cli._models_with_promoted_keys_in_experimental", lambda: []
+            "olmlx.cli.serve._models_with_promoted_keys_in_experimental", lambda: []
         )
         monkeypatch.setattr(
-            "olmlx.cli._audit_per_model_flash_in_distributed",
+            "olmlx.cli.serve._audit_per_model_flash_in_distributed",
             lambda registry=None: None,
         )
 
@@ -1907,8 +1907,8 @@ class TestCreateStore:
     def test_calls_ensure_config(self, tmp_path, monkeypatch):
         """_create_store must call ensure_config so fresh installs get models.json."""
         config_path = tmp_path / "models.json"
-        monkeypatch.setattr("olmlx.cli.settings.models_config", config_path)
-        monkeypatch.setattr("olmlx.cli.settings.models_dir", tmp_path / "models")
+        monkeypatch.setattr("olmlx.config.settings.models_config", config_path)
+        monkeypatch.setattr("olmlx.config.settings.models_dir", tmp_path / "models")
         _create_store()
         # ensure_config should have created models.json
         assert config_path.exists()
@@ -1922,7 +1922,7 @@ class TestCreateStore:
         config_path = tmp_path / "models.json"
         original = "{bad json"
         config_path.write_text(original)
-        monkeypatch.setattr("olmlx.cli.settings.models_config", config_path)
+        monkeypatch.setattr("olmlx.config.settings.models_config", config_path)
         with pytest.raises(ModelsConfigError):
             _create_store()
         # File contents must be untouched — losing the user's config to a
@@ -1932,7 +1932,7 @@ class TestCreateStore:
     def test_ensure_config_permission_error_raises(self, tmp_path, monkeypatch):
         """Permission error in ensure_config should propagate."""
         monkeypatch.setattr(
-            "olmlx.cli.ensure_config",
+            "olmlx.cli.models_cmd.ensure_config",
             lambda: (_ for _ in ()).throw(PermissionError("Permission denied")),
         )
         with pytest.raises(PermissionError):
@@ -1949,7 +1949,7 @@ def mock_store():
 @pytest.fixture
 def _patch_store(monkeypatch, mock_store):
     """Patch _create_store to return mock_store."""
-    monkeypatch.setattr("olmlx.cli._create_store", lambda: mock_store)
+    monkeypatch.setattr("olmlx.cli.models_cmd._create_store", lambda: mock_store)
 
 
 class TestCreateStoreErrorHandlingInCommands:
@@ -1957,7 +1957,7 @@ class TestCreateStoreErrorHandlingInCommands:
 
     def test_list_handles_store_error(self, monkeypatch, capsys):
         monkeypatch.setattr(
-            "olmlx.cli._create_store",
+            "olmlx.cli.models_cmd._create_store",
             lambda: (_ for _ in ()).throw(Exception("bad config")),
         )
         with pytest.raises(SystemExit) as exc_info:
@@ -1967,7 +1967,7 @@ class TestCreateStoreErrorHandlingInCommands:
 
     def test_show_handles_store_error(self, monkeypatch, capsys):
         monkeypatch.setattr(
-            "olmlx.cli._create_store",
+            "olmlx.cli.models_cmd._create_store",
             lambda: (_ for _ in ()).throw(Exception("bad config")),
         )
         args = MagicMock(model_name="test")
@@ -1978,7 +1978,7 @@ class TestCreateStoreErrorHandlingInCommands:
 
     def test_pull_handles_store_error(self, monkeypatch, capsys):
         monkeypatch.setattr(
-            "olmlx.cli._create_store",
+            "olmlx.cli.models_cmd._create_store",
             lambda: (_ for _ in ()).throw(Exception("bad config")),
         )
         args = MagicMock(model_name="test")
@@ -1989,7 +1989,7 @@ class TestCreateStoreErrorHandlingInCommands:
 
     def test_delete_handles_store_error(self, monkeypatch, capsys):
         monkeypatch.setattr(
-            "olmlx.cli._create_store",
+            "olmlx.cli.models_cmd._create_store",
             lambda: (_ for _ in ()).throw(Exception("bad config")),
         )
         args = MagicMock(model_name="test", yes=True)

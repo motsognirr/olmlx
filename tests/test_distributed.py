@@ -837,7 +837,7 @@ class TestAtexitGuard:
 
     def test_atexit_registered_once(self):
         """_launch_distributed_workers should register atexit only once."""
-        import olmlx.cli as cli_module
+        import olmlx.cli.distributed_launch as cli_module
 
         # Reset the flag
         cli_module._atexit_registered = False
@@ -850,7 +850,7 @@ class TestFileHandleLeak:
 
     def test_log_fh_closed_on_popen_failure(self, tmp_path, monkeypatch):
         """If Popen raises, the log file handle should be closed."""
-        import olmlx.cli as cli_module
+        import olmlx.cli.distributed_launch as cli_module
 
         # Reset state
         cli_module._worker_procs.clear()
@@ -1034,7 +1034,7 @@ class TestSSHFailureDetection:
 
     def test_ssh_failure_detected_early(self, tmp_path, monkeypatch):
         """Immediate SSH failure should be detected before server starts."""
-        import olmlx.cli as cli_module
+        import olmlx.cli.distributed_launch as cli_module
 
         cli_module._worker_procs.clear()
         cli_module._atexit_registered = False
@@ -1107,7 +1107,7 @@ class TestCleanupWorkersRobust:
 
     def test_cleanup_kills_after_terminate_timeout(self):
         """If terminate doesn't work within timeout, kill should be called."""
-        import olmlx.cli as cli_module
+        import olmlx.cli.distributed_launch as cli_module
 
         mock_proc = MagicMock()
         mock_proc.terminate = MagicMock()
@@ -1132,7 +1132,7 @@ class TestLogFileHandleLifetime:
 
     def test_log_handles_stored_alongside_procs(self, tmp_path, monkeypatch):
         """Log file handles should be stored and not closed immediately."""
-        import olmlx.cli as cli_module
+        import olmlx.cli.distributed_launch as cli_module
 
         cli_module._worker_procs.clear()
         cli_module._worker_log_fhs.clear()
@@ -1229,7 +1229,7 @@ class TestRingHostfileGeneration:
 
     def test_ring_hostfile_generated(self, tmp_path, monkeypatch):
         """_launch_distributed_workers should generate a ring hostfile."""
-        import olmlx.cli as cli_module
+        import olmlx.cli.distributed_launch as cli_module
 
         cli_module._worker_procs.clear()
         cli_module._worker_log_fhs.clear()
@@ -1290,7 +1290,7 @@ class TestRingHostfileGeneration:
 
     def test_ring_hostfile_port_increments(self, tmp_path, monkeypatch):
         """Each host should get an incrementing port in the ring hostfile."""
-        import olmlx.cli as cli_module
+        import olmlx.cli.distributed_launch as cli_module
 
         cli_module._worker_procs.clear()
         cli_module._worker_log_fhs.clear()
@@ -1476,7 +1476,7 @@ class TestSSHCommandConstruction:
 
     def test_ssh_command_includes_working_dir(self, tmp_path, monkeypatch):
         """SSH command should cd to working dir when configured."""
-        import olmlx.cli as cli_module
+        import olmlx.cli.distributed_launch as cli_module
 
         cli_module._worker_procs.clear()
         cli_module._worker_log_fhs.clear()
@@ -1531,7 +1531,7 @@ class TestSSHCommandConstruction:
 
     def test_ssh_command_includes_hostfile(self, tmp_path, monkeypatch):
         """SSH command should create a temp hostfile on the remote."""
-        import olmlx.cli as cli_module
+        import olmlx.cli.distributed_launch as cli_module
 
         cli_module._worker_procs.clear()
         cli_module._worker_log_fhs.clear()
@@ -1585,7 +1585,7 @@ class TestSSHCommandConstruction:
 
     def test_ssh_command_no_mlx_port_or_world_size(self, tmp_path, monkeypatch):
         """SSH command should NOT include MLX_PORT or MLX_WORLD_SIZE (ring backend uses hostfile)."""
-        import olmlx.cli as cli_module
+        import olmlx.cli.distributed_launch as cli_module
 
         cli_module._worker_procs.clear()
         cli_module._worker_log_fhs.clear()
@@ -1750,7 +1750,7 @@ def _restore_signal_disposition():
     """
     import signal
 
-    import olmlx.cli as cli_module
+    import olmlx.cli.distributed_launch as cli_module
 
     old_term = signal.getsignal(signal.SIGTERM)
     old_int = signal.getsignal(signal.SIGINT)
@@ -1776,7 +1776,7 @@ class TestSignalCleanup:
         """Start each test from the interpreter-default dispositions."""
         import signal
 
-        import olmlx.cli as cli_module
+        import olmlx.cli.distributed_launch as cli_module
 
         signal.signal(signal.SIGTERM, signal.SIG_DFL)
         signal.signal(signal.SIGINT, signal.default_int_handler)
@@ -1787,7 +1787,7 @@ class TestSignalCleanup:
         """After install, both handlers are non-default Python callables."""
         import signal
 
-        import olmlx.cli as cli_module
+        import olmlx.cli.distributed_launch as cli_module
 
         cli_module._install_signal_handlers()
 
@@ -1801,7 +1801,7 @@ class TestSignalCleanup:
         """The SIGTERM handler calls _cleanup_workers and exits 128+15."""
         import signal
 
-        import olmlx.cli as cli_module
+        import olmlx.cli.distributed_launch as cli_module
 
         cleanup = MagicMock()
         monkeypatch.setattr(cli_module, "_cleanup_workers", cleanup)
@@ -1819,7 +1819,7 @@ class TestSignalCleanup:
         """A cleanup failure must not leave the coordinator alive on signal."""
         import signal
 
-        import olmlx.cli as cli_module
+        import olmlx.cli.distributed_launch as cli_module
 
         cleanup = MagicMock(side_effect=ProcessLookupError("worker already gone"))
         monkeypatch.setattr(cli_module, "_cleanup_workers", cleanup)
@@ -1837,7 +1837,7 @@ class TestSignalCleanup:
         """A raising chained handler must not prevent the exit either."""
         import signal
 
-        import olmlx.cli as cli_module
+        import olmlx.cli.distributed_launch as cli_module
 
         cleanup = MagicMock()
         monkeypatch.setattr(cli_module, "_cleanup_workers", cleanup)
@@ -1859,7 +1859,7 @@ class TestSignalCleanup:
         """Default SIGINT disposition (default_int_handler) is not chained."""
         import signal
 
-        import olmlx.cli as cli_module
+        import olmlx.cli.distributed_launch as cli_module
 
         cleanup = MagicMock()
         monkeypatch.setattr(cli_module, "_cleanup_workers", cleanup)
@@ -1878,7 +1878,7 @@ class TestSignalCleanup:
         """A non-default handler installed earlier still runs."""
         import signal
 
-        import olmlx.cli as cli_module
+        import olmlx.cli.distributed_launch as cli_module
 
         cleanup = MagicMock()
         monkeypatch.setattr(cli_module, "_cleanup_workers", cleanup)
@@ -1902,7 +1902,7 @@ class TestSignalCleanup:
         """Calling install twice must not re-wrap (no self-chaining)."""
         import signal
 
-        import olmlx.cli as cli_module
+        import olmlx.cli.distributed_launch as cli_module
 
         cli_module._install_signal_handlers()
         first = signal.getsignal(signal.SIGTERM)
@@ -1911,7 +1911,7 @@ class TestSignalCleanup:
 
     def test_cleanup_workers_idempotent(self):
         """Safe to run from both the signal path and atexit."""
-        import olmlx.cli as cli_module
+        import olmlx.cli.distributed_launch as cli_module
 
         mock_proc = MagicMock()
         cli_module._worker_procs.clear()
@@ -1931,7 +1931,7 @@ class TestSignalCleanup:
         """Handlers must already be installed when Popen runs."""
         import signal
 
-        import olmlx.cli as cli_module
+        import olmlx.cli.distributed_launch as cli_module
 
         cli_module._worker_procs.clear()
         cli_module._worker_log_fhs.clear()

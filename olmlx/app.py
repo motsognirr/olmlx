@@ -91,7 +91,7 @@ async def _lifespan_inner(app: FastAPI):
         # The CLI starts the ring backend and sideband server before uvicorn
         # (to avoid the slow transformers import blocking the sideband).
         # Retrieve the pre-created state from cmd_serve().
-        from olmlx.cli import (
+        from olmlx.cli.serve import (
             _cli_distributed_coordinator,
             _cli_distributed_group,
             _cli_distributed_layer_counts,
