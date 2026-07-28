@@ -15,13 +15,18 @@ Single-user, localhost-only inference server:
 olmlx/
 ├── app.py              # FastAPI app factory, middleware, router registration
 ├── config.py           # Settings (pydantic-settings, OLMLX_ env prefix)
-├── cli.py              # CLI subcommands (serve, chat, service, models, config, dflash, eagle, flash, spectral, shard, bench)
+├── cli/                # CLI package: one module per subcommand family (serve, distributed_launch, service, models_cmd, chat_cmd, bench_cmd, prepare_cmd, parser); __init__ re-exports everything + owns dispatch
 ├── chat/               # In-process terminal chat + MCP agent loop
 │   └── voice/          # Push-to-talk STT (Whisper) + Kokoro TTS
 ├── engine/
 │   ├── inference.py    # generate_chat/completion/embeddings/transcription/rerank
+│   ├── generation_options.py  # sampling-defaults layering + generate-kwargs assembly (facade-re-exported by inference.py)
+│   ├── kv_budget.py    # KV memory estimation + prompt tokenization helpers (facade-re-exported by inference.py)
 │   ├── panel.py        # Multi-model panel + judge coordinator (per-turn reconciler)
 │   ├── model_manager.py
+│   ├── model_load_utils.py    # config sanitize, buffer materialization, model-type fallback, Gemma 4 unified-text loader (facade-re-exported by model_manager.py)
+│   ├── cache_capabilities.py  # KV-cache trim/persistence capability predicates (facade-re-exported by model_manager.py)
+│   ├── loaded_model.py # LoadedModel dataclass, structural_copy, load errors (facade-re-exported by model_manager.py)
 │   ├── speculative_loaders.py
 │   ├── spec_decoder_base.py  # SpecDecoderBase: shared mechanics for all speculative strategies
 │   ├── speculative.py  # classic + PLD decoders
