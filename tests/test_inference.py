@@ -473,13 +473,17 @@ class TestBuildGenerateKwargs:
 
     def test_make_sampler_none_raises(self, monkeypatch):
         """When make_sampler is None (mlx-lm not installed), should raise RuntimeError."""
-        monkeypatch.setattr(_inf_mod, "make_sampler", None)
+        from olmlx.engine import generation_options as _genopt_mod
+
+        monkeypatch.setattr(_genopt_mod, "make_sampler", None)
         with pytest.raises(RuntimeError, match="mlx-lm is not installed"):
             _build_generate_kwargs({"temperature": 0.7})
 
     def test_make_logits_processors_none_raises(self, monkeypatch):
         """When make_logits_processors is None (mlx-lm not installed), should raise RuntimeError."""
-        monkeypatch.setattr(_inf_mod, "make_logits_processors", None)
+        from olmlx.engine import generation_options as _genopt_mod
+
+        monkeypatch.setattr(_genopt_mod, "make_logits_processors", None)
         with pytest.raises(RuntimeError, match="mlx-lm is not installed"):
             _build_generate_kwargs({"repeat_penalty": 1.1})
 
@@ -856,7 +860,7 @@ class TestApplySeed:
     def test_apply_seed_consume_pops(self):
         """_apply_seed(consume=True) should pop seed — text models must not forward it."""
         kwargs = {"seed": 42, "max_tokens": 100}
-        with patch("olmlx.engine.inference.mx") as mock_mx:
+        with patch("olmlx.engine.generation_options.mx") as mock_mx:
             _apply_seed(kwargs, consume=True)
         assert "seed" not in kwargs
         mock_mx.random.seed.assert_called_once_with(42)
@@ -864,7 +868,7 @@ class TestApplySeed:
     def test_apply_seed_no_consume_keeps(self):
         """_apply_seed(consume=False) should keep seed — VLMs forward it to mlx-vlm."""
         kwargs = {"seed": 42, "max_tokens": 100}
-        with patch("olmlx.engine.inference.mx") as mock_mx:
+        with patch("olmlx.engine.generation_options.mx") as mock_mx:
             _apply_seed(kwargs, consume=False)
         assert "seed" in kwargs
         mock_mx.random.seed.assert_called_once_with(42)
@@ -872,7 +876,7 @@ class TestApplySeed:
     def test_apply_seed_no_seed(self):
         """_apply_seed with no seed key should be a no-op."""
         kwargs = {"max_tokens": 100}
-        with patch("olmlx.engine.inference.mx") as mock_mx:
+        with patch("olmlx.engine.generation_options.mx") as mock_mx:
             _apply_seed(kwargs)
         mock_mx.random.seed.assert_not_called()
 

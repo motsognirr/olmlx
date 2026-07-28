@@ -196,7 +196,7 @@ class TestCmdFlashInfo:
         # local_path returns a dir with no flash artifacts.
         monkeypatch.setattr(store.registry, "resolve", lambda name: None)
         monkeypatch.setattr(store, "local_path", lambda hf: tmp_path / "model")
-        monkeypatch.setattr("olmlx.cli._create_store", lambda: store)
+        monkeypatch.setattr("olmlx.cli.models_cmd._create_store", lambda: store)
 
         ns = type("NS", (), {"model": "missing/model"})()
         cmd_flash_info(ns)

@@ -68,7 +68,7 @@ class TestFlashInfo:
         mock_store.local_path.return_value = tmp_path / "model"
 
         with (
-            patch("olmlx.cli.ensure_config"),
+            patch("olmlx.cli.models_cmd.ensure_config"),
             patch.dict(
                 "sys.modules",
                 {},
@@ -124,7 +124,7 @@ class TestFlashInfo:
         mock_store = mock_store_cls.return_value
         mock_store.local_path.return_value = model_dir
 
-        with patch("olmlx.cli.ensure_config"):
+        with patch("olmlx.cli.models_cmd.ensure_config"):
             import olmlx.engine.registry as reg_mod
             import olmlx.models.store as store_mod
 

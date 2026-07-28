@@ -51,7 +51,7 @@ class TestParseKeepAlive:
 
     @pytest.mark.parametrize("value", ["invalid", "1d", "abc123", ""])
     def test_invalid_format_warns_and_defaults(self, value, caplog):
-        with caplog.at_level(logging.WARNING, logger="olmlx.engine.model_manager"):
+        with caplog.at_level(logging.WARNING, logger="olmlx.engine.loaded_model"):
             assert parse_keep_alive(value) == 300.0  # default
         assert "Invalid keep_alive format" in caplog.text
 
@@ -1163,7 +1163,9 @@ class TestGemma4UnifiedTextLoader:
             called["cfg"] = cfg
             return sentinel
 
-        monkeypatch.setattr(mm, "_load_gemma4_unified_text", fake_loader)
+        import olmlx.engine.model_load_utils as mlu
+
+        monkeypatch.setattr(mlu, "_load_gemma4_unified_text", fake_loader)
         result = mm._maybe_load_gemma4_unified_text(str(tmp_path))
 
         assert result is sentinel
@@ -2934,7 +2936,7 @@ class TestEnsureTokenizerEosInStops:
         # Scope caplog to our logger to avoid spurious failures from unrelated
         # WARNING-level emissions (e.g. deprecation notices from pytest plugins).
         tok = _FakeTokenizerWrapper(inner_eos=None, stops={151643})
-        with caplog.at_level(logging.WARNING, logger="olmlx.engine.model_manager"):
+        with caplog.at_level(logging.WARNING, logger="olmlx.engine.model_load_utils"):
             _ensure_tokenizer_eos_in_stops(tok)
         assert tok.eos_token_ids == {151643}
         assert not caplog.records, f"unexpected warnings: {caplog.records}"
@@ -2952,7 +2954,7 @@ class TestEnsureTokenizerEosInStops:
         # also DEBUG-log so a future mlx-lm change of the stop-set type is
         # discoverable rather than silently disabling the workaround.
         tok = _FakeTokenizerWrapper(inner_eos=151645, stops=None)
-        with caplog.at_level(logging.DEBUG, logger="olmlx.engine.model_manager"):
+        with caplog.at_level(logging.DEBUG, logger="olmlx.engine.model_load_utils"):
             _ensure_tokenizer_eos_in_stops(tok)
         assert tok.eos_token_ids is None
         assert any("not set" in r.message for r in caplog.records)
@@ -2963,7 +2965,7 @@ class TestEnsureTokenizerEosInStops:
         # discoverable without spamming WARNING for deliberate variants.
         tok = _FakeTokenizerWrapper(inner_eos=151645, stops={151643})
         del tok._tokenizer
-        with caplog.at_level(logging.DEBUG, logger="olmlx.engine.model_manager"):
+        with caplog.at_level(logging.DEBUG, logger="olmlx.engine.model_load_utils"):
             _ensure_tokenizer_eos_in_stops(tok)
         assert tok.eos_token_ids == {151643}
         assert any("not accessible" in r.message for r in caplog.records)
@@ -2973,7 +2975,7 @@ class TestEnsureTokenizerEosInStops:
         # branch or promotes/demotes its log level.
         tok = _FakeTokenizerWrapper(inner_eos=None, stops={151643})
         tok._tokenizer.eos_token_id = 3.14  # float: not int, list, or None
-        with caplog.at_level(logging.WARNING, logger="olmlx.engine.model_manager"):
+        with caplog.at_level(logging.WARNING, logger="olmlx.engine.model_load_utils"):
             _ensure_tokenizer_eos_in_stops(tok)
         assert tok.eos_token_ids == {151643}  # unchanged
         assert any("unexpected type" in r.message for r in caplog.records)

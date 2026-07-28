@@ -61,12 +61,13 @@ from olmlx.engine.grammar import GrammarSpec
 from olmlx.engine.logits_processors import (
     _GptOssChannelFilter,
     _install_grammar_processor,
-    _make_frequency_penalty_processor,
-    _make_presence_penalty_processor,
-    # Re-exported only for back-compat with tests that import them from here.
     _gpt_oss_filter as _gpt_oss_filter,
     _GPT_OSS_STRUCTURAL_TOKENS as _GPT_OSS_STRUCTURAL_TOKENS,
     _resolve_model_vocab_size as _resolve_model_vocab_size,
+    # Re-exported for tests that import them from here; the in-module
+    # consumer (_build_generate_kwargs) moved to generation_options.
+    _make_frequency_penalty_processor as _make_frequency_penalty_processor,
+    _make_presence_penalty_processor as _make_presence_penalty_processor,
 )
 
 # Chat-template application + message normalization were extracted to a focused
@@ -96,6 +97,23 @@ from olmlx.utils import tracing as _tracing
 from olmlx.utils.audio_input import cleanup_temp_audio, materialize_audio
 from olmlx.utils.streaming import async_mlx_stream, materialize_lazy_cache_state
 from olmlx.utils.timing import Timer, TimingStats
+
+# Extracted helper modules (#split-large-modules). Re-exported so
+# `from olmlx.engine.inference import X` and facade-level monkeypatch
+# targets keep working for code still living in this module.
+from olmlx.engine.generation_options import (  # noqa: F401
+    _apply_sampling_defaults,
+    _apply_seed,
+    _build_generate_kwargs,
+    _merge_default_options,
+)
+from olmlx.engine.kv_budget import (  # noqa: F401
+    MEMORY_SAFETY_FACTOR,
+    _parse_kv_cache_quant,
+    build_context_input_tokens,
+    estimate_kv_cache_bytes,
+    tokenize_for_cache,
+)
 
 
 def _strategy_label(lm: "LoadedModel") -> str:
@@ -722,250 +740,6 @@ async def _schedule_deferred_inference_cleanup(
         )
 
 
-MEMORY_SAFETY_FACTOR = 1.3
-"""Safety multiplier for KV cache memory estimates (Bug #125).
-
-Metal alignment, intermediate buffers, and allocator overhead can cause actual
-memory usage to exceed the raw 2-bytes-per-element calculation by 20-30%.
-"""
-
-
-def estimate_kv_cache_bytes(
-    model: Any, num_tokens: int, *, kv_cache_quant: str | None = None
-) -> int:
-    """Estimate KV cache memory for a given number of tokens.
-
-    Formula: sum_over_attn_layers(2 * kv_heads_i * head_dim) * num_tokens * bytes_per_element * MEMORY_SAFETY_FACTOR
-
-    When *kv_cache_quant* is set (e.g. ``"turboquant:4"``), the per-head
-    storage is reduced from ``head_dim * 2`` bytes (fp16) to the compressed
-    size: ``head_dim / (8 / bits)`` packed-index bytes + 4 norm bytes.
-
-    For NAS models (e.g. nemotron-nas) that have per-layer variable attention
-    (some layers are no-op with self_attn=None, and KV head counts vary per
-    layer), we introspect model.model.layers to count only actual attention
-    layers and read their n_kv_heads.  Falls back to args-based estimation
-    when layer introspection isn't possible.
-    """
-    if num_tokens <= 0:
-        return 0
-
-    # TurboQuant compression ratio.  Normal fp16 stores head_dim * 2 bytes
-    # per K or V entry.  TurboQuant stores head_dim/(8/bits) packed-index
-    # bytes + 4 float32 norm bytes.  We compute a multiplier <1 to scale
-    # the fp16 estimate.  MLA models use a different cache layout so
-    # TurboQuant does not apply there (ratio stays 1.0).
-    _tq_ratio = 1.0  # applied to raw estimate before safety factor
-
-    # mlx-lm text models: model.args
-    # mlx-vlm vision-language models: model.language_model.args or .config
-    # Wrapper args (e.g. Qwen3_5_MoE ModelArgs) carry only a ``text_config``
-    # dict; the real attention fields live on ``model.language_model.args``.
-    args = getattr(model, "args", None)
-    args_owner: Any = model
-    is_wrapper = (
-        args is not None
-        and hasattr(args, "text_config")
-        and not hasattr(args, "num_attention_heads")
-        and not hasattr(args, "kv_lora_rank")
-    )
-    if args is None or is_wrapper:
-        lang_model = getattr(model, "language_model", None)
-        inner_args = None
-        if lang_model is not None:
-            inner_args = getattr(lang_model, "args", None) or getattr(
-                lang_model, "config", None
-            )
-        if inner_args is not None:
-            args = inner_args
-            args_owner = lang_model
-        elif is_wrapper:
-            # Fail loudly — otherwise we'd fall through to args.num_attention_heads
-            # on the wrapper itself and crash with an opaque AttributeError.
-            raise AttributeError(
-                "model.args is a text_config wrapper but could not resolve "
-                "inner attention config (model.language_model missing or has "
-                "no 'args'/'config')"
-            )
-    if args is None:
-        args = getattr(model, "config", None)
-    if args is None:
-        raise AttributeError(
-            "Model has no 'args' attribute (checked model.args, "
-            "model.language_model.args/config, model.config)"
-        )
-
-    # MLA (Multi-head Latent Attention) models like DeepSeek V3 compress the
-    # KV cache to (kv_lora_rank + qk_rope_head_dim) per layer instead of
-    # (2 * num_kv_heads * head_dim).  Detect via kv_lora_rank in model args.
-    kv_lora_rank = getattr(args, "kv_lora_rank", None)
-    if isinstance(kv_lora_rank, int) and kv_lora_rank > 0:
-        qk_rope_head_dim = getattr(args, "qk_rope_head_dim", 0)
-        num_layers = args.num_hidden_layers
-        bytes_per_element = 2  # float16/bfloat16
-        # MLA stores compressed_kv (kv_lora_rank dims) as keys and
-        # k_pe (qk_rope_head_dim dims) as values, each with 1 effective head.
-        raw = (
-            num_layers
-            * 2
-            * (kv_lora_rank + qk_rope_head_dim)
-            * num_tokens
-            * bytes_per_element
-        )
-        return int(raw * MEMORY_SAFETY_FACTOR)
-
-    num_heads = args.num_attention_heads
-    head_dim = (
-        args.head_dim if hasattr(args, "head_dim") else args.hidden_size // num_heads
-    )
-    bytes_per_element = 2  # float16/bfloat16
-
-    if kv_cache_quant is not None:
-        method, quant_bits = _parse_kv_cache_quant(kv_cache_quant)
-        fp16_per_entry = head_dim * bytes_per_element
-        if method == "turboquant":
-            # TurboQuant: packed indices + float32 norm
-            tq_per_entry = head_dim // (8 // quant_bits) + 4  # 4 bytes for f32 norm
-            _tq_ratio = tq_per_entry / fp16_per_entry
-        elif method == "spectral":
-            # SpectralQuant: two packed regimes (semantic + tail) + float32 norm
-            # Conservative estimate using avg_bits (actual varies per head)
-            sq_per_entry = head_dim // (8 // quant_bits) + 4
-            _tq_ratio = sq_per_entry / fp16_per_entry
-        elif method == "shard":
-            # ShardQuant: PCA-basis-projected packed indices + float32 norm.
-            # Rank truncation makes the real footprint smaller than this, so
-            # the turboquant-style estimate is a safe upper bound — but still
-            # far below fp16. Without it, shard-quant models were estimated at
-            # full fp16 KV size, 503-ing long prompts that would actually fit
-            # (#634).
-            shard_per_entry = head_dim // (8 // quant_bits) + 4
-            _tq_ratio = shard_per_entry / fp16_per_entry
-
-    # Try layer introspection for NAS/variable-attention/hybrid models.
-    # ``args_owner`` was set above to the component whose args we resolved
-    # (model.language_model for VLMs/wrappers, else model) so we introspect
-    # the correct layer tree and avoid hitting a vision encoder.
-    inner = getattr(args_owner, "model", None)
-    layers = getattr(inner, "layers", None) if inner is not None else None
-    if isinstance(layers, (list, tuple)) and len(layers) > 0:
-        # Per-layer accounting for hybrid attention (e.g. Gemma 4): some
-        # layers may use sliding-window attention with a different
-        # n_kv_heads/head_dim and a hard cap on cache depth, while others
-        # use full attention with their own dimensions.
-        sliding_window = getattr(args, "sliding_window", None)
-        raw_total = 0
-        found_attn_layer = False
-        introspection_complete = True
-        for layer in layers:
-            self_attn = getattr(layer, "self_attn", None)
-            if self_attn is None:
-                continue  # no-op attention layer — no KV cache
-            layer_kv_heads = getattr(self_attn, "n_kv_heads", None)
-            if not isinstance(layer_kv_heads, int):
-                # Try alternate attribute name (e.g. Qwen3-Next uses
-                # "num_key_value_heads" instead of "n_kv_heads")
-                layer_kv_heads = getattr(self_attn, "num_key_value_heads", None)
-            if not isinstance(layer_kv_heads, int):
-                # Standard model — fall back to args
-                introspection_complete = False
-                break
-            found_attn_layer = True
-            # Per-layer head_dim falls back to the global head_dim if the
-            # attention module doesn't expose its own as an int (most
-            # uniform models).  isinstance check guards against test
-            # MagicMocks auto-creating non-numeric attributes.
-            attn_head_dim = getattr(self_attn, "head_dim", None)
-            layer_head_dim = (
-                attn_head_dim if isinstance(attn_head_dim, int) else head_dim
-            )
-            # Sliding-window attention: cap effective tokens at the window
-            # size.  Use `is True` to avoid being fooled by truthy MagicMocks
-            # in tests; production code sets a literal bool.  Prefer a
-            # per-layer window if exposed (defensive — Gemma 4 today shares
-            # a single window across all sliding layers via args, but a
-            # future model could expose heterogeneous windows).
-            is_sliding = getattr(self_attn, "is_sliding", None) is True
-            layer_sw: int | None = None
-            for attr in ("sliding_window_size", "sliding_window"):
-                v = getattr(self_attn, attr, None)
-                if isinstance(v, int) and v > 0:
-                    layer_sw = v
-                    break
-            if layer_sw is None and isinstance(sliding_window, int):
-                layer_sw = sliding_window
-            if is_sliding and layer_sw is None:
-                # A sliding-window layer with no resolvable window size
-                # falls through to a full-prompt estimate (safe overestimate
-                # — won't cause OOM, just a spurious 503 on long prompts).
-                # Log so the condition is diagnosable without a debugger.
-                logger.debug(
-                    "Layer %d reports is_sliding=True but no window size "
-                    "found on self_attn or args; using full token count for "
-                    "KV estimation (safe overestimate)",
-                    getattr(self_attn, "layer_idx", -1),
-                )
-            effective_tokens = (
-                min(num_tokens, layer_sw)
-                if is_sliding and layer_sw is not None
-                else num_tokens
-            )
-            raw_total += (
-                2
-                * layer_kv_heads
-                * layer_head_dim
-                * effective_tokens
-                * bytes_per_element
-            )
-        # Only trust introspection when every encountered layer reported its
-        # KV heads.  found_attn_layer == False likely means the attention
-        # module uses a different attribute name (e.g. "attention" instead of
-        # "self_attn"); fall through to the args-based estimate in that case.
-        if introspection_complete and found_attn_layer:
-            return int(raw_total * _tq_ratio * MEMORY_SAFETY_FACTOR)
-
-    # Fallback: uniform estimate from args
-    num_layers = args.num_hidden_layers
-    num_kv_heads = getattr(args, "num_key_value_heads", num_heads)
-    raw = num_layers * 2 * num_kv_heads * head_dim * num_tokens * bytes_per_element
-    return int(raw * _tq_ratio * MEMORY_SAFETY_FACTOR)
-
-
-def tokenize_for_cache(tokenizer: Any, prompt_text: str) -> list[int]:
-    """Tokenize prompt text matching stream_generate's tokenization logic.
-
-    Must exactly replicate the BOS heuristic in mlx_lm.generate.stream_generate
-    to avoid token sequence divergence (which would cause every request to be a
-    cache miss).  stream_generate uses ``bos_token is None``, NOT ``not bos_token``.
-    """
-    bos = getattr(tokenizer, "bos_token", None)
-    add_special = bos is None or not prompt_text.startswith(bos)
-    return tokenizer.encode(prompt_text, add_special_tokens=add_special)
-
-
-def build_context_input_tokens(
-    tokenizer: Any, prompt_text: str, context: list[int] | None
-) -> list[int]:
-    """Build the full input token sequence for Ollama ``/api/generate`` context.
-
-    Tokenizes *prompt_text* (via :func:`tokenize_for_cache`, so the ids match
-    what generation would produce for the string) and, when *context* is a
-    non-empty prior token sequence, prepends it — the legacy Ollama
-    stateless-continuation mechanism (issue #656).  A leading BOS on the fresh
-    prompt is dropped when *context* is supplied so the concatenated sequence
-    doesn't repeat the sequence-initial BOS (whether the BOS came from
-    ``add_special_tokens`` or from a chat template that emits it as literal
-    text — both surface as ``bos_token_id`` at position 0).
-    """
-    prompt_tokens = tokenize_for_cache(tokenizer, prompt_text)
-    if not context:
-        return prompt_tokens
-    bos_id = getattr(tokenizer, "bos_token_id", None)
-    if bos_id is not None and prompt_tokens and prompt_tokens[0] == bos_id:
-        prompt_tokens = prompt_tokens[1:]
-    return list(context) + prompt_tokens
-
-
 async def _acquire_inference_lock(timeout_override: float | None = None):
     """Acquire the inference lock with optional timeout.
 
@@ -1188,183 +962,6 @@ async def _trace_inference_gen(
             yield chunk
 
 
-def _merge_default_options(defaults: dict | None, request: dict | None) -> dict:
-    """Merge per-model default options with per-request options.
-
-    Request values win per-key; keys absent from the request fall back to
-    model defaults.  ``request=None`` and ``request={}`` both mean "use
-    defaults"; any non-None ``request`` is layered on top of ``defaults``.
-    ``defaults=None`` is accepted symmetrically with ``request`` and treated
-    as an empty dict so callers that haven't normalised the field can still
-    use this helper without a guard.
-
-    History: prior versions dropped *all* defaults whenever the request
-    supplied *any* options — so a request that sent ``top_k`` without
-    ``temperature`` silently lost the model's default temperature and ran
-    greedy (no sampler built).  Surfaced via opencode + Qwen3-Coder-Next-4bit
-    where opencode sent ``{top_k, top_p, min_p}`` and ``models.json``'s
-    ``"temperature": 0.7`` was discarded.  The current always-merge form
-    matches Ollama's per-model options semantics.
-    """
-    return {**(defaults or {}), **(request or {})}
-
-
-def _apply_sampling_defaults(options: dict, *, is_distributed: bool = False) -> dict:
-    """Layer Ollama-parity sampling defaults *under* already-merged options.
-
-    olmlx otherwise decodes greedily with no repetition penalty when a request
-    (and the model's own defaults) leave the sampling params unset.  On weaker
-    models that combination — greedy + a JSON grammar, which removes the natural
-    end-of-sequence escape — walks deterministically into unbounded repetition
-    and runs to ``max_tokens`` (#646).  Real Ollama applies these defaults
-    server-side even when the client omits them, which prevents the
-    degeneration; matching that here closes the gap for every surface that
-    routes through ``generate_chat`` / ``generate_completion`` (Ollama and
-    OpenAI alike).
-
-    The defaults are layered *under* ``options`` so an explicit per-request or
-    per-model value always wins — including a deliberate ``temperature=0``
-    (greedy), which is a real value, not "unset".  Gated by
-    ``settings.sampling_defaults_enabled`` so the historical greedy-by-default
-    behaviour is one setting away.  Does not mutate *options*.
-
-    Skipped for distributed models: ``_build_generate_kwargs`` folds these into
-    a ``sampler`` callable + ``logits_processors``, which ``broadcast_inference``
-    cannot ``json.dumps`` to the workers — injecting them would crash *every*
-    distributed request (grammar is already rejected on that path, so the
-    defaults have no benefit there anyway).
-    """
-    # Identity check, not truthiness (mirrors ``_batch_eligible``): tests patch
-    # ``inference.settings`` with a MagicMock whose every attribute is truthy,
-    # which must never inject MagicMock sampling values into ``make_sampler``.
-    if is_distributed or settings.sampling_defaults_enabled is not True:
-        return options
-    defaults = {
-        "temperature": settings.default_temperature,
-        "top_p": settings.default_top_p,
-        "top_k": settings.default_top_k,
-        "repeat_penalty": settings.default_repeat_penalty,
-        "repeat_last_n": settings.default_repeat_last_n,
-    }
-    return {**defaults, **options}
-
-
-def _build_generate_kwargs(options: dict | None, is_vlm: bool = False) -> dict:
-    """Convert Ollama options dict to mlx_lm/mlx_vlm generate kwargs.
-
-    For text models (mlx-lm ≥ 0.30.7), sampling params are folded into a
-    ``sampler`` callable via ``make_sampler``, and penalty params into a
-    ``logits_processors`` list via ``make_logits_processors``.
-
-    For VLMs (mlx-vlm), params are passed directly as before.
-    """
-    if not options:
-        return {}
-    kwargs = {}
-
-    if is_vlm:
-        # mlx-vlm still accepts direct keyword arguments
-        vlm_mappings = {
-            "temperature": "temperature",
-            "top_p": "top_p",
-            "top_k": "top_k",
-            "seed": "seed",
-            "num_predict": "max_tokens",
-            "repeat_penalty": "repetition_penalty",
-            "repeat_last_n": "repetition_context_size",
-            "min_p": "min_p",
-        }
-        for ollama_key, mlx_key in vlm_mappings.items():
-            if ollama_key in options:
-                kwargs[mlx_key] = options[ollama_key]
-        # Forward stop sequences for downstream (popped before passing to mlx-vlm)
-        if "stop" in options and options["stop"]:
-            raw = options["stop"]
-            kwargs["stop"] = [raw] if isinstance(raw, str) else raw
-    else:
-        # mlx-lm ≥ 0.30.7: sampling via make_sampler / make_logits_processors
-        sampler_args = {}
-        sampling_map = {
-            "temperature": "temp",
-            "top_p": "top_p",
-            "top_k": "top_k",
-            "min_p": "min_p",
-        }
-        for ollama_key, sampler_key in sampling_map.items():
-            if ollama_key in options:
-                sampler_args[sampler_key] = options[ollama_key]
-        # Only build sampler when temperature is explicitly set — make_sampler
-        # defaults temp=0.0 (greedy), which makes top_k/top_p/min_p irrelevant.
-        if sampler_args and "temp" in sampler_args:
-            if make_sampler is None:
-                raise RuntimeError("mlx-lm is not installed; cannot build sampler")
-            kwargs["sampler"] = make_sampler(**sampler_args)
-        elif sampler_args:
-            logger.warning(
-                "top_k/top_p/min_p provided without temperature; no sampler "
-                "will be built and these params will have no effect"
-            )
-
-        # Collect penalty params — only build processors when repeat_penalty
-        # is present; repeat_last_n alone is a no-op (no penalty to apply).
-        if "repeat_penalty" in options:
-            penalty_args = {"repetition_penalty": options["repeat_penalty"]}
-            if "repeat_last_n" in options:
-                penalty_args["repetition_context_size"] = options["repeat_last_n"]
-            if make_logits_processors is None:
-                raise RuntimeError(
-                    "mlx-lm is not installed; cannot build logits processors"
-                )
-            kwargs["logits_processors"] = make_logits_processors(**penalty_args)
-        elif "repeat_last_n" in options:
-            logger.warning(
-                "repeat_last_n without repeat_penalty has no effect; ignored"
-            )
-
-        if "num_predict" in options:
-            kwargs["max_tokens"] = options["num_predict"]
-
-        # Forward seed so _apply_seed can consume it before generation
-        if "seed" in options:
-            kwargs["seed"] = options["seed"]
-
-        # Forward stop sequences for downstream (popped before passing to mlx-lm)
-        if "stop" in options and options["stop"]:
-            raw = options["stop"]
-            kwargs["stop"] = [raw] if isinstance(raw, str) else raw
-
-        # Build custom logits processors for frequency/presence penalty
-        # and merge with any existing repeat_penalty processors.
-        _existing = kwargs.pop("logits_processors", [])
-        fp = options.get("frequency_penalty")
-        if fp is not None and fp != 0:
-            _existing.append(_make_frequency_penalty_processor(fp))
-        pp = options.get("presence_penalty")
-        if pp is not None and pp != 0:
-            _existing.append(_make_presence_penalty_processor(pp))
-        if _existing:
-            kwargs["logits_processors"] = _existing
-
-    return kwargs
-
-
-def _apply_seed(kwargs: dict, *, consume: bool = True) -> None:
-    """Read ``seed`` from *kwargs* and set the MLX RNG state.
-
-    Must be called from the inference thread, not the event loop.
-
-    Args:
-        kwargs: Generate kwargs dict (may contain ``seed``).
-        consume: If True, pop the key so it is not forwarded to the
-                 underlying generate call (required for mlx-lm which
-                 does not accept a ``seed`` kwarg).  If False, the key
-                 is left in place (VLMs forward it to mlx-vlm).
-    """
-    seed = kwargs.pop("seed", None) if consume else kwargs.get("seed", None)
-    if seed is not None:
-        mx.random.seed(seed)
-
-
 def _get_model_for_cache(model: Any, is_vlm: bool) -> Any:
     """Get the language model for cache creation.
 
@@ -1404,13 +1001,6 @@ def _make_shard_prompt_cache(
     return make_shard_cache(
         cache_model, calibration_dir, bits=bits, fused=settings.shard_fused
     )
-
-
-def _parse_kv_cache_quant(spec: str) -> tuple[str, int]:
-    """Split an `OLMLX_KV_CACHE_QUANT` value like `"spectral:4"`
-    into `(method, bits)`.  Format is validated at config load time."""
-    method, bits_str = spec.split(":")
-    return method, int(bits_str)
 
 
 def _parse_kv_eviction(spec: str) -> tuple[int, int]:
