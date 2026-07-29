@@ -360,7 +360,7 @@ def stream_layer_forward(
                 tap._layer_pos = layer_pos  # renumber from per-call 0 to global ordinal
                 layer_pos += 1
         for si in range(len(hidden)):
-            if tap_installed:
+            if tap_installed and acc is not None:
                 source_ref["idx"] = acc.sources.index(sample_sources[si])
             # Fresh per (sample, layer) cache: GDN-safe (recurrent state must
             # not carry across independent forward passes at this layer).

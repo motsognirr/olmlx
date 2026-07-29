@@ -75,10 +75,10 @@ def mask_dropped_experts(model, keep: dict[int, list[int]]) -> Callable[[], None
             orig_bias = gate.e_score_correction_bias
             gate.e_score_correction_bias = orig_bias + neg
 
-            def _restore(g=gate, b=orig_bias):
+            def _restore_gate_bias(g=gate, b=orig_bias):
                 g.e_score_correction_bias = b
 
-            restores.append(_restore)
+            restores.append(_restore_gate_bias)
         elif info.style == STYLE_MINIMAX:
             # bias lives on the MoE block itself, not under a nested gate
             # module (structural difference from DeepSeek) — same
@@ -87,18 +87,18 @@ def mask_dropped_experts(model, keep: dict[int, list[int]]) -> Callable[[], None
             orig_bias = block.e_score_correction_bias
             block.e_score_correction_bias = orig_bias + neg
 
-            def _restore(m=block, b=orig_bias):
+            def _restore_block_bias(m=block, b=orig_bias):
                 m.e_score_correction_bias = b
 
-            restores.append(_restore)
+            restores.append(_restore_block_bias)
         else:
             gate = getattr(info.module, info.gate_attr)
             setattr(info.module, info.gate_attr, _MaskedGate(gate, neg))
 
-            def _restore(m=info.module, a=info.gate_attr, g=gate):
+            def _restore_wrapped_gate(m=info.module, a=info.gate_attr, g=gate):
                 setattr(m, a, g)
 
-            restores.append(_restore)
+            restores.append(_restore_wrapped_gate)
 
     def restore_all() -> None:
         for r in reversed(restores):
