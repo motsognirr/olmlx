@@ -102,6 +102,12 @@ from olmlx.cli.prepare_cmd import (  # noqa: F401
     _show_flash_moe_info,
     _show_flash_dense_info,
 )
+from olmlx.cli.reap_cmd import (  # noqa: F401
+    cmd_reap_apply,
+    cmd_reap_calibrate,
+    cmd_reap_plan,
+    cmd_reap_report,
+)
 from olmlx.cli.parser import (  # noqa: F401
     build_parser,
 )
@@ -136,6 +142,10 @@ _COMMAND_HANDLERS: dict[tuple[str, str | None], str] = {
     ("bench", "compare"): "cmd_bench_compare",
     ("bench", "list"): "cmd_bench_list",
     ("bench", "leaderboard"): "cmd_bench_leaderboard",
+    ("reap", "calibrate"): "cmd_reap_calibrate",
+    ("reap", "plan"): "cmd_reap_plan",
+    ("reap", "apply"): "cmd_reap_apply",
+    ("reap", "report"): "cmd_reap_report",
     ("config", "show"): "cmd_config_show",
 }
 

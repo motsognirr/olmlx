@@ -15,7 +15,7 @@ Single-user, localhost-only inference server:
 olmlx/
 ├── app.py              # FastAPI app factory, middleware, router registration
 ├── config.py           # Settings (pydantic-settings, OLMLX_ env prefix)
-├── cli/                # CLI package: one module per subcommand family (serve, distributed_launch, service, models_cmd, chat_cmd, bench_cmd, prepare_cmd, parser); __init__ re-exports everything + owns dispatch
+├── cli/                # CLI package: one module per subcommand family (serve, distributed_launch, service, models_cmd, chat_cmd, bench_cmd, prepare_cmd, reap_cmd, parser); __init__ re-exports everything + owns dispatch
 ├── chat/               # In-process terminal chat + MCP agent loop
 │   └── voice/          # Push-to-talk STT (Whisper) + Kokoro TTS
 ├── engine/
@@ -43,7 +43,8 @@ olmlx/
 │   ├── dflash/         # Block-diffusion speculative decoder + training
 │   ├── eagle/          # EAGLE speculative decoder + training
 │   ├── mtp/            # Qwen3.6 native MTP head decoder
-│   └── agent/          # Autonomous agent: orchestrator/store/memory/skills/delegate (OLMLX_AGENT_*)
+│   ├── agent/          # Autonomous agent: orchestrator/store/memory/skills/delegate (OLMLX_AGENT_*)
+│   └── reap/           # REAP expert pruning: calibrate/plan/apply/report (olmlx reap *)
 ├── routers/
 │   ├── anthropic.py / openai.py / responses.py / audio.py / rerank.py / metrics.py
 │   ├── streaming_common.py  # shared tools-mode buffering + keepalive

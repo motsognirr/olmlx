@@ -719,6 +719,149 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
 
+    # REAP expert pruning (#701)
+    reap = sub.add_parser("reap", help="REAP expert pruning for MoE models")
+    reap_sub = reap.add_subparsers(dest="reap_command")
+
+    reap_cal = reap_sub.add_parser("calibrate", help="Streaming saliency calibration")
+    reap_cal.add_argument("model")
+    reap_cal.add_argument(
+        "--sources",
+        type=str,
+        default="english,code,chinese",
+        help="Comma-separated calibration sources (default: english,code,chinese)",
+    )
+    reap_cal.add_argument(
+        "--samples-per-source",
+        type=_positive_int,
+        default=256,
+        help="Calibration samples per source (default: 256)",
+    )
+    reap_cal.add_argument(
+        "--max-tokens",
+        type=_positive_int,
+        default=512,
+        help="Max tokens per sample (default: 512)",
+    )
+    reap_cal.add_argument(
+        "--output",
+        type=str,
+        default=None,
+        help="Saliency output path (default: <model>/reap/saliency.npz)",
+    )
+
+    reap_plan = reap_sub.add_parser("plan", help="Keep/drop (+bank) planning")
+    reap_plan.add_argument("model")
+    reap_plan.add_argument(
+        "--mode",
+        choices=["uniform", "global", "graded"],
+        default="uniform",
+        help="Plan mode (default: uniform)",
+    )
+    reap_plan.add_argument(
+        "--keep",
+        type=_positive_int,
+        default=None,
+        help="Experts to keep per layer (uniform mode)",
+    )
+    reap_plan.add_argument(
+        "--keep-fraction",
+        type=float,
+        default=None,
+        help="Fraction of all experts to keep (global/graded)",
+    )
+    reap_plan.add_argument(
+        "--sources",
+        type=str,
+        default=None,
+        help="Comma-separated source subset for domain builds",
+    )
+    reap_plan.add_argument(
+        "--floor-multiple",
+        type=_positive_int,
+        default=4,
+        help="Per-layer floor = multiple * top_k (default: 4)",
+    )
+    reap_plan.add_argument(
+        "--high-fraction",
+        type=float,
+        default=0.25,
+        help="Graded: fraction of kept experts in the high bank (default: 0.25)",
+    )
+    reap_plan.add_argument(
+        "--high-bits",
+        type=int,
+        choices=[4, 5, 6, 8],
+        default=8,
+        help="Graded: high-bank bits (default: 8)",
+    )
+    reap_plan.add_argument(
+        "--low-bits",
+        type=int,
+        choices=[2, 3, 4],
+        default=4,
+        help="Graded: low-bank bits (default: 4)",
+    )
+    reap_plan.add_argument(
+        "--saliency",
+        type=str,
+        default=None,
+        help="Saliency npz path (default: <model>/reap/saliency.npz)",
+    )
+    reap_plan.add_argument(
+        "--output",
+        type=str,
+        default=None,
+        help="Plan output path (default: <model>/reap/reap_plan.json)",
+    )
+
+    reap_apply = reap_sub.add_parser("apply", help="Prune the checkpoint per plan")
+    reap_apply.add_argument("model")
+    reap_apply.add_argument(
+        "--plan", type=str, required=True, help="reap_plan.json path"
+    )
+    reap_apply.add_argument(
+        "--output-dir",
+        type=str,
+        default=None,
+        help="Output dir (default: <model>/reap/pruned-<mode><keep>)",
+    )
+
+    reap_rep = reap_sub.add_parser(
+        "report", help="Overlap analysis + held-out perplexity"
+    )
+    reap_rep.add_argument("model")
+    reap_rep.add_argument(
+        "--saliency",
+        type=str,
+        default=None,
+        help="Saliency npz path (default: <model>/reap/saliency.npz)",
+    )
+    reap_rep.add_argument(
+        "--keep",
+        type=_positive_int,
+        default=None,
+        help="Keep count for overlap analysis (default: from reap_plan.json)",
+    )
+    reap_rep.add_argument(
+        "--pruned-dir",
+        type=str,
+        default=None,
+        help="Pruned model dir for the perplexity gate",
+    )
+    reap_rep.add_argument(
+        "--samples-per-source",
+        type=_positive_int,
+        default=32,
+        help="Held-out samples per source for perplexity (default: 32)",
+    )
+    reap_rep.add_argument(
+        "--skip-ppl",
+        action="store_true",
+        default=False,
+        help="Skip the perplexity gate (overlap analysis only)",
+    )
+
     # Bench (benchmarking)
     bench = sub.add_parser("bench", help="Benchmarking and functional tests")
     bench_sub = bench.add_subparsers(dest="bench_command")
