@@ -284,3 +284,28 @@ class TestRewriteConfig:
         cfg = {"text_config": {"n_routed_experts": 8}}
         assert rewrite_config_num_experts(cfg, 4) == "n_routed_experts"
         assert cfg["text_config"]["n_routed_experts"] == 4
+
+
+class TestIndexlessLayouts:
+    def test_multi_shard_without_index_rejected(self, tmp_path):
+        src, _ = _save(make_tiny_qwen3_moe, "qwen3_moe", tmp_path)
+        w = mx.load(str(src / "model.safetensors"))
+        keys = sorted(w)
+        half = len(keys) // 2
+        mx.save_safetensors(
+            str(src / "model-00001-of-00002.safetensors"),
+            {k: w[k] for k in keys[:half]},
+        )
+        mx.save_safetensors(
+            str(src / "model-00002-of-00002.safetensors"),
+            {k: w[k] for k in keys[half:]},
+        )
+        (src / "model.safetensors").unlink()
+        with pytest.raises(ReapApplyError, match="index"):
+            apply_plan(src, _uniform_plan([0, 1], [0, 1, 2, 3]), tmp_path / "out")
+
+    def test_no_safetensors_rejected(self, tmp_path):
+        src, _ = _save(make_tiny_qwen3_moe, "qwen3_moe", tmp_path)
+        (src / "model.safetensors").unlink()
+        with pytest.raises(ReapApplyError, match="no .safetensors"):
+            apply_plan(src, _uniform_plan([0, 1], [0, 1, 2, 3]), tmp_path / "out")

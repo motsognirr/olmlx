@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import time
 from pathlib import Path
 from typing import Any, Callable
@@ -13,6 +14,8 @@ import numpy as np
 
 from olmlx.engine.flash.prepare import load_model_with_strict_fallback
 from olmlx.engine.reap.arch import MoeModuleInfo, applied_scores, find_moe_module
+
+logger = logging.getLogger(__name__)
 
 
 class SaliencyAccumulator:
@@ -317,6 +320,24 @@ def stream_layer_forward(
     layers = inner.layers
     moe_layer_indices, num_experts, top_k = _moe_scan(layers)
 
+    # Window detection is best-effort (known conventions only). If the config
+    # advertises a sliding window but no layer matched any convention, the
+    # masks below would silently over-attend past the window — make it loud.
+    layer_windows = [
+        _layer_window_size(inner, args, li, layer) for li, layer in enumerate(layers)
+    ]
+    if getattr(args, "sliding_window", None) and not any(
+        w is not None for w in layer_windows
+    ):
+        logger.warning(
+            "config advertises sliding_window=%s but no layer matched a known "
+            "sliding-attention convention (layer_types / is_sliding / "
+            "use_sliding_window); streaming calibration will use full causal "
+            "masks and its saliency may diverge from the model's real "
+            "attention pattern",
+            getattr(args, "sliding_window", None),
+        )
+
     # Derived up front from every tagged text (not the post-encode-filter
     # sample list below) so a source whose samples all encode to empty still
     # shows up in meta, matching collect_saliency's up-front `sources`.
@@ -376,7 +397,7 @@ def stream_layer_forward(
             # Per-layer window_size mirrors sliding-attention layers (gpt_oss
             # etc.) — a global unwindowed mask silently over-attends on those
             # layers once seq_len exceeds the window. See task-4-report.md.
-            window = _layer_window_size(inner, args, li, layer)
+            window = layer_windows[li]
             mask = (
                 create_causal_mask(seq_len, window_size=window) if seq_len > 1 else None
             )

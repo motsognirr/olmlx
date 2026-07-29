@@ -151,6 +151,20 @@ def apply_plan(
 
     index_path = model_dir / "model.safetensors.index.json"
     index = json.loads(index_path.read_text()) if index_path.exists() else None
+    if index:
+        shards = sorted(set(index["weight_map"].values()))
+    else:
+        # Without an index, format detection and the shard loop below both
+        # assume the single-file layout — refuse anything else explicitly
+        # rather than failing later with a confusing FileNotFoundError.
+        shards = sorted(p.name for p in model_dir.glob("*.safetensors"))
+        if not shards:
+            raise ReapApplyError(f"no .safetensors files found in {model_dir}")
+        if shards != ["model.safetensors"]:
+            raise ReapApplyError(
+                f"multi-file checkpoint without model.safetensors.index.json "
+                f"is unsupported (found {shards}); regenerate the index"
+            )
     fmt = _detect_expert_format(model_dir, plan.moe_layer_indices[0], index)
     moe_prefix = fmt.expert_prefix.split(".")[0]  # e.g. "mlp"
     container_rel = fmt.expert_prefix[len(moe_prefix) + 1 :]  # e.g. "switch_mlp"
@@ -168,9 +182,6 @@ def apply_plan(
         for suffix in _ROUTER_SUFFIXES
     ]
 
-    shards = (
-        sorted(set(index["weight_map"].values())) if index else ["model.safetensors"]
-    )
     output_dir.mkdir(parents=True, exist_ok=True)
     weight_map: dict[str, str] = {}
     total_size = 0

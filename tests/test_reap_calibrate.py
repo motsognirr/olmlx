@@ -215,3 +215,42 @@ class TestStreamingEqualsHooked:
         monkeypatch.setattr(cal_mod, "load_model_with_strict_fallback", fake_load)
         cal_mod.calibrate_saliency_streaming("/fake", _tagged(1), max_tokens=8)
         assert calls["lazy"] is True
+
+
+class TestUnrecognizedSlidingWindowWarning:
+    """A config that advertises sliding_window without any known per-layer
+    convention must warn loudly (masks would silently over-attend otherwise)."""
+
+    def test_warns_when_no_convention_matches(self, monkeypatch, caplog):
+        import logging
+
+        from olmlx.engine.reap import calibrate as cal_mod
+
+        model, args = make_tiny_qwen3_moe()
+        args.sliding_window = 8  # advertised, but qwen3_moe has no layer_types/flags
+        monkeypatch.setattr(
+            cal_mod,
+            "load_model_with_strict_fallback",
+            lambda p, lazy: (model, FakeTokenizer()),
+        )
+        with caplog.at_level(logging.WARNING, logger="olmlx.engine.reap.calibrate"):
+            cal_mod.calibrate_saliency_streaming("/fake", _tagged(1), max_tokens=8)
+        assert any("sliding-attention convention" in r.message for r in caplog.records)
+
+    def test_no_warning_when_convention_matches(self, monkeypatch, caplog):
+        import logging
+
+        from olmlx.engine.reap import calibrate as cal_mod
+        from tests.reap_factories import make_tiny_gpt_oss
+
+        model, _ = make_tiny_gpt_oss(sliding_window=8)
+        monkeypatch.setattr(
+            cal_mod,
+            "load_model_with_strict_fallback",
+            lambda p, lazy: (model, FakeTokenizer()),
+        )
+        with caplog.at_level(logging.WARNING, logger="olmlx.engine.reap.calibrate"):
+            cal_mod.calibrate_saliency_streaming("/fake", _tagged(1), max_tokens=8)
+        assert not any(
+            "sliding-attention convention" in r.message for r in caplog.records
+        )
