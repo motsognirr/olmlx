@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import pytest
 
+from olmlx.engine.reap import corpus as corpus_mod
 from olmlx.engine.reap.corpus import (
     BUILTIN_SOURCES,
     build_calibration_corpus,
@@ -46,10 +47,25 @@ def _fake_load_dataset(rows_by_key):
 
 
 class TestBuildCorpus:
-    def _patch(self, monkeypatch, rows_by_key):
+    def _patch(self, monkeypatch, rows_by_key, block_fallback=False):
         import datasets
 
         monkeypatch.setattr(datasets, "load_dataset", _fake_load_dataset(rows_by_key))
+        # For content-asserting tests, block synthetic fallback to detect suite pollution:
+        # if datasets is poisoned and the fallback is triggered, the test fails loudly
+        # instead of silently getting wrong content from synthetic text.
+        if block_fallback:
+
+            def raise_fallback_blocked(*args, **kwargs):
+                raise RuntimeError(
+                    "synthetic_source_texts was called (datasets fallback triggered); "
+                    "this indicates the datasets module was poisoned by an earlier test. "
+                    "Check test ordering and sys.modules state."
+                )
+
+            monkeypatch.setattr(
+                corpus_mod, "synthetic_source_texts", raise_fallback_blocked
+            )
 
     def test_interleaved_and_tagged(self, monkeypatch):
         en = [{"text": f"english document number {i} " * 10} for i in range(5)]
@@ -60,6 +76,7 @@ class TestBuildCorpus:
                 ("allenai/c4", "en"): en,
                 (BUILTIN_SOURCES["code"].dataset, BUILTIN_SOURCES["code"].config): code,
             },
+            block_fallback=True,
         )
         out = build_calibration_corpus(["english", "code"], 3)
         assert len(out) == 6
@@ -69,21 +86,25 @@ class TestBuildCorpus:
 
     def test_min_chars_filter(self, monkeypatch):
         rows = [{"text": "short"}] + [{"text": "x" * 200}] * 3
-        self._patch(monkeypatch, {("allenai/c4", "en"): rows})
+        self._patch(monkeypatch, {("allenai/c4", "en"): rows}, block_fallback=True)
         out = build_calibration_corpus(["english"], 2)
         assert all(len(t) >= 100 for _, t in out)
 
     def test_cjk_filter_for_chinese(self, monkeypatch):
         mojibake = {"text": "a" * 200}  # claims zh, no CJK
         good = {"text": "中文测试" * 60}
-        self._patch(monkeypatch, {("allenai/c4", "zh"): [mojibake, good, good]})
+        self._patch(
+            monkeypatch,
+            {("allenai/c4", "zh"): [mojibake, good, good]},
+            block_fallback=True,
+        )
         out = build_calibration_corpus(["chinese"], 2)
         assert len(out) == 2
         assert all(cjk_fraction(t) >= 0.3 for _, t in out)
 
     def test_skip_reserves_held_out(self, monkeypatch):
         rows = [{"text": f"document number {i:03d} " * 10} for i in range(10)]
-        self._patch(monkeypatch, {("allenai/c4", "en"): rows})
+        self._patch(monkeypatch, {("allenai/c4", "en"): rows}, block_fallback=True)
         cal = build_calibration_corpus(["english"], 3)
         held = build_calibration_corpus(["english"], 2, skip=3)
         cal_texts = {t for _, t in cal}
@@ -91,7 +112,7 @@ class TestBuildCorpus:
 
     def test_char_cap(self, monkeypatch):
         rows = [{"text": "y" * 10_000}] * 2
-        self._patch(monkeypatch, {("allenai/c4", "en"): rows})
+        self._patch(monkeypatch, {("allenai/c4", "en"): rows}, block_fallback=True)
         out = build_calibration_corpus(["english"], 2, char_cap=1000)
         assert all(len(t) == 1000 for _, t in out)
 
