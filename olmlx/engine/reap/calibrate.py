@@ -248,6 +248,42 @@ def _resolve_head(model, inner):
     return norm, inner.embed_tokens.as_linear
 
 
+def _layer_window_size(inner, args, li: int, layer) -> int | None:
+    """Best-effort per-layer sliding-window size, mirroring how the model's own
+    full-forward decides it, so the streaming mask matches the hooked one exactly.
+
+    Returns None for global/full-attention layers (plain causal, unbounded).
+    Two conventions are checked (covers gpt_oss/olmo3-style backbones and
+    gemma3/cohere2-style layers; falls back to full causal if neither applies —
+    still correct for archs with no sliding attention, e.g. qwen3_moe/deepseek_v3):
+    - a backbone- or args-level `layer_types` list, indexed by `li`, where any
+      value other than "full_attention" means sliding (gpt_oss, olmo3);
+    - a boolean `is_sliding`/`use_sliding_window` flag on the layer or its
+      `self_attn` (gemma3_text, cohere2).
+    """
+    layer_types = getattr(inner, "layer_types", None) or getattr(
+        args, "layer_types", None
+    )
+    if layer_types is not None and li < len(layer_types):
+        is_sliding = layer_types[li] != "full_attention"
+    else:
+        is_sliding = False
+        attn = getattr(layer, "self_attn", None)
+        for holder in (attn, layer):
+            if holder is None:
+                continue
+            for attr in ("is_sliding", "use_sliding_window"):
+                flag = getattr(holder, attr, None)
+                if flag is not None:
+                    is_sliding = bool(flag)
+                    break
+            if is_sliding:
+                break
+    if not is_sliding:
+        return None
+    return getattr(inner, "window_size", None) or getattr(args, "sliding_window", None)
+
+
 def stream_layer_forward(
     model_path,
     tagged_texts,
@@ -280,12 +316,18 @@ def stream_layer_forward(
 
     model, tokenizer = load_model_with_strict_fallback(model_path, lazy=True)
     inner = _get_backbone(model)
+    args = getattr(model, "args", None)
     layers = inner.layers
     moe_layer_indices, num_experts, top_k = _moe_scan(layers)
 
+    # Derived up front from every tagged text (not the post-encode-filter
+    # sample list below) so a source whose samples all encode to empty still
+    # shows up in meta, matching collect_saliency's up-front `sources`.
+    all_sources = list(dict.fromkeys(s for s, _ in tagged_texts))
+
     embed = inner.embed_tokens
     mx.eval(embed.parameters())
-    hidden_size = getattr(getattr(model, "args", None), "hidden_size", 0) or 1
+    hidden_size = getattr(args, "hidden_size", 0) or 1
     scale = _embed_normalizer(model, inner, hidden_size)
     hidden, token_ids, sample_sources = [], [], []
     for source, text in tagged_texts:
@@ -298,7 +340,7 @@ def stream_layer_forward(
         token_ids.append(ids)
         sample_sources.append(source)
 
-    tied = bool(getattr(getattr(model, "args", None), "tie_word_embeddings", False))
+    tied = bool(getattr(args, "tie_word_embeddings", False))
     if not keep_head:
         head = getattr(model, "lm_head", None)
         if head is not None:
@@ -334,7 +376,13 @@ def stream_layer_forward(
             # which applies the mask via mx.where(mask, scores, min) — an
             # additive float mask is nonzero (truthy) exactly where it should
             # be falsy, inverting the causal direction. See task-4-report.md.
-            mask = create_causal_mask(seq_len) if seq_len > 1 else None
+            # Per-layer window_size mirrors sliding-attention layers (gpt_oss
+            # etc.) — a global unwindowed mask silently over-attends on those
+            # layers once seq_len exceeds the window. See task-4-report.md.
+            window = _layer_window_size(inner, args, li, layer)
+            mask = (
+                create_causal_mask(seq_len, window_size=window) if seq_len > 1 else None
+            )
             out = layer(hidden[si], mask=mask, cache=cache_i)
             hidden[si] = out[0] if isinstance(out, (tuple, list)) else out
             mx.eval(hidden[si])
@@ -356,11 +404,11 @@ def stream_layer_forward(
             per_sample_final(si, sample_sources[si], head(h), token_ids[si])
 
     return {
-        "model_type": getattr(getattr(model, "args", None), "model_type", "unknown"),
+        "model_type": getattr(args, "model_type", "unknown"),
         "num_experts": num_experts,
         "top_k": top_k,
         "moe_layer_indices": moe_layer_indices,
-        "sources": list(dict.fromkeys(sample_sources)),
+        "sources": all_sources,
         "num_samples": len(hidden),
         "max_tokens": max_tokens,
         "prepared_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),

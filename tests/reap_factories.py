@@ -42,7 +42,15 @@ def make_tiny_qwen3_moe(*, num_experts=8, top_k=2, num_layers=2, hidden=64, voca
     return _build(qwen3_moe, args)
 
 
-def make_tiny_gpt_oss(*, num_experts=8, top_k=2, num_layers=2, hidden=64, vocab=128):
+def make_tiny_gpt_oss(
+    *,
+    num_experts=8,
+    top_k=2,
+    num_layers=2,
+    hidden=64,
+    vocab=128,
+    sliding_window=4096,
+):
     from mlx_lm.models import gpt_oss
 
     # GptOssMoeModel.__init__ requires both "sliding_attention" and
@@ -53,6 +61,10 @@ def make_tiny_gpt_oss(*, num_experts=8, top_k=2, num_layers=2, hidden=64, vocab=
         :num_layers
     ]
 
+    # sliding_window defaults to 4096, which dwarfs the tests' 16-token
+    # sequences (sliding-window semantics can't diverge from full causal at
+    # that length). Callers that need real windowed-attention behavior (e.g.
+    # a streaming-vs-hooked regression test) pass a small value explicitly.
     args = gpt_oss.ModelArgs(
         model_type="gpt_oss",
         hidden_size=hidden,
@@ -65,7 +77,7 @@ def make_tiny_gpt_oss(*, num_experts=8, top_k=2, num_layers=2, hidden=64, vocab=
         vocab_size=vocab,
         num_local_experts=num_experts,
         num_experts_per_tok=top_k,
-        sliding_window=4096,
+        sliding_window=sliding_window,
         rope_theta=10000.0,
         layer_types=layer_types,
     )

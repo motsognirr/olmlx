@@ -175,6 +175,33 @@ class TestStreamingEqualsHooked:
         np.testing.assert_array_equal(stream_acc.count, hooked_acc.count)
         assert stream_meta["moe_layer_indices"] == hooked_meta["moe_layer_indices"]
 
+    def test_streaming_matches_hooked_gpt_oss_narrow_sliding_window(self, monkeypatch):
+        """Regression: a per-arch-uniform mask silently ignores gpt_oss's
+        sliding_attention layers. With window << seq_len the sliding layers
+        must only attend to the last `window` positions, same as the real
+        full-forward's create_attention_mask(..., window_size=...) path."""
+        from olmlx.engine.reap import calibrate as cal_mod
+
+        mx.random.seed(3)
+        model, args = make_tiny_gpt_oss(sliding_window=8)
+        tok = FakeTokenizer()
+        texts = _tagged(2)
+
+        hooked_acc, hooked_meta = collect_saliency(model, tok, texts, max_tokens=40)
+
+        monkeypatch.setattr(
+            cal_mod,
+            "load_model_with_strict_fallback",
+            lambda path, lazy: (model, tok),
+        )
+        stream_acc, stream_meta = cal_mod.calibrate_saliency_streaming(
+            "/fake/path", texts, max_tokens=40
+        )
+
+        np.testing.assert_allclose(stream_acc.sum, hooked_acc.sum, rtol=1e-3, atol=1e-6)
+        np.testing.assert_array_equal(stream_acc.count, hooked_acc.count)
+        assert stream_meta["moe_layer_indices"] == hooked_meta["moe_layer_indices"]
+
     def test_loader_called_lazy(self, monkeypatch):
         from olmlx.engine.reap import calibrate as cal_mod
 
