@@ -121,6 +121,17 @@ class TestUniformPrune:
         assert prov["keep_count"] == 4 and prov["num_experts_orig"] == 8
         assert (out / "tokenizer_config.json").exists()
 
+    def test_store_internal_artifacts_not_copied(self, tmp_path):
+        """A stale manifest.json / .downloading marker in the source (olmlx
+        store metadata) must not leak into the pruned artifact — a copied
+        manifest misidentifies the output as the unpruned base model."""
+        src, _ = _save(make_tiny_qwen3_moe, "qwen3_moe", tmp_path)
+        (src / "manifest.json").write_text('{"name": "base:latest", "size": 1}')
+        (src / ".downloading").write_text("")
+        out = apply_plan(src, _uniform_plan([0, 1], [0, 1, 2, 3]), tmp_path / "out")
+        assert not (out / "manifest.json").exists()
+        assert not (out / ".downloading").exists()
+
     def test_pruned_model_reloads_and_runs(self, tmp_path):
         from mlx_lm.models import qwen3_moe
 

@@ -231,8 +231,12 @@ def apply_plan(
                 indent=2,
             )
         )
+    # config.json is rewritten above; manifest.json / .downloading are olmlx
+    # store metadata for the SOURCE dir — copying a stale manifest makes the
+    # pruned artifact masquerade as the unpruned base model.
+    skip_copy = {"config.json", "manifest.json", ".downloading"}
     for f in collect_non_weight_files(model_dir):
-        if f.name != "config.json":
+        if f.name not in skip_copy:
             shutil.copy2(f, output_dir / f.name)
     (output_dir / "reap_provenance.json").write_text(
         json.dumps(
