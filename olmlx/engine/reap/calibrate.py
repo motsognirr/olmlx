@@ -323,9 +323,9 @@ def stream_layer_forward(
         for si in range(len(hidden)):
             if tap_installed:
                 source_ref["idx"] = acc.sources.index(sample_sources[si])
-            cache_i = make_prompt_cache(model)[
-                li
-            ]  # fresh per (sample, layer): GDN-safe
+            # Fresh per (sample, layer) cache: GDN-safe (recurrent state must
+            # not carry across independent forward passes at this layer).
+            cache_i = make_prompt_cache(model)[li]
             seq_len = hidden[si].shape[1]
             # Boolean mask (True=attend), matching what each arch's own
             # full-forward builds via create_attention_mask(..., return_array=True)
