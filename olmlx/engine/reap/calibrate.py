@@ -12,6 +12,7 @@ import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
 
+from olmlx.engine.flash.prepare import load_model_with_strict_fallback
 from olmlx.engine.reap.arch import MoeModuleInfo, applied_scores, find_moe_module
 
 logger = logging.getLogger(__name__)
@@ -235,4 +236,155 @@ def collect_saliency(
         "max_tokens": max_tokens,
         "prepared_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
     }
+    return acc, meta
+
+
+def _resolve_head(model, inner):
+    """Returns (norm, head_fn) for final logits; head_fn may use tied embeddings."""
+    norm = getattr(inner, "norm", None) or getattr(inner, "final_layernorm", None)
+    lm_head = getattr(model, "lm_head", None)
+    if lm_head is not None:
+        return norm, lm_head
+    return norm, inner.embed_tokens.as_linear
+
+
+def stream_layer_forward(
+    model_path,
+    tagged_texts,
+    *,
+    max_tokens=512,
+    acc: SaliencyAccumulator | None = None,
+    keep_head=False,
+    per_sample_final=None,
+    progress_callback=None,
+):
+    """Layer-at-a-time streaming forward over a lazily-loaded model.
+
+    One disk pass; peak RAM ~= one layer + all sample hidden states. With `acc`
+    set, installs SaliencyTaps on MoE layers (calibration). With `keep_head`,
+    applies final norm + lm_head per sample and calls
+    per_sample_final(sample_idx, source, logits, token_ids) (perplexity).
+    Consumes the model (layers are nullified as it advances).
+    Returns the meta dict (same shape as collect_saliency's).
+    """
+    import gc
+
+    from mlx_lm.models.base import create_causal_mask
+    from mlx_lm.models.cache import make_prompt_cache
+
+    from olmlx.engine.flash.prepare import (
+        _embed_normalizer,
+        _get_backbone,
+        _nullify_module_params,
+    )
+
+    model, tokenizer = load_model_with_strict_fallback(model_path, lazy=True)
+    inner = _get_backbone(model)
+    layers = inner.layers
+    moe_layer_indices, num_experts, top_k = _moe_scan(layers)
+
+    embed = inner.embed_tokens
+    mx.eval(embed.parameters())
+    hidden_size = getattr(getattr(model, "args", None), "hidden_size", 0) or 1
+    scale = _embed_normalizer(model, inner, hidden_size)
+    hidden, token_ids, sample_sources = [], [], []
+    for source, text in tagged_texts:
+        ids = _encode(tokenizer, text, max_tokens)
+        if not ids:
+            continue
+        h = embed(mx.array([ids])) * scale
+        mx.eval(h)
+        hidden.append(h)
+        token_ids.append(ids)
+        sample_sources.append(source)
+
+    tied = bool(getattr(getattr(model, "args", None), "tie_word_embeddings", False))
+    if not keep_head:
+        head = getattr(model, "lm_head", None)
+        if head is not None:
+            _nullify_module_params(head)
+        if not tied:
+            _nullify_module_params(embed)
+    # keep_head: embed must survive when tied (it IS the head); norm+lm_head stay.
+    gc.collect()
+    mx.clear_cache()
+
+    source_ref = {"idx": 0}
+    layer_pos = 0
+    for li, layer in enumerate(layers):
+        mx.eval(layer.parameters())
+        tap_installed: list[tuple[int, Any, str]] = []
+        if acc is not None:
+            tap_installed = install_taps([layer], acc, source_ref)
+            if tap_installed:
+                tap = getattr(layer, tap_installed[0][2])
+                tap._layer_pos = layer_pos  # renumber from per-call 0 to global ordinal
+                layer_pos += 1
+        for si in range(len(hidden)):
+            if tap_installed:
+                source_ref["idx"] = acc.sources.index(sample_sources[si])
+            cache_i = make_prompt_cache(model)[
+                li
+            ]  # fresh per (sample, layer): GDN-safe
+            seq_len = hidden[si].shape[1]
+            # Boolean mask (True=attend), matching what each arch's own
+            # full-forward builds via create_attention_mask(..., return_array=True)
+            # (or the equivalent "causal" fast-path for seq_len <= window_size).
+            # A float additive mask (0/-1e9) breaks DeepSeek-V3's MLA attention,
+            # which applies the mask via mx.where(mask, scores, min) — an
+            # additive float mask is nonzero (truthy) exactly where it should
+            # be falsy, inverting the causal direction. See task-4-report.md.
+            mask = create_causal_mask(seq_len) if seq_len > 1 else None
+            out = layer(hidden[si], mask=mask, cache=cache_i)
+            hidden[si] = out[0] if isinstance(out, (tuple, list)) else out
+            mx.eval(hidden[si])
+        if tap_installed:
+            remove_taps([layer], tap_installed)
+        _nullify_module_params(layer)
+        gc.collect()
+        mx.clear_cache()
+        if progress_callback:
+            progress_callback(
+                f"Processed layer {li + 1}/{len(layers)}",
+                0.05 + (li + 1) / len(layers) * 0.9,
+            )
+
+    if keep_head and per_sample_final is not None:
+        norm, head = _resolve_head(model, inner)
+        for si in range(len(hidden)):
+            h = norm(hidden[si]) if norm is not None else hidden[si]
+            per_sample_final(si, sample_sources[si], head(h), token_ids[si])
+
+    return {
+        "model_type": getattr(getattr(model, "args", None), "model_type", "unknown"),
+        "num_experts": num_experts,
+        "top_k": top_k,
+        "moe_layer_indices": moe_layer_indices,
+        "sources": list(dict.fromkeys(sample_sources)),
+        "num_samples": len(hidden),
+        "max_tokens": max_tokens,
+        "prepared_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+    }
+
+
+def calibrate_saliency_streaming(
+    model_path, tagged_texts, *, max_tokens=512, progress_callback=None
+):
+    sources = list(dict.fromkeys(s for s, _ in tagged_texts))
+    # geometry probe on a throwaway lazy skeleton is avoided: stream_layer_forward
+    # scans MoE geometry itself, but the accumulator needs dims up front — so size
+    # it lazily on first add via a thin pre-scan of the same lazy load.
+    model, _tok = load_model_with_strict_fallback(model_path, lazy=True)
+    from olmlx.engine.flash.prepare import _get_backbone
+
+    moe_layer_indices, num_experts, _top_k = _moe_scan(_get_backbone(model).layers)
+    del model
+    acc = SaliencyAccumulator(len(moe_layer_indices), num_experts, sources)
+    meta = stream_layer_forward(
+        model_path,
+        list(tagged_texts),
+        max_tokens=max_tokens,
+        acc=acc,
+        progress_callback=progress_callback,
+    )
     return acc, meta

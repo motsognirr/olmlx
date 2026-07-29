@@ -144,3 +144,47 @@ class TestSaliencyMatchesManualReference:
         np.add.at(counts, np.array(inds).reshape(-1), 1)
         np.testing.assert_allclose(acc.sum[0, 0], expected, rtol=1e-4)
         np.testing.assert_array_equal(acc.count[0, 0], counts)
+
+
+class TestStreamingEqualsHooked:
+    """Invariant 5: streaming layer-at-a-time saliency == full-forward hooked saliency."""
+
+    @pytest.mark.parametrize(
+        "factory", [make_tiny_qwen3_moe, make_tiny_gpt_oss, make_tiny_deepseek_v3]
+    )
+    def test_streaming_matches_hooked(self, factory, monkeypatch):
+        from olmlx.engine.reap import calibrate as cal_mod
+
+        mx.random.seed(3)
+        model, args = factory()
+        tok = FakeTokenizer()
+        texts = _tagged(2)
+
+        hooked_acc, hooked_meta = collect_saliency(model, tok, texts, max_tokens=16)
+
+        monkeypatch.setattr(
+            cal_mod,
+            "load_model_with_strict_fallback",
+            lambda path, lazy: (model, tok),
+        )
+        stream_acc, stream_meta = cal_mod.calibrate_saliency_streaming(
+            "/fake/path", texts, max_tokens=16
+        )
+
+        np.testing.assert_allclose(stream_acc.sum, hooked_acc.sum, rtol=1e-3, atol=1e-6)
+        np.testing.assert_array_equal(stream_acc.count, hooked_acc.count)
+        assert stream_meta["moe_layer_indices"] == hooked_meta["moe_layer_indices"]
+
+    def test_loader_called_lazy(self, monkeypatch):
+        from olmlx.engine.reap import calibrate as cal_mod
+
+        model, _ = make_tiny_qwen3_moe()
+        calls = {}
+
+        def fake_load(path, lazy):
+            calls["lazy"] = lazy
+            return model, FakeTokenizer()
+
+        monkeypatch.setattr(cal_mod, "load_model_with_strict_fallback", fake_load)
+        cal_mod.calibrate_saliency_streaming("/fake", _tagged(1), max_tokens=8)
+        assert calls["lazy"] is True
