@@ -239,13 +239,40 @@ def collect_saliency(
     return acc, meta
 
 
+def _find_lm_head(model):
+    """lm_head on the model or its VLM language tower (qwen3_5_moe-style)."""
+    for holder in (model, getattr(model, "language_model", None)):
+        head = getattr(holder, "lm_head", None) if holder is not None else None
+        if head is not None:
+            return head
+    return None
+
+
+def _is_tied(model) -> bool:
+    for holder in (model, getattr(model, "language_model", None)):
+        args = getattr(holder, "args", None) if holder is not None else None
+        if args is not None and getattr(args, "tie_word_embeddings", False):
+            return True
+    return False
+
+
 def _resolve_head(model, inner):
-    """Returns (norm, head_fn) for final logits; head_fn may use tied embeddings."""
+    """Returns (norm, head_fn) for final logits.
+
+    Falls back to the embedding matrix ONLY for genuinely tied models —
+    scoring an untied model through embed.as_linear yields random-quality
+    logits (worse-than-uniform perplexity), so that case is a hard error.
+    """
     norm = getattr(inner, "norm", None) or getattr(inner, "final_layernorm", None)
-    lm_head = getattr(model, "lm_head", None)
+    lm_head = _find_lm_head(model)
     if lm_head is not None:
         return norm, lm_head
-    return norm, inner.embed_tokens.as_linear
+    if _is_tied(model):
+        return norm, inner.embed_tokens.as_linear
+    raise ValueError(
+        "no lm_head found on the model or its language_model, and embeddings "
+        "are not tied — refusing to compute logits with the embedding matrix"
+    )
 
 
 def _layer_types(inner, args) -> list[str] | None:
@@ -381,7 +408,7 @@ def stream_layer_forward(
 
     tied = bool(getattr(args, "tie_word_embeddings", False))
     if not keep_head:
-        head = getattr(model, "lm_head", None)
+        head = _find_lm_head(model)
         if head is not None:
             _nullify_module_params(head)
         if not tied:
