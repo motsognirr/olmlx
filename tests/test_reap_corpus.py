@@ -2,6 +2,14 @@ from __future__ import annotations
 
 import pytest
 
+# Import datasets at module level to avoid PyArrow extension type re-registration
+# errors when multiple tests import it (ArrowKeyError: type already defined).
+# This happens in full-suite runs where earlier tests have already imported it.
+try:
+    import datasets
+except ImportError:
+    datasets = None
+
 from olmlx.engine.reap import corpus as corpus_mod
 from olmlx.engine.reap.corpus import (
     BUILTIN_SOURCES,
@@ -48,8 +56,8 @@ def _fake_load_dataset(rows_by_key):
 
 class TestBuildCorpus:
     def _patch(self, monkeypatch, rows_by_key, block_fallback=False):
-        import datasets
-
+        if datasets is None:
+            pytest.skip("datasets not installed")
         monkeypatch.setattr(datasets, "load_dataset", _fake_load_dataset(rows_by_key))
         # For content-asserting tests, block synthetic fallback to detect suite pollution:
         # if datasets is poisoned and the fallback is triggered, the test fails loudly
@@ -117,7 +125,8 @@ class TestBuildCorpus:
         assert all(len(t) == 1000 for _, t in out)
 
     def test_fallback_to_synthetic_on_error(self, monkeypatch):
-        import datasets
+        if datasets is None:
+            pytest.skip("datasets not installed")
 
         def boom(*a, **k):
             raise ConnectionError("offline")
