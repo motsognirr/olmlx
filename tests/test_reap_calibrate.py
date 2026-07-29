@@ -281,3 +281,54 @@ class TestStreamingHybridGdn:
         np.testing.assert_allclose(stream_acc.sum, hooked_acc.sum, rtol=1e-3, atol=1e-6)
         np.testing.assert_array_equal(stream_acc.count, hooked_acc.count)
         assert stream_meta["moe_layer_indices"] == hooked_meta["moe_layer_indices"]
+
+
+class TestResolveHead:
+    """_resolve_head must find lm_head on VLM wrappers (model.language_model)
+    and must never silently score with the embedding matrix when untied."""
+
+    @staticmethod
+    def _backbone():
+        from types import SimpleNamespace
+
+        return SimpleNamespace(
+            norm=lambda x: x,
+            embed_tokens=SimpleNamespace(as_linear=lambda x: x),
+        )
+
+    def test_outer_lm_head(self):
+        from types import SimpleNamespace
+
+        from olmlx.engine.reap.calibrate import _resolve_head
+
+        head = lambda x: x  # noqa: E731
+        model = SimpleNamespace(lm_head=head)
+        assert _resolve_head(model, self._backbone())[1] is head
+
+    def test_vlm_nested_lm_head(self):
+        from types import SimpleNamespace
+
+        from olmlx.engine.reap.calibrate import _resolve_head
+
+        head = lambda x: x  # noqa: E731
+        model = SimpleNamespace(language_model=SimpleNamespace(lm_head=head))
+        assert _resolve_head(model, self._backbone())[1] is head
+
+    def test_tied_falls_back_to_embedding(self):
+        from types import SimpleNamespace
+
+        from olmlx.engine.reap.calibrate import _resolve_head
+
+        inner = self._backbone()
+        model = SimpleNamespace(args=SimpleNamespace(tie_word_embeddings=True))
+        norm, head = _resolve_head(model, inner)
+        assert head is inner.embed_tokens.as_linear
+
+    def test_untied_without_head_raises(self):
+        from types import SimpleNamespace
+
+        from olmlx.engine.reap.calibrate import _resolve_head
+
+        model = SimpleNamespace(args=SimpleNamespace(tie_word_embeddings=False))
+        with pytest.raises(ValueError, match="lm_head"):
+            _resolve_head(model, self._backbone())
