@@ -159,6 +159,40 @@ class TestGuards:
         with pytest.raises(ReapApplyError, match="mystery_bias"):
             apply_plan(src, _uniform_plan([0, 1], [0, 1, 2, 3]), tmp_path / "out")
 
+    def test_rejects_plan_num_experts_orig_mismatch(self, tmp_path):
+        """A stale/mismatched plan.num_experts_orig must be rejected up front —
+        otherwise _classify's error branch keys off the wrong count and an
+        unrecognized tensor sized to the checkpoint's ACTUAL expert count gets
+        copied through instead of erroring (the exact misrouting trap)."""
+        src, _ = _save(make_tiny_qwen3_moe, "qwen3_moe", tmp_path)  # actual: 8 experts
+        plan = _uniform_plan([0, 1], [0, 1, 2, 3], num_experts=4)  # stale: plan says 4
+        with pytest.raises(ReapApplyError, match="num_experts_orig"):
+            apply_plan(src, plan, tmp_path / "out")
+
+    def test_rejects_out_of_range_layer_index(self, tmp_path):
+        """Plan layers must be plausible against the checkpoint's
+        num_hidden_layers, or a typo'd layer index silently no-ops."""
+        src, _ = _save(
+            make_tiny_qwen3_moe, "qwen3_moe", tmp_path
+        )  # num_hidden_layers=2
+        plan = _uniform_plan([0, 5], [0, 1, 2, 3])
+        with pytest.raises(ReapApplyError, match="layer"):
+            apply_plan(src, plan, tmp_path / "out")
+
+    def test_rejects_grouped_routing_config(self, tmp_path):
+        """Uniform prune leaves n_group/topk_group untouched; on a
+        group-routed checkpoint that either breaks MoEGate's group reshape or
+        silently shifts group partition boundaries. Not supported yet."""
+        src, _ = _save(make_tiny_deepseek_v3, "deepseek_v3", tmp_path)
+        cfg_path = src / "config.json"
+        cfg = json.loads(cfg_path.read_text())
+        cfg["n_group"] = 4
+        cfg["topk_group"] = 2
+        cfg_path.write_text(json.dumps(cfg))
+        plan = _uniform_plan([1], list(range(6)), num_experts=8)
+        with pytest.raises(ReapApplyError, match="n_group"):
+            apply_plan(src, plan, tmp_path / "out")
+
 
 class TestQuantizedSlicing:
     def test_quantized_triple_sliced_together(self, tmp_path):

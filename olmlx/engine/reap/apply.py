@@ -109,6 +109,42 @@ def apply_plan(
 
     config = json.loads((model_dir / "config.json").read_text())
     cfg_view = config.get("text_config", config)
+
+    actual_num_experts = None
+    for key in _EXPERT_COUNT_KEYS:
+        if key in cfg_view:
+            actual_num_experts = cfg_view[key]
+            break
+    if actual_num_experts is not None and actual_num_experts != plan.num_experts_orig:
+        raise ReapApplyError(
+            f"plan.num_experts_orig={plan.num_experts_orig} does not match the "
+            f"checkpoint config's expert count ({actual_num_experts}); refusing "
+            f"to apply a stale/mismatched plan (the misrouting guard keys off "
+            f"num_experts_orig, so a mismatch would silently weaken it)"
+        )
+
+    n_group = cfg_view.get("n_group")
+    if n_group is not None and n_group > 1:
+        raise ReapApplyError(
+            f"group-routed config (n_group={n_group}) is not supported by "
+            f"apply_plan yet; a uniform prune leaves n_group/topk_group "
+            f"untouched, which either breaks MoEGate's group reshape or "
+            f"silently shifts group partition boundaries (phase 3 territory)"
+        )
+
+    num_hidden_layers = cfg_view.get("num_hidden_layers")
+    if num_hidden_layers is not None:
+        bad_layers = sorted(
+            idx
+            for idx in set(plan.keep) | set(plan.moe_layer_indices)
+            if not (0 <= idx < num_hidden_layers)
+        )
+        if bad_layers:
+            raise ReapApplyError(
+                f"plan references layer index/indices {bad_layers} outside "
+                f"num_hidden_layers={num_hidden_layers}"
+            )
+
     top_k = cfg_view.get("num_experts_per_tok", plan.top_k)
     if top_k > keep_count:
         raise ReapApplyError(f"num_experts_per_tok={top_k} > keep_count={keep_count}")

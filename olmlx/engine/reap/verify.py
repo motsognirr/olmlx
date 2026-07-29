@@ -1,7 +1,8 @@
 """Equivalence checking for REAP pruning: mask dropped experts on the full model
 and compare against the pruned artifact.
 
-Also the runtime backbone of `reap report`'s sanity check. The rotation test in
+Exercised today by the invariant tests only (no runtime callers); wiring it
+into `reap report`'s sanity check is phase-3 territory. The rotation test in
 tests/test_reap_equivalence.py proves this check can detect misrouting; keep it
 sensitive (max-abs on logits, no mean-pooling).
 

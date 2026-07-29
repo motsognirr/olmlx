@@ -61,7 +61,11 @@ def cmd_reap_plan(args):
         Path(args.saliency) if args.saliency else _reap_dir(local_dir) / "saliency.npz"
     )
     acc, meta = load_saliency(saliency_path)
-    sources = [s.strip() for s in args.sources.split(",")] if args.sources else None
+    sources = (
+        [s.strip() for s in args.sources.split(",") if s.strip()]
+        if args.sources
+        else None
+    )
     sal = acc.saliency(sources)
     common = dict(top_k=meta["top_k"], num_experts=meta["num_experts"])
     if args.mode == "uniform":

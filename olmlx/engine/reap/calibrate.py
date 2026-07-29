@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import logging
 import time
 from pathlib import Path
 from typing import Any, Callable
@@ -14,8 +13,6 @@ import numpy as np
 
 from olmlx.engine.flash.prepare import load_model_with_strict_fallback
 from olmlx.engine.reap.arch import MoeModuleInfo, applied_scores, find_moe_module
-
-logger = logging.getLogger(__name__)
 
 
 class SaliencyAccumulator:
