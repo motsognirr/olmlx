@@ -369,6 +369,13 @@ def stream_layer_forward(
     gc.collect()
     mx.clear_cache()
 
+    # One cache list per sample, built once (O(S*L) constructions instead of
+    # O(S*L^2) from calling make_prompt_cache inside the double loop). Each
+    # entry is still used exactly once — fresh per (sample, layer), the
+    # GDN-safety requirement — and dropped right after its forward so live KV
+    # state never exceeds one forward's worth.
+    sample_caches = [make_prompt_cache(model) for _ in hidden]
+
     source_ref = {"idx": 0}
     layer_pos = 0
     for li, layer in enumerate(layers):
@@ -385,7 +392,7 @@ def stream_layer_forward(
                 source_ref["idx"] = acc.sources.index(sample_sources[si])
             # Fresh per (sample, layer) cache: GDN-safe (recurrent state must
             # not carry across independent forward passes at this layer).
-            cache_i = make_prompt_cache(model)[li]
+            cache_i = sample_caches[si][li]
             seq_len = hidden[si].shape[1]
             # Boolean mask (True=attend), matching what each arch's own
             # full-forward builds via create_attention_mask(..., return_array=True)
@@ -404,6 +411,7 @@ def stream_layer_forward(
             out = layer(hidden[si], mask=mask, cache=cache_i)
             hidden[si] = out[0] if isinstance(out, (tuple, list)) else out
             mx.eval(hidden[si])
+            sample_caches[si][li] = None  # drop this cache's KV state now
         if tap_installed:
             remove_taps([layer], tap_installed)
         _nullify_module_params(layer)
