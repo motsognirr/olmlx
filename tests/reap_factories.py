@@ -123,7 +123,23 @@ def make_tiny_deepseek_v3(
         rms_norm_eps=1e-5,
         rope_theta=10000.0,
     )
-    return _build(deepseek_v3, args)
+    model, args = _build(deepseek_v3, args)
+    # MoEGate.weight is a bare `mx.zeros(...)` attribute in mlx-lm's
+    # deepseek_v3.py (not an nn.Linear, so it's never touched by mlx's
+    # default random-init policy) — real usage always overwrites it via
+    # checkpoint load. Left at zero, `x @ weight.T` is identically 0 for
+    # every token, so top-k selection degenerates into a pure tie broken by
+    # argpartition's *unstable* tie-break, which is sensitive to incidental
+    # array memory layout (e.g. contiguous-after-eval vs a lazy gather) and
+    # produced flaky/order-dependent equivalence & rotation-detection
+    # results. Give it a small random draw so routing actually depends on
+    # the input, matching every other (nn.Linear-backed) router style.
+    for layer in model.model.layers:
+        gate = getattr(getattr(layer, "mlp", None), "gate", None)
+        if gate is not None and hasattr(gate, "weight"):
+            gate.weight = mx.random.normal(gate.weight.shape) * 0.02
+    mx.eval(model.parameters())
+    return model, args
 
 
 def tiny_config_dict(args, model_type: str) -> dict:
