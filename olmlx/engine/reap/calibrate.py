@@ -248,6 +248,27 @@ def _resolve_head(model, inner):
     return norm, inner.embed_tokens.as_linear
 
 
+def _layer_types(inner, args) -> list[str] | None:
+    return getattr(inner, "layer_types", None) or getattr(args, "layer_types", None)
+
+
+def _is_linear_attention(inner, args, li: int, layer) -> bool:
+    """True for GDN/SSM linear-attention layers (qwen3_5/qwen3_next hybrids).
+
+    These take an ssm mask (a (B, S) padding mask, None when unpadded) — never
+    the (S, S) causal matrix, which their `mx.where(mask[..., None], qkv, 0)`
+    would broadcast batch-ways into a shape crash.
+    """
+    if getattr(layer, "is_linear", None):
+        return True
+    layer_types = _layer_types(inner, args)
+    return (
+        layer_types is not None
+        and li < len(layer_types)
+        and layer_types[li] == "linear_attention"
+    )
+
+
 def _layer_window_size(inner, args, li: int, layer) -> int | None:
     """Best-effort per-layer sliding-window size, mirroring how the model's own
     full-forward decides it, so the streaming mask matches the hooked one exactly.
@@ -261,11 +282,11 @@ def _layer_window_size(inner, args, li: int, layer) -> int | None:
     - a boolean `is_sliding`/`use_sliding_window` flag on the layer or its
       `self_attn` (gemma3_text, cohere2).
     """
-    layer_types = getattr(inner, "layer_types", None) or getattr(
-        args, "layer_types", None
-    )
+    layer_types = _layer_types(inner, args)
     if layer_types is not None and li < len(layer_types):
-        is_sliding = layer_types[li] != "full_attention"
+        # "linear_attention" (GDN) is neither full nor sliding — handled by
+        # _is_linear_attention; only genuinely windowed types count here.
+        is_sliding = layer_types[li] not in ("full_attention", "linear_attention")
     else:
         is_sliding = False
         attn = getattr(layer, "self_attn", None)
@@ -305,7 +326,7 @@ def stream_layer_forward(
     """
     import gc
 
-    from mlx_lm.models.base import create_causal_mask
+    from mlx_lm.models.base import create_causal_mask, create_ssm_mask
     from mlx_lm.models.cache import make_prompt_cache
 
     from olmlx.engine.flash.prepare import (
@@ -404,10 +425,18 @@ def stream_layer_forward(
             # Per-layer window_size mirrors sliding-attention layers (gpt_oss
             # etc.) — a global unwindowed mask silently over-attends on those
             # layers once seq_len exceeds the window. See task-4-report.md.
-            window = layer_windows[li]
-            mask = (
-                create_causal_mask(seq_len, window_size=window) if seq_len > 1 else None
-            )
+            # GDN linear-attention layers instead get the model's own ssm mask
+            # (None for unpadded batches), mirroring e.g. Qwen3_5TextModel:
+            # `mask = ssm_mask if layer.is_linear else fa_mask`.
+            if _is_linear_attention(inner, args, li, layer):
+                mask = create_ssm_mask(hidden[si], cache_i)
+            else:
+                window = layer_windows[li]
+                mask = (
+                    create_causal_mask(seq_len, window_size=window)
+                    if seq_len > 1
+                    else None
+                )
             out = layer(hidden[si], mask=mask, cache=cache_i)
             hidden[si] = out[0] if isinstance(out, (tuple, list)) else out
             mx.eval(hidden[si])

@@ -254,3 +254,30 @@ class TestUnrecognizedSlidingWindowWarning:
         assert not any(
             "sliding-attention convention" in r.message for r in caplog.records
         )
+
+
+class TestStreamingHybridGdn:
+    """Streaming == hooked must hold on hybrid GDN models (qwen3_5): GDN layers
+    take an ssm mask (None when unpadded), never the (S, S) causal matrix —
+    passing the causal matrix broadcasts qkv batch-ways and crashes."""
+
+    def test_streaming_matches_hooked_hybrid(self, monkeypatch):
+        from olmlx.engine.reap import calibrate as cal_mod
+        from tests.reap_factories import make_tiny_qwen3_5_hybrid
+
+        mx.random.seed(23)
+        model, _ = make_tiny_qwen3_5_hybrid()
+        tok = FakeTokenizer()
+        texts = _tagged(2)
+
+        hooked_acc, hooked_meta = collect_saliency(model, tok, texts, max_tokens=24)
+
+        monkeypatch.setattr(
+            cal_mod, "load_model_with_strict_fallback", lambda p, lazy: (model, tok)
+        )
+        stream_acc, stream_meta = cal_mod.calibrate_saliency_streaming(
+            "/fake", texts, max_tokens=24
+        )
+        np.testing.assert_allclose(stream_acc.sum, hooked_acc.sum, rtol=1e-3, atol=1e-6)
+        np.testing.assert_array_equal(stream_acc.count, hooked_acc.count)
+        assert stream_meta["moe_layer_indices"] == hooked_meta["moe_layer_indices"]

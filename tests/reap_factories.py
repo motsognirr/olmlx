@@ -155,3 +155,42 @@ def save_tiny_model(model, config: dict, out_dir: Path) -> Path:
     mx.save_safetensors(str(out_dir / "model.safetensors"), weights)
     (out_dir / "config.json").write_text(json.dumps(config, indent=2))
     return out_dir
+
+
+def make_tiny_qwen3_5_hybrid(
+    *, num_experts=8, top_k=2, num_layers=4, hidden=64, vocab=128
+):
+    """Hybrid GDN + MoE (qwen3_5): layers 0-2 linear attention, layer 3 full.
+
+    Exercises the streaming driver's per-layer mask dispatch — GDN layers must
+    receive an ssm mask (None for unpadded batches), never the causal matrix.
+    """
+    from mlx_lm.models import qwen3_5
+
+    args = qwen3_5.TextModelArgs(
+        model_type="qwen3_5",
+        hidden_size=hidden,
+        intermediate_size=hidden * 2,
+        num_hidden_layers=num_layers,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=16,
+        rms_norm_eps=1e-5,
+        vocab_size=vocab,
+        full_attention_interval=4,
+        linear_num_value_heads=4,
+        linear_num_key_heads=2,
+        linear_key_head_dim=8,
+        linear_value_head_dim=8,
+        linear_conv_kernel_dim=4,
+        num_experts=num_experts,
+        num_experts_per_tok=top_k,
+        decoder_sparse_step=1,
+        moe_intermediate_size=hidden // 2,
+        shared_expert_intermediate_size=hidden // 2,
+        norm_topk_prob=True,
+        tie_word_embeddings=False,
+    )
+    model = qwen3_5.TextModel(args)
+    mx.eval(model.parameters())
+    return model, args
