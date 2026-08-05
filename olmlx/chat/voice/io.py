@@ -70,9 +70,22 @@ class VoiceIO:
         24 kHz float32 segments; each is played as it arrives.
         """
         for sentence in split_into_sentences(text):
-            async for segment in generate_speech(
-                self._manager, self._tts_model, sentence, voice=self._voice
-            ):
-                # play() blocks on sd.wait() until the segment finishes; keep it
-                # off the event loop.
-                await asyncio.to_thread(playback.play, segment, _TTS_SAMPLE_RATE)
+            try:
+                async for segment in generate_speech(
+                    self._manager, self._tts_model, sentence, voice=self._voice
+                ):
+                    # play() blocks on sd.wait() until the segment finishes; keep it
+                    # off the event loop.
+                    await asyncio.to_thread(playback.play, segment, _TTS_SAMPLE_RATE)
+            except Exception as exc:
+                # Some Kokoro voices (e.g., af_heart) crash with broadcast_shapes
+                # errors for certain ordinary sentences (issue #703). Fall back to
+                # a known-good voice so speech synthesis does not abort the session.
+                logger.warning(
+                    "TTS failed with voice %s on sentence %r (%s); retrying with af_bella",
+                    self._voice, sentence, exc
+                )
+                async for segment in generate_speech(
+                    self._manager, self._tts_model, sentence, voice="af_bella"
+                ):
+                    await asyncio.to_thread(playback.play, segment, _TTS_SAMPLE_RATE)
