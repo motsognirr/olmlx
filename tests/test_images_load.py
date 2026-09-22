@@ -372,3 +372,19 @@ class TestMfluxErrorTranslation:
         with pytest.raises(RuntimeError, match="incompatible"):
             with _translate_mflux_import_errors("Qwen/Qwen-Image-2.1"):
                 raise ImportError("No module named 'mflux.models.x'")
+
+    def test_config_attribute_drift_is_reported(self, monkeypatch):
+        from olmlx.engine.model_manager import _translate_mflux_import_errors
+
+        class _NoAliases:
+            model_name = "Qwen/Qwen-Image-2.1"
+
+        _stub_mflux(monkeypatch)
+        monkeypatch.setitem(
+            sys.modules["mflux.models.common.config.model_config"].__dict__,
+            "AVAILABLE_MODELS",
+            {"qwen-image": _NoAliases(), "qwen-image-2.1": _NoAliases()},
+        )
+        with pytest.raises(RuntimeError, match="incompatible"):
+            with _translate_mflux_import_errors("Qwen/Qwen-Image-2.1"):
+                image_gen.resolve_image_variant("Qwen/Qwen-Image-2.1")

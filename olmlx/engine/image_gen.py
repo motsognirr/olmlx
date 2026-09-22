@@ -76,10 +76,16 @@ def resolve_image_variant(hf_path: str) -> tuple[ImageVariant, Any]:
             raise ImportError(
                 f"mflux has no '{variant.key}' model config (AVAILABLE_MODELS)"
             ) from exc
-        names = {cfg.model_name, *cfg.aliases}
+        try:
+            model_name = cfg.model_name
+            names = {model_name, *cfg.aliases}
+        except (AttributeError, TypeError) as exc:
+            raise ImportError(
+                f"mflux '{variant.key}' model config has no model_name/aliases"
+            ) from exc
         if hf_path in names:
             return variant, cfg
-        supported.append(cfg.model_name)
+        supported.append(model_name)
     raise ValueError(
         f"'{hf_path}' is not a supported image model. Declare one of "
         f'{sorted(supported)} as the hf_path of a "type": "image" entry '

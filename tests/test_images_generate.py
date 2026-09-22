@@ -418,3 +418,30 @@ class TestNonImageRejectedBeforeLoad:
         mgr.ensure_loaded = AsyncMock(side_effect=ValueError("Model 'x' not found."))
         with pytest.raises(ValueError, match="not found"):
             await generate_image(mgr, "x", "a cat", width=64, height=64)
+
+
+class TestImageRejectedBeforeLoadOnOtherModalities:
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("entry", ["transcription", "speech", "rerank"])
+    async def test_declared_image_rejected_without_loading(self, entry, tmp_path):
+        from olmlx.engine import inference
+        from olmlx.engine.registry import ModelConfig
+
+        mgr = MagicMock()
+        mgr.registry.resolve.return_value = ModelConfig(
+            hf_path="Qwen/Qwen-Image-2.1", type="image"
+        )
+        mgr.ensure_loaded = AsyncMock(side_effect=AssertionError("loaded"))
+        with pytest.raises(ValueError, match="image model"):
+            if entry == "transcription":
+                await inference.generate_transcription(
+                    mgr, "qwen-image:2.1", str(tmp_path / "a.wav")
+                )
+            elif entry == "speech":
+                async for _ in inference.generate_speech(
+                    mgr, "qwen-image:2.1", "hi", voice="af_heart"
+                ):
+                    pass
+            else:
+                await inference.generate_rerank(mgr, "qwen-image:2.1", "q", ["d"])
+        mgr.ensure_loaded.assert_not_called()

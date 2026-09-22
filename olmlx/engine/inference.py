@@ -4941,6 +4941,7 @@ async def generate_rerank(
     keep_alive: int | str | None = None,
 ) -> dict:
     """Score documents against a query with a cross-encoder reranker (#369)."""
+    _reject_declared_image_before_load(manager, model_name, "reranking")
     lm = await manager.ensure_loaded(model_name, keep_alive, pin=True)
     try:
         if not getattr(lm, "is_reranker", False):
@@ -5017,6 +5018,7 @@ async def generate_transcription(
     # patch() targets) via importlib so ModelHolder injection lands correctly.
     whisper_transcribe = importlib.import_module("mlx_whisper.transcribe")
 
+    _reject_declared_image_before_load(manager, model_name, "transcription")
     lm = await manager.ensure_loaded(model_name, keep_alive, pin=True)
 
     try:
@@ -5108,6 +5110,7 @@ async def generate_speech(
     ``TTSGenerationError`` (a ``RuntimeError``, -> HTTP 500) if the mlx-audio
     backend fails mid-generation — that is never the client's fault (#703).
     """
+    _reject_declared_image_before_load(manager, model_name, "speech synthesis")
     lm = await manager.ensure_loaded(model_name, keep_alive, pin=True)
     try:
         if not lm.is_tts:

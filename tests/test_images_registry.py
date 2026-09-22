@@ -77,3 +77,42 @@ class TestRegistryImageEntries:
     def test_text_entry_is_not_image(self, reg):
         mc = reg.resolve("qwen3:32b")
         assert mc is not None and not mc.is_image
+
+
+class TestResolveImageByRepoId:
+    """A declared image model addressed by its repo id resolves to its entry.
+
+    ``resolve()`` synthesizes a marker-less ModelConfig for any ``/`` name, so
+    without this ``Qwen/Qwen-Image-2.1`` would be treated as a text model:
+    a wrong 400 on /v1/images, and a 33 GB store download on the text paths
+    before failing.
+    """
+
+    @pytest.fixture
+    def reg(self, tmp_path, monkeypatch):
+        cfg = {
+            "qwen-image:2.1": {
+                "type": "image",
+                "hf_path": "Qwen/Qwen-Image-2.1",
+                "image_quantize": 8,
+            },
+            "qwen3:8b": "Qwen/Qwen3-8B",
+        }
+        path = tmp_path / "models.json"
+        path.write_text(json.dumps(cfg))
+        monkeypatch.setattr("olmlx.engine.registry.settings.models_config", path)
+        r = ModelRegistry()
+        r.load()
+        return r
+
+    def test_repo_id_resolves_to_declared_image_entry(self, reg):
+        mc = reg.resolve("Qwen/Qwen-Image-2.1")
+        assert mc is not None and mc.is_image and mc.image_quantize == 8
+
+    def test_text_repo_id_unchanged(self, reg):
+        mc = reg.resolve("Qwen/Qwen3-8B")
+        assert mc is not None and not mc.is_image
+
+    def test_undeclared_repo_id_is_plain(self, reg):
+        mc = reg.resolve("Qwen/Qwen-Image-2512")
+        assert mc is not None and not mc.is_image

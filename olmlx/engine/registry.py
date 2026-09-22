@@ -1654,6 +1654,14 @@ class ModelRegistry:
             normalized = self.normalize_name(name)
             if normalized in self._mappings:
                 return self._mappings[normalized]
+            # A declared image model (#723) addressed by its repo id instead of
+            # its alias: image models are never sniffed, so a marker-less
+            # synthetic config would route it as a text model (a wrong 400 on
+            # /v1/images, and a full diffusers download before failing on the
+            # text paths). First declared match wins.
+            for mc in self._mappings.values():
+                if mc.is_image and mc.hf_path == name:
+                    return mc
             return ModelConfig(hf_path=name)
         validate_model_name(name)
         normalized = self.normalize_name(name)
