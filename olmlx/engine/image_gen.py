@@ -68,7 +68,14 @@ def resolve_image_variant(hf_path: str) -> tuple[ImageVariant, Any]:
 
     supported: list[str] = []
     for variant in _VARIANTS:
-        cfg = AVAILABLE_MODELS[variant.key]
+        try:
+            cfg = AVAILABLE_MODELS[variant.key]
+        except KeyError as exc:
+            # mflux internals drifted (the extra is upper-bounded for this).
+            # ImportError so the loader reports "incompatible mflux".
+            raise ImportError(
+                f"mflux has no '{variant.key}' model config (AVAILABLE_MODELS)"
+            ) from exc
         names = {cfg.model_name, *cfg.aliases}
         if hf_path in names:
             return variant, cfg
@@ -91,7 +98,13 @@ def load_image_model(hf_path: str, quantize: int | None, model_path: str) -> Any
     ``hf_path``.
     """
     variant, mflux_config = resolve_image_variant(hf_path)
-    cls = getattr(importlib.import_module(variant.module), variant.class_name)
+    module = importlib.import_module(variant.module)
+    try:
+        cls = getattr(module, variant.class_name)
+    except AttributeError as exc:
+        raise ImportError(
+            f"mflux module {variant.module} has no {variant.class_name}"
+        ) from exc
     return cls(quantize=quantize, model_path=model_path, model_config=mflux_config)
 
 

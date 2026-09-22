@@ -7,7 +7,7 @@ import logging
 import threading
 import time
 
-from fastapi import APIRouter, Request, Response
+from fastapi import APIRouter, HTTPException, Request, Response
 
 from olmlx.config import settings
 from olmlx.engine.image_gen import ImageGenerationCancelled, encode_image
@@ -45,6 +45,14 @@ async def _watch_disconnect(request: Request, cancel: threading.Event) -> None:
 
 @router.post("/v1/images/generations", response_model=ImageGenerationResponse)
 async def images_generations(req: ImageGenerationRequest, request: Request):
+    if len(req.prompt) > settings.image_max_prompt_chars:
+        raise HTTPException(
+            status_code=413,
+            detail=(
+                f"prompt exceeds {settings.image_max_prompt_chars} characters "
+                "(OLMLX_IMAGE_MAX_PROMPT_CHARS)."
+            ),
+        )
     width, height = req.dimensions
     limit = settings.image_max_dimension
     if width > limit or height > limit:

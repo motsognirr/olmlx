@@ -246,3 +246,18 @@ class TestDisconnectThroughRealStack:
             finally:
                 server.should_exit = True
                 await serve
+
+
+class TestPromptLimit:
+    @pytest.mark.asyncio
+    async def test_oversized_prompt_is_413(self, app_client, monkeypatch):
+        monkeypatch.setattr("olmlx.routers.images.settings.image_max_prompt_chars", 10)
+        with patch(
+            "olmlx.routers.images.generate_image", new_callable=AsyncMock
+        ) as mock:
+            resp = await app_client.post(
+                "/v1/images/generations", json={"model": "m", "prompt": "x" * 11}
+            )
+        assert resp.status_code == 413
+        assert "OLMLX_IMAGE_MAX_PROMPT_CHARS" in resp.text
+        mock.assert_not_called()

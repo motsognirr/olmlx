@@ -11,6 +11,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from olmlx.engine import image_gen
 from olmlx.engine.model_manager import LoadedModel, ModelManager
 from olmlx.engine.registry import ModelRegistry
 from olmlx.engine.template_caps import TemplateCaps
@@ -331,3 +332,43 @@ class TestGuards:
         with patch("olmlx.engine.grammar.drop_for_tokenizer") as drop:
             ModelManager._close_loaded_model(lm)
         drop.assert_not_called()
+
+
+class TestMfluxErrorTranslation:
+    def test_missing_available_models_key_is_drift(self, monkeypatch):
+        # A renamed AVAILABLE_MODELS key is mflux drift: surface it as the
+        # "incompatible" error, not an opaque KeyError 500.
+        from olmlx.engine.model_manager import _translate_mflux_import_errors
+
+        _stub_mflux(monkeypatch)
+        monkeypatch.setitem(
+            sys.modules["mflux.models.common.config.model_config"].__dict__,
+            "AVAILABLE_MODELS",
+            {"qwen-image": _AVAILABLE["qwen-image"]},  # 2.1 key renamed away
+        )
+        with pytest.raises(RuntimeError, match="incompatible"):
+            with _translate_mflux_import_errors("Qwen/Qwen-Image-2.1"):
+                image_gen.resolve_image_variant("Qwen/Qwen-Image-2.1")
+
+    def test_missing_variant_class_is_drift(self, monkeypatch, tmp_path):
+        from olmlx.engine.model_manager import _translate_mflux_import_errors
+
+        _stub_mflux(monkeypatch)
+        del sys.modules[
+            "mflux.models.qwen21.variants.txt2img.qwen_image_21"
+        ].QwenImage21
+        with pytest.raises(RuntimeError, match="incompatible"):
+            with _translate_mflux_import_errors("Qwen/Qwen-Image-2.1"):
+                image_gen.load_image_model("Qwen/Qwen-Image-2.1", None, str(tmp_path))
+
+    def test_find_spec_valueerror_does_not_escape(self, monkeypatch):
+        # find_spec raises ValueError when sys.modules["mflux"] exists with
+        # __spec__ = None; that must not replace the actionable error.
+        from olmlx.engine.model_manager import _translate_mflux_import_errors
+
+        broken = types.ModuleType("mflux")
+        broken.__spec__ = None
+        monkeypatch.setitem(sys.modules, "mflux", broken)
+        with pytest.raises(RuntimeError, match="incompatible"):
+            with _translate_mflux_import_errors("Qwen/Qwen-Image-2.1"):
+                raise ImportError("No module named 'mflux.models.x'")

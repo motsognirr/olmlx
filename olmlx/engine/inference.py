@@ -5229,6 +5229,21 @@ async def generate_image(
     import secrets
 
     from olmlx.engine import image_gen
+    from olmlx.engine.registry import ModelConfig
+
+    # Image models are declared, so a non-image entry is known up front:
+    # refuse it before ensure_loaded evicts models to load a chat LLM just to
+    # return a 400. Unknown names fall through to ensure_loaded's not-found.
+    try:
+        declared = manager.registry.resolve(model_name)
+    except Exception:
+        declared = None
+    if isinstance(declared, ModelConfig) and not declared.is_image:
+        raise ValueError(
+            f"Model '{model_name}' is not an image model. "
+            "/v1/images/generations requires a models.json entry declared "
+            'with "type": "image" (e.g. hf_path "Qwen/Qwen-Image-2.1").'
+        )
 
     lm = await manager.ensure_loaded(model_name, keep_alive, pin=True)
     try:

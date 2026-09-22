@@ -391,3 +391,30 @@ class TestImageRejectedBeforeLoad:
             else:
                 await inference.generate_embeddings(mgr, "qwen-image:2.1", ["hi"])
         mgr.ensure_loaded.assert_not_called()
+
+
+class TestNonImageRejectedBeforeLoad:
+    @pytest.mark.asyncio
+    async def test_text_model_rejected_without_loading(self):
+        # The kind is declared in models.json, so a non-image entry must be
+        # refused before ensure_loaded evicts models to load a chat LLM just
+        # to return a 400.
+        from olmlx.engine.inference import generate_image
+        from olmlx.engine.registry import ModelConfig
+
+        mgr = MagicMock()
+        mgr.registry.resolve.return_value = ModelConfig(hf_path="Qwen/Qwen3-8B")
+        mgr.ensure_loaded = AsyncMock(side_effect=AssertionError("loaded"))
+        with pytest.raises(ValueError, match="not an image model"):
+            await generate_image(mgr, "qwen3:8b", "a cat", width=64, height=64)
+        mgr.ensure_loaded.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_unknown_name_falls_through_to_loader_error(self):
+        from olmlx.engine.inference import generate_image
+
+        mgr = MagicMock()
+        mgr.registry.resolve.return_value = None
+        mgr.ensure_loaded = AsyncMock(side_effect=ValueError("Model 'x' not found."))
+        with pytest.raises(ValueError, match="not found"):
+            await generate_image(mgr, "x", "a cat", width=64, height=64)

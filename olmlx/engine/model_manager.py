@@ -111,7 +111,13 @@ def _translate_mflux_import_errors(hf_path: str):
     except ImportError as exc:
         import importlib.util
 
-        if importlib.util.find_spec("mflux") is None:
+        try:
+            missing = importlib.util.find_spec("mflux") is None
+        except ValueError:
+            # find_spec raises when sys.modules["mflux"] exists with
+            # __spec__ = None; a module object is there, so it's installed.
+            missing = False
+        if missing:
             raise ValueError(
                 f"Model '{hf_path}' is an image model, but the image-generation "
                 "dependencies are not installed. Install with: "

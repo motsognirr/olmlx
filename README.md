@@ -345,7 +345,7 @@ curl http://localhost:11434/v1/images/generations -d '{
 }' | jq -r '.data[0].b64_json' | base64 -d > out.png
 ```
 
-Request fields: `prompt`, `size` (`WxH`, multiples of 16, max
+Request fields: `prompt` (max `OLMLX_IMAGE_MAX_PROMPT_CHARS`, default 8192), `size` (`WxH`, multiples of 16, max
 `OLMLX_IMAGE_MAX_DIMENSION`), `output_format` (`png`/`jpeg`/`webp`), plus the
 olmlx extensions `seed`, `steps`, `guidance` and `negative_prompt` (unset
 `steps`/`guidance` use each model's defaults: 40 / 1.0 for Qwen-Image-2.1,
