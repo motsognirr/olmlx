@@ -23,12 +23,17 @@ jobs:
         with:
           fetch-depth: 1
 
-      - name: Run Aider Code Review (gpt-5.4-mini)
+      # `gpt-5.6-luna` is the budget tier of the GPT-5.6 family and the direct
+      # successor to gpt-5.4-mini: it beats it on 27 of 32 shared benchmarks
+      # (SWE-bench Verified 93 vs 73), carries 1M context instead of 400k, and
+      # costs ~73% less ($0.20/$1.20 vs $0.75/$4.50 per 1M). It is roughly 2x
+      # slower per response, which is irrelevant for a ~1 min review job.
+      - name: Run Aider Code Review (gpt-5.6-luna)
         uses: motsognirr/aider-code-review@v1
         with:
           openai_api_key: ${{ secrets.OPENAI_API_KEY }}
           github_token: ${{ secrets.GITHUB_TOKEN }}
-          model: gpt-5.4-mini
+          model: gpt-5.6-luna
 
   deepseek-review:
     runs-on: ubuntu-latest
