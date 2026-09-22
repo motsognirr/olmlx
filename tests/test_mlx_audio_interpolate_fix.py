@@ -174,3 +174,26 @@ def test_patched_matches_upstream_on_unhandled_call_shapes(case):
     assert _outcome(interp_mod.interpolate, shape, **kwargs) == _outcome(
         _original_interpolate(), shape, **kwargs
     )
+
+
+def test_patched_matches_upstream_on_non_array_input():
+    # The wrapper gates on getattr(input, "ndim", 0) >= 3. An object without a
+    # real array contract must still fail the way upstream fails it, not in
+    # the wrapper's own size computation.
+    ensure_interpolate_scale_patch()
+
+    class _NotAnArray:
+        ndim = 3
+
+    class _NoNdim:
+        pass
+
+    for obj in (_NotAnArray(), _NoNdim(), object(), None):
+
+        def outcome(fn):
+            try:
+                return ("ok", fn(obj, scale_factor=2.0, mode="linear"))
+            except BaseException as exc:  # noqa: BLE001 - comparing failures
+                return (type(exc).__name__, str(exc))
+
+        assert outcome(interp_mod.interpolate) == outcome(_original_interpolate())
