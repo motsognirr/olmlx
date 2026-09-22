@@ -2923,17 +2923,6 @@ class ModelManager(SpeculativeLoaderMixin):
                 "(issue #469)."
             ) from exc
 
-        # mlx-audio derives scaled interpolation sizes in float, so a
-        # reciprocal scale factor (Kokoro's 1/300) can ceil one frame too far
-        # and blow up the vocoder with a [broadcast_shapes] error mid-
-        # utterance (#703). Patch before load_model, which imports the model
-        # modules that bind ``interpolate`` by name.
-        from olmlx.engine.mlx_audio_interpolate_fix import (
-            ensure_interpolate_scale_patch,
-        )
-
-        ensure_interpolate_scale_patch()
-
         model = tts_utils.load_model(Path(load_path))
         # Kokoro carries no lazy underscore buffers, but the loader is generic
         # over all mlx-audio TTS models — several (fish, spark, indextts, ...)

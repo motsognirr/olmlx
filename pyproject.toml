@@ -81,7 +81,13 @@ otel = [
 # Kokoro TTS for /v1/audio/speech and `olmlx chat --voice` (#367, #469).
 # Not core: this stack is several GB and only serves speech synthesis.
 audio = [
-    "mlx-audio>=0.4.4",
+    # >=0.4.5: 0.4.4 crashes mid-utterance with a [broadcast_shapes] error on
+    # ~18% of Kokoro inputs. mlx-audio's `interpolate` derives scaled sizes in
+    # float, so a reciprocal scale factor (Kokoro's 1/300) ceils one frame too
+    # far and SineGen's F0 round-trip comes back 300 samples long. Upstream
+    # #785 aligns the sine waves to the F0 length in SineGen; first released in
+    # 0.4.5. olmlx issue #703.
+    "mlx-audio>=0.4.5",
     # Kokoro TTS (mlx-audio) needs misaki for English grapheme->phoneme text
     # processing; without it /v1/audio/speech raises ImportError at generate
     # time. The [en] extra pulls the English pipeline (spacy etc.). Issue #367.

@@ -2216,7 +2216,7 @@ wheels = [
 
 [[package]]
 name = "mlx-audio"
-version = "0.4.4"
+version = "0.4.6"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "huggingface-hub" },
@@ -2229,9 +2229,9 @@ dependencies = [
     { name = "tqdm" },
     { name = "transformers" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/af/1e/f712c9f7997e5051c4da3b658f38162203bb703c750741984c8358c8b897/mlx_audio-0.4.4.tar.gz", hash = "sha256:d751e5f477517e4e7f04de5567318e2fe91b4606af5d7e4b2973603c4777814a", size = 1386491, upload-time = "2026-06-06T15:32:03.504Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/e7/02/40b042713edf6f8f7714f711a2fc5191b871c4c39d79df6e7726de6a81e9/mlx_audio-0.4.6.tar.gz", hash = "sha256:9f377ba4c0927af06526ed2d03b2fa44eb158d83385da96422da17c926b8589f", size = 1488412, upload-time = "2026-07-25T09:07:07.729Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/b8/4d/93ac0e0526591c856a1ea2cd00a41f31530d9e021cc95bc9400550926d51/mlx_audio-0.4.4-py3-none-any.whl", hash = "sha256:39fe81b03e2b1354be70de82dc8bf01dd6e75efcb464150afef89f18f734d0d5", size = 1669932, upload-time = "2026-06-06T15:32:01.807Z" },
+    { url = "https://files.pythonhosted.org/packages/a3/e6/f8c4a521567d3a4494ad0a5e88f16cc9b516b784e7cb5aa4768775e346ca/mlx_audio-0.4.6-py3-none-any.whl", hash = "sha256:cd9c3958d50bf3f30fc78d64fc1b638f84961a6aadb0731582a5c16efe7bb7e5", size = 1792380, upload-time = "2026-07-25T09:07:06.157Z" },
 ]
 
 [[package]]
@@ -2878,7 +2878,7 @@ requires-dist = [
     { name = "mcp", specifier = ">=1.28.1" },
     { name = "misaki", extras = ["en"], marker = "extra == 'audio'", specifier = ">=0.9.4" },
     { name = "mlx", specifier = ">=0.32.0,<0.33" },
-    { name = "mlx-audio", marker = "extra == 'audio'", specifier = ">=0.4.4" },
+    { name = "mlx-audio", marker = "extra == 'audio'", specifier = ">=0.4.5" },
     { name = "mlx-lm", specifier = ">=0.31.3,<0.32" },
     { name = "mlx-vlm", specifier = ">=0.6.4,<0.7" },
     { name = "mlx-whisper", specifier = ">=0.4.3" },
