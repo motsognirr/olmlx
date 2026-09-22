@@ -2,7 +2,6 @@
 
 import asyncio
 import base64
-import contextlib
 import logging
 import threading
 import time
@@ -45,14 +44,19 @@ async def _watch_disconnect(request: Request, cancel: threading.Event) -> None:
 
 @router.post("/v1/images/generations", response_model=ImageGenerationResponse)
 async def images_generations(req: ImageGenerationRequest, request: Request):
-    if len(req.prompt) > settings.image_max_prompt_chars:
-        raise HTTPException(
-            status_code=413,
-            detail=(
-                f"prompt exceeds {settings.image_max_prompt_chars} characters "
-                "(OLMLX_IMAGE_MAX_PROMPT_CHARS)."
-            ),
-        )
+    # negative_prompt goes through the same text encoder, so cap it too.
+    for field, text in (
+        ("prompt", req.prompt),
+        ("negative_prompt", req.negative_prompt),
+    ):
+        if text is not None and len(text) > settings.image_max_prompt_chars:
+            raise HTTPException(
+                status_code=413,
+                detail=(
+                    f"{field} exceeds {settings.image_max_prompt_chars} "
+                    "characters (OLMLX_IMAGE_MAX_PROMPT_CHARS)."
+                ),
+            )
     width, height = req.dimensions
     limit = settings.image_max_dimension
     if width > limit or height > limit:
@@ -82,11 +86,14 @@ async def images_generations(req: ImageGenerationRequest, request: Request):
         return Response(status_code=499)
     finally:
         watcher.cancel()
-        # The watcher's outcome is irrelevant here; never let its failure
-        # (e.g. a receive() error once the request completes) replace the
-        # real response or exception.
-        with contextlib.suppress(asyncio.CancelledError, Exception):
-            await watcher
+        # asyncio.wait consumes the watcher's outcome WITHOUT raising it, so
+        # its failure (e.g. a receive() error once the request completes)
+        # can't replace the real response/exception — while a cancellation of
+        # THIS handler task still propagates (a suppress(CancelledError) here
+        # couldn't tell the two apart and would swallow it).
+        await asyncio.wait({watcher})
+        if not watcher.cancelled():
+            watcher.exception()  # mark retrieved
 
     # PIL encoding is CPU-bound (hundreds of ms for a 1024px PNG); keep it off
     # the event loop.

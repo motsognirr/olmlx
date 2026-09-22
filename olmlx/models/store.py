@@ -461,6 +461,15 @@ class ModelStore:
             return
 
         resolved = self.registry.resolve(name)
+        if resolved is not None and resolved.is_image is True:
+            # Same exact-match variant guard the load path runs, BEFORE the
+            # download: a declared image entry pointing at an unsupported repo
+            # must not pull tens of GB only to fail at load (#723).
+            from olmlx.engine import image_gen
+
+            image_hf_path = _strip_ollama_tag(resolved.hf_path)
+            with image_gen.translate_mflux_errors(image_hf_path):
+                image_gen.resolve_image_variant(image_hf_path)
         hf_path = resolved.hf_path if resolved is not None else None
         if hf_path is None:
             if "/" in name:

@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import gc
 import importlib
 import json
@@ -53,6 +52,9 @@ from olmlx.engine.model_load_utils import (  # noqa: F401
     _load_gemma4_unified_text,
     _maybe_load_gemma4_unified_text,
 )
+from olmlx.engine.image_gen import (  # noqa: F401
+    translate_mflux_errors as _translate_mflux_import_errors,
+)
 from olmlx.engine.cache_capabilities import (  # noqa: F401
     _is_serializable_cache,
     _kv_quant_blocks_snapshot,
@@ -95,38 +97,6 @@ _FALLBACK_EXCEPTIONS = (
     OSError,
     json.JSONDecodeError,
 )
-
-
-@contextlib.contextmanager
-def _translate_mflux_import_errors(hf_path: str):
-    """Map mflux ``ImportError``s to actionable errors (#723).
-
-    mflux missing -> ``ValueError`` (HTTP 400) with the install command, like
-    the TTS loader (#469). mflux installed but an internal module olmlx
-    imports is gone/broken (drift past the tested version) -> ``RuntimeError``
-    naming the incompatibility; reinstalling the extra would not help.
-    """
-    try:
-        yield
-    except ImportError as exc:
-        import importlib.util
-
-        try:
-            missing = importlib.util.find_spec("mflux") is None
-        except ValueError:
-            # find_spec raises when sys.modules["mflux"] exists with
-            # __spec__ = None; a module object is there, so it's installed.
-            missing = False
-        if missing:
-            raise ValueError(
-                f"Model '{hf_path}' is an image model, but the image-generation "
-                "dependencies are not installed. Install with: "
-                "uv sync --extra image (or pip install 'olmlx[image]')."
-            ) from exc
-        raise RuntimeError(
-            f"The installed mflux is incompatible with olmlx's image support "
-            f"({exc}); install the version the [image] extra pins."
-        ) from exc
 
 
 class ModelManager(SpeculativeLoaderMixin):

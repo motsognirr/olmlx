@@ -261,3 +261,65 @@ class TestPromptLimit:
         assert resp.status_code == 413
         assert "OLMLX_IMAGE_MAX_PROMPT_CHARS" in resp.text
         mock.assert_not_called()
+
+
+class TestNegativePromptLimit:
+    @pytest.mark.asyncio
+    async def test_oversized_negative_prompt_is_413(self, app_client, monkeypatch):
+        monkeypatch.setattr("olmlx.routers.images.settings.image_max_prompt_chars", 10)
+        with patch(
+            "olmlx.routers.images.generate_image", new_callable=AsyncMock
+        ) as mock:
+            resp = await app_client.post(
+                "/v1/images/generations",
+                json={"model": "m", "prompt": "p", "negative_prompt": "x" * 11},
+            )
+        assert resp.status_code == 413
+        mock.assert_not_called()
+
+
+class TestHandlerCancellationPropagates:
+    @pytest.mark.asyncio
+    async def test_cancel_during_watcher_cleanup_is_not_swallowed(self):
+        """A cancel of the handler that lands while the finally awaits the
+        watcher must propagate, not be suppressed as if it were the watcher's
+        own CancelledError (which would carry on to encode + respond)."""
+        import asyncio
+        import threading
+        from unittest.mock import MagicMock
+
+        from olmlx.routers import images as images_router
+        from olmlx.schemas.images import ImageGenerationRequest
+
+        in_cleanup = asyncio.Event()
+
+        async def slow_to_stop_watcher(request, cancel: threading.Event):
+            try:
+                await asyncio.sleep(3600)
+            except asyncio.CancelledError:
+                in_cleanup.set()
+                await asyncio.sleep(0.5)  # slow shutdown: widens the window
+                raise
+
+        async def quick_generate(*a, **kw):
+            await asyncio.sleep(0.05)  # let the watcher task start
+            return {"image": object(), "seed": 1}
+
+        request = MagicMock()
+        request.app.state.model_manager = object()
+        encode = MagicMock(return_value=b"x")
+        with (
+            patch.object(images_router, "generate_image", quick_generate),
+            patch.object(images_router, "_watch_disconnect", slow_to_stop_watcher),
+            patch.object(images_router, "encode_image", encode),
+        ):
+            task = asyncio.create_task(
+                images_router.images_generations(
+                    ImageGenerationRequest(model="m", prompt="p"), request
+                )
+            )
+            await asyncio.wait_for(in_cleanup.wait(), 5)
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+        encode.assert_not_called()

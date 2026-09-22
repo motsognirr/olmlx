@@ -12,8 +12,10 @@ lazily inside each function — importing this module never requires it.
 
 from __future__ import annotations
 
+import contextlib
 import importlib
 import threading
+from collections.abc import Iterator
 from dataclasses import dataclass
 from typing import Any
 
@@ -91,6 +93,38 @@ def resolve_image_variant(hf_path: str) -> tuple[ImageVariant, Any]:
         f'{sorted(supported)} as the hf_path of a "type": "image" entry '
         "in models.json (exact repo id)."
     )
+
+
+@contextlib.contextmanager
+def translate_mflux_errors(hf_path: str) -> Iterator[None]:
+    """Map mflux ``ImportError``s to actionable errors (#723).
+
+    mflux missing -> ``ValueError`` (HTTP 400) with the install command, like
+    the TTS loader (#469). mflux installed but an internal module olmlx
+    imports is gone/broken (drift past the tested version) -> ``RuntimeError``
+    naming the incompatibility; reinstalling the extra would not help.
+    """
+    try:
+        yield
+    except ImportError as exc:
+        import importlib.util
+
+        try:
+            missing = importlib.util.find_spec("mflux") is None
+        except ValueError:
+            # find_spec raises when sys.modules["mflux"] exists with
+            # __spec__ = None; a module object is there, so it's installed.
+            missing = False
+        if missing:
+            raise ValueError(
+                f"Model '{hf_path}' is an image model, but the image-generation "
+                "dependencies are not installed. Install with: "
+                "uv sync --extra image (or pip install 'olmlx[image]')."
+            ) from exc
+        raise RuntimeError(
+            f"The installed mflux is incompatible with olmlx's image support "
+            f"({exc}); install the version the [image] extra pins."
+        ) from exc
 
 
 def load_image_model(hf_path: str, quantize: int | None, model_path: str) -> Any:

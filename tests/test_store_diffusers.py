@@ -82,7 +82,10 @@ def test_show_and_delete_diffusers_model(store):
 
 
 @pytest.mark.asyncio
-async def test_pull_image_model_downloads_into_store(store):
+async def test_pull_image_model_downloads_into_store(store, monkeypatch):
+    from tests.test_images_load import _stub_mflux
+
+    _stub_mflux(monkeypatch)
     with patch(
         "huggingface_hub.snapshot_download", side_effect=_fake_diffusers_download(store)
     ):
@@ -90,3 +93,39 @@ async def test_pull_image_model_downloads_into_store(store):
     assert statuses[-1] == "success"
     manifest = json.loads((store.local_path(REPO) / "manifest.json").read_text())
     assert manifest["family"] == "image"
+
+
+@pytest.mark.asyncio
+async def test_pull_rejects_unsupported_image_repo_before_download(
+    tmp_path, monkeypatch
+):
+    # The exact-match variant guard must cover pull too, not only load:
+    # otherwise `olmlx models pull` downloads tens of GB of an unsupported repo.
+    from tests.test_images_load import _stub_mflux
+
+    cfg = {"flux:dev": {"type": "image", "hf_path": "black-forest-labs/FLUX.1-dev"}}
+    path = tmp_path / "models.json"
+    path.write_text(json.dumps(cfg))
+    monkeypatch.setattr("olmlx.engine.registry.settings.models_config", path)
+    monkeypatch.setattr("olmlx.models.store.settings.models_dir", tmp_path / "models")
+    reg = ModelRegistry()
+    reg.load()
+    store = ModelStore(reg)
+    _stub_mflux(monkeypatch)
+    with patch("huggingface_hub.snapshot_download") as dl:
+        with pytest.raises(ValueError, match="not a supported image model"):
+            async for _ in store.pull("flux:dev"):
+                pass
+    dl.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_pull_supported_image_repo_still_downloads(store, monkeypatch):
+    from tests.test_images_load import _stub_mflux
+
+    _stub_mflux(monkeypatch)
+    with patch(
+        "huggingface_hub.snapshot_download", side_effect=_fake_diffusers_download(store)
+    ):
+        statuses = [e["status"] async for e in store.pull("qwen-image:2.1")]
+    assert statuses[-1] == "success"
