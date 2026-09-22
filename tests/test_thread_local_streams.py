@@ -410,6 +410,19 @@ _TINY_DRAFT_DIMS = {
     "rms_norm_eps": 1e-6,
     "rope_theta": 10000.0,
     "max_position_embeddings": 2048,
+    # Deliberately yarn, not the default RoPE: ``initialize_rope`` only builds
+    # a scaled variant (here ``YarnRoPE``) when a ``scaling_config`` is
+    # present, and only those variants precompute a lazy ``_freqs`` under an
+    # underscore key that ``parameters()`` skips. Without this the wiring
+    # tests below are satisfied by ``mx.eval(parameters())`` alone and the
+    # ``_materialize_module_buffers`` half of ``_materialize_draft_model``
+    # goes untested. Both loaders read ``rope_scaling`` off the top-level
+    # draft config and pass it to ``initialize_rope``.
+    "rope_scaling": {
+        "rope_type": "yarn",
+        "factor": 2.0,
+        "original_max_position_embeddings": 1024,
+    },
 }
 
 
@@ -488,11 +501,42 @@ def _write_draft_dir(tmp_path, donor, config: dict):
     return tmp_path
 
 
-def _eval_draft_params_on_worker(decoder):
-    """Eval the decoder's draft parameters from a fresh thread."""
+def _underscore_array_leaves(model):
+    """Collect the model's underscore-keyed ``mx.array`` leaves.
+
+    A probe, not a reimplementation of ``_materialize_module_buffers``: these
+    are exactly the buffers ``parameters()`` skips (``nn.Module`` is a
+    ``dict``, so attributes live in ``.items()``), so evaling *only* the
+    parameters can never reach them. The scaled-RoPE ``_freqs`` built from
+    ``_TINY_DRAFT_DIMS["rope_scaling"]`` lands here.
+    """
+    leaves = []
+    for _, module in model.named_modules():
+        for key, value in module.items():
+            if key.startswith("_") and isinstance(value, mx.array):
+                leaves.append(value)
+    return leaves
+
+
+def _eval_draft_on_worker(decoder):
+    """Eval the decoder's draft parameters *and* buffers from a fresh thread.
+
+    Both halves matter: ``parameters()`` covers the ``load_weights`` result
+    (the reported dflash crash), the underscore leaves cover the lazy
+    scaled-RoPE ``_freqs`` that ``parameters()`` traversal misses. Production
+    pulls both on the first draft forward.
+    """
+    draft = decoder._draft
+    buffers = _underscore_array_leaves(draft)
+    assert buffers, (
+        "no underscore-keyed array buffers on the draft — expected a scaled "
+        "RoPE _freqs from _TINY_DRAFT_DIMS['rope_scaling']; without one this "
+        "test cannot gate the _materialize_module_buffers half of the fix"
+    )
 
     def work():
-        mx.eval(decoder._draft.parameters())
+        mx.eval(draft.parameters())
+        mx.eval(buffers)
         return True
 
     return _run_in_thread(work)
@@ -581,7 +625,7 @@ class TestSpecDraftWeightMaterialization:
                 strategy="dflash",
             ),
         )
-        res = _eval_draft_params_on_worker(decoder)
+        res = _eval_draft_on_worker(decoder)
         assert res.get("error") is None, (
             f"_load_dflash_decoder left draft weights lazy: {res.get('error')!r}"
         )
@@ -613,7 +657,7 @@ class TestSpecDraftWeightMaterialization:
                 strategy="eagle",
             ),
         )
-        res = _eval_draft_params_on_worker(decoder)
+        res = _eval_draft_on_worker(decoder)
         assert res.get("error") is None, (
             f"_load_eagle_decoder left draft weights lazy: {res.get('error')!r}"
         )
