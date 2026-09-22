@@ -175,6 +175,32 @@ def _probe_bundled_draft_dir(local_dir: Path, strategy: str) -> Path | None:
     return None
 
 
+def _materialize_draft_model(draft_model: Any) -> None:
+    """Eager-eval a hand-loaded draft model on the load thread.
+
+    The dflash/eagle loaders build their draft via ``mx.load`` +
+    ``load_weights`` with no eval — unlike mlx-lm's ``load``, nothing
+    materializes the weights, so every one stays a lazy load op bound to the
+    load thread's CPU stream. Under mlx >= 0.31.2 thread-local streams (#499)
+    the first draft forward runs on a *different* generation worker thread and
+    crashes with "There is no Stream(cpu, N) in current thread" (for DFlash at
+    ``step()``'s ``mx.eval(draft_tokens_arr)`` — prefill only runs the target,
+    so the draft weights are first pulled mid-generation). Same mechanism as
+    the flash-MoE wrapper param gap; classic drafts dodge it by routing
+    through ``_load_with_model_type_fallback``.
+
+    ``_materialize_module_buffers`` additionally covers lazy underscore-keyed
+    buffers (e.g. a scaled-RoPE ``_freqs`` from ``initialize_rope`` when the
+    draft config carries ``rope_scaling``) that ``parameters()`` skips.
+    Lazy import from model_manager — this module must not import it at top
+    level (imported *by* model_manager to build the class).
+    """
+    from olmlx.engine.model_manager import _materialize_module_buffers
+
+    mx.eval(draft_model.parameters())
+    _materialize_module_buffers(draft_model)
+
+
 class SpeculativeLoaderMixin:
     """Draft-model loading for speculative decoding (mixed into ModelManager)."""
 
@@ -366,6 +392,7 @@ class SpeculativeLoaderMixin:
         # ``DFlashDraftModel.bind()`` and are intentionally absent from
         # the draft safetensors.
         draft_model.load_weights(weights, strict=False)
+        _materialize_draft_model(draft_model)
         logger.info(
             "Loaded dflash draft weights from %s (%d file(s))",
             draft_dir,
@@ -565,6 +592,7 @@ class SpeculativeLoaderMixin:
         # ``strict=False`` permits the absent ``embed_tokens`` /
         # ``lm_head`` (re-bound from target on every prefill).
         draft_model.load_weights(weights, strict=False)
+        _materialize_draft_model(draft_model)
         logger.info(
             "Loaded EAGLE draft weights from %s (%d file(s))",
             draft_dir,

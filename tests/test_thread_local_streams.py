@@ -391,3 +391,273 @@ class TestWhisperTtsLoaderWiring:
         assert res.get("error") is None, (
             f"_load_model_tts left buffers lazy: {res.get('error')!r}"
         )
+
+
+# ---------------------------------------------------------------------------
+# Speculative draft loaders (dflash / eagle) — draft weights must be
+# materialized on the load thread
+# ---------------------------------------------------------------------------
+
+
+_TINY_DRAFT_DIMS = {
+    "hidden_size": 8,
+    "num_hidden_layers": 1,
+    "num_attention_heads": 2,
+    "num_key_value_heads": 1,
+    "head_dim": 4,
+    "intermediate_size": 16,
+    "vocab_size": 32,
+    "rms_norm_eps": 1e-6,
+    "rope_theta": 10000.0,
+    "max_position_embeddings": 2048,
+    # Deliberately yarn, not the default RoPE: ``initialize_rope`` only builds
+    # a scaled variant (here ``YarnRoPE``) when a ``scaling_config`` is
+    # present, and only those variants precompute a lazy ``_freqs`` under an
+    # underscore key that ``parameters()`` skips. Without this the wiring
+    # tests below are satisfied by ``mx.eval(parameters())`` alone and the
+    # ``_materialize_module_buffers`` half of ``_materialize_draft_model``
+    # goes untested. Both loaders read ``rope_scaling`` off the top-level
+    # draft config and pass it to ``initialize_rope``.
+    "rope_scaling": {
+        "rope_type": "yarn",
+        "factor": 2.0,
+        "original_max_position_embeddings": 1024,
+    },
+}
+
+
+def _spec_target(vocab_size=32, hidden_size=8, num_layers=2):
+    """Minimal mlx-lm-shaped target for the dflash/eagle decoders.
+
+    Mirrors ``tests/test_dflash.py``'s ``_Target`` (``.model.layers``,
+    ``.model.embed_tokens``, ``.lm_head``) plus an ``args`` namespace so the
+    loaders' vocab/hidden compatibility probes resolve.
+    """
+    from types import SimpleNamespace
+
+    import mlx.nn as nn
+
+    class _Attn(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.n_heads = 1
+            self.n_kv_heads = 1
+            self.proj = nn.Linear(hidden_size, hidden_size, bias=False)
+
+        def __call__(self, x, mask=None, cache=None):
+            if cache is not None:
+                k = v = x.reshape(x.shape[0], 1, -1, x.shape[-1])
+                cache.update_and_fetch(k, v)
+            return self.proj(x)
+
+    class _Layer(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.self_attn = _Attn()
+
+        def __call__(self, x, mask=None, cache=None):
+            return x + self.self_attn(x, mask=mask, cache=cache)
+
+    class _Inner(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.embed_tokens = nn.Embedding(vocab_size, hidden_size)
+            self.layers = [_Layer() for _ in range(num_layers)]
+            self.norm = nn.RMSNorm(hidden_size)
+
+    class _Target(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.model = _Inner()
+            self.lm_head = nn.Linear(hidden_size, vocab_size, bias=False)
+            self.args = SimpleNamespace(vocab_size=vocab_size, hidden_size=hidden_size)
+
+        @property
+        def layers(self):
+            return self.model.layers
+
+        def __call__(self, input_ids, cache=None):
+            h = self.model.embed_tokens(input_ids)
+            for i, layer in enumerate(self.model.layers):
+                h = layer(h, cache=cache[i] if cache is not None else None)
+            return self.lm_head(self.model.norm(h))
+
+    target = _Target()
+    mx.eval(target.parameters())
+    return target
+
+
+def _write_draft_dir(tmp_path, donor, config: dict):
+    """Save *donor*'s parameters + *config* as an on-disk draft checkpoint."""
+    import json
+
+    from mlx.utils import tree_flatten
+
+    mx.eval(donor.parameters())
+    mx.save_safetensors(
+        str(tmp_path / "model.safetensors"), dict(tree_flatten(donor.parameters()))
+    )
+    (tmp_path / "config.json").write_text(json.dumps(config))
+    return tmp_path
+
+
+def _underscore_array_leaves(model):
+    """Collect the model's underscore-keyed ``mx.array`` leaves.
+
+    A probe, not a reimplementation of ``_materialize_module_buffers``: these
+    are exactly the buffers ``parameters()`` skips (``nn.Module`` is a
+    ``dict``, so attributes live in ``.items()``), so evaling *only* the
+    parameters can never reach them. The scaled-RoPE ``_freqs`` built from
+    ``_TINY_DRAFT_DIMS["rope_scaling"]`` lands here.
+    """
+    leaves = []
+    for _, module in model.named_modules():
+        for key, value in module.items():
+            if key.startswith("_") and isinstance(value, mx.array):
+                leaves.append(value)
+    return leaves
+
+
+def _eval_draft_on_worker(decoder):
+    """Eval the decoder's draft parameters *and* buffers from a fresh thread.
+
+    Both halves matter: ``parameters()`` covers the ``load_weights`` result
+    (the reported dflash crash), the underscore leaves cover the lazy
+    scaled-RoPE ``_freqs`` that ``parameters()`` traversal misses. Production
+    pulls both on the first draft forward.
+    """
+    draft = decoder._draft
+    buffers = _underscore_array_leaves(draft)
+    assert buffers, (
+        "no underscore-keyed array buffers on the draft — expected a scaled "
+        "RoPE _freqs from _TINY_DRAFT_DIMS['rope_scaling']; without one this "
+        "test cannot gate the _materialize_module_buffers half of the fix"
+    )
+
+    def work():
+        mx.eval(draft.parameters())
+        mx.eval(buffers)
+        return True
+
+    return _run_in_thread(work)
+
+
+@pytest.mark.usefixtures("metal_default_device")
+class TestSpecDraftWeightMaterialization:
+    """dflash/eagle draft weights must be materialized on the load thread.
+
+    ``_load_dflash_decoder`` / ``_load_eagle_decoder`` load draft weights via
+    ``mx.load`` + ``load_weights`` with no eval at all — every draft weight
+    stays a lazy load op bound to the load thread's CPU stream. DFlash prefill
+    only runs the *target*, so the first eval that pulls the draft weights is
+    ``mx.eval(draft_tokens_arr)`` inside ``step()`` — on the generation worker
+    thread, raising "There is no Stream(cpu, N) in current thread". Same
+    mechanism as the flash-MoE wrapper param gap; classic drafts dodge it by
+    routing through ``_load_with_model_type_fallback``.
+    """
+
+    def test_unevaled_loaded_weights_crash_cross_thread_without_fix(self, tmp_path):
+        # Negative control: locks in that mx.load-derived weights that are
+        # never eval'd stay bound to the loading thread, so a future refactor
+        # that drops the loader-side eval can't silently pass.
+        import mlx.nn as nn
+
+        from mlx.utils import tree_flatten
+
+        class Tiny(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.lin = nn.Linear(8, 8, bias=False)
+
+        donor = Tiny()
+        mx.eval(donor.parameters())
+        wf = tmp_path / "model.safetensors"
+        mx.save_safetensors(str(wf), dict(tree_flatten(donor.parameters())))
+
+        model = Tiny()
+        model.load_weights(list(mx.load(str(wf)).items()))  # lazy, never eval'd
+
+        res = _run_in_thread(lambda: (mx.eval(model.parameters()), True)[1])
+        assert res.get("error") is not None, (
+            "expected the load-thread-bound lazy weights to crash on the "
+            "worker thread — if this passes, mx.load results no longer stay "
+            "lazy and the loader-side eval may be unnecessary"
+        )
+        assert "Stream" in str(res["error"])
+
+    def test_load_dflash_decoder_materializes_draft_weights(self, tmp_path):
+        from olmlx.engine.dflash.draft_model import DFlashDraftModel, DraftConfig
+        from olmlx.engine.registry import SpeculativeConfig
+        from olmlx.engine.speculative_loaders import SpeculativeLoaderMixin
+
+        donor = DFlashDraftModel(
+            DraftConfig(
+                **_TINY_DRAFT_DIMS,
+                block_size=4,
+                num_target_layers=1,
+                target_layer_ids=[0],
+                mask_token_id=0,
+            )
+        )
+        draft_dir = _write_draft_dir(
+            tmp_path,
+            donor,
+            {
+                **_TINY_DRAFT_DIMS,
+                "block_size": 4,
+                "dflash_config": {
+                    "target_layer_ids": [0],
+                    "mask_token_id": 0,
+                    "dflash_attention_version": 2,
+                },
+            },
+        )
+
+        class _Mgr(SpeculativeLoaderMixin):
+            store = None
+
+        decoder = _Mgr()._load_dflash_decoder(
+            _spec_target(),
+            SpeculativeConfig(
+                enabled=True,
+                draft_model=str(draft_dir),
+                num_tokens=None,
+                strategy="dflash",
+            ),
+        )
+        res = _eval_draft_on_worker(decoder)
+        assert res.get("error") is None, (
+            f"_load_dflash_decoder left draft weights lazy: {res.get('error')!r}"
+        )
+
+    def test_load_eagle_decoder_materializes_draft_weights(self, tmp_path):
+        from olmlx.engine.eagle.draft_model import EagleConfig, EagleDraftModel
+        from olmlx.engine.registry import SpeculativeConfig
+        from olmlx.engine.speculative_loaders import SpeculativeLoaderMixin
+
+        donor = EagleDraftModel(EagleConfig(**_TINY_DRAFT_DIMS, block_size=4))
+        draft_dir = _write_draft_dir(
+            tmp_path,
+            donor,
+            {
+                **_TINY_DRAFT_DIMS,
+                "eagle_config": {"block_size": 4, "target_layer_id": 1},
+            },
+        )
+
+        class _Mgr(SpeculativeLoaderMixin):
+            store = None
+
+        decoder = _Mgr()._load_eagle_decoder(
+            _spec_target(),
+            SpeculativeConfig(
+                enabled=True,
+                draft_model=str(draft_dir),
+                num_tokens=None,
+                strategy="eagle",
+            ),
+        )
+        res = _eval_draft_on_worker(decoder)
+        assert res.get("error") is None, (
+            f"_load_eagle_decoder left draft weights lazy: {res.get('error')!r}"
+        )
