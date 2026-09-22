@@ -20,6 +20,8 @@ upstream fixes the size computation.
 
 import importlib
 import math
+import sys
+from unittest import mock
 
 import mlx.core as mx
 import pytest
@@ -156,6 +158,12 @@ _PARITY_CASES = {
     "negative scale": dict(input_shape=(1, 1, 7), scale_factor=-2.0),
     "nan scale": dict(input_shape=(1, 1, 7), scale_factor=float("nan")),
     "inf scale": dict(input_shape=(1, 1, 7), scale_factor=float("inf")),
+    # raw == 234.5 exactly: round() is banker's, but the isclose() guard means
+    # a half-way value is never within tolerance of its rounded integer, so it
+    # is left alone and upstream's ceil decides.
+    "exact half": dict(input_shape=(1, 1, 469), scale_factor=0.5),
+    "exact half, odd": dict(input_shape=(1, 1, 7), scale_factor=0.5),
+    "exact half, up": dict(input_shape=(1, 1, 471), scale_factor=0.5),
 }
 
 
@@ -197,3 +205,60 @@ def test_patched_matches_upstream_on_non_array_input():
                 return (type(exc).__name__, str(exc))
 
         assert outcome(interp_mod.interpolate) == outcome(_original_interpolate())
+
+
+def test_rebind_matches_on_identity_not_name():
+    # The sys.modules sweep replaces attributes that *are* the original
+    # function object. A module with its own unrelated `interpolate` helper
+    # keeps it; one that imported mlx-audio's gets rebound.
+    import types
+
+    original = _original_interpolate()
+    foreign = types.ModuleType("fake_pkg_with_own_interpolate")
+    foreign.interpolate = lambda *a, **k: "mine"
+    importer = types.ModuleType("fake_pkg_importing_mlx_audio")
+    importer.interpolate = original
+    own_helper = foreign.interpolate
+
+    with mock.patch.dict(
+        sys.modules,
+        {foreign.__name__: foreign, importer.__name__: importer},
+    ):
+        # Force a re-patch so the sweep runs with these modules loaded.
+        interp_mod.interpolate = original
+        try:
+            ensure_interpolate_scale_patch()
+            assert foreign.interpolate is own_helper
+            assert importer.interpolate is interp_mod.interpolate
+            assert importer.interpolate is not original
+        finally:
+            ensure_interpolate_scale_patch()
+
+
+def test_rebind_survives_a_module_with_a_hostile_getattr():
+    # A module whose attribute access raises must not abort the sweep before
+    # the real importers are rebound.
+    import types
+
+    original = _original_interpolate()
+
+    class _Hostile(types.ModuleType):
+        def __getattribute__(self, name):
+            if name == "interpolate":
+                raise RuntimeError("no attributes for you")
+            return super().__getattribute__(name)
+
+    hostile = _Hostile("fake_hostile_module")
+    importer = types.ModuleType("fake_pkg_importing_mlx_audio_2")
+    importer.interpolate = original
+
+    with mock.patch.dict(
+        sys.modules,
+        {hostile.__name__: hostile, importer.__name__: importer},
+    ):
+        interp_mod.interpolate = original
+        try:
+            ensure_interpolate_scale_patch()
+            assert importer.interpolate is interp_mod.interpolate
+        finally:
+            ensure_interpolate_scale_patch()

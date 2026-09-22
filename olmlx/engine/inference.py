@@ -560,6 +560,10 @@ class TTSGenerationError(RuntimeError):
 # MemoryError is the reachable one here: mlx raises it on an allocation
 # failure, and app.py turns it into 503 ``model_too_large`` rather than an
 # opaque internal error. Everything else from the TTS backend is wrapped.
+#
+# Do NOT add a ``ValueError`` subclass here: the speech router's ``except
+# ValueError`` blocks exist for the non-TTS-model case and would report it as
+# a client-side 400, which is exactly the misclassification #703 fixed.
 _TTS_PASSTHROUGH_ERRORS = (MemoryError,)
 
 
@@ -5104,16 +5108,19 @@ async def generate_speech(
                             # generic 500 (MemoryError -> 503 model_too_large).
                             # Wrapping these would *lose* information, which is
                             # the opposite of the point.
-                            loop.call_soon_threadsafe(queue.put_nowait, exc)
-                            return
-                        wrapped = TTSGenerationError(f"{type(exc).__name__}: {exc}")
-                        # Chain manually: the wrap happens here but the raise
-                        # happens on the loop, so ``raise ... from exc`` isn't
-                        # available. __cause__ carries the original — including
-                        # its worker-thread __traceback__, which is attached to
-                        # the exception object and so survives the hop.
-                        wrapped.__cause__ = exc
-                        loop.call_soon_threadsafe(queue.put_nowait, wrapped)
+                            failure: Exception = exc
+                        else:
+                            failure = TTSGenerationError(f"{type(exc).__name__}: {exc}")
+                            # Chain manually: the wrap happens here but the raise
+                            # happens on the loop, so ``raise ... from exc`` isn't
+                            # available. __cause__ carries the original — including
+                            # its worker-thread __traceback__, which is attached
+                            # to the exception object and so survives the hop.
+                            failure.__cause__ = exc
+                        # No sentinel: the queued exception *is* the terminal
+                        # item. The consumer's ``raise item`` ends the loop, so
+                        # enqueuing a sentinel after it would be unreachable.
+                        loop.call_soon_threadsafe(queue.put_nowait, failure)
 
                 worker = asyncio.create_task(asyncio.to_thread(_worker))
                 try:
