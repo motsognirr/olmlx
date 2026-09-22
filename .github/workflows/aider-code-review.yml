@@ -40,9 +40,13 @@ jobs:
         with:
           fetch-depth: 1
 
-      - name: Run Aider Code Review (deepseek-v4-pro)
+      # `deepseek-flash` = DeepSeek-V4.1-Flash (released 2026-09-10), the newest
+      # model on the first-party API. The old `deepseek-v4-pro` alias has been
+      # routed to V4.1-Flash since 2026-09-14 and V4.1-Flash beats V4-Pro on
+      # coding benchmarks (DeepSWE v1.1: 74.2 vs 62.7). Revisit when V4.1-Pro ships.
+      - name: Run Aider Code Review (deepseek-flash)
         uses: motsognirr/aider-code-review@v1
         with:
           deepseek_api_key: ${{ secrets.DEEPSEEK_API_KEY }}
           github_token: ${{ secrets.GITHUB_TOKEN }}
-          model: deepseek/deepseek-v4-pro
+          model: deepseek/deepseek-flash
