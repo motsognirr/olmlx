@@ -207,6 +207,8 @@ async def create_speech(request: Request, body: SpeechRequest):
             async for chunk in _pcm_chunks():
                 parts.append(chunk)
         except ValueError as exc:  # non-TTS model etc.
+            # A backend crash raises TTSGenerationError (a RuntimeError), so
+            # it flows past this catch to app.py's 500 handler (#703).
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         return Response(
             audio_utils.wav_bytes(b"".join(parts), sample_rate=_TTS_SAMPLE_RATE),
@@ -217,7 +219,9 @@ async def create_speech(request: Request, body: SpeechRequest):
     # become a clean HTTP 400 *before* the 200 streaming response starts. We
     # prime the PCM source itself rather than the encoded stream because ffmpeg
     # emits a container header before consuming any input, which would let the
-    # upstream error slip past after the response had already begun.
+    # upstream error slip past after the response had already begun. An
+    # mlx-audio backend crash on the first segment is caught here too, but as
+    # TTSGenerationError (a RuntimeError) it becomes a 500, not a 400 (#703).
     pcm_agen = _pcm_chunks().__aiter__()
     try:
         first = await pcm_agen.__anext__()

@@ -86,3 +86,32 @@ async def test_generate_speech_releases_ref_on_early_close():
     await agen.aclose()  # client disconnect
 
     lm.release_ref.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_generate_speech_wraps_backend_crash(monkeypatch):
+    # A crash inside the third-party mlx-audio generator is a backend
+    # failure, not bad client input (#703): it must surface as
+    # TTSGenerationError (a RuntimeError -> HTTP 500), not as the raw
+    # ValueError that the router maps to a 400.
+    from olmlx.engine.inference import TTSGenerationError
+
+    lm = _fake_lm()
+
+    def _gen(text, voice=None, speed=1.0, **kw):
+        yield _Result(np.array([0.1], dtype=np.float32))
+        raise ValueError(
+            "[broadcast_shapes] Shapes (1,70200,1) and (1,70500,9) cannot be broadcast."
+        )
+
+    lm.model = types.SimpleNamespace(generate=_gen)
+    manager = MagicMock()
+    manager.ensure_loaded = AsyncMock(return_value=lm)
+    manager.store = None
+
+    with pytest.raises(TTSGenerationError, match="broadcast_shapes") as excinfo:
+        async for _ in generate_speech(manager, "kokoro", "hi", voice="af_heart"):
+            pass
+    assert not isinstance(excinfo.value, ValueError)
+    assert "ValueError" in str(excinfo.value)
+    lm.release_ref.assert_called_once()

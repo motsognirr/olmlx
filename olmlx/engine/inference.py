@@ -542,6 +542,19 @@ class ServerBusyError(RuntimeError):
     pass
 
 
+class TTSGenerationError(RuntimeError):
+    """Raised when the mlx-audio TTS backend fails mid-generation (#703).
+
+    A ``RuntimeError`` (-> HTTP 500), deliberately *not* a ``ValueError``: the
+    third-party generator raises ``ValueError`` for internal shape mismatches,
+    which is indistinguishable by type from the one client-facing
+    ``ValueError`` ``generate_speech`` raises itself (non-TTS model -> 400).
+    Wrapping keeps a backend crash from being reported as the caller's fault.
+    """
+
+    pass
+
+
 _DEFERRED_CLEANUP_TIMEOUT = 600  # 10 minutes max wait for stuck thread
 _DEFERRED_WAIT_TIMEOUT = 30.0  # max wait for deferred cleanup before rejecting
 
@@ -5020,7 +5033,9 @@ async def generate_speech(
     one worker thread (keeping all MLX work on a single thread, per the #284
     stream hazards) and bridge segments to the event loop via a queue.
 
-    Raises ``ValueError`` (-> HTTP 400) if the model is not a TTS model.
+    Raises ``ValueError`` (-> HTTP 400) if the model is not a TTS model, and
+    ``TTSGenerationError`` (a ``RuntimeError``, -> HTTP 500) if the mlx-audio
+    backend fails mid-generation — that is never the client's fault (#703).
     """
     lm = await manager.ensure_loaded(model_name, keep_alive, pin=True)
     try:
@@ -5067,7 +5082,14 @@ async def generate_speech(
                             loop.call_soon_threadsafe(queue.put_nowait, audio)
                         loop.call_soon_threadsafe(queue.put_nowait, sentinel)
                     except Exception as exc:  # noqa: BLE001 - re-raised on loop
-                        loop.call_soon_threadsafe(queue.put_nowait, exc)
+                        # Anything the third-party generator raises is a
+                        # backend failure, never the client's input. Wrap so
+                        # it can't be mistaken for the non-TTS-model
+                        # ValueError the router maps to a 400 (#703).
+                        loop.call_soon_threadsafe(
+                            queue.put_nowait,
+                            TTSGenerationError(f"{type(exc).__name__}: {exc}"),
+                        )
 
                 worker = asyncio.create_task(asyncio.to_thread(_worker))
                 try:

@@ -121,3 +121,44 @@ async def test_speech_non_tts_model_400(app_client):
             json={"model": "qwen3", "input": "hi", "voice": "alloy"},
         )
     assert resp.status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_speech_backend_crash_500(app_client):
+    # A TTS backend crash is not a client input problem (#703).
+    from olmlx.engine.inference import TTSGenerationError
+
+    async def _raise(*a, **k):
+        raise TTSGenerationError("ValueError: [broadcast_shapes] ...")
+        yield  # pragma: no cover - makes this an async generator
+
+    with patch("olmlx.routers.audio.generate_speech", _raise):
+        resp = await app_client.post(
+            "/v1/audio/speech",
+            json={"model": "kokoro", "input": "hi", "voice": "alloy"},
+        )
+    assert resp.status_code == 500
+    assert "invalid_request_error" not in resp.text
+
+
+@pytest.mark.asyncio
+async def test_speech_wav_backend_crash_500(app_client):
+    # Same for the buffered wav path, which has its own except ValueError.
+    from olmlx.engine.inference import TTSGenerationError
+
+    async def _raise(*a, **k):
+        raise TTSGenerationError("ValueError: [broadcast_shapes] ...")
+        yield  # pragma: no cover - makes this an async generator
+
+    with patch("olmlx.routers.audio.generate_speech", _raise):
+        resp = await app_client.post(
+            "/v1/audio/speech",
+            json={
+                "model": "kokoro",
+                "input": "hi",
+                "voice": "alloy",
+                "response_format": "wav",
+            },
+        )
+    assert resp.status_code == 500
+    assert "invalid_request_error" not in resp.text

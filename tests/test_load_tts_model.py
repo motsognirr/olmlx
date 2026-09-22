@@ -62,3 +62,32 @@ def test_load_tts_without_mlx_audio_gives_install_hint(tmp_path, monkeypatch):
     monkeypatch.setitem(sys.modules, "mlx_audio.tts.utils", None)
     with pytest.raises(ValueError, match=r"uv sync --extra audio"):
         ModelManager._load_model_tts(mgr, "owner/Kokoro-82M", str(tmp_path))
+
+
+def test_load_tts_applies_interpolate_scale_patch(tmp_path, monkeypatch):
+    # The TTS loader is the single mlx-audio chokepoint, so the #703
+    # interpolate rounding workaround is applied there — before load_model
+    # imports the kokoro modules that bind the function by name.
+    from olmlx.engine.model_manager import ModelManager
+
+    mgr = ModelManager.__new__(ModelManager)
+    calls = []
+    _stub_mlx_audio(monkeypatch, MagicMock(return_value=MagicMock()))
+    monkeypatch.setattr(
+        "olmlx.engine.mlx_audio_interpolate_fix.ensure_interpolate_scale_patch",
+        lambda: calls.append(1),
+    )
+    ModelManager._load_model_tts(mgr, "owner/Kokoro-82M", str(tmp_path))
+    assert calls == [1]
+
+
+def test_load_tts_survives_unpatchable_mlx_audio(tmp_path, monkeypatch):
+    # The stubbed mlx_audio above has no tts.models.interpolate; the
+    # workaround must degrade to a warning, never break the load.
+    from olmlx.engine.model_manager import ModelManager
+
+    mgr = ModelManager.__new__(ModelManager)
+    fake_model = MagicMock()
+    _stub_mlx_audio(monkeypatch, MagicMock(return_value=fake_model))
+    model, *_ = ModelManager._load_model_tts(mgr, "owner/Kokoro-82M", str(tmp_path))
+    assert model is fake_model
