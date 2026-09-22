@@ -62,7 +62,9 @@ def resolve_image_variant(hf_path: str) -> tuple[ImageVariant, Any]:
 
     Raises ``ImportError`` if mflux is not installed.
     """
-    from mflux.models.common.config.model_config import AVAILABLE_MODELS
+    from mflux.models.common.config.model_config import (  # type: ignore[import-not-found]
+        AVAILABLE_MODELS,
+    )
 
     supported: list[str] = []
     for variant in _VARIANTS:
