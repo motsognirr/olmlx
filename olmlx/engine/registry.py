@@ -1659,8 +1659,11 @@ class ModelRegistry:
             # synthetic config would route it as a text model (a wrong 400 on
             # /v1/images, and a full diffusers download before failing on the
             # text paths). First declared match wins.
+            # Compare tag-stripped like every other hf_path consumer
+            # (``_strip_ollama_tag``; inlined — importing it from the store
+            # would be an import cycle).
             for mc in self._mappings.values():
-                if mc.is_image and mc.hf_path == name:
+                if mc.is_image and mc.hf_path.partition(":")[0] == name:
                     return mc
             return ModelConfig(hf_path=name)
         validate_model_name(name)

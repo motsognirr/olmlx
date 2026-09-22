@@ -468,8 +468,14 @@ class ModelStore:
             from olmlx.engine import image_gen
 
             image_hf_path = _strip_ollama_tag(resolved.hf_path)
-            with image_gen.translate_mflux_errors(image_hf_path):
-                image_gen.resolve_image_variant(image_hf_path)
+
+            def _check_variant() -> None:
+                with image_gen.translate_mflux_errors(image_hf_path):
+                    image_gen.resolve_image_variant(image_hf_path)
+
+            # Off the event loop: the first call imports mflux (torch,
+            # opencv, ...), seconds of blocking the whole server otherwise.
+            await asyncio.to_thread(_check_variant)
         hf_path = resolved.hf_path if resolved is not None else None
         if hf_path is None:
             if "/" in name:

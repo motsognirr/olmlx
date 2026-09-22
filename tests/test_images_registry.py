@@ -116,3 +116,16 @@ class TestResolveImageByRepoId:
     def test_undeclared_repo_id_is_plain(self, reg):
         mc = reg.resolve("Qwen/Qwen-Image-2512")
         assert mc is not None and not mc.is_image
+
+
+def test_repo_id_matches_tagged_image_entry(tmp_path, monkeypatch):
+    # Every other consumer strips an Ollama-style ":tag" from hf_path; the
+    # repo-id -> image-entry fallback must too.
+    cfg = {"qwen-image:8": {"type": "image", "hf_path": "Qwen/Qwen-Image-2.1:8bit"}}
+    path = tmp_path / "models.json"
+    path.write_text(json.dumps(cfg))
+    monkeypatch.setattr("olmlx.engine.registry.settings.models_config", path)
+    r = ModelRegistry()
+    r.load()
+    mc = r.resolve("Qwen/Qwen-Image-2.1")
+    assert mc is not None and mc.is_image

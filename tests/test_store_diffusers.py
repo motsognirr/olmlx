@@ -129,3 +129,26 @@ async def test_pull_supported_image_repo_still_downloads(store, monkeypatch):
     ):
         statuses = [e["status"] async for e in store.pull("qwen-image:2.1")]
     assert statuses[-1] == "success"
+
+
+@pytest.mark.asyncio
+async def test_pull_variant_check_runs_off_the_event_loop(store, monkeypatch):
+    # The check imports mflux (torch/opencv/...): seconds of blocking import
+    # that must not stall the event loop.
+    import threading
+
+    from olmlx.engine import image_gen
+
+    loop_thread = threading.get_ident()
+    seen = []
+
+    def fake_resolve(hf_path):
+        seen.append(threading.get_ident())
+        return (None, None)
+
+    monkeypatch.setattr(image_gen, "resolve_image_variant", fake_resolve)
+    with patch(
+        "huggingface_hub.snapshot_download", side_effect=_fake_diffusers_download(store)
+    ):
+        [e async for e in store.pull("qwen-image:2.1")]
+    assert seen and seen[0] != loop_thread
