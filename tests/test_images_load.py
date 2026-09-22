@@ -185,60 +185,96 @@ class TestResolveVariant:
             image_gen.resolve_image_variant(hf_path)
 
 
+def _store_returning(local_dir):
+    store = MagicMock()
+    store.ensure_downloaded.return_value = local_dir
+    return store
+
+
 class TestLoadModelImage:
-    def test_load_dispatches_to_variant_class(self, registry, monkeypatch):
+    """Image models load from the olmlx ModelStore, never the HF cache."""
+
+    def test_load_passes_store_dir_to_mflux(self, registry, monkeypatch, tmp_path):
         fake_model = MagicMock()
         cls21 = MagicMock(return_value=fake_model)
         _stub_mflux(monkeypatch, qwen21_cls=cls21)
         mgr = _bare_manager(registry)
         with patch("olmlx.engine.model_manager._materialize_image_model") as mat:
             model, tok, is_vlm, caps, dec = mgr._load_model_image(
-                "Qwen/Qwen-Image-2.1", registry.resolve("qwen-image:2.1")
+                "Qwen/Qwen-Image-2.1",
+                registry.resolve("qwen-image:2.1"),
+                str(tmp_path),
             )
         assert model is fake_model
         assert tok is None and is_vlm is False and dec is None
         assert isinstance(caps, TemplateCaps)
-        cls21.assert_called_once()
         kwargs = cls21.call_args.kwargs
         assert kwargs["quantize"] == 8  # from models.json image_quantize
-        # mflux owns resolution + download: never a local path.
-        assert kwargs["model_path"] is None
+        # mflux reads the store directory; it must never resolve/download
+        # the repo itself (that would land in the HF cache).
+        assert kwargs["model_path"] == str(tmp_path)
         assert kwargs["model_config"] is _AVAILABLE["qwen-image-2.1"]
         mat.assert_called_once_with(fake_model)
 
-    def test_load_20b_uses_qwen_image_class(self, registry, monkeypatch):
+    def test_load_20b_uses_qwen_image_class(self, registry, monkeypatch, tmp_path):
         cls = MagicMock(return_value=MagicMock())
         _stub_mflux(monkeypatch, qwen_image_cls=cls)
         mgr = _bare_manager(registry)
         with patch("olmlx.engine.model_manager._materialize_image_model"):
             mgr._load_model_image(
-                "Qwen/Qwen-Image-2512", registry.resolve("qwen-image:20b")
+                "Qwen/Qwen-Image-2512",
+                registry.resolve("qwen-image:20b"),
+                str(tmp_path),
             )
         assert cls.call_args.kwargs["quantize"] is None
 
-    def test_declared_but_unsupported_repo_rejected(self, registry, monkeypatch):
+    def test_load_model_downloads_into_store(self, registry, monkeypatch, tmp_path):
+        _stub_mflux(monkeypatch)
+        store = _store_returning(tmp_path)
+        mgr = _bare_manager(registry, store=store)
+        sentinel = (object(), None, False, TemplateCaps(), None)
+        mc = registry.resolve("qwen-image:2.1")
+        with patch.object(
+            ModelManager, "_load_model_image", return_value=sentinel
+        ) as li:
+            out = mgr._load_model("Qwen/Qwen-Image-2.1", image_config=mc)
+        assert out is sentinel
+        store.ensure_downloaded.assert_called_once_with("Qwen/Qwen-Image-2.1")
+        li.assert_called_once_with("Qwen/Qwen-Image-2.1", mc, str(tmp_path))
+
+    def test_unsupported_repo_rejected_before_download(
+        self, registry, monkeypatch, tmp_path
+    ):
+        # The exact-match guard must run BEFORE the store download, so a typo
+        # can't pull tens of GB of the wrong repo.
         cls = MagicMock()
         _stub_mflux(monkeypatch, qwen_image_cls=cls, qwen21_cls=cls)
-        mgr = _bare_manager(registry)
+        store = _store_returning(tmp_path)
+        mgr = _bare_manager(registry, store=store)
         with pytest.raises(ValueError, match="not a supported image model"):
-            mgr._load_model_image(
-                "Qwen/Qwen-Image-Typo", registry.resolve("bogus:image")
+            mgr._load_model(
+                "Qwen/Qwen-Image-Typo", image_config=registry.resolve("bogus:image")
             )
+        store.ensure_downloaded.assert_not_called()
         cls.assert_not_called()
 
-    def test_missing_mflux_gives_install_hint(self, registry, monkeypatch):
+    def test_missing_mflux_gives_install_hint_before_download(
+        self, registry, monkeypatch, tmp_path
+    ):
         monkeypatch.setitem(sys.modules, "mflux", None)
         monkeypatch.setitem(
             sys.modules, "mflux.models.common.config.model_config", None
         )
-        mgr = _bare_manager(registry)
+        store = _store_returning(tmp_path)
+        mgr = _bare_manager(registry, store=store)
         with pytest.raises(ValueError, match=r"uv sync --extra image"):
-            mgr._load_model_image(
-                "Qwen/Qwen-Image-2.1", registry.resolve("qwen-image:2.1")
+            mgr._load_model(
+                "Qwen/Qwen-Image-2.1", image_config=registry.resolve("qwen-image:2.1")
             )
+        store.ensure_downloaded.assert_not_called()
 
     def test_drifted_mflux_is_not_reported_as_missing_extra(
-        self, registry, monkeypatch
+        self, registry, monkeypatch, tmp_path
     ):
         # mflux installed, but the variant module is gone (internal drift):
         # reinstalling the extra would not help, so don't say it would.
@@ -250,24 +286,11 @@ class TestLoadModelImage:
         with patch("importlib.util.find_spec", return_value=object()):
             with pytest.raises(RuntimeError, match="incompatible") as ei:
                 mgr._load_model_image(
-                    "Qwen/Qwen-Image-2.1", registry.resolve("qwen-image:2.1")
+                    "Qwen/Qwen-Image-2.1",
+                    registry.resolve("qwen-image:2.1"),
+                    str(tmp_path),
                 )
         assert "--extra image" not in str(ei.value)
-
-    def test_load_model_skips_store_download(self, registry, monkeypatch):
-        # mflux resolves + downloads image models itself; the olmlx store must
-        # not try to snapshot a diffusers-layout repo.
-        store = MagicMock()
-        mgr = _bare_manager(registry, store=store)
-        sentinel = (object(), None, False, TemplateCaps(), None)
-        mc = registry.resolve("qwen-image:2.1")
-        with patch.object(
-            ModelManager, "_load_model_image", return_value=sentinel
-        ) as li:
-            out = mgr._load_model("Qwen/Qwen-Image-2.1", image_config=mc)
-        assert out is sentinel
-        li.assert_called_once_with("Qwen/Qwen-Image-2.1", mc)
-        store.ensure_downloaded.assert_not_called()
 
 
 class TestGuards:
@@ -308,19 +331,3 @@ class TestGuards:
         with patch("olmlx.engine.grammar.drop_for_tokenizer") as drop:
             ModelManager._close_loaded_model(lm)
         drop.assert_not_called()
-
-
-class TestPullRejectsImageModels:
-    @pytest.mark.asyncio
-    async def test_pull_image_model_rejected(self, registry, tmp_path, monkeypatch):
-        # mflux downloads image models into the HF cache on first use; a store
-        # pull would put a second, never-used copy into OLMLX_MODELS_DIR.
-        from olmlx.models.store import ModelStore
-
-        monkeypatch.setattr("olmlx.models.store.settings.models_dir", tmp_path / "m")
-        store = ModelStore(registry)
-        with patch.object(store, "ensure_downloaded") as dl:
-            with pytest.raises(ValueError, match="image model"):
-                async for _ in store.pull("qwen-image:2.1"):
-                    pass
-        dl.assert_not_called()

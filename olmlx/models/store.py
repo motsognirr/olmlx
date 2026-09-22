@@ -105,10 +105,25 @@ def _estimate_param_count(cfg: dict) -> int | None:
     return embeddings + layers * (attn + mlp)
 
 
+#: Top-level files that mark a complete model directory. Transformers / MLX
+#: checkpoints carry ``config.json``; diffusers pipelines (mflux image models,
+#: #723) carry ``model_index.json`` instead, with per-component configs under
+#: ``transformer/``, ``vae/``, ``text_encoder/`` ...
+_MODEL_MARKER_FILES: tuple[str, ...] = ("config.json", "model_index.json")
+
+
+def _has_model_marker(model_dir: Path) -> bool:
+    """True when *model_dir* holds a model's top-level marker file."""
+    return any((model_dir / name).exists() for name in _MODEL_MARKER_FILES)
+
+
 def _extract_metadata(model_dir: Path) -> dict:
     """Extract model metadata from config.json if available."""
     config_path = model_dir / "config.json"
     meta = {"family": "", "parameter_size": "", "quantization_level": ""}
+    if not config_path.exists() and (model_dir / "model_index.json").exists():
+        meta["family"] = "image"  # diffusers pipeline (#723)
+        return meta
     cfg = None
     if config_path.exists():
         try:
@@ -237,9 +252,7 @@ class ModelStore:
     def is_downloaded(self, hf_path: str) -> bool:
         """Check if a model is already downloaded locally."""
         local = self.local_path(hf_path)
-        return (local / "config.json").exists() and not (
-            local / ".downloading"
-        ).exists()
+        return _has_model_marker(local) and not (local / ".downloading").exists()
 
     def _resolve_model_dir(self, name: str) -> tuple[Path, bool] | None:
         """Resolve a model name to its local directory.
@@ -265,7 +278,7 @@ class ModelStore:
             d = self.local_path(hf_path)
             if (d / "manifest.json").exists():
                 return (d, True)
-            if (d / "config.json").exists():
+            if _has_model_marker(d):
                 return (d, False)
         # Fall back to old name-based directories
         normalized = self.registry.normalize_name(name)
@@ -273,7 +286,7 @@ class ModelStore:
             d = self.models_dir / candidate
             if (d / "manifest.json").exists():
                 return (d, True)
-            if (d / "config.json").exists():
+            if _has_model_marker(d):
                 return (d, False)
         return None
 
@@ -343,11 +356,11 @@ class ModelStore:
             # success (#695). Verify the download actually produced model
             # files BEFORE clearing the marker — is_downloaded() must stay
             # False so the empty dir is never surfaced by list_local()/show().
-            if not (local_dir / "config.json").exists():
+            if not _has_model_marker(local_dir):
                 raise FileNotFoundError(
                     f"Download of '{hf_path}' produced no model files "
-                    "(no config.json) — the repo may not exist or the "
-                    "download failed"
+                    "(no config.json / model_index.json) — the repo may not "
+                    "exist or the download failed"
                 )
             try:
                 marker.unlink(missing_ok=True)
@@ -448,15 +461,6 @@ class ModelStore:
             return
 
         resolved = self.registry.resolve(name)
-        if resolved is not None and resolved.is_image is True:
-            # mflux resolves and downloads image models (#723) into the HF
-            # cache on first use; a store pull would add a second, never-used
-            # copy of a tens-of-GB diffusers repo under OLMLX_MODELS_DIR.
-            raise ValueError(
-                f"Model '{name}' is an image model; it is downloaded "
-                "automatically on first use of /v1/images/generations and "
-                "cannot be pulled."
-            )
         hf_path = resolved.hf_path if resolved is not None else None
         if hf_path is None:
             if "/" in name:
@@ -586,9 +590,8 @@ class ModelStore:
                         continue
                     except Exception:
                         logger.warning("Failed to load manifest: %s", manifest_path)
-                # No valid manifest — try to derive one from config.json
-                config_path = d / "config.json"
-                if config_path.exists():
+                # No valid manifest — try to derive one from the model files
+                if _has_model_marker(d):
                     manifest: ModelManifest | None = None
                     try:
                         info = dir_to_info.get(d.name)

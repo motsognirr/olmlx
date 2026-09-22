@@ -1,11 +1,15 @@
 """Live mflux text-to-image test against a real model (#723).
 
-Loads on one thread and generates on another — the cross-thread shape the
-server uses (``asyncio.to_thread`` load vs. generation) and that mflux's
-single-threaded CLI never exercises. Skips cleanly when mflux (the [image]
-extra) or the weights are not already present (no forced multi-GB pull).
+Drives the real load path — the olmlx ModelStore directory under
+``OLMLX_MODELS_DIR`` handed to mflux — loading on one thread and generating on
+another, the cross-thread shape the server uses (``asyncio.to_thread`` load
+vs. generation) and that mflux's single-threaded CLI never exercises. Skips
+cleanly when mflux (the [image] extra) is missing or the model is not already
+in the store (no forced multi-GB pull). Runs with ``HF_HUB_OFFLINE=1`` so any
+attempt to reach the Hub / HF cache instead of the store fails loudly.
 """
 
+import json
 import threading
 
 import pytest
@@ -13,16 +17,6 @@ import pytest
 pytestmark = [pytest.mark.real_model]
 
 REPO = "Qwen/Qwen-Image-2.1"
-
-
-def _cached_or_skip(repo: str) -> None:
-    from huggingface_hub import snapshot_download
-    from huggingface_hub.errors import LocalEntryNotFoundError
-
-    try:
-        snapshot_download(repo, local_files_only=True)
-    except LocalEntryNotFoundError:
-        pytest.skip(f"{repo} not downloaded; skipping live image test")
 
 
 def _on_thread(fn):
@@ -42,15 +36,13 @@ def _on_thread(fn):
     return out["value"]
 
 
-def test_generate_cross_thread(tmp_path, monkeypatch):
-    import json
-
+def test_generate_cross_thread_from_store(tmp_path, monkeypatch):
     pytest.importorskip("mflux")
-    _cached_or_skip(REPO)
 
     from olmlx.engine import image_gen
     from olmlx.engine.model_manager import ModelManager
     from olmlx.engine.registry import ModelRegistry
+    from olmlx.models.store import ModelStore
 
     cfg = tmp_path / "models.json"
     cfg.write_text(
@@ -61,12 +53,14 @@ def test_generate_cross_thread(tmp_path, monkeypatch):
     monkeypatch.setattr("olmlx.engine.registry.settings.models_config", cfg)
     registry = ModelRegistry()
     registry.load()
-    mgr = ModelManager.__new__(ModelManager)
-    mgr.registry = registry
-    mgr.store = None
+    store = ModelStore(registry)  # real OLMLX_MODELS_DIR
+    if not store.is_downloaded(REPO):
+        pytest.skip(f"{REPO} not in the model store; `olmlx models pull` it first")
+    monkeypatch.setenv("HF_HUB_OFFLINE", "1")
 
+    mgr = ModelManager(registry, store)
     mc = registry.resolve("qwen-image:2.1")
-    model, *_ = _on_thread(lambda: mgr._load_model_image(REPO, mc))
+    model, *_ = _on_thread(lambda: mgr._load_model(REPO, image_config=mc))
     image = _on_thread(
         lambda: image_gen.generate_image(
             model,

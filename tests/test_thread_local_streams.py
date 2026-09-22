@@ -744,8 +744,7 @@ class TestImageModelMaterialization:
         cls = _image_model_class(_write_image_weights(tmp_path))
         _stub_mflux(monkeypatch, qwen21_cls=cls)
         mgr = ModelManager.__new__(ModelManager)
-        mgr.registry = None  # no image_quantize lookup
-        model, *_ = mgr._load_model_image("Qwen/Qwen-Image-2.1")
+        model, *_ = mgr._load_model_image("Qwen/Qwen-Image-2.1", None, str(tmp_path))
         res = _eval_image_model_on_worker(model)
         assert res.get("error") is None, (
             f"_load_model_image left weights/buffers lazy: {res.get('error')!r}"

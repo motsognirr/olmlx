@@ -58,7 +58,7 @@ def resolve_image_variant(hf_path: str) -> tuple[ImageVariant, Any]:
     ``aliases`` — never ``ModelConfig.from_name``, which is a loose substring
     matcher that resolves ``Qwen/Qwen3-32B-4bit`` (a text LLM) to a Qwen-Image
     base. A miss raises ``ValueError`` so a typo fails at load with a clear
-    message instead of downloading tens of GB of the wrong thing.
+    message before the store downloads tens of GB of the wrong thing.
 
     Raises ``ImportError`` if mflux is not installed.
     """
@@ -76,21 +76,23 @@ def resolve_image_variant(hf_path: str) -> tuple[ImageVariant, Any]:
     raise ValueError(
         f"'{hf_path}' is not a supported image model. Declare one of "
         f'{sorted(supported)} as the hf_path of a "type": "image" entry '
-        "in models.json (exact repo id; mflux resolves and downloads it)."
+        "in models.json (exact repo id)."
     )
 
 
-def load_image_model(hf_path: str, quantize: int | None) -> Any:
-    """Build the mflux model for *hf_path*.
+def load_image_model(hf_path: str, quantize: int | None, model_path: str) -> Any:
+    """Build the mflux model for *hf_path* from the local directory *model_path*.
 
-    ``model_path=None`` hands resolution and download to mflux, which knows
-    its own diffusers-style component layout (``vae/``, ``transformer/``,
-    ``text_encoder/`` ...). Raises ``ImportError`` if mflux is missing and
-    ``ValueError`` for an unsupported ``hf_path``.
+    *model_path* is the olmlx ModelStore directory the repo was downloaded
+    into (``OLMLX_MODELS_DIR``). It must always be passed: with
+    ``model_path=None`` mflux resolves and downloads the repo itself, into the
+    Hugging Face cache, bypassing olmlx's model storage. Raises
+    ``ImportError`` if mflux is missing and ``ValueError`` for an unsupported
+    ``hf_path``.
     """
     variant, mflux_config = resolve_image_variant(hf_path)
     cls = getattr(importlib.import_module(variant.module), variant.class_name)
-    return cls(quantize=quantize, model_path=None, model_config=mflux_config)
+    return cls(quantize=quantize, model_path=model_path, model_config=mflux_config)
 
 
 class _CancelCallback:

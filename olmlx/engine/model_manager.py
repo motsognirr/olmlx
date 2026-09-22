@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import gc
 import importlib
 import json
@@ -94,6 +95,32 @@ _FALLBACK_EXCEPTIONS = (
     OSError,
     json.JSONDecodeError,
 )
+
+
+@contextlib.contextmanager
+def _translate_mflux_import_errors(hf_path: str):
+    """Map mflux ``ImportError``s to actionable errors (#723).
+
+    mflux missing -> ``ValueError`` (HTTP 400) with the install command, like
+    the TTS loader (#469). mflux installed but an internal module olmlx
+    imports is gone/broken (drift past the tested version) -> ``RuntimeError``
+    naming the incompatibility; reinstalling the extra would not help.
+    """
+    try:
+        yield
+    except ImportError as exc:
+        import importlib.util
+
+        if importlib.util.find_spec("mflux") is None:
+            raise ValueError(
+                f"Model '{hf_path}' is an image model, but the image-generation "
+                "dependencies are not installed. Install with: "
+                "uv sync --extra image (or pip install 'olmlx[image]')."
+            ) from exc
+        raise RuntimeError(
+            f"The installed mflux is incompatible with olmlx's image support "
+            f"({exc}); install the version the [image] extra pins."
+        ) from exc
 
 
 class ModelManager(SpeculativeLoaderMixin):
@@ -2632,8 +2659,10 @@ class ModelManager(SpeculativeLoaderMixin):
         """Load a model, using config.json inspection to choose the right library.
 
         *image_config* is the models.json ``ModelConfig`` of a declared
-        ``type: "image"`` entry (#723); when set, the mflux image loader is
-        used and no config.json inspection or store download happens.
+        ``type: "image"`` entry (#723); when set, the repo is validated against
+        mflux's supported variants, downloaded into the store like any other
+        model, and loaded by the mflux image loader (no config.json
+        inspection).
 
         *model_exp* is the resolved ExperimentalSettings for this model.
         Falls back to global defaults if not provided.
@@ -2678,14 +2707,18 @@ class ModelManager(SpeculativeLoaderMixin):
             flash_moe_config = ModelConfig(hf_path=hf_path).resolved_flash_moe()
         spec_enabled = spec_config.enabled
 
-        # Image models (#723): mflux resolves and downloads its own
-        # diffusers-layout checkpoints, so skip the store download entirely.
+        # Image models (#723) go through the store like every other model.
+        # Validate the declared repo against mflux's supported variants BEFORE
+        # downloading, so a typo can't pull tens of GB of the wrong thing.
         if image_config is not None:
             if getattr(self, "_distributed_group", None) is not None:
                 raise ValueError(
                     f"Image model '{hf_path}' is not supported in distributed mode."
                 )
-            return self._load_model_image(hf_path, image_config)
+            with _translate_mflux_import_errors(hf_path):
+                from olmlx.engine import image_gen
+
+                image_gen.resolve_image_variant(hf_path)
 
         # Ensure model is downloaded to the store
         load_path: str = hf_path
@@ -2711,6 +2744,9 @@ class ModelManager(SpeculativeLoaderMixin):
                     hf_path,
                 )
                 manifest.save(local_dir / "manifest.json")
+
+        if image_config is not None:
+            return self._load_model_image(hf_path, image_config, load_path)
 
         # Check for flash-MoE-prepared model
         if self._is_flash_moe_enabled(flash_moe_config):
@@ -2943,39 +2979,21 @@ class ModelManager(SpeculativeLoaderMixin):
         _materialize_module_buffers(model)
         return model, None, False, TemplateCaps(), None
 
-    def _load_model_image(self, hf_path: str, image_config: Any = None):
-        """Load an mflux text-to-image model (issue #723).
+    def _load_model_image(self, hf_path: str, image_config: Any, load_path: str):
+        """Load an mflux text-to-image model (issue #723) from *load_path*.
 
+        *load_path* is the store directory ``_load_model`` downloaded the repo
+        into; mflux reads the diffusers layout from it and never downloads.
         Returns the 5-tuple shape ``_load_model`` uses
         ``(model, tokenizer, is_vlm, caps, speculative_decoder)``. Image models
         have no tokenizer / chat template / speculative decoder — the image
-        path drives ``model.generate_image`` directly. mflux owns resolution
-        and download (``model_path=None``); ``resolve_image_variant`` guards
-        the declared ``hf_path`` with an exact match first.
+        path drives ``model.generate_image`` directly.
         """
         from olmlx.engine import image_gen
 
         quantize = image_config.image_quantize if image_config is not None else None
-        try:
-            model = image_gen.load_image_model(hf_path, quantize)
-        except ImportError as exc:
-            import importlib.util
-
-            if importlib.util.find_spec("mflux") is None:
-                # ValueError -> HTTP 400 on /v1/images/generations, instead of
-                # an opaque 500 (same contract as the TTS loader, #469).
-                raise ValueError(
-                    f"Model '{hf_path}' is an image model, but the "
-                    "image-generation dependencies are not installed. Install "
-                    "with: uv sync --extra image (or pip install 'olmlx[image]')."
-                ) from exc
-            # mflux IS installed but an internal module olmlx imports is gone
-            # or broken (drift past the tested version) — reinstalling the
-            # extra won't help, so say what actually happened.
-            raise RuntimeError(
-                f"The installed mflux is incompatible with olmlx's image "
-                f"support ({exc}); install the version the [image] extra pins."
-            ) from exc
+        with _translate_mflux_import_errors(hf_path):
+            model = image_gen.load_image_model(hf_path, quantize, load_path)
         _materialize_image_model(model)
         return model, None, False, TemplateCaps(), None
 

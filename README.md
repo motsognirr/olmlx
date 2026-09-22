@@ -323,11 +323,12 @@ endpoint via mflux (requires the `image` extra). Supported models are
 **Qwen-Image** (`Qwen/Qwen-Image-2512`, 20B MMDiT).
 
 Image models are never auto-detected — declare them in `~/.olmlx/models.json`
-with `"type": "image"`. The `hf_path` must be the exact repo id; mflux resolves
-and downloads the weights itself (into the Hugging Face cache, not
-`OLMLX_MODELS_DIR`), so there is no `olmlx pull` step. `image_quantize`
-(3/4/5/6/8) quantizes the diffusion transformer on load (the text encoder stays
-bf16):
+with `"type": "image"`; the `hf_path` must be the exact repo id. Like every other
+model, the weights are stored in `OLMLX_MODELS_DIR` (default `~/.olmlx/models`):
+`olmlx models pull qwen-image:2.1` (or `/api/pull`) downloads them ahead of time,
+otherwise the first request downloads them. They show up in `/api/tags` with
+`family: "image"`. `image_quantize` (3/4/5/6/8) quantizes the diffusion
+transformer on load (the text encoder stays bf16):
 
 ```json
 {
