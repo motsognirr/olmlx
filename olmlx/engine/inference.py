@@ -567,6 +567,27 @@ class TTSGenerationError(RuntimeError):
 _TTS_PASSTHROUGH_ERRORS = (MemoryError,)
 
 
+def _reject_non_lm_model(lm: LoadedModel, model_name: str, surface: str) -> None:
+    """Raise ``ValueError`` (-> 400) if *lm* is not a text/VLM language model.
+
+    Whisper / TTS / reranker / image models load with ``tokenizer=None`` (or a
+    non-generative head), so on the chat / completion / embedding paths they
+    would otherwise die deep in templating with an opaque 500. ``is True``
+    (identity) so MagicMock-backed test models don't trip it.
+    """
+    for flag, kind, endpoint in (
+        ("is_image", "an image model", "/v1/images/generations"),
+        ("is_whisper", "a Whisper STT model", "/v1/audio/transcriptions"),
+        ("is_tts", "a TTS model", "/v1/audio/speech"),
+        ("is_reranker", "a reranker", "/v1/rerank"),
+    ):
+        if getattr(lm, flag, False) is True:
+            raise ValueError(
+                f"Model '{model_name}' is {kind} and cannot be used for "
+                f"{surface}; use {endpoint}."
+            )
+
+
 class ImageGenerationError(RuntimeError):
     """Raised when the mflux backend fails mid-generation (#723).
 
@@ -1214,6 +1235,7 @@ async def generate_completion(
     # template / kwargs setup doesn't leak the pin.
     pin_released_or_transferred = False
     try:
+        _reject_non_lm_model(lm, model_name, "text completion")
         # /api/generate defaults thinking OFF when unspecified (None), unlike the
         # chat route's "think unless tools".  Coerce once so the template
         # instruction and the downstream thinking_expected signal stay consistent
@@ -4355,6 +4377,7 @@ async def generate_chat(
     # template / kwargs setup doesn't leak the pin.
     pin_released_or_transferred = False
     try:
+        _reject_non_lm_model(lm, model_name, "chat")
         # Per-model default for enable_thinking applies when the request
         # didn't set the flag. Request value, when present, still wins.
         # See issue #400.
@@ -4736,6 +4759,7 @@ async def generate_embeddings(
     lm = await manager.ensure_loaded(model_name, keep_alive, pin=True)
 
     try:
+        _reject_non_lm_model(lm, model_name, "embeddings")
         async with _inference_locked(
             lm.inference_queue_timeout, sync_mode=lm.sync_mode
         ):
@@ -5241,9 +5265,26 @@ async def generate_image(
                             )
                     return image
 
+                inf_timeout = (
+                    lm.inference_timeout
+                    if lm.inference_timeout is not None
+                    else settings.inference_timeout
+                )
+                if not isinstance(inf_timeout, (int, float)):
+                    inf_timeout = None  # MagicMock settings in tests
                 worker = asyncio.ensure_future(asyncio.to_thread(_run))
                 try:
-                    image = await asyncio.shield(worker)
+                    image = await asyncio.wait_for(
+                        asyncio.shield(worker), timeout=inf_timeout
+                    )
+                except asyncio.TimeoutError:
+                    # The per-step cancel event is the enforcement hook:
+                    # stop the denoise loop, then report the timeout.
+                    cancel.set()
+                    await _drain_image_worker(worker)
+                    raise ImageGenerationError(
+                        f"image generation exceeded inference_timeout ({inf_timeout}s)"
+                    ) from None
                 except asyncio.CancelledError:
                     cancel.set()
                     await _drain_image_worker(worker)
@@ -5253,21 +5294,41 @@ async def generate_image(
         lm.release_ref()
 
 
+# Upper bound on waiting for a cancelled image worker to stop. It normally
+# stops within one diffusion step, but the text-encoder forward and VAE decode
+# are single long calls that never poll the cancel event.
+_IMAGE_DRAIN_TIMEOUT = 600.0
+
+
+def _retrieve_exception(fut: asyncio.Future) -> None:
+    if not fut.cancelled():
+        fut.exception()
+
+
 async def _drain_image_worker(worker: asyncio.Future) -> None:
-    """Wait for a cancelled image worker to actually stop.
+    """Wait (bounded) for a cancelled image worker to actually stop.
 
     The caller holds the inference lock; returning before the worker thread
-    exits would release it while the denoise loop still runs on Metal. The
-    worker stops within one diffusion step of its cancel event being set.
-    Repeated cancellation of the caller is absorbed (the caller re-raises the
-    original ``CancelledError`` afterwards).
+    exits would release it while the denoise loop still runs on Metal, so we
+    wait up to ``_IMAGE_DRAIN_TIMEOUT``. Past that the worker is abandoned
+    with a loud error rather than wedging every other request behind the lock
+    forever. Repeated cancellation of the caller is absorbed (the caller
+    re-raises the original ``CancelledError`` afterwards).
     """
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + _IMAGE_DRAIN_TIMEOUT
     while not worker.done():
+        remaining = deadline - loop.time()
+        if remaining <= 0:
+            logger.error(
+                "Image worker did not stop within %.0fs of cancellation; "
+                "releasing the inference lock while it is still running",
+                _IMAGE_DRAIN_TIMEOUT,
+            )
+            worker.add_done_callback(_retrieve_exception)
+            return
         try:
-            await asyncio.shield(worker)
+            await asyncio.wait({worker}, timeout=remaining)
         except asyncio.CancelledError:
             continue
-        except Exception:
-            break
-    if not worker.cancelled():
-        worker.exception()  # mark retrieved; the cancel is what propagates
+    _retrieve_exception(worker)  # mark retrieved; the caller's error propagates

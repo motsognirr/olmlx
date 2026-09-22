@@ -448,6 +448,15 @@ class ModelStore:
             return
 
         resolved = self.registry.resolve(name)
+        if resolved is not None and resolved.is_image is True:
+            # mflux resolves and downloads image models (#723) into the HF
+            # cache on first use; a store pull would add a second, never-used
+            # copy of a tens-of-GB diffusers repo under OLMLX_MODELS_DIR.
+            raise ValueError(
+                f"Model '{name}' is an image model; it is downloaded "
+                "automatically on first use of /v1/images/generations and "
+                "cannot be pulled."
+            )
         hf_path = resolved.hf_path if resolved is not None else None
         if hf_path is None:
             if "/" in name:

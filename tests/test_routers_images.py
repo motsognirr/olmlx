@@ -152,10 +152,11 @@ class TestImagesRouter:
         from olmlx.routers.images import _watch_disconnect
 
         request = MagicMock()
-        request.is_disconnected = AsyncMock(side_effect=[False, True])
+        request.receive = AsyncMock(
+            side_effect=[{"type": "http.request"}, {"type": "http.disconnect"}]
+        )
         cancel = threading.Event()
-        with patch("olmlx.routers.images._DISCONNECT_POLL_S", 0.0):
-            await asyncio.wait_for(_watch_disconnect(request, cancel), 2)
+        await asyncio.wait_for(_watch_disconnect(request, cancel), 2)
         assert cancel.is_set()
 
 
@@ -182,3 +183,66 @@ class TestImageModelListing:
         )
         resp = await app_client.get("/v1/models")
         assert "qwen-image:2.1" in {m["id"] for m in resp.json()["data"]}
+
+
+class TestDisconnectThroughRealStack:
+    @pytest.mark.asyncio
+    async def test_client_disconnect_sets_cancel_event(self):
+        """End-to-end over a real socket + the app's real middleware stack.
+
+        ``request.is_disconnected()`` never reports a disconnect behind the
+        app's ``BaseHTTPMiddleware``s (it receives under a pre-cancelled scope,
+        which drops the message), so a mocked-request test can't catch a
+        regression here — this drives uvicorn and an actually-closed client.
+        """
+        import asyncio
+        import socket
+        import threading
+
+        import httpx
+        import uvicorn
+
+        from olmlx.app import create_app
+
+        fired = threading.Event()
+
+        async def slow_generate(manager, model, prompt, *, cancel_event, **kw):
+            for _ in range(200):
+                if cancel_event.is_set():
+                    fired.set()
+                    raise ImageGenerationCancelled("cancelled")
+                await asyncio.sleep(0.05)
+            raise AssertionError("cancel never fired")
+
+        sock = socket.socket()
+        sock.bind(("127.0.0.1", 0))
+        port = sock.getsockname()[1]
+        sock.close()
+
+        app = create_app()
+        app.state.model_manager = object()
+        server = uvicorn.Server(
+            uvicorn.Config(
+                app, host="127.0.0.1", port=port, log_level="error", lifespan="off"
+            )
+        )
+        with patch("olmlx.routers.images.generate_image", slow_generate):
+            serve = asyncio.create_task(server.serve())
+            try:
+                while not server.started:
+                    await asyncio.sleep(0.02)
+                async with httpx.AsyncClient() as client:
+                    with pytest.raises(httpx.TimeoutException):
+                        await client.post(
+                            f"http://127.0.0.1:{port}/v1/images/generations",
+                            json={"model": "m", "prompt": "p"},
+                            timeout=0.5,
+                        )
+                for _ in range(100):
+                    if fired.is_set():
+                        break
+                    await asyncio.sleep(0.05)
+                assert fired.is_set(), "client disconnect did not cancel generation"
+            finally:
+                server.should_exit = True
+                await serve

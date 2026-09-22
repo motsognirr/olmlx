@@ -56,7 +56,7 @@ class TestModelConfigImageType:
         assert "type" not in mc._extra
 
 
-class TestRegistryImageLookup:
+class TestRegistryImageEntries:
     @pytest.fixture
     def reg(self, tmp_path, monkeypatch):
         cfg = {
@@ -70,18 +70,10 @@ class TestRegistryImageLookup:
         r.load()
         return r
 
-    def test_declared_image_config_found_by_hf_path(self, reg):
-        mc = reg.image_config_for("Qwen/Qwen-Image-2.1")
-        assert mc is not None and mc.is_image
-
-    def test_text_model_is_not_image(self, reg):
-        # Regression for the mflux substring-matcher hazard: a Qwen3 text
-        # model must never be treated as an image model.
-        assert reg.image_config_for("Qwen/Qwen3-32B-4bit") is None
-
-    def test_undeclared_path_is_not_image(self, reg):
-        assert reg.image_config_for("Qwen/Qwen-Image-2512") is None
-
     def test_image_entry_resolves(self, reg):
         mc = reg.resolve("qwen-image:2.1")
         assert mc is not None and mc.is_image
+
+    def test_text_entry_is_not_image(self, reg):
+        mc = reg.resolve("qwen3:32b")
+        assert mc is not None and not mc.is_image

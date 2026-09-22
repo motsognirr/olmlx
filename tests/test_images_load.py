@@ -86,30 +86,70 @@ def _bare_manager(registry, store=None):
     return mgr
 
 
-class TestDetectModelKind:
-    def test_declared_image_short_circuits_before_config_fetch(self, registry):
-        mgr = _bare_manager(registry)
-        with patch("huggingface_hub.hf_hub_download") as dl:
-            assert mgr._detect_model_kind("Qwen/Qwen-Image-2.1") == "image"
-        dl.assert_not_called()
+class TestModelKindFromEntry:
+    """The image kind comes from the *requested* entry, never from hf_path."""
 
-    def test_text_model_not_detected_as_image(self, registry, tmp_path):
+    @staticmethod
+    def _manager(registry, monkeypatch):
+        mgr = ModelManager(registry, None)
+        captured = {}
+
+        def fake_load(hf_path, *args):
+            captured["hf_path"] = hf_path
+            captured["image_config"] = args[-1] if args else None
+            return (MagicMock(), None, False, TemplateCaps(), False, None)
+
+        monkeypatch.setattr(mgr, "_load_model_and_shard", fake_load)
+        monkeypatch.setattr(
+            mgr,
+            "_detect_model_kind",
+            MagicMock(side_effect=AssertionError("image kind must not be sniffed")),
+        )
+        return mgr, captured
+
+    @pytest.mark.asyncio
+    async def test_declared_image_entry_skips_detection(self, registry, monkeypatch):
+        mgr, captured = self._manager(registry, monkeypatch)
+        lm = await mgr.ensure_loaded("qwen-image:2.1")
+        assert lm.is_image is True
+        assert captured["image_config"].image_quantize == 8
+        assert captured["hf_path"] == "Qwen/Qwen-Image-2.1"
+
+    @pytest.mark.asyncio
+    async def test_entries_sharing_hf_path_keep_their_own_quantize(
+        self, tmp_path, monkeypatch
+    ):
+        cfg = {
+            "qwen-image:q4": {
+                "type": "image",
+                "hf_path": "Qwen/Qwen-Image-2.1",
+                "image_quantize": 4,
+            },
+            "qwen-image:q8": {
+                "type": "image",
+                "hf_path": "Qwen/Qwen-Image-2.1",
+                "image_quantize": 8,
+            },
+        }
+        path = tmp_path / "models.json"
+        path.write_text(json.dumps(cfg))
+        monkeypatch.setattr("olmlx.engine.registry.settings.models_config", path)
+        reg = ModelRegistry()
+        reg.load()
+        mgr, captured = self._manager(reg, monkeypatch)
+        await mgr.ensure_loaded("qwen-image:q8")
+        assert captured["image_config"].image_quantize == 8
+
+    def test_detect_never_returns_image(self, registry, tmp_path):
         # Misclassification regression: mflux's ModelConfig.from_name resolves
         # Qwen/Qwen3-32B-4bit to a Qwen-Image base. Detection must never use
-        # it — an undeclared text model stays on the config.json path.
+        # it — the config.json path decides, and never says "image".
         mgr = _bare_manager(registry)
         cfg = tmp_path / "config.json"
         cfg.write_text(json.dumps({"model_type": "qwen3"}))
         with patch("huggingface_hub.hf_hub_download", return_value=str(cfg)):
-            assert mgr._detect_model_kind("Qwen/Qwen3-32B-4bit") != "image"
-
-    def test_manager_without_registry_still_detects(self, tmp_path):
-        mgr = ModelManager.__new__(ModelManager)
-        mgr.store = None
-        cfg = tmp_path / "config.json"
-        cfg.write_text(json.dumps({"model_type": "qwen3"}))
-        with patch("huggingface_hub.hf_hub_download", return_value=str(cfg)):
-            assert mgr._detect_model_kind("Qwen/Qwen3-8B") == "text"
+            assert mgr._detect_model_kind("Qwen/Qwen3-32B-4bit") == "text"
+            assert mgr._detect_model_kind("Qwen/Qwen-Image-2.1") != "image"
 
 
 class TestResolveVariant:
@@ -152,7 +192,9 @@ class TestLoadModelImage:
         _stub_mflux(monkeypatch, qwen21_cls=cls21)
         mgr = _bare_manager(registry)
         with patch("olmlx.engine.model_manager._materialize_image_model") as mat:
-            model, tok, is_vlm, caps, dec = mgr._load_model_image("Qwen/Qwen-Image-2.1")
+            model, tok, is_vlm, caps, dec = mgr._load_model_image(
+                "Qwen/Qwen-Image-2.1", registry.resolve("qwen-image:2.1")
+            )
         assert model is fake_model
         assert tok is None and is_vlm is False and dec is None
         assert isinstance(caps, TemplateCaps)
@@ -169,7 +211,9 @@ class TestLoadModelImage:
         _stub_mflux(monkeypatch, qwen_image_cls=cls)
         mgr = _bare_manager(registry)
         with patch("olmlx.engine.model_manager._materialize_image_model"):
-            mgr._load_model_image("Qwen/Qwen-Image-2512")
+            mgr._load_model_image(
+                "Qwen/Qwen-Image-2512", registry.resolve("qwen-image:20b")
+            )
         assert cls.call_args.kwargs["quantize"] is None
 
     def test_declared_but_unsupported_repo_rejected(self, registry, monkeypatch):
@@ -177,7 +221,9 @@ class TestLoadModelImage:
         _stub_mflux(monkeypatch, qwen_image_cls=cls, qwen21_cls=cls)
         mgr = _bare_manager(registry)
         with pytest.raises(ValueError, match="not a supported image model"):
-            mgr._load_model_image("Qwen/Qwen-Image-Typo")
+            mgr._load_model_image(
+                "Qwen/Qwen-Image-Typo", registry.resolve("bogus:image")
+            )
         cls.assert_not_called()
 
     def test_missing_mflux_gives_install_hint(self, registry, monkeypatch):
@@ -187,7 +233,26 @@ class TestLoadModelImage:
         )
         mgr = _bare_manager(registry)
         with pytest.raises(ValueError, match=r"uv sync --extra image"):
-            mgr._load_model_image("Qwen/Qwen-Image-2.1")
+            mgr._load_model_image(
+                "Qwen/Qwen-Image-2.1", registry.resolve("qwen-image:2.1")
+            )
+
+    def test_drifted_mflux_is_not_reported_as_missing_extra(
+        self, registry, monkeypatch
+    ):
+        # mflux installed, but the variant module is gone (internal drift):
+        # reinstalling the extra would not help, so don't say it would.
+        _stub_mflux(monkeypatch)
+        monkeypatch.setitem(
+            sys.modules, "mflux.models.qwen21.variants.txt2img.qwen_image_21", None
+        )
+        mgr = _bare_manager(registry)
+        with patch("importlib.util.find_spec", return_value=object()):
+            with pytest.raises(RuntimeError, match="incompatible") as ei:
+                mgr._load_model_image(
+                    "Qwen/Qwen-Image-2.1", registry.resolve("qwen-image:2.1")
+                )
+        assert "--extra image" not in str(ei.value)
 
     def test_load_model_skips_store_download(self, registry, monkeypatch):
         # mflux resolves + downloads image models itself; the olmlx store must
@@ -195,12 +260,13 @@ class TestLoadModelImage:
         store = MagicMock()
         mgr = _bare_manager(registry, store=store)
         sentinel = (object(), None, False, TemplateCaps(), None)
+        mc = registry.resolve("qwen-image:2.1")
         with patch.object(
             ModelManager, "_load_model_image", return_value=sentinel
         ) as li:
-            out = mgr._load_model("Qwen/Qwen-Image-2.1")
+            out = mgr._load_model("Qwen/Qwen-Image-2.1", image_config=mc)
         assert out is sentinel
-        li.assert_called_once_with("Qwen/Qwen-Image-2.1")
+        li.assert_called_once_with("Qwen/Qwen-Image-2.1", mc)
         store.ensure_downloaded.assert_not_called()
 
 
@@ -244,8 +310,17 @@ class TestGuards:
         drop.assert_not_called()
 
 
-def test_mock_registry_does_not_route_to_image_loader():
-    # A MagicMock registry returns a truthy MagicMock from image_config_for;
-    # that must not be mistaken for a declared image entry.
-    mgr = _bare_manager(MagicMock())
-    assert mgr._declared_image_config("Qwen/Qwen3-8B") is None
+class TestPullRejectsImageModels:
+    @pytest.mark.asyncio
+    async def test_pull_image_model_rejected(self, registry, tmp_path, monkeypatch):
+        # mflux downloads image models into the HF cache on first use; a store
+        # pull would put a second, never-used copy into OLMLX_MODELS_DIR.
+        from olmlx.models.store import ModelStore
+
+        monkeypatch.setattr("olmlx.models.store.settings.models_dir", tmp_path / "m")
+        store = ModelStore(registry)
+        with patch.object(store, "ensure_downloaded") as dl:
+            with pytest.raises(ValueError, match="image model"):
+                async for _ in store.pull("qwen-image:2.1"):
+                    pass
+        dl.assert_not_called()

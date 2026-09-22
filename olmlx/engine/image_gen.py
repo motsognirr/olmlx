@@ -106,6 +106,16 @@ class _CancelCallback:
 
     def call_in_loop(self, t, seed, prompt, latents, config, time_steps) -> None:  # noqa: ARG002
         if self._cancel_event.is_set():
+            # mflux calls in-loop callbacks BEFORE its per-step
+            # ``mx.eval(latents)``. Materialize this step's graph first: it
+            # feeds persistent model state (Qwen21Transformer._geometry_cache
+            # rope/mask arrays built on the first step), which would otherwise
+            # stay lazy and bound to this worker thread and crash the next
+            # request's worker with "There is no Stream(gpu, N)".
+            if latents is not None:
+                import mlx.core as mx
+
+                mx.eval(latents)
             raise ImageGenerationCancelled(f"image generation cancelled at step {t}")
 
 

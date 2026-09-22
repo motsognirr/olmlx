@@ -1701,19 +1701,6 @@ class ModelRegistry:
         """Return all configured adapter name → AdapterConfig mappings."""
         return dict(self._adapters)
 
-    def image_config_for(self, hf_path: str) -> ModelConfig | None:
-        """Return the declared ``type: "image"`` entry for *hf_path* (#723).
-
-        Image models are identified only by an explicit models.json marker,
-        keyed here by the (tag-stripped) HF path the model manager loads — the
-        manager's kind detection and loader only see ``hf_path``, not the
-        requested name. Exact string match; ``None`` for anything undeclared.
-        """
-        for mc in self.list_models().values():
-            if mc.is_image and mc.hf_path.split(":", 1)[0] == hf_path:
-                return mc
-        return None
-
     def _validate_panels(self) -> None:
         """Drop panels referencing unknown models; warn on judge-in-panel.
 

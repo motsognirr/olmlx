@@ -275,3 +275,87 @@ def test_patch_target_exists():
     # Router tests patch this name.
     with patch("olmlx.routers.images.generate_image"):
         pass
+
+
+class TestNonLmModelsRejectedOnTextPaths:
+    """Image (and whisper/tts/reranker) models on the chat / completion /
+    embedding entry points must fail with a clear 400, not an opaque 500 from
+    a ``None`` tokenizer deep in templating (PR #724 review)."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "flag", ["is_image", "is_whisper", "is_tts", "is_reranker"]
+    )
+    @pytest.mark.parametrize("entry", ["chat", "completion", "embeddings"])
+    async def test_rejected(self, flag, entry):
+        from olmlx.engine import inference
+
+        lm = LoadedModel(
+            name="m", hf_path="m", model=MagicMock(), tokenizer=None, **{flag: True}
+        )
+        mgr = _manager(lm)
+        with pytest.raises(ValueError, match="cannot be used for"):
+            if entry == "chat":
+                await inference.generate_chat(
+                    mgr, "m", [{"role": "user", "content": "hi"}], stream=False
+                )
+            elif entry == "completion":
+                await inference.generate_completion(mgr, "m", "hi", stream=False)
+            else:
+                await inference.generate_embeddings(mgr, "m", ["hi"])
+        assert lm.active_refs == 0  # pin released on rejection
+
+
+class TestCancelMaterializesStepGraph:
+    def test_cancel_evals_latents_before_raising(self):
+        # mflux runs the in-loop callback BEFORE its per-step mx.eval(latents).
+        # A cancel at step 0 would otherwise leave Qwen21Transformer's
+        # persistent _geometry_cache (rope/mask) as lazy arrays bound to this
+        # worker thread, crashing the next request on another thread.
+        ev = threading.Event()
+        ev.set()
+        cb = image_gen._CancelCallback(ev)
+        latents = object()
+        with patch("mlx.core.eval") as ev_mx:
+            with pytest.raises(ImageGenerationCancelled):
+                cb.call_in_loop(
+                    t=0,
+                    seed=0,
+                    prompt="p",
+                    latents=latents,
+                    config=None,
+                    time_steps=None,
+                )
+        ev_mx.assert_called_once_with(latents)
+
+
+class TestInferenceTimeout:
+    @pytest.mark.asyncio
+    async def test_inference_timeout_cancels_generation(self):
+        from olmlx.engine.inference import ImageGenerationError, generate_image
+
+        model = _FakeMfluxModel(
+            steps=500, on_step=lambda t: threading.Event().wait(0.01)
+        )
+        lm = _image_lm(model)
+        lm.inference_timeout = 0.1
+        with pytest.raises(ImageGenerationError, match="inference_timeout"):
+            await generate_image(_manager(lm), "m", "p", width=64, height=64)
+        assert model.steps_run < 500
+        assert lm.active_refs == 0
+
+    @pytest.mark.asyncio
+    async def test_drain_is_bounded(self, monkeypatch):
+        # A worker that never observes the cancel event must not wedge the
+        # inference lock forever.
+        from olmlx.engine import inference
+
+        monkeypatch.setattr(inference, "_IMAGE_DRAIN_TIMEOUT", 0.2)
+        release = threading.Event()
+        worker = asyncio.ensure_future(asyncio.to_thread(release.wait, 5))
+        loop = asyncio.get_running_loop()
+        t0 = loop.time()
+        await inference._drain_image_worker(worker)
+        assert loop.time() - t0 < 2
+        release.set()
+        await worker

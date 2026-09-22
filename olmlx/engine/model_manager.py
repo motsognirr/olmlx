@@ -815,7 +815,20 @@ class ModelManager(SpeculativeLoaderMixin):
                 # not-yet-cached model; run it off the event loop so the whole
                 # server doesn't freeze for the round trip (#614). It is
                 # recomputed on the worker thread in ``_load_model`` anyway.
-                _model_kind = await asyncio.to_thread(self._detect_model_kind, hf_path)
+                #
+                # Image models (#723) are declared, never sniffed: the kind
+                # comes from THIS entry's ``type: "image"`` marker (resolved by
+                # name, so two entries sharing an hf_path keep their own
+                # ``image_quantize``) and is threaded to the loader, never
+                # re-derived from hf_path. ``is True``: a MagicMock registry's
+                # model_config must not route every model to the image loader.
+                image_config = model_config if model_config.is_image is True else None
+                if image_config is not None:
+                    _model_kind = "image"
+                else:
+                    _model_kind = await asyncio.to_thread(
+                        self._detect_model_kind, hf_path
+                    )
                 if _model_kind in ("whisper", "tts", "reranker", "image"):
                     kv_cache_quant = None
                     kv_eviction = None
@@ -1003,6 +1016,7 @@ class ModelManager(SpeculativeLoaderMixin):
                         flash_config,
                         flash_moe_config,
                         weight_quant_str,
+                        image_config,
                     )
                     timeout = settings.model_load_timeout
                     is_distributed = False
@@ -1431,13 +1445,11 @@ class ModelManager(SpeculativeLoaderMixin):
 
     def _detect_model_kind(self, hf_path: str) -> str:
         """Return 'text', 'vlm', or 'unknown' by checking config.json against installed libraries."""
-        # Image models (#723) are declared, never sniffed: their diffusers
-        # layout has no top-level config.json (the read below would return
-        # "unknown"), and mflux's name resolver is a substring matcher that
-        # maps Qwen/Qwen3-* text models to Qwen-Image. Short-circuit BEFORE
-        # any config.json download.
-        if self._declared_image_config(hf_path) is not None:
-            return "image"
+        # Never returns "image": image models (#723) are declared via
+        # models.json and threaded through as ``image_config`` — their
+        # diffusers layout has no top-level config.json, and mflux's name
+        # resolver is a substring matcher that maps Qwen/Qwen3-* text models
+        # to Qwen-Image, so sniffing is not an option.
         config = None
         # Check local store first
         if self.store is not None:
@@ -2615,8 +2627,13 @@ class ModelManager(SpeculativeLoaderMixin):
         flash_config: ResolvedFlashConfig | None = None,
         flash_moe_config: FlashMoeConfig | None = None,
         weight_quant_str: str | None = None,
+        image_config: Any = None,
     ) -> tuple[Any, Any, bool, TemplateCaps, Any]:
         """Load a model, using config.json inspection to choose the right library.
+
+        *image_config* is the models.json ``ModelConfig`` of a declared
+        ``type: "image"`` entry (#723); when set, the mflux image loader is
+        used and no config.json inspection or store download happens.
 
         *model_exp* is the resolved ExperimentalSettings for this model.
         Falls back to global defaults if not provided.
@@ -2663,12 +2680,12 @@ class ModelManager(SpeculativeLoaderMixin):
 
         # Image models (#723): mflux resolves and downloads its own
         # diffusers-layout checkpoints, so skip the store download entirely.
-        if self._declared_image_config(hf_path) is not None:
+        if image_config is not None:
             if getattr(self, "_distributed_group", None) is not None:
                 raise ValueError(
                     f"Image model '{hf_path}' is not supported in distributed mode."
                 )
-            return self._load_model_image(hf_path)
+            return self._load_model_image(hf_path, image_config)
 
         # Ensure model is downloaded to the store
         load_path: str = hf_path
@@ -2926,18 +2943,7 @@ class ModelManager(SpeculativeLoaderMixin):
         _materialize_module_buffers(model)
         return model, None, False, TemplateCaps(), None
 
-    def _declared_image_config(self, hf_path: str) -> Any:
-        """The models.json ``type: "image"`` entry for *hf_path*, else None."""
-        registry = getattr(self, "registry", None)
-        if registry is None:
-            return None
-        mc = registry.image_config_for(hf_path)
-        # Identity check, not truthiness: tests drive the manager with a
-        # MagicMock registry whose every call returns a truthy MagicMock, which
-        # would route every model into the image loader.
-        return mc if getattr(mc, "is_image", False) is True else None
-
-    def _load_model_image(self, hf_path: str):
+    def _load_model_image(self, hf_path: str, image_config: Any = None):
         """Load an mflux text-to-image model (issue #723).
 
         Returns the 5-tuple shape ``_load_model`` uses
@@ -2949,17 +2955,26 @@ class ModelManager(SpeculativeLoaderMixin):
         """
         from olmlx.engine import image_gen
 
-        mc = self._declared_image_config(hf_path)
-        quantize = mc.image_quantize if mc is not None else None
+        quantize = image_config.image_quantize if image_config is not None else None
         try:
             model = image_gen.load_image_model(hf_path, quantize)
         except ImportError as exc:
-            # ValueError -> HTTP 400 on /v1/images/generations, instead of an
-            # opaque 500 (same contract as the TTS loader, #469).
-            raise ValueError(
-                f"Model '{hf_path}' is an image model, but the image-generation "
-                "dependencies are not installed. Install with: "
-                "uv sync --extra image (or pip install 'olmlx[image]')."
+            import importlib.util
+
+            if importlib.util.find_spec("mflux") is None:
+                # ValueError -> HTTP 400 on /v1/images/generations, instead of
+                # an opaque 500 (same contract as the TTS loader, #469).
+                raise ValueError(
+                    f"Model '{hf_path}' is an image model, but the "
+                    "image-generation dependencies are not installed. Install "
+                    "with: uv sync --extra image (or pip install 'olmlx[image]')."
+                ) from exc
+            # mflux IS installed but an internal module olmlx imports is gone
+            # or broken (drift past the tested version) — reinstalling the
+            # extra won't help, so say what actually happened.
+            raise RuntimeError(
+                f"The installed mflux is incompatible with olmlx's image "
+                f"support ({exc}); install the version the [image] extra pins."
             ) from exc
         _materialize_image_model(model)
         return model, None, False, TemplateCaps(), None
@@ -3046,6 +3061,7 @@ class ModelManager(SpeculativeLoaderMixin):
         flash_config: ResolvedFlashConfig | None = None,
         flash_moe_config: FlashMoeConfig | None = None,
         weight_quant_str: str | None = None,
+        image_config: Any = None,
     ) -> tuple[Any, Any, bool, TemplateCaps, bool, Any]:
         """Load a model and optionally shard it for distributed inference.
 
@@ -3069,6 +3085,7 @@ class ModelManager(SpeculativeLoaderMixin):
             flash_config=flash_config,
             flash_moe_config=flash_moe_config,
             weight_quant_str=weight_quant_str,
+            image_config=image_config,
         )
         is_distributed = False
 

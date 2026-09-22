@@ -22,22 +22,25 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
-# How often to poll for a client disconnect while a generation runs. The
-# worker checks the cancel event once per diffusion step (~seconds each), so a
-# sub-second poll adds no meaningful latency to the abort.
-_DISCONNECT_POLL_S = 0.5
-
 
 async def _watch_disconnect(request: Request, cancel: threading.Event) -> None:
-    """Set *cancel* when the client goes away (non-streaming handlers are not
-    cancelled by the server on disconnect, so without this a closed client
-    would still pay for a full multi-minute generation under the lock)."""
+    """Set *cancel* when the client goes away.
+
+    Non-streaming handlers are not cancelled by the server on disconnect, so
+    without this a closed client would still pay for a full multi-minute
+    generation under the inference lock. This blocks on ``request.receive()``
+    rather than polling ``request.is_disconnected()``: the latter receives
+    under a pre-cancelled scope, and behind the app's ``BaseHTTPMiddleware``s
+    that drops the ``http.disconnect`` message, so it never reports one. The
+    request body has already been read by FastAPI, so the next ASGI message is
+    the disconnect.
+    """
     while not cancel.is_set():
-        if await request.is_disconnected():
+        message = await request.receive()
+        if message["type"] == "http.disconnect":
             logger.info("Client disconnected; cancelling image generation")
             cancel.set()
             return
-        await asyncio.sleep(_DISCONNECT_POLL_S)
 
 
 @router.post("/v1/images/generations", response_model=ImageGenerationResponse)
@@ -70,9 +73,11 @@ async def images_generations(req: ImageGenerationRequest, request: Request):
         # The client is gone; nobody reads this. 499 = client closed request.
         return Response(status_code=499)
     finally:
-        cancel.set()  # stops the watcher loop
         watcher.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
+        # The watcher's outcome is irrelevant here; never let its failure
+        # (e.g. a receive() error once the request completes) replace the
+        # real response or exception.
+        with contextlib.suppress(asyncio.CancelledError, Exception):
             await watcher
 
     # PIL encoding is CPU-bound (hundreds of ms for a 1024px PNG); keep it off

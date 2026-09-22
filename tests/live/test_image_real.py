@@ -65,7 +65,8 @@ def test_generate_cross_thread(tmp_path, monkeypatch):
     mgr.registry = registry
     mgr.store = None
 
-    model, *_ = _on_thread(lambda: mgr._load_model_image(REPO))
+    mc = registry.resolve("qwen-image:2.1")
+    model, *_ = _on_thread(lambda: mgr._load_model_image(REPO, mc))
     image = _on_thread(
         lambda: image_gen.generate_image(
             model,

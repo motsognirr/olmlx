@@ -348,7 +348,9 @@ Request fields: `prompt`, `size` (`WxH`, multiples of 16, max
 `OLMLX_IMAGE_MAX_DIMENSION`), `output_format` (`png`/`jpeg`/`webp`), plus the
 olmlx extensions `seed`, `steps`, `guidance` and `negative_prompt` (unset
 `steps`/`guidance` use each model's defaults: 40 / 1.0 for Qwen-Image-2.1,
-4 / 4.0 for Qwen-Image). Only `n: 1` and `response_format: "b64_json"` are
+4 / 4.0 for Qwen-Image). `negative_prompt` only takes effect with classifier-free
+guidance, i.e. `guidance` > 1 — Qwen-Image-2.1's default of 1.0 ignores it, so
+pass e.g. `"guidance": 4.0` alongside it. Only `n: 1` and `response_format: "b64_json"` are
 supported; the response echoes the `seed` used. Closing the connection cancels
 the generation at the next diffusion step.
 

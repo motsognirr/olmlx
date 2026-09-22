@@ -34,6 +34,8 @@ class ImageGenerationRequest(BaseModel):
     steps: int | None = Field(default=None, ge=1, le=200)
     #: CFG scale; unset uses the variant's default (4.0 / 1.0).
     guidance: float | None = Field(default=None, ge=0.0, le=50.0)
+    #: Only effective with CFG (guidance > 1); Qwen-Image-2.1's default
+    #: guidance of 1.0 ignores it.
     negative_prompt: str | None = None
     keep_alive: str | None = None
 
