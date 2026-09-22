@@ -567,6 +567,15 @@ class TTSGenerationError(RuntimeError):
 _TTS_PASSTHROUGH_ERRORS = (MemoryError,)
 
 
+class ImageGenerationError(RuntimeError):
+    """Raised when the mflux backend fails mid-generation (#723).
+
+    A ``RuntimeError`` (-> HTTP 500), not a ``ValueError``, for the same reason
+    as ``TTSGenerationError``: a third-party ``ValueError`` from inside the
+    diffusion loop must not be reported as a client error (400).
+    """
+
+
 _DEFERRED_CLEANUP_TIMEOUT = 600  # 10 minutes max wait for stuck thread
 _DEFERRED_WAIT_TIMEOUT = 30.0  # max wait for deferred cleanup before rejecting
 
@@ -2483,6 +2492,7 @@ def _batch_eligible(
         or lm.is_whisper
         or lm.is_tts
         or lm.is_reranker
+        or lm.is_image
         or lm.is_distributed
         or lm.is_flash
         or lm.is_flash_moe
@@ -5138,3 +5148,126 @@ async def generate_speech(
                     await worker
     finally:
         lm.release_ref()
+
+
+async def generate_image(
+    manager: ModelManager,
+    model_name: str,
+    prompt: str,
+    *,
+    width: int,
+    height: int,
+    seed: int | None = None,
+    steps: int | None = None,
+    guidance: float | None = None,
+    negative_prompt: str | None = None,
+    keep_alive: str | None = None,
+    cancel_event: threading.Event | None = None,
+) -> dict:
+    """Generate one image with a managed mflux model (issue #723).
+
+    Returns ``{"image": PIL.Image.Image, "seed": int}``. The whole denoise loop
+    runs on one worker thread under the inference lock. *cancel_event* (set by
+    the router on client disconnect) is checked by an mflux in-loop callback
+    after every diffusion step; cancelling this coroutine sets it too and then
+    **waits for the worker to stop** before the lock is released, so a dying
+    denoise loop never overlaps the next request on Metal.
+
+    Raises ``ValueError`` (-> 400) for a non-image model, ``ImageGenerationError``
+    (-> 500) if mflux fails, and ``ImageGenerationCancelled`` when cancelled
+    via *cancel_event*.
+    """
+    import secrets
+
+    from olmlx.engine import image_gen
+
+    lm = await manager.ensure_loaded(model_name, keep_alive, pin=True)
+    try:
+        if not lm.is_image:
+            raise ValueError(
+                f"Model '{model_name}' is not an image model. "
+                "/v1/images/generations requires a models.json entry declared "
+                'with "type": "image" (e.g. hf_path "Qwen/Qwen-Image-2.1").'
+            )
+        if seed is None:
+            seed = secrets.randbelow(2**31)
+        cancel = cancel_event if cancel_event is not None else threading.Event()
+
+        async with _inference_locked(
+            lm.inference_queue_timeout, sync_mode=lm.sync_mode
+        ):
+            with (
+                _tracing.span(
+                    "inference",
+                    model=lm.name,
+                    surface=surface_var.get(),
+                    strategy="none",
+                ),
+                _inference_ref(lm, keep_alive=keep_alive, adopt=True),
+            ):
+
+                def _run():
+                    try:
+                        image = image_gen.generate_image(
+                            lm.model,
+                            prompt,
+                            seed=seed,
+                            width=width,
+                            height=height,
+                            steps=steps,
+                            guidance=guidance,
+                            negative_prompt=negative_prompt,
+                            cancel_event=cancel,
+                        )
+                    except (image_gen.ImageGenerationCancelled, MemoryError):
+                        raise
+                    except Exception as exc:
+                        logger.error(
+                            "Image backend failed during generation for %s",
+                            lm.name,
+                            exc_info=exc,
+                        )
+                        raise ImageGenerationError(
+                            f"{type(exc).__name__}: {exc}"
+                        ) from exc
+                    finally:
+                        # Fence this worker's GPU work before the thread
+                        # exits (the loop thread never syncs worker streams).
+                        try:
+                            mx.synchronize()
+                        except Exception:
+                            logger.warning(
+                                "image post-generation sync failed", exc_info=True
+                            )
+                    return image
+
+                worker = asyncio.ensure_future(asyncio.to_thread(_run))
+                try:
+                    image = await asyncio.shield(worker)
+                except asyncio.CancelledError:
+                    cancel.set()
+                    await _drain_image_worker(worker)
+                    raise
+                return {"image": image, "seed": seed}
+    finally:
+        lm.release_ref()
+
+
+async def _drain_image_worker(worker: asyncio.Future) -> None:
+    """Wait for a cancelled image worker to actually stop.
+
+    The caller holds the inference lock; returning before the worker thread
+    exits would release it while the denoise loop still runs on Metal. The
+    worker stops within one diffusion step of its cancel event being set.
+    Repeated cancellation of the caller is absorbed (the caller re-raises the
+    original ``CancelledError`` afterwards).
+    """
+    while not worker.done():
+        try:
+            await asyncio.shield(worker)
+        except asyncio.CancelledError:
+            continue
+        except Exception:
+            break
+    if not worker.cancelled():
+        worker.exception()  # mark retrieved; the cancel is what propagates

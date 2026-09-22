@@ -39,7 +39,9 @@ async def list_models(request: Request):
                 ),
             )
         )
-    # Add configured but not-yet-pulled models
+    # Add configured but not-yet-pulled models. Image models (#723) are never
+    # "pulled" into the store (mflux downloads them itself), so they always
+    # land here; mark the family so clients can tell them apart.
     for name, model_config in configured.items():
         normalized = registry.normalize_name(name)
         if normalized not in local_names:
@@ -47,6 +49,11 @@ async def list_models(request: Request):
                 ModelInfo(
                     name=normalized,
                     model=model_config.hf_path,
+                    details=(
+                        ModelDetails(family="image")
+                        if model_config.is_image
+                        else ModelDetails()
+                    ),
                 )
             )
 

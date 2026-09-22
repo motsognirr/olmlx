@@ -182,6 +182,13 @@ class Settings(BaseSettings):
             description="Max input length for /v1/audio/speech (OLMLX_TTS_MAX_INPUT_CHARS).",
         ),
     ] = 8192
+    image_max_dimension: Annotated[
+        int,
+        Field(
+            ge=64,
+            description="Max width/height in pixels for /v1/images/generations (OLMLX_IMAGE_MAX_DIMENSION).",
+        ),
+    ] = 2048
     # Voice mode for `olmlx chat --voice` (issue #444). STT reuses the Whisper
     # ModelManager kind; TTS reuses the Kokoro `tts` kind + streaming
     # generate_speech from the /v1/audio/speech work (#367). Models resolve

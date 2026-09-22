@@ -71,6 +71,11 @@ Swap `audio` for `voice` to also get push-to-talk mic capture. Source installs
 (`uv sync`) provision the model automatically — no extra step. Without it, the
 first `/v1/audio/speech` request fails with a spaCy load error.
 
+Text-to-image (`/v1/images/generations`, via [mflux](https://github.com/mflux-community/mflux))
+ships in the `image` extra: `uv tool install "olmlx[image]"`, `pipx install
+"olmlx[image]"`, or `uv sync --extra image` from source. See
+[Image Generation](#image-generation).
+
 ## CLI
 
 ```bash
@@ -310,6 +315,49 @@ Add VLM mappings to `~/.olmlx/models.json`:
 
 VLMs are automatically detected by inspecting `config.json` for vision-related keys (`vision_config`, `vision_tower`, `vision_model`, `mm_vision_tower`, etc.) and loaded via mlx-vlm instead of mlx-lm. Beyond LLaVA, this covers current mlx-vlm architectures such as Gemma 4 (which also supports tools alongside images) and Qwen-VL. One exception: hybrid Qwen 3.5 text towers whose `text_config.layer_types` include `linear_attention` are routed through mlx-lm — the mlx-vlm path crashes with a Metal stream error on that architecture.
 
+## Image Generation
+
+olmlx serves text-to-image on the OpenAI-compatible `/v1/images/generations`
+endpoint via mflux (requires the `image` extra). Supported models are
+**Qwen-Image-2.1** (`Qwen/Qwen-Image-2.1`, 7.1B DiT + Qwen3-VL text encoder) and
+**Qwen-Image** (`Qwen/Qwen-Image-2512`, 20B MMDiT).
+
+Image models are never auto-detected — declare them in `~/.olmlx/models.json`
+with `"type": "image"`. The `hf_path` must be the exact repo id; mflux resolves
+and downloads the weights itself (into the Hugging Face cache, not
+`OLMLX_MODELS_DIR`), so there is no `olmlx pull` step. `image_quantize`
+(3/4/5/6/8) quantizes the diffusion transformer on load (the text encoder stays
+bf16):
+
+```json
+{
+  "qwen-image:2.1": { "type": "image", "hf_path": "Qwen/Qwen-Image-2.1", "image_quantize": 8 },
+  "qwen-image:20b": { "type": "image", "hf_path": "Qwen/Qwen-Image-2512", "image_quantize": 4 }
+}
+```
+
+```bash
+curl http://localhost:11434/v1/images/generations -d '{
+  "model": "qwen-image:2.1",
+  "prompt": "a lighthouse on a cliff at dusk, oil painting",
+  "size": "1024x1024"
+}' | jq -r '.data[0].b64_json' | base64 -d > out.png
+```
+
+Request fields: `prompt`, `size` (`WxH`, multiples of 16, max
+`OLMLX_IMAGE_MAX_DIMENSION`), `output_format` (`png`/`jpeg`/`webp`), plus the
+olmlx extensions `seed`, `steps`, `guidance` and `negative_prompt` (unset
+`steps`/`guidance` use each model's defaults: 40 / 1.0 for Qwen-Image-2.1,
+4 / 4.0 for Qwen-Image). Only `n: 1` and `response_format: "b64_json"` are
+supported; the response echoes the `seed` used. Closing the connection cancels
+the generation at the next diffusion step.
+
+Image models take a `OLMLX_MAX_LOADED_MODELS` slot like any other model (expect
+~20–25 GB resident for Qwen-Image-2.1 at `image_quantize: 8`), and a
+high-step 1024px generation holds the inference lock for minutes. Requests
+queued behind it give up after `OLMLX_INFERENCE_QUEUE_TIMEOUT` (default 300 s);
+raise it, or set a per-model `inference_queue_timeout`, if that bites.
+
 ## API Endpoints
 
 ### Ollama API
@@ -344,6 +392,7 @@ VLMs are automatically detected by inspecting `config.json` for vision-related k
 | `/v1/rerank` | POST | Rerank documents against a query (cross-encoder) |
 | `/v1/audio/transcriptions` | POST | Speech-to-text (Whisper) |
 | `/v1/audio/speech` | POST | Text-to-speech (Kokoro) |
+| `/v1/images/generations` | POST | Text-to-image (mflux Qwen-Image; `image` extra) |
 
 ### Anthropic Messages API
 

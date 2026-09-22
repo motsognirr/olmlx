@@ -146,6 +146,8 @@ class LoadedModel:
     is_whisper: bool = False
     is_tts: bool = False
     is_reranker: bool = False
+    # mflux text-to-image model (#723): no tokenizer / KV cache / chat path.
+    is_image: bool = False
     speculative_decoder: Any = None
     weight_store: Any = None
     # LoRA-adapter hot-swap (issue #362). On an adapter entry, ``adapter_base``

@@ -1,0 +1,184 @@
+"""/v1/images/generations router (#723)."""
+
+import base64
+from unittest.mock import AsyncMock, patch
+
+import pytest
+from PIL import Image
+
+from olmlx.engine.image_gen import ImageGenerationCancelled
+
+
+def _fake_out(seed=7):
+    return {"image": Image.new("RGB", (16, 16), (0, 128, 255)), "seed": seed}
+
+
+class TestImagesRouter:
+    @pytest.mark.asyncio
+    async def test_generates_b64_png(self, app_client):
+        with patch(
+            "olmlx.routers.images.generate_image", new_callable=AsyncMock
+        ) as mock:
+            mock.return_value = _fake_out(seed=123)
+            resp = await app_client.post(
+                "/v1/images/generations",
+                json={
+                    "model": "qwen-image:2.1",
+                    "prompt": "a lighthouse at dusk",
+                    "size": "512x768",
+                    "seed": 123,
+                    "steps": 8,
+                    "guidance": 2.5,
+                    "negative_prompt": "blurry",
+                    "quality": "hd",  # OpenAI field: accepted and ignored
+                },
+            )
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert isinstance(body["created"], int)
+        assert body["output_format"] == "png"
+        assert body["size"] == "512x768"
+        assert len(body["data"]) == 1
+        assert body["data"][0]["seed"] == 123
+        assert base64.b64decode(body["data"][0]["b64_json"]).startswith(b"\x89PNG")
+        args, kwargs = mock.call_args
+        assert args[1:] == ("qwen-image:2.1", "a lighthouse at dusk")
+        assert kwargs["width"] == 512 and kwargs["height"] == 768
+        assert kwargs["seed"] == 123
+        assert kwargs["steps"] == 8
+        assert kwargs["guidance"] == 2.5
+        assert kwargs["negative_prompt"] == "blurry"
+        assert kwargs["cancel_event"] is not None
+
+    @pytest.mark.asyncio
+    async def test_jpeg_output(self, app_client):
+        with patch(
+            "olmlx.routers.images.generate_image", new_callable=AsyncMock
+        ) as mock:
+            mock.return_value = _fake_out()
+            resp = await app_client.post(
+                "/v1/images/generations",
+                json={"model": "m", "prompt": "p", "output_format": "jpeg"},
+            )
+        assert resp.status_code == 200
+        raw = base64.b64decode(resp.json()["data"][0]["b64_json"])
+        assert raw.startswith(b"\xff\xd8")
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "payload",
+        [
+            {"prompt": "   "},
+            {"n": 2},
+            {"response_format": "url"},
+            {"size": "1024"},
+            {"size": "1000x1024"},  # not a multiple of 16
+            {"size": "32x32"},
+            {"steps": 0},
+            {"guidance": -1},
+            {"seed": -1},
+            {"output_format": "gif"},
+        ],
+    )
+    async def test_rejects_invalid_requests(self, app_client, payload):
+        body = {"model": "m", "prompt": "p", **payload}
+        with patch(
+            "olmlx.routers.images.generate_image", new_callable=AsyncMock
+        ) as mock:
+            resp = await app_client.post("/v1/images/generations", json=body)
+        assert resp.status_code == 400, resp.text
+        mock.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_rejects_size_over_limit(self, app_client, monkeypatch):
+        monkeypatch.setattr("olmlx.routers.images.settings.image_max_dimension", 1024)
+        with patch(
+            "olmlx.routers.images.generate_image", new_callable=AsyncMock
+        ) as mock:
+            resp = await app_client.post(
+                "/v1/images/generations",
+                json={"model": "m", "prompt": "p", "size": "2048x1024"},
+            )
+        assert resp.status_code == 400
+        assert "OLMLX_IMAGE_MAX_DIMENSION" in resp.text
+        mock.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_non_image_model_is_400(self, app_client):
+        with patch(
+            "olmlx.routers.images.generate_image",
+            new_callable=AsyncMock,
+            side_effect=ValueError("Model 'qwen3' is not an image model."),
+        ):
+            resp = await app_client.post(
+                "/v1/images/generations", json={"model": "qwen3", "prompt": "p"}
+            )
+        assert resp.status_code == 400
+        assert "not an image model" in resp.text
+
+    @pytest.mark.asyncio
+    async def test_backend_failure_is_500(self, app_client):
+        from olmlx.engine.inference import ImageGenerationError
+
+        with patch(
+            "olmlx.routers.images.generate_image",
+            new_callable=AsyncMock,
+            side_effect=ImageGenerationError("ValueError: shape mismatch"),
+        ):
+            resp = await app_client.post(
+                "/v1/images/generations", json={"model": "m", "prompt": "p"}
+            )
+        assert resp.status_code == 500
+
+    @pytest.mark.asyncio
+    async def test_cancelled_generation_returns_499(self, app_client):
+        with patch(
+            "olmlx.routers.images.generate_image",
+            new_callable=AsyncMock,
+            side_effect=ImageGenerationCancelled("cancelled"),
+        ):
+            resp = await app_client.post(
+                "/v1/images/generations", json={"model": "m", "prompt": "p"}
+            )
+        assert resp.status_code == 499
+
+    @pytest.mark.asyncio
+    async def test_disconnect_sets_cancel_event(self):
+        # The watcher flips the cancel event the worker polls each step.
+        import asyncio
+        import threading
+        from unittest.mock import MagicMock
+
+        from olmlx.routers.images import _watch_disconnect
+
+        request = MagicMock()
+        request.is_disconnected = AsyncMock(side_effect=[False, True])
+        cancel = threading.Event()
+        with patch("olmlx.routers.images._DISCONNECT_POLL_S", 0.0):
+            await asyncio.wait_for(_watch_disconnect(request, cancel), 2)
+        assert cancel.is_set()
+
+
+class TestImageModelListing:
+    @pytest.mark.asyncio
+    async def test_tags_marks_image_family(self, app_client, registry):
+        from olmlx.engine.registry import ModelConfig
+
+        registry._mappings["qwen-image:2.1"] = ModelConfig.from_entry(
+            {"type": "image", "hf_path": "Qwen/Qwen-Image-2.1"}
+        )
+        resp = await app_client.get("/api/tags")
+        assert resp.status_code == 200
+        by_name = {m["name"]: m for m in resp.json()["models"]}
+        assert by_name["qwen-image:2.1"]["details"]["family"] == "image"
+        assert by_name["qwen3:latest"]["details"].get("family") != "image"
+
+    @pytest.mark.asyncio
+    async def test_v1_models_lists_image_model(self, app_client, registry):
+        from olmlx.engine.registry import ModelConfig
+
+        registry._mappings["qwen-image:2.1"] = ModelConfig.from_entry(
+            {"type": "image", "hf_path": "Qwen/Qwen-Image-2.1"}
+        )
+        resp = await app_client.get("/v1/models")
+        assert "qwen-image:2.1" in {m["id"] for m in resp.json()["data"]}

@@ -102,6 +102,16 @@ audio = [
     #   python -m spacy download en_core_web_sm
     # (documented in the README audio/voice setup section). Issue #367.
 ]
+# Text-to-image via mflux on /v1/images/generations (#723). Not core: mflux
+# drags in opencv-python, matplotlib, fonttools, sentencepiece, piexif and
+# hf-transfer (~150-250MB) that only serve image generation.
+# NOTE: mflux makes torch (>=2.13.0) and pillow (>=12.3.0) *explicit* hard
+# requirements of this extra. olmlx itself still deliberately leaves torch
+# undeclared (it rides in transitively via xgrammar and mlx-whisper); both sit
+# exactly on mflux's floor in uv.lock, with no headroom below.
+# Upper-bounded: olmlx imports mflux internals (variant module paths,
+# AVAILABLE_MODELS, the in-loop callback registry) that are not a stable API.
+image = ["mflux>=0.20.0,<0.21"]
 # Terminal voice chat (`olmlx chat --voice`, #444): mic capture + playback via
 # PortAudio, plus the TTS stack it speaks through (self-referential extra).
 voice = ["olmlx[audio]", "sounddevice>=0.4.6"]
