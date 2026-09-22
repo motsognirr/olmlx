@@ -359,3 +359,35 @@ class TestInferenceTimeout:
         assert loop.time() - t0 < 2
         release.set()
         await worker
+
+
+class TestImageRejectedBeforeLoad:
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("entry", ["chat", "completion", "embeddings"])
+    async def test_declared_image_rejected_without_loading(self, entry):
+        # A declared image entry must be rejected from its models.json marker
+        # BEFORE ensure_loaded — loading ~20 GB just to reject the request
+        # would evict the chat models the client actually wanted.
+        from olmlx.engine import inference
+        from olmlx.engine.registry import ModelConfig
+
+        mgr = MagicMock()
+        mgr.registry.resolve.return_value = ModelConfig(
+            hf_path="Qwen/Qwen-Image-2.1", type="image"
+        )
+        mgr.ensure_loaded = AsyncMock(side_effect=AssertionError("loaded"))
+        with pytest.raises(ValueError, match="image model"):
+            if entry == "chat":
+                await inference.generate_chat(
+                    mgr,
+                    "qwen-image:2.1",
+                    [{"role": "user", "content": "hi"}],
+                    stream=False,
+                )
+            elif entry == "completion":
+                await inference.generate_completion(
+                    mgr, "qwen-image:2.1", "hi", stream=False
+                )
+            else:
+                await inference.generate_embeddings(mgr, "qwen-image:2.1", ["hi"])
+        mgr.ensure_loaded.assert_not_called()

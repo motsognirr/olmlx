@@ -588,6 +588,28 @@ def _reject_non_lm_model(lm: LoadedModel, model_name: str, surface: str) -> None
             )
 
 
+def _reject_declared_image_before_load(
+    manager: ModelManager, model_name: str, surface: str
+) -> None:
+    """Reject a models.json ``type: "image"`` entry *before* loading it.
+
+    ``_reject_non_lm_model`` needs the loaded model's kind flags, but loading
+    an image model (~20 GB) just to refuse the request would evict the chat
+    models the client actually wanted. Image models are declared, so their
+    kind is known from the registry entry up front. Resolution errors are left
+    for ``ensure_loaded`` to report as usual.
+    """
+    try:
+        mc = manager.registry.resolve(model_name)
+    except Exception:
+        return
+    if getattr(mc, "is_image", False) is True:
+        raise ValueError(
+            f"Model '{model_name}' is an image model and cannot be used for "
+            f"{surface}; use /v1/images/generations."
+        )
+
+
 class ImageGenerationError(RuntimeError):
     """Raised when the mflux backend fails mid-generation (#723).
 
@@ -1223,6 +1245,7 @@ async def generate_completion(
     """
     stats = TimingStats()
 
+    _reject_declared_image_before_load(manager, model_name, "text completion")
     with Timer() as load_timer:
         lm = await manager.ensure_loaded(model_name, keep_alive, pin=True)
     stats.load_duration = load_timer.duration_ns
@@ -4365,6 +4388,7 @@ async def generate_chat(
     """Generate a chat completion."""
     stats = TimingStats()
 
+    _reject_declared_image_before_load(manager, model_name, "chat")
     with Timer() as load_timer:
         lm = await manager.ensure_loaded(model_name, keep_alive, pin=True)
     stats.load_duration = load_timer.duration_ns
@@ -4756,6 +4780,7 @@ async def generate_embeddings(
     Returns ``(embeddings, total_tokens)`` where ``total_tokens`` is the summed
     token count across all inputs (for OpenAI ``usage.prompt_tokens``).
     """
+    _reject_declared_image_before_load(manager, model_name, "embeddings")
     lm = await manager.ensure_loaded(model_name, keep_alive, pin=True)
 
     try:
