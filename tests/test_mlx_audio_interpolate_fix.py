@@ -135,3 +135,42 @@ def test_sinegen_no_longer_raises_broadcast_error():
     assert sine_waves.shape == (1, BROKEN_WIDTH, 9)
     assert uv.shape == (1, BROKEN_WIDTH, 1)
     assert not mx.any(mx.isnan(sine_waves)).item()
+
+
+# Every call shape the wrapper does not mean to change. The patched function
+# must raise exactly what upstream raises, including where upstream itself
+# raises something other than ValueError (a short scale_factor tuple indexes
+# out of range inside upstream's own size loop, which runs *before* its
+# spatial_dims check).
+_PARITY_CASES = {
+    "scalar scale": dict(input_shape=(1, 1, 7), scale_factor=2.0),
+    "list scale": dict(input_shape=(1, 1, 7), scale_factor=[2.0]),
+    "over-long tuple": dict(input_shape=(1, 1, 7), scale_factor=(2.0, 3.0)),
+    "empty tuple": dict(input_shape=(1, 1, 7), scale_factor=()),
+    "short tuple, 4D": dict(input_shape=(1, 1, 7, 7), scale_factor=(2.0,)),
+    "scalar scale, 4D": dict(input_shape=(1, 1, 7, 7), scale_factor=2.0),
+    "non-numeric scale": dict(input_shape=(1, 1, 7), scale_factor="x"),
+    "dict scale": dict(input_shape=(1, 1, 7), scale_factor={"a": 1}),
+    "2D input": dict(input_shape=(1, 7), scale_factor=2.0),
+    "zero scale": dict(input_shape=(1, 1, 7), scale_factor=0.0),
+    "negative scale": dict(input_shape=(1, 1, 7), scale_factor=-2.0),
+    "nan scale": dict(input_shape=(1, 1, 7), scale_factor=float("nan")),
+    "inf scale": dict(input_shape=(1, 1, 7), scale_factor=float("inf")),
+}
+
+
+def _outcome(fn, input_shape, **kwargs):
+    try:
+        return ("ok", fn(mx.zeros(input_shape), mode="linear", **kwargs).shape)
+    except BaseException as exc:  # noqa: BLE001 - comparing failure modes
+        return (type(exc).__name__, str(exc))
+
+
+@pytest.mark.parametrize("case", _PARITY_CASES, ids=list(_PARITY_CASES))
+def test_patched_matches_upstream_on_unhandled_call_shapes(case):
+    ensure_interpolate_scale_patch()
+    kwargs = dict(_PARITY_CASES[case])
+    shape = kwargs.pop("input_shape")
+    assert _outcome(interp_mod.interpolate, shape, **kwargs) == _outcome(
+        _original_interpolate(), shape, **kwargs
+    )

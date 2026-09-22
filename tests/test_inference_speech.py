@@ -114,4 +114,9 @@ async def test_generate_speech_wraps_backend_crash(monkeypatch):
             pass
     assert not isinstance(excinfo.value, ValueError)
     assert "ValueError" in str(excinfo.value)
+    # The wrap happens on the worker thread and the raise on the loop, so the
+    # chain is set by hand — without it the backend traceback is lost.
+    cause = excinfo.value.__cause__
+    assert isinstance(cause, ValueError)
+    assert cause.__traceback__ is not None
     lm.release_ref.assert_called_once()

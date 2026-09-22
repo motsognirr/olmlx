@@ -5086,10 +5086,18 @@ async def generate_speech(
                         # backend failure, never the client's input. Wrap so
                         # it can't be mistaken for the non-TTS-model
                         # ValueError the router maps to a 400 (#703).
-                        loop.call_soon_threadsafe(
-                            queue.put_nowait,
-                            TTSGenerationError(f"{type(exc).__name__}: {exc}"),
+                        logger.error(
+                            "TTS backend failed during generation for %s",
+                            lm.name,
+                            exc_info=exc,
                         )
+                        wrapped = TTSGenerationError(f"{type(exc).__name__}: {exc}")
+                        # Chain manually: the wrap happens here but the raise
+                        # happens on the loop, so ``raise ... from exc`` isn't
+                        # available. __cause__ keeps the original traceback
+                        # reachable for anything that walks the chain.
+                        wrapped.__cause__ = exc
+                        loop.call_soon_threadsafe(queue.put_nowait, wrapped)
 
                 worker = asyncio.create_task(asyncio.to_thread(_worker))
                 try:
