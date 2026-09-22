@@ -86,3 +86,95 @@ async def test_generate_speech_releases_ref_on_early_close():
     await agen.aclose()  # client disconnect
 
     lm.release_ref.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_generate_speech_wraps_backend_crash(monkeypatch):
+    # A crash inside the third-party mlx-audio generator is a backend
+    # failure, not bad client input (#703): it must surface as
+    # TTSGenerationError (a RuntimeError -> HTTP 500), not as the raw
+    # ValueError that the router maps to a 400.
+    from olmlx.engine.inference import TTSGenerationError
+
+    lm = _fake_lm()
+
+    def _gen(text, voice=None, speed=1.0, **kw):
+        yield _Result(np.array([0.1], dtype=np.float32))
+        raise ValueError(
+            "[broadcast_shapes] Shapes (1,70200,1) and (1,70500,9) cannot be broadcast."
+        )
+
+    lm.model = types.SimpleNamespace(generate=_gen)
+    manager = MagicMock()
+    manager.ensure_loaded = AsyncMock(return_value=lm)
+    manager.store = None
+
+    with pytest.raises(TTSGenerationError, match="broadcast_shapes") as excinfo:
+        async for _ in generate_speech(manager, "kokoro", "hi", voice="af_heart"):
+            pass
+    assert not isinstance(excinfo.value, ValueError)
+    assert "ValueError" in str(excinfo.value)
+    # The wrap happens on the worker thread and the raise on the loop, so the
+    # chain is set by hand — without it the backend traceback is lost.
+    cause = excinfo.value.__cause__
+    assert isinstance(cause, ValueError)
+    assert cause.__traceback__ is not None
+    lm.release_ref.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_generate_speech_preserves_memory_error():
+    # MemoryError already maps to 503 model_too_large in app.py. Wrapping it
+    # into TTSGenerationError would downgrade that to a generic 500, losing
+    # information rather than adding it.
+    from olmlx.engine.inference import TTSGenerationError
+
+    lm = _fake_lm()
+
+    def _gen(text, voice=None, speed=1.0, **kw):
+        raise MemoryError("[metal::malloc] Attempting to allocate 40 GB")
+        yield  # pragma: no cover - makes this a generator
+
+    lm.model = types.SimpleNamespace(generate=_gen)
+    manager = MagicMock()
+    manager.ensure_loaded = AsyncMock(return_value=lm)
+    manager.store = None
+
+    with pytest.raises(MemoryError) as excinfo:
+        async for _ in generate_speech(manager, "kokoro", "hi", voice="af_heart"):
+            pass
+    assert not isinstance(excinfo.value, TTSGenerationError)
+    lm.release_ref.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_generate_speech_crash_keeps_worker_traceback():
+    # The wrap happens on the worker thread and the raise on the event loop.
+    # __traceback__ is attached to the exception object, so the worker frames
+    # travel with it — the formatted chain must still name the failing frame.
+    import traceback
+
+    from olmlx.engine.inference import TTSGenerationError
+
+    lm = _fake_lm()
+
+    def _explode_deep_in_mlx_audio():
+        raise ValueError("[broadcast_shapes] boom")
+
+    def _gen(text, voice=None, speed=1.0, **kw):
+        _explode_deep_in_mlx_audio()
+        yield  # pragma: no cover - makes this a generator
+
+    lm.model = types.SimpleNamespace(generate=_gen)
+    manager = MagicMock()
+    manager.ensure_loaded = AsyncMock(return_value=lm)
+    manager.store = None
+
+    with pytest.raises(TTSGenerationError) as excinfo:
+        async for _ in generate_speech(manager, "kokoro", "hi", voice="af_heart"):
+            pass
+
+    exc = excinfo.value
+    rendered = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
+    assert "_explode_deep_in_mlx_audio" in rendered
+    assert "direct cause" in rendered

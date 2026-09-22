@@ -542,6 +542,31 @@ class ServerBusyError(RuntimeError):
     pass
 
 
+class TTSGenerationError(RuntimeError):
+    """Raised when the mlx-audio TTS backend fails mid-generation (#703).
+
+    A ``RuntimeError`` (-> HTTP 500), deliberately *not* a ``ValueError``: the
+    third-party generator raises ``ValueError`` for internal shape mismatches,
+    which is indistinguishable by type from the one client-facing
+    ``ValueError`` ``generate_speech`` raises itself (non-TTS model -> 400).
+    Wrapping keeps a backend crash from being reported as the caller's fault.
+    """
+
+    pass
+
+
+# Exceptions app.py already maps to a *more* specific response than the
+# generic RuntimeError 500, so wrapping them would throw information away.
+# MemoryError is the reachable one here: mlx raises it on an allocation
+# failure, and app.py turns it into 503 ``model_too_large`` rather than an
+# opaque internal error. Everything else from the TTS backend is wrapped.
+#
+# Do NOT add a ``ValueError`` subclass here: the speech router's ``except
+# ValueError`` blocks exist for the non-TTS-model case and would report it as
+# a client-side 400, which is exactly the misclassification #703 fixed.
+_TTS_PASSTHROUGH_ERRORS = (MemoryError,)
+
+
 _DEFERRED_CLEANUP_TIMEOUT = 600  # 10 minutes max wait for stuck thread
 _DEFERRED_WAIT_TIMEOUT = 30.0  # max wait for deferred cleanup before rejecting
 
@@ -5020,7 +5045,9 @@ async def generate_speech(
     one worker thread (keeping all MLX work on a single thread, per the #284
     stream hazards) and bridge segments to the event loop via a queue.
 
-    Raises ``ValueError`` (-> HTTP 400) if the model is not a TTS model.
+    Raises ``ValueError`` (-> HTTP 400) if the model is not a TTS model, and
+    ``TTSGenerationError`` (a ``RuntimeError``, -> HTTP 500) if the mlx-audio
+    backend fails mid-generation — that is never the client's fault (#703).
     """
     lm = await manager.ensure_loaded(model_name, keep_alive, pin=True)
     try:
@@ -5067,7 +5094,33 @@ async def generate_speech(
                             loop.call_soon_threadsafe(queue.put_nowait, audio)
                         loop.call_soon_threadsafe(queue.put_nowait, sentinel)
                     except Exception as exc:  # noqa: BLE001 - re-raised on loop
-                        loop.call_soon_threadsafe(queue.put_nowait, exc)
+                        # Anything the third-party generator raises is a
+                        # backend failure, never the client's input. Wrap so
+                        # it can't be mistaken for the non-TTS-model
+                        # ValueError the router maps to a 400 (#703).
+                        logger.error(
+                            "TTS backend failed during generation for %s",
+                            lm.name,
+                            exc_info=exc,
+                        )
+                        if isinstance(exc, _TTS_PASSTHROUGH_ERRORS):
+                            # Already mapped to a better response than a
+                            # generic 500 (MemoryError -> 503 model_too_large).
+                            # Wrapping these would *lose* information, which is
+                            # the opposite of the point.
+                            failure: Exception = exc
+                        else:
+                            failure = TTSGenerationError(f"{type(exc).__name__}: {exc}")
+                            # Chain manually: the wrap happens here but the raise
+                            # happens on the loop, so ``raise ... from exc`` isn't
+                            # available. __cause__ carries the original — including
+                            # its worker-thread __traceback__, which is attached
+                            # to the exception object and so survives the hop.
+                            failure.__cause__ = exc
+                        # No sentinel: the queued exception *is* the terminal
+                        # item. The consumer's ``raise item`` ends the loop, so
+                        # enqueuing a sentinel after it would be unreachable.
+                        loop.call_soon_threadsafe(queue.put_nowait, failure)
 
                 worker = asyncio.create_task(asyncio.to_thread(_worker))
                 try:
