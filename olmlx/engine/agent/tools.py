@@ -286,6 +286,41 @@ def _check_image_target(name: str, root: Path) -> None:
         raise _ImageArgError(f"{path} already exists; choose a different filename")
 
 
+def _check_image_dir(name: str, root: Path) -> None:
+    """Early check for the default output dir (a symlink escaping the
+    workspace, or a non-directory), before minutes of generation."""
+    path = _confined(name, root)
+    if path.exists() and not path.is_dir():
+        raise _ImageArgError(f"{path} exists and is not a directory")
+
+
+#: Backstop for waiting on an aborted generation. generate_image bounds its own
+#: worker drain (``_IMAGE_DRAIN_TIMEOUT``); this only guarantees the tool call
+#: returns even if that contract breaks. None = drain timeout + 30s.
+_ABORT_DRAIN_TIMEOUT: float | None = None
+
+
+async def _abort_generation(
+    gen: "asyncio.Future[dict]", cancel: threading.Event
+) -> None:
+    cancel.set()
+    gen.cancel()
+    timeout = _ABORT_DRAIN_TIMEOUT
+    if timeout is None:
+        from olmlx.engine.inference import _IMAGE_DRAIN_TIMEOUT
+
+        timeout = _IMAGE_DRAIN_TIMEOUT + 30.0
+    await asyncio.wait({gen}, timeout=timeout)
+    if not gen.done():
+        logger.warning(
+            "generate_image did not stop within %.0fs of being aborted; abandoning it",
+            timeout,
+        )
+    # Consume the outcome (now or whenever it lands) so it is never logged as
+    # an unretrieved exception; the abort reason is what gets reported.
+    gen.add_done_callback(lambda f: f.cancelled() or f.exception())
+
+
 class _NameTaken(Exception):
     """The target file already exists (distinct from a failing ``mkdir``,
     which also raises ``FileExistsError`` when a parent is a regular file)."""
@@ -543,9 +578,11 @@ class AgentToolManager(BuiltinToolManager):
         try:
             params = self._validate_image_args(tool, arguments)
             name, fmt = _image_filename(arguments.get("filename"))
+            # Disk syscalls stay off the event loop (agent I/O invariant).
             if name is not None:
-                # Disk syscalls stay off the event loop (agent I/O invariant).
                 await asyncio.to_thread(_check_image_target, name, workspace)
+            else:
+                await asyncio.to_thread(_check_image_dir, "images", workspace)
         except _ImageArgError as exc:
             return _err(str(exc), user=True)
         if self._context.cancel_event.is_set():
@@ -572,11 +609,7 @@ class AgentToolManager(BuiltinToolManager):
                 return_when=asyncio.FIRST_COMPLETED,
             )
             if gen not in done:
-                cancel.set()
-                gen.cancel()
-                await asyncio.wait({gen})
-                if not gen.cancelled():
-                    gen.exception()  # consumed; the abort reason wins
+                await _abort_generation(gen, cancel)
                 if cancelled in done:
                     return _err("Image generation was cancelled.", user=False)
                 return _err(
@@ -599,9 +632,7 @@ class AgentToolManager(BuiltinToolManager):
             if not gen.done():
                 # This tool call itself was cancelled: stop the denoise and
                 # wait for the worker so it never outlives the call.
-                cancel.set()
-                gen.cancel()
-                await asyncio.wait({gen})
+                await _abort_generation(gen, cancel)
 
         seed = out["seed"]
         stem = f"images/{self._context.run_id[:8]}-{seed}"

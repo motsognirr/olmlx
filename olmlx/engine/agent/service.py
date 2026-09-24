@@ -348,6 +348,13 @@ class AgentService:
         # generate_image creates workspace files, so the hard-off file-write
         # posture must cover it too.
         if s.agent_file_write_policy == "deny":
+            if not self._warned_image_model:
+                self._warned_image_model = True
+                logger.warning(
+                    "agent_image_model=%r is set but agent_file_write_policy="
+                    "deny; generate_image (which writes files) is disabled.",
+                    image_model,
+                )
             return None
         # Only advertise the tool for a declared image entry: an undeclared or
         # text model would otherwise fail (or trigger a load) on first use.

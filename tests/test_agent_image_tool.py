@@ -295,12 +295,27 @@ class TestSandbox:
 
     async def test_images_path_is_a_file(self, context, workspace):
         (workspace / "images").write_text("not a dir")
-        tools = _tools(context, workspace, FakeGenerator())
+        gen = FakeGenerator()
+        tools = _tools(context, workspace, gen)
         result = await tools.call_tool(
             "generate_image", {"prompt": "x", "width": 64, "height": 64}
         )
         assert isinstance(result, ToolError)
         assert "None" not in result.message
+        # Caught before generation, not after minutes of denoising.
+        assert gen.calls == []
+
+    async def test_symlinked_default_dir_rejected_before_generation(
+        self, context, workspace, tmp_path
+    ):
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        (workspace / "images").symlink_to(outside)
+        gen = FakeGenerator()
+        tools = _tools(context, workspace, gen)
+        result = await tools.call_tool("generate_image", {"prompt": "x"})
+        assert isinstance(result, ToolError)
+        assert gen.calls == []
 
 
 class TestErrors:
@@ -464,6 +479,38 @@ class TestCancellation:
         assert "budget" in result.message
         assert task_cancelled.is_set()
 
+    async def test_abort_returns_even_if_generation_ignores_cancel(
+        self, context, workspace, monkeypatch
+    ):
+        from olmlx.engine.agent import tools as tools_mod
+
+        monkeypatch.setattr(tools_mod, "_ABORT_DRAIN_TIMEOUT", 0.05)
+        release = asyncio.Event()
+
+        async def stubborn(prompt, **kwargs):
+            while True:
+                try:
+                    await release.wait()
+                    return {"image": Image.new("RGB", (64, 64)), "seed": 1}
+                except asyncio.CancelledError:
+                    continue  # swallows the cancel, keeps blocking
+
+        context.time_remaining = lambda: 0.05
+        tools = AgentToolManager(
+            ChatConfig(model_name="m", write_root=workspace),
+            context,
+            image_tool=AgentImageTool(
+                generate=stubborn, max_dimension=2048, max_prompt_chars=100
+            ),
+        )
+        result = await asyncio.wait_for(
+            tools.call_tool("generate_image", {"prompt": "x"}), 2
+        )
+        assert isinstance(result, ToolError)
+        assert "budget" in result.message
+        release.set()  # let the abandoned task finish cleanly
+        await asyncio.sleep(0)
+
     async def test_exhausted_budget_does_not_generate(self, context, workspace):
         gen = FakeGenerator()
         context.time_remaining = lambda: 0.0
@@ -555,15 +602,17 @@ class TestServiceWiring:
         )
         assert "generate_image" not in sess.builtin.tool_names
 
-    def test_not_offered_when_file_writes_denied(self, store, tmp_path):
-        sess = self._session(
-            store,
-            tmp_path,
-            agent_image_model="qwen-image",
-            agent_file_write_policy="deny",
-            max_loaded_models=2,
-        )
+    def test_not_offered_when_file_writes_denied(self, store, tmp_path, caplog):
+        with caplog.at_level("WARNING", logger="olmlx.engine.agent.service"):
+            sess = self._session(
+                store,
+                tmp_path,
+                agent_image_model="qwen-image",
+                agent_file_write_policy="deny",
+                max_loaded_models=2,
+            )
         assert "generate_image" not in sess.builtin.tool_names
+        assert any("deny" in r.getMessage() for r in caplog.records)
 
     def test_warns_when_model_slots_too_few(self, store, tmp_path, caplog):
         with caplog.at_level("WARNING", logger="olmlx.engine.agent.service"):
