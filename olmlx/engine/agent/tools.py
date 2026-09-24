@@ -278,12 +278,25 @@ def _confined(name: str, root: Path) -> Path:
         raise _ImageArgError(str(exc)) from None
 
 
+def _check_parents_are_dirs(path: Path, root: Path) -> None:
+    """The nearest existing ancestor of *path* (inside *root*) must be a
+    directory — otherwise the save would fail only after generation."""
+    for ancestor in path.parents:
+        if ancestor.exists():
+            if not ancestor.is_dir():
+                raise _ImageArgError(f"{ancestor} exists and is not a directory")
+            return
+        if ancestor == root:
+            return
+
+
 def _check_image_target(name: str, root: Path) -> None:
     """Early (pre-generation) check so a bad path doesn't waste minutes of
     generation. Re-checked at save time — the disk can change meanwhile."""
     path = _confined(name, root)
     if path.exists():
         raise _ImageArgError(f"{path} already exists; choose a different filename")
+    _check_parents_are_dirs(path, root.resolve())
 
 
 def _check_image_dir(name: str, root: Path) -> None:
@@ -292,12 +305,14 @@ def _check_image_dir(name: str, root: Path) -> None:
     path = _confined(name, root)
     if path.exists() and not path.is_dir():
         raise _ImageArgError(f"{path} exists and is not a directory")
+    _check_parents_are_dirs(path, root.resolve())
 
 
-#: Backstop for waiting on an aborted generation. generate_image bounds its own
-#: worker drain (``_IMAGE_DRAIN_TIMEOUT``); this only guarantees the tool call
-#: returns even if that contract breaks. None = drain timeout + 30s.
-_ABORT_DRAIN_TIMEOUT: float | None = None
+#: Backstop for waiting on an aborted generation. Returning early is safe:
+#: generate_image keeps the inference lock until its own (bounded) worker
+#: drain finishes, so an abandoned denoise can't overlap later Metal work —
+#: this only keeps a stuck worker from stalling run cancel / shutdown.
+_ABORT_DRAIN_TIMEOUT = 30.0
 
 
 async def _abort_generation(
@@ -305,16 +320,11 @@ async def _abort_generation(
 ) -> None:
     cancel.set()
     gen.cancel()
-    timeout = _ABORT_DRAIN_TIMEOUT
-    if timeout is None:
-        from olmlx.engine.inference import _IMAGE_DRAIN_TIMEOUT
-
-        timeout = _IMAGE_DRAIN_TIMEOUT + 30.0
-    await asyncio.wait({gen}, timeout=timeout)
+    await asyncio.wait({gen}, timeout=_ABORT_DRAIN_TIMEOUT)
     if not gen.done():
         logger.warning(
             "generate_image did not stop within %.0fs of being aborted; abandoning it",
-            timeout,
+            _ABORT_DRAIN_TIMEOUT,
         )
     # Consume the outcome (now or whenever it lands) so it is never logged as
     # an unretrieved exception; the abort reason is what gets reported.
@@ -658,6 +668,7 @@ class AgentToolManager(BuiltinToolManager):
             return _err(f"Image generation failed: {exc}", user=False)
         finally:
             cancelled.cancel()
+            await asyncio.wait({cancelled})
             if not gen.done() and not aborted:
                 # This tool call itself was cancelled: stop the denoise and
                 # wait for the worker so it never outlives the call.

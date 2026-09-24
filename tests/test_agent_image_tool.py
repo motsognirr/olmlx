@@ -361,6 +361,20 @@ class TestSandbox:
         assert result.is_user_error is False
         assert gen.calls == []
 
+    @pytest.mark.parametrize("filename", ["art/logo.png", "art/sub/logo.png"])
+    async def test_explicit_filename_parent_is_a_file(
+        self, context, workspace, filename
+    ):
+        (workspace / "art").write_text("not a dir")
+        gen = FakeGenerator()
+        tools = _tools(context, workspace, gen)
+        result = await tools.call_tool(
+            "generate_image", {"prompt": "x", "filename": filename}
+        )
+        assert isinstance(result, ToolError)
+        assert "not a directory" in result.message
+        assert gen.calls == []
+
     async def test_symlinked_default_dir_rejected_before_generation(
         self, context, workspace, tmp_path
     ):
