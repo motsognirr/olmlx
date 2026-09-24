@@ -79,8 +79,8 @@ class AgentService:
         self._session_factory = session_factory
         self._id_factory = id_factory or (lambda: uuid.uuid4().hex)
         self._handles: dict[str, _RunHandle] = {}
-        self._warned_image_slots = False
-        self._warned_image_model = False
+        #: generate_image config problems already logged (once per reason).
+        self._image_warnings: set[str] = set()
         self._delegate_runner = DelegateRunner(self)
 
     async def startup(self) -> None:
@@ -348,8 +348,8 @@ class AgentService:
         # generate_image creates workspace files, so the hard-off file-write
         # posture must cover it too.
         if s.agent_file_write_policy == "deny":
-            if not self._warned_image_model:
-                self._warned_image_model = True
+            if "deny" not in self._image_warnings:
+                self._image_warnings.add("deny")
                 logger.warning(
                     "agent_image_model=%r is set but agent_file_write_policy="
                     "deny; generate_image (which writes files) is disabled.",
@@ -362,8 +362,8 @@ class AgentService:
         try:
             entry = registry.resolve(image_model) if registry is not None else None
         except Exception:
-            if not self._warned_image_model:
-                self._warned_image_model = True
+            if "resolve" not in self._image_warnings:
+                self._image_warnings.add("resolve")
                 logger.warning(
                     "agent_image_model=%r could not be resolved; "
                     "generate_image is disabled.",
@@ -372,16 +372,16 @@ class AgentService:
                 )
             return None
         if not (isinstance(entry, ModelConfig) and entry.is_image is True):
-            if not self._warned_image_model:
-                self._warned_image_model = True
+            if "not_image" not in self._image_warnings:
+                self._image_warnings.add("not_image")
                 logger.warning(
                     "agent_image_model=%r is not a models.json entry declared "
                     'with "type": "image"; generate_image is disabled.',
                     image_model,
                 )
             return None
-        if s.max_loaded_models < 2 and not self._warned_image_slots:
-            self._warned_image_slots = True
+        if s.max_loaded_models < 2 and "slots" not in self._image_warnings:
+            self._image_warnings.add("slots")
             logger.warning(
                 "agent_image_model=%r with max_loaded_models=%d: each "
                 "generate_image call will evict the agent's LLM and reload it "

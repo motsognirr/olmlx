@@ -603,6 +603,7 @@ class AgentToolManager(BuiltinToolManager):
         # immediately; generate_image drains its worker before returning.
         cancel = threading.Event()
         gen = asyncio.ensure_future(tool.generate(**params, cancel_event=cancel))
+        aborted = False
         cancelled = asyncio.ensure_future(self._context.cancel_event.wait())
         try:
             done, _ = await asyncio.wait(
@@ -611,6 +612,7 @@ class AgentToolManager(BuiltinToolManager):
                 return_when=asyncio.FIRST_COMPLETED,
             )
             if gen not in done:
+                aborted = True
                 await _abort_generation(gen, cancel)
                 if cancelled in done:
                     return _err("Image generation was cancelled.", user=False)
@@ -631,7 +633,7 @@ class AgentToolManager(BuiltinToolManager):
             return _err(f"Image generation failed: {exc}", user=False)
         finally:
             cancelled.cancel()
-            if not gen.done():
+            if not gen.done() and not aborted:
                 # This tool call itself was cancelled: stop the denoise and
                 # wait for the worker so it never outlives the call.
                 await _abort_generation(gen, cancel)

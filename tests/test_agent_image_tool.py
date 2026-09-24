@@ -496,7 +496,7 @@ class TestCancellation:
         assert task_cancelled.is_set()
 
     async def test_abort_returns_even_if_generation_ignores_cancel(
-        self, context, workspace, monkeypatch
+        self, context, workspace, monkeypatch, caplog
     ):
         from olmlx.engine.agent import tools as tools_mod
 
@@ -524,6 +524,9 @@ class TestCancellation:
         )
         assert isinstance(result, ToolError)
         assert "budget" in result.message
+        # Drained (and warned about) once, not again in the finally block.
+        abandoned = [r for r in caplog.records if "abandoning" in r.getMessage()]
+        assert len(abandoned) == 1
         release.set()  # let the abandoned task finish cleanly
         await asyncio.sleep(0)
 
@@ -629,6 +632,31 @@ class TestServiceWiring:
             )
         assert "generate_image" not in sess.builtin.tool_names
         assert any("deny" in r.getMessage() for r in caplog.records)
+
+    def test_each_disable_reason_warns_once_independently(
+        self, store, tmp_path, caplog
+    ):
+        manager = _manager(**{"qwen3": _TEXT_ENTRY})
+        svc = self._service(
+            store,
+            tmp_path,
+            manager,
+            agent_image_model="qwen3",
+            max_loaded_models=2,
+        )
+        with caplog.at_level("WARNING", logger="olmlx.engine.agent.service"):
+            svc._make_image_tool()
+            svc._make_image_tool()  # repeat: no second warning
+            manager.registry = _FakeRegistry({})  # now resolve -> error path
+
+            def boom(name):
+                raise ValueError("bad name")
+
+            manager.registry.resolve = boom
+            svc._make_image_tool()
+        msgs = [r.getMessage() for r in caplog.records]
+        assert sum("not a models.json entry" in m for m in msgs) == 1
+        assert sum("could not be resolved" in m for m in msgs) == 1
 
     def test_warns_when_model_slots_too_few(self, store, tmp_path, caplog):
         with caplog.at_level("WARNING", logger="olmlx.engine.agent.service"):
