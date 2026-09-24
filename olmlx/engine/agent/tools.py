@@ -327,23 +327,48 @@ class _NameTaken(Exception):
 
 
 def _write_new(name: str, root: Path, data: bytes) -> Path:
-    """Resolve *name* inside *root* (following symlinks, like ``write_file``)
-    and write *data* to a new file; never overwrites (``"xb"``)."""
+    """Write *data* to a new file at *name* inside *root*; never overwrites.
+
+    The path is confined like ``write_file`` (symlinks followed, must land
+    in *root*), then created by walking it from *root* one component at a
+    time with ``dir_fd`` + ``O_NOFOLLOW`` and a final ``O_CREAT|O_EXCL``. Each
+    opened directory fd pins the directory, so swapping a component for a
+    symlink between the check and the write can't redirect it outside.
+    """
+    real_root = root.resolve()
     path = _confined(name, root)
+    parts = path.relative_to(real_root).parts
+    dir_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    # The root itself is operator config (trusted); create it like write_file.
+    real_root.mkdir(parents=True, exist_ok=True)
+    fd = os.open(real_root, os.O_RDONLY | os.O_DIRECTORY)
     try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-    except FileExistsError:
-        raise NotADirectoryError(
-            f"{path.parent} exists and is not a directory"
-        ) from None
-    # Re-resolve after mkdir: a symlink planted during generation must not
-    # redirect the write outside the workspace.
-    path = _confined(name, root)
-    try:
-        with open(path, "xb") as f:
+        for part in parts[:-1]:
+            try:
+                os.mkdir(part, dir_fd=fd)
+            except FileExistsError:
+                pass
+            try:
+                next_fd = os.open(part, dir_flags, dir_fd=fd)
+            except OSError as exc:
+                raise NotADirectoryError(
+                    f"{part!r} in {path} is not a plain directory ({exc.strerror})"
+                ) from None
+            os.close(fd)
+            fd = next_fd
+        try:
+            file_fd = os.open(
+                parts[-1],
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                0o644,
+                dir_fd=fd,
+            )
+        except FileExistsError:
+            raise _NameTaken(str(path)) from None
+        with os.fdopen(file_fd, "wb") as f:
             f.write(data)
-    except FileExistsError:
-        raise _NameTaken(str(path)) from None
+    finally:
+        os.close(fd)
     return path
 
 

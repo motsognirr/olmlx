@@ -293,6 +293,46 @@ class TestSandbox:
         assert isinstance(result, ToolError)
         assert list(outside.iterdir()) == []
 
+    async def test_symlink_swapped_after_confinement_check_cannot_escape(
+        self, context, workspace, tmp_path, monkeypatch
+    ):
+        """Simulate losing the check-vs-open race: path confinement says the
+        target is inside the workspace, but a component is already a symlink
+        to outside. The fd-relative O_NOFOLLOW walk must still refuse."""
+        from olmlx.engine.agent import tools as tools_mod
+
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        (workspace / "art").symlink_to(outside)
+        monkeypatch.setattr(
+            tools_mod, "_confined", lambda name, root: root.resolve() / name
+        )
+        monkeypatch.setattr(tools_mod, "_check_image_target", lambda n, r: None)
+        tools = _tools(context, workspace, FakeGenerator())
+        result = await tools.call_tool(
+            "generate_image", {"prompt": "x", "filename": "art/logo.png"}
+        )
+        assert isinstance(result, ToolError)
+        assert list(outside.iterdir()) == []
+
+    async def test_final_component_symlink_not_followed(
+        self, context, workspace, tmp_path, monkeypatch
+    ):
+        from olmlx.engine.agent import tools as tools_mod
+
+        victim = tmp_path / "victim.png"
+        (workspace / "logo.png").symlink_to(victim)
+        monkeypatch.setattr(
+            tools_mod, "_confined", lambda name, root: root.resolve() / name
+        )
+        monkeypatch.setattr(tools_mod, "_check_image_target", lambda n, r: None)
+        tools = _tools(context, workspace, FakeGenerator())
+        result = await tools.call_tool(
+            "generate_image", {"prompt": "x", "filename": "logo.png"}
+        )
+        assert isinstance(result, ToolError)
+        assert not victim.exists()
+
     async def test_images_path_is_a_file(self, context, workspace):
         (workspace / "images").write_text("not a dir")
         gen = FakeGenerator()
