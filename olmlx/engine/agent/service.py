@@ -29,6 +29,7 @@ from olmlx.engine.agent.orchestrator import AgentContext, Budgets, Orchestrator
 from olmlx.engine.agent.store import AgentStore
 
 if TYPE_CHECKING:
+    from olmlx.engine.agent.tools import AgentImageTool
     from olmlx.engine.model_manager import ModelManager
 
 logger = logging.getLogger(__name__)
@@ -78,6 +79,8 @@ class AgentService:
         self._session_factory = session_factory
         self._id_factory = id_factory or (lambda: uuid.uuid4().hex)
         self._handles: dict[str, _RunHandle] = {}
+        #: generate_image config problems already logged (once per reason).
+        self._image_warnings: set[str] = set()
         self._delegate_runner = DelegateRunner(self)
 
     async def startup(self) -> None:
@@ -303,7 +306,9 @@ class AgentService:
         skills.load()
         # Pass the live SkillManager so a mid-run create_skill registers into
         # it and is immediately usable via use_skill (#636).
-        builtin = AgentToolManager(config, context, skills=skills)
+        builtin = AgentToolManager(
+            config, context, skills=skills, image_tool=self._make_image_tool()
+        )
         # Gate the mutating/exec builtins per policy; every other tool stays
         # ALLOW so the agent still runs autonomously. AUTO routes through an LLM
         # safety judge (fail-closed); "deny" blocks outright; "allow" trusts.
@@ -314,6 +319,9 @@ class AgentService:
                     "bash": ToolPolicy(s.agent_shell_policy),
                     "write_file": ToolPolicy(s.agent_file_write_policy),
                     "edit_file": ToolPolicy(s.agent_file_write_policy),
+                    # Writes model-chosen files too (#725), so it follows the
+                    # same posture; "deny" additionally never offers it.
+                    "generate_image": ToolPolicy(s.agent_file_write_policy),
                 },
             ),
             llm_judge=self._make_tool_safety_judge(run["model"], run["goal"]),
@@ -324,6 +332,78 @@ class AgentService:
             skills=skills,
             builtin=builtin,
             tool_safety=tool_safety,
+        )
+
+    def _make_image_tool(self) -> "AgentImageTool | None":
+        """The ``generate_image`` wiring, or None when no image model is set.
+
+        Routes through ``inference.generate_image`` (inference lock, drain on
+        cancel, Metal-stream handling) — never mflux directly (issue #725).
+        """
+        from olmlx.engine.agent.tools import AgentImageTool
+
+        from olmlx.engine.registry import ModelConfig
+
+        s = self._settings
+        image_model = s.agent_image_model
+        if not image_model:
+            return None
+        # generate_image creates workspace files, so the hard-off file-write
+        # posture must cover it too.
+        if s.agent_file_write_policy == "deny":
+            if "deny" not in self._image_warnings:
+                self._image_warnings.add("deny")
+                logger.warning(
+                    "agent_image_model=%r is set but agent_file_write_policy="
+                    "deny; generate_image (which writes files) is disabled.",
+                    image_model,
+                )
+            return None
+        # Only advertise the tool for a declared image entry: an undeclared or
+        # text model would otherwise fail (or trigger a load) on first use.
+        registry = getattr(self._manager_getter(), "registry", None)
+        try:
+            entry = registry.resolve(image_model) if registry is not None else None
+        except Exception:
+            if "resolve" not in self._image_warnings:
+                self._image_warnings.add("resolve")
+                logger.warning(
+                    "agent_image_model=%r could not be resolved; "
+                    "generate_image is disabled.",
+                    image_model,
+                    exc_info=True,
+                )
+            return None
+        if not (isinstance(entry, ModelConfig) and entry.is_image is True):
+            if "not_image" not in self._image_warnings:
+                self._image_warnings.add("not_image")
+                logger.warning(
+                    "agent_image_model=%r is not a models.json entry declared "
+                    'with "type": "image"; generate_image is disabled.',
+                    image_model,
+                )
+            return None
+        if s.max_loaded_models < 2 and "slots" not in self._image_warnings:
+            self._image_warnings.add("slots")
+            logger.warning(
+                "agent_image_model=%r with max_loaded_models=%d: each "
+                "generate_image call will evict the agent's LLM and reload it "
+                "afterwards. Set OLMLX_MAX_LOADED_MODELS>=2 if memory allows.",
+                image_model,
+                s.max_loaded_models,
+            )
+
+        async def generate(prompt: str, **kwargs: Any) -> dict:
+            from olmlx.engine import inference
+
+            return await inference.generate_image(
+                self._manager_getter(), image_model, prompt, **kwargs
+            )
+
+        return AgentImageTool(
+            generate=generate,
+            max_dimension=s.image_max_dimension,
+            max_prompt_chars=s.image_max_prompt_chars,
         )
 
     def _make_tool_safety_judge(self, model: str, goal: str):

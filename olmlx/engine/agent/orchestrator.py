@@ -85,6 +85,11 @@ class AgentContext:
     #: authoritative finish signal is the ``tool_call`` event stream).
     finished: bool = False
     finish_summary: str = ""
+    #: Seconds left in the run's wallclock budget (None = unlimited). Set by
+    #: the orchestrator; lets a long tool call (generate_image, #725) abort
+    #: instead of overrunning the budget, which is otherwise only checked at
+    #: iteration boundaries.
+    time_remaining: Callable[[], float | None] | None = None
 
 
 class Orchestrator:
@@ -135,6 +140,10 @@ class Orchestrator:
 
         def elapsed() -> float:
             return prior_runtime + (self.clock() - start)
+
+        wallclock = self.budgets.wallclock_timeout
+        if wallclock is not None:
+            self.context.time_remaining = lambda: wallclock - elapsed()
 
         try:
             while True:

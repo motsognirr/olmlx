@@ -536,7 +536,7 @@ class Settings(BaseSettings):
     #: actions. ``auto`` (default) routes each such call through an LLM safety
     #: judge; ``allow`` trusts them unconditionally; ``deny`` blocks them.
     #: ``agent_shell_policy`` governs ``bash``; ``agent_file_write_policy``
-    #: governs ``write_file`` and ``edit_file``. All other tools stay allowed.
+    #: governs ``write_file``, ``edit_file`` and ``generate_image``. All other tools stay allowed.
     agent_shell_policy: Literal["allow", "auto", "deny"] = "auto"
     agent_file_write_policy: Literal["allow", "auto", "deny"] = "auto"
     #: Confine agent file writes to this directory — absolute-path escapes are
@@ -544,6 +544,12 @@ class Settings(BaseSettings):
     #: server's working directory. Only bounds the agent; interactive chat is
     #: unaffected.
     agent_workspace_dir: Path | None = None
+    #: Image model for the agent's ``generate_image`` tool (issue #725): a
+    #: models.json entry declared ``"type": "image"``. Empty (default) means
+    #: the tool is not offered. Images are saved inside the agent workspace.
+    #: The image model takes its own ``max_loaded_models`` slot — with fewer
+    #: than 2, every image call evicts (and later reloads) the agent's LLM.
+    agent_image_model: str = ""
 
     @model_validator(mode="after")
     def validate_auto_calibrate(self) -> "Settings":
