@@ -8,6 +8,8 @@ first, then to the inherited file/shell/web/plan tools.
 Phase 1 adds only ``finish`` (the self-judged success terminator). Later phases
 register ``remember`` / ``recall`` (Phase 2), ``create_skill`` (Phase 3), and
 ``delegate`` (Phase 4) by extending ``_agent_handlers`` / ``_agent_defs``.
+``generate_image`` (#725) is offered only when an ``AgentImageTool`` is passed
+(``OLMLX_AGENT_IMAGE_MODEL`` set).
 
 ``finish`` itself does no control-flow magic: the orchestrator detects it from
 the ``tool_call`` event ``ChatSession`` emits, so the handler only needs to
@@ -19,9 +21,12 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from typing import TYPE_CHECKING, Any
+import threading
+from dataclasses import dataclass
+from pathlib import Path
+from typing import TYPE_CHECKING, Any, Awaitable, Callable
 
-from olmlx.chat.builtin_tools import BuiltinToolManager
+from olmlx.chat.builtin_tools import BuiltinToolManager, _resolve_path
 from olmlx.chat.config import ChatConfig
 from olmlx.chat.errors import ToolError
 
@@ -148,6 +153,105 @@ _CREATE_SKILL_DEF = {
     },
 }
 
+_GENERATE_IMAGE_DEF = {
+    "type": "function",
+    "function": {
+        "name": "generate_image",
+        "description": (
+            "Generate an image from a text prompt and save it to a file in the "
+            "workspace. Returns the saved file's path (not the image data). "
+            "Slow: expect minutes per image."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "prompt": {
+                    "type": "string",
+                    "description": "Detailed description of the image.",
+                },
+                "filename": {
+                    "type": "string",
+                    "description": (
+                        "Optional output path inside the workspace; the "
+                        "extension (.png, .jpg, .webp) picks the format. "
+                        "Existing files are never overwritten. Defaults to "
+                        "images/<run>-<seed>.png."
+                    ),
+                },
+                "width": {
+                    "type": "integer",
+                    "description": "Width in pixels (multiple of 16). Default 1024.",
+                },
+                "height": {
+                    "type": "integer",
+                    "description": "Height in pixels (multiple of 16). Default 1024.",
+                },
+                "seed": {
+                    "type": "integer",
+                    "description": "Optional seed for reproducibility.",
+                },
+                "steps": {
+                    "type": "integer",
+                    "description": "Optional diffusion steps (model default if unset).",
+                },
+                "negative_prompt": {
+                    "type": "string",
+                    "description": "Optional description of what to avoid.",
+                },
+            },
+            "required": ["prompt"],
+        },
+    },
+}
+
+#: Output-file suffix -> ``image_gen.encode_image`` format.
+_IMAGE_SUFFIX_FORMATS = {
+    ".png": "png",
+    ".jpg": "jpeg",
+    ".jpeg": "jpeg",
+    ".webp": "webp",
+}
+_IMAGE_DEFAULT_SIZE = 1024
+_IMAGE_MAX_STEPS = 200
+
+
+@dataclass(frozen=True)
+class AgentImageTool:
+    """Wiring for the ``generate_image`` tool (issue #725).
+
+    ``generate`` has ``inference.generate_image``'s signature minus the
+    manager/model (bound by the service), so every call goes through the
+    inference lock and Metal-stream handling — never mflux directly. Limits
+    mirror the ``/v1/images/generations`` router's settings.
+    """
+
+    generate: Callable[..., Awaitable[dict]]
+    max_dimension: int
+    max_prompt_chars: int
+
+
+class _ImageArgError(ValueError):
+    pass
+
+
+def _int_arg(
+    arguments: dict, key: str, default: int | None, lo: int, hi: int
+) -> int | None:
+    value = arguments.get(key)
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        raise _ImageArgError(f"{key!r} must be an integer")
+    try:
+        as_int = int(value)
+    except (TypeError, ValueError):
+        raise _ImageArgError(f"{key!r} must be an integer") from None
+    if isinstance(value, float) and value != as_int:
+        raise _ImageArgError(f"{key!r} must be an integer")
+    if not lo <= as_int <= hi:
+        raise _ImageArgError(f"{key!r} must be between {lo} and {hi}")
+    return as_int
+
 
 #: Inherited builtin tools that make no sense for a headless autonomous run.
 #: ``question`` blocks on a human answer that never comes — it would return the
@@ -159,9 +263,16 @@ _EXCLUDED_BUILTINS = frozenset({"question"})
 class AgentToolManager(BuiltinToolManager):
     """Builtin tools plus the agent's control tools, bound to an AgentContext."""
 
-    def __init__(self, config: ChatConfig, context: "AgentContext", skills: Any = None):
+    def __init__(
+        self,
+        config: ChatConfig,
+        context: "AgentContext",
+        skills: Any = None,
+        image_tool: AgentImageTool | None = None,
+    ):
         super().__init__(config)
         self._context = context
+        self._image_tool = image_tool
         # The live SkillManager (when the agent rides a ChatSession), so a
         # ``create_skill`` mid-run is immediately usable via ``use_skill``
         # (#636). None in tests / bare tool-manager use.
@@ -173,6 +284,8 @@ class AgentToolManager(BuiltinToolManager):
             _CREATE_SKILL_DEF,
             _DELEGATE_DEF,
         ]
+        if image_tool is not None:
+            self._agent_defs.append(_GENERATE_IMAGE_DEF)
 
     @property
     def tool_names(self) -> set[str]:
@@ -198,6 +311,8 @@ class AgentToolManager(BuiltinToolManager):
             return await self._handle_create_skill(arguments)
         if name == "delegate":
             return await self._handle_delegate(arguments)
+        if name == "generate_image" and self._image_tool is not None:
+            return await self._handle_generate_image(self._image_tool, arguments)
         return await super().call_tool(name, arguments)
 
     def _handle_finish(self, arguments: dict) -> str:
@@ -302,4 +417,158 @@ class AgentToolManager(BuiltinToolManager):
             message=(f"Subagent {status}: {result.get('error') or 'no result'}"),
             tool_name="delegate",
             is_user_error=False,
+        )
+
+    def _validate_image_args(self, tool: AgentImageTool, arguments: dict) -> dict:
+        prompt = arguments.get("prompt")
+        if not isinstance(prompt, str) or not prompt.strip():
+            raise _ImageArgError("generate_image requires a non-empty 'prompt'")
+        negative = arguments.get("negative_prompt")
+        if negative is not None and not isinstance(negative, str):
+            raise _ImageArgError("'negative_prompt' must be a string")
+        for key, text in (("prompt", prompt), ("negative_prompt", negative)):
+            if text is not None and len(text) > tool.max_prompt_chars:
+                raise _ImageArgError(
+                    f"{key!r} exceeds {tool.max_prompt_chars} characters"
+                )
+        width = _int_arg(
+            arguments, "width", _IMAGE_DEFAULT_SIZE, 64, tool.max_dimension
+        )
+        height = _int_arg(
+            arguments, "height", _IMAGE_DEFAULT_SIZE, 64, tool.max_dimension
+        )
+        if width % 16 or height % 16:  # type: ignore[operator]
+            raise _ImageArgError("'width' and 'height' must be multiples of 16")
+        return {
+            "prompt": prompt,
+            "width": width,
+            "height": height,
+            "seed": _int_arg(arguments, "seed", None, 0, 2**32 - 1),
+            "steps": _int_arg(arguments, "steps", None, 1, _IMAGE_MAX_STEPS),
+            "negative_prompt": negative or None,
+        }
+
+    def _image_target(self, filename: Any) -> tuple[Path | None, str]:
+        """Resolve an explicit ``filename`` to ``(path, format)``.
+
+        Returns ``(None, "png")`` when no filename was given (the default name
+        needs the seed, known only after generation). Confined to the
+        workspace exactly like ``write_file``.
+        """
+        if filename is None or (isinstance(filename, str) and not filename.strip()):
+            return None, "png"
+        if not isinstance(filename, str):
+            raise _ImageArgError("'filename' must be a string")
+        suffix = Path(filename).suffix.lower()
+        if not suffix:
+            filename += ".png"
+            suffix = ".png"
+        fmt = _IMAGE_SUFFIX_FORMATS.get(suffix)
+        if fmt is None:
+            raise _ImageArgError(
+                f"unsupported image extension {suffix!r}; "
+                "use .png, .jpg, .jpeg or .webp"
+            )
+        try:
+            path = _resolve_path(filename, confine_root=self._workspace())
+        except ValueError as exc:
+            raise _ImageArgError(str(exc)) from None
+        if path.exists():
+            raise _ImageArgError(f"{path} already exists; choose a different filename")
+        return path, fmt
+
+    def _workspace(self) -> Path:
+        return self._config.write_root or Path.cwd()
+
+    async def _handle_generate_image(
+        self, tool: AgentImageTool, arguments: dict
+    ) -> str | ToolError:
+        from olmlx.engine.image_gen import ImageGenerationCancelled, encode_image
+
+        try:
+            params = self._validate_image_args(tool, arguments)
+            target, fmt = self._image_target(arguments.get("filename"))
+        except _ImageArgError as exc:
+            return ToolError(
+                message=str(exc), tool_name="generate_image", is_user_error=True
+            )
+        if self._context.cancel_event.is_set():
+            return ToolError(
+                message="Run is cancelled; image not generated.",
+                tool_name="generate_image",
+                is_user_error=False,
+            )
+
+        # Agent cancel is a cooperative asyncio.Event; generate_image polls a
+        # threading.Event after every diffusion step. Bridge the two so a
+        # cancelled run stops a multi-minute denoise instead of waiting it out.
+        cancel = threading.Event()
+
+        async def _bridge_cancel() -> None:
+            await self._context.cancel_event.wait()
+            cancel.set()
+
+        bridge = asyncio.create_task(_bridge_cancel())
+        try:
+            out = await tool.generate(**params, cancel_event=cancel)
+        except ImageGenerationCancelled:
+            return ToolError(
+                message="Image generation was cancelled.",
+                tool_name="generate_image",
+                is_user_error=False,
+            )
+        except ValueError as exc:
+            return ToolError(
+                message=str(exc), tool_name="generate_image", is_user_error=True
+            )
+        except Exception as exc:
+            logger.warning("generate_image failed", exc_info=True)
+            return ToolError(
+                message=f"Image generation failed: {exc}",
+                tool_name="generate_image",
+                is_user_error=False,
+            )
+        finally:
+            bridge.cancel()
+            await asyncio.wait({bridge})
+
+        seed = out["seed"]
+        stem = f"{self._context.run_id[:8]}-{seed}"
+        default_dir = self._workspace().resolve() / "images"
+
+        def _save() -> Path:
+            data = encode_image(out["image"], fmt)
+            if target is not None:
+                target.parent.mkdir(parents=True, exist_ok=True)
+                # "xb": never clobber a file created while we were generating.
+                with open(target, "xb") as f:
+                    f.write(data)
+                return target
+            default_dir.mkdir(parents=True, exist_ok=True)
+            n = 0
+            while True:
+                path = default_dir / (f"{stem}.png" if n == 0 else f"{stem}-{n}.png")
+                try:
+                    with open(path, "xb") as f:
+                        f.write(data)
+                    return path
+                except FileExistsError:
+                    n += 1
+
+        try:
+            path = await asyncio.to_thread(_save)
+        except FileExistsError:
+            return ToolError(
+                message=f"{target} already exists; choose a different filename",
+                tool_name="generate_image",
+                is_user_error=True,
+            )
+        except OSError as exc:
+            return ToolError(
+                message=f"Error saving image: {exc}",
+                tool_name="generate_image",
+                is_user_error=False,
+            )
+        return (
+            f"Saved {params['width']}x{params['height']} image to {path} (seed {seed})."
         )

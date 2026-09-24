@@ -78,6 +78,7 @@ class AgentService:
         self._session_factory = session_factory
         self._id_factory = id_factory or (lambda: uuid.uuid4().hex)
         self._handles: dict[str, _RunHandle] = {}
+        self._warned_image_slots = False
         self._delegate_runner = DelegateRunner(self)
 
     async def startup(self) -> None:
@@ -303,7 +304,9 @@ class AgentService:
         skills.load()
         # Pass the live SkillManager so a mid-run create_skill registers into
         # it and is immediately usable via use_skill (#636).
-        builtin = AgentToolManager(config, context, skills=skills)
+        builtin = AgentToolManager(
+            config, context, skills=skills, image_tool=self._make_image_tool()
+        )
         # Gate the mutating/exec builtins per policy; every other tool stays
         # ALLOW so the agent still runs autonomously. AUTO routes through an LLM
         # safety judge (fail-closed); "deny" blocks outright; "allow" trusts.
@@ -324,6 +327,41 @@ class AgentService:
             skills=skills,
             builtin=builtin,
             tool_safety=tool_safety,
+        )
+
+    def _make_image_tool(self) -> Any:
+        """The ``generate_image`` wiring, or None when no image model is set.
+
+        Routes through ``inference.generate_image`` (inference lock, drain on
+        cancel, Metal-stream handling) — never mflux directly (issue #725).
+        """
+        from olmlx.engine.agent.tools import AgentImageTool
+
+        s = self._settings
+        image_model = s.agent_image_model
+        if not image_model:
+            return None
+        if s.max_loaded_models < 2 and not self._warned_image_slots:
+            self._warned_image_slots = True
+            logger.warning(
+                "agent_image_model=%r with max_loaded_models=%d: each "
+                "generate_image call will evict the agent's LLM and reload it "
+                "afterwards. Set OLMLX_MAX_LOADED_MODELS>=2 if memory allows.",
+                image_model,
+                s.max_loaded_models,
+            )
+
+        async def generate(prompt: str, **kwargs: Any) -> dict:
+            from olmlx.engine import inference
+
+            return await inference.generate_image(
+                self._manager_getter(), image_model, prompt, **kwargs
+            )
+
+        return AgentImageTool(
+            generate=generate,
+            max_dimension=s.image_max_dimension,
+            max_prompt_chars=s.image_max_prompt_chars,
         )
 
     def _make_tool_safety_judge(self, model: str, goal: str):

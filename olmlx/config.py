@@ -544,6 +544,12 @@ class Settings(BaseSettings):
     #: server's working directory. Only bounds the agent; interactive chat is
     #: unaffected.
     agent_workspace_dir: Path | None = None
+    #: Image model for the agent's ``generate_image`` tool (issue #725): a
+    #: models.json entry declared ``"type": "image"``. Empty (default) means
+    #: the tool is not offered. Images are saved inside the agent workspace.
+    #: The image model takes its own ``max_loaded_models`` slot — with fewer
+    #: than 2, every image call evicts (and later reloads) the agent's LLM.
+    agent_image_model: str = ""
 
     @model_validator(mode="after")
     def validate_auto_calibrate(self) -> "Settings":
