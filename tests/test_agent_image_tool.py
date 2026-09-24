@@ -305,6 +305,22 @@ class TestSandbox:
         # Caught before generation, not after minutes of denoising.
         assert gen.calls == []
 
+    async def test_precheck_os_error_is_tool_error(
+        self, context, workspace, monkeypatch
+    ):
+        from olmlx.engine.agent import tools as tools_mod
+
+        def broken(name, root):
+            raise PermissionError("workspace unreadable")
+
+        monkeypatch.setattr(tools_mod, "_check_image_dir", broken)
+        gen = FakeGenerator()
+        tools = _tools(context, workspace, gen)
+        result = await tools.call_tool("generate_image", {"prompt": "x"})
+        assert isinstance(result, ToolError)
+        assert result.is_user_error is False
+        assert gen.calls == []
+
     async def test_symlinked_default_dir_rejected_before_generation(
         self, context, workspace, tmp_path
     ):

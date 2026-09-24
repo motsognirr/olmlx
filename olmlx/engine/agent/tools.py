@@ -585,6 +585,8 @@ class AgentToolManager(BuiltinToolManager):
                 await asyncio.to_thread(_check_image_dir, "images", workspace)
         except _ImageArgError as exc:
             return _err(str(exc), user=True)
+        except OSError as exc:
+            return _err(f"Cannot check output path: {exc}", user=False)
         if self._context.cancel_event.is_set():
             return _err("Run is cancelled; image not generated.", user=False)
         remaining = (
