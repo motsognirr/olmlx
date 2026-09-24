@@ -29,6 +29,7 @@ from olmlx.engine.agent.orchestrator import AgentContext, Budgets, Orchestrator
 from olmlx.engine.agent.store import AgentStore
 
 if TYPE_CHECKING:
+    from olmlx.engine.agent.tools import AgentImageTool
     from olmlx.engine.model_manager import ModelManager
 
 logger = logging.getLogger(__name__)
@@ -330,7 +331,7 @@ class AgentService:
             tool_safety=tool_safety,
         )
 
-    def _make_image_tool(self) -> Any:
+    def _make_image_tool(self) -> "AgentImageTool | None":
         """The ``generate_image`` wiring, or None when no image model is set.
 
         Routes through ``inference.generate_image`` (inference lock, drain on
@@ -344,13 +345,25 @@ class AgentService:
         image_model = s.agent_image_model
         if not image_model:
             return None
+        # generate_image creates workspace files, so the hard-off file-write
+        # posture must cover it too.
+        if s.agent_file_write_policy == "deny":
+            return None
         # Only advertise the tool for a declared image entry: an undeclared or
         # text model would otherwise fail (or trigger a load) on first use.
         registry = getattr(self._manager_getter(), "registry", None)
         try:
             entry = registry.resolve(image_model) if registry is not None else None
         except Exception:
-            entry = None
+            if not self._warned_image_model:
+                self._warned_image_model = True
+                logger.warning(
+                    "agent_image_model=%r could not be resolved; "
+                    "generate_image is disabled.",
+                    image_model,
+                    exc_info=True,
+                )
+            return None
         if not (isinstance(entry, ModelConfig) and entry.is_image is True):
             if not self._warned_image_model:
                 self._warned_image_model = True

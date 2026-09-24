@@ -225,6 +225,13 @@ class TestValidation:
             {"prompt": "x", "steps": 500},
             {"prompt": "x", "seed": -1},
             {"prompt": "x", "negative_prompt": "y" * 11},
+            {"prompt": "x", "width": float("inf")},
+            {"prompt": "x", "seed": float("inf")},
+            {"prompt": "x", "width": 64.5},
+            {"prompt": "x", "width": True},
+            {"prompt": "x", "filename": "renders/"},
+            {"prompt": "x", "filename": ".."},
+            {"prompt": 5},
         ],
     )
     async def test_invalid_args_rejected_before_generation(
@@ -238,12 +245,73 @@ class TestValidation:
         assert gen.calls == []
 
 
+class TestDefaults:
+    async def test_default_size_respects_small_max_dimension(self, context, workspace):
+        gen = FakeGenerator()
+        tools = _tools(context, workspace, gen, max_dimension=770)
+        result = await tools.call_tool("generate_image", {"prompt": "x"})
+        assert isinstance(result, str), result
+        assert gen.calls[0]["width"] == 768
+        assert gen.calls[0]["height"] == 768
+
+
+class TestSandbox:
+    async def test_symlinked_default_dir_cannot_escape(
+        self, context, workspace, tmp_path
+    ):
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        (workspace / "images").symlink_to(outside)
+        tools = _tools(context, workspace, FakeGenerator())
+        result = await tools.call_tool(
+            "generate_image", {"prompt": "x", "width": 64, "height": 64}
+        )
+        assert isinstance(result, ToolError)
+        assert list(outside.iterdir()) == []
+
+    async def test_symlink_planted_during_generation_cannot_escape(
+        self, context, workspace, tmp_path
+    ):
+        outside = tmp_path / "outside"
+        outside.mkdir()
+
+        async def gen(prompt, **kwargs):
+            # Passed the pre-generation check; now redirect the target dir.
+            (workspace / "art").symlink_to(outside)
+            return {"image": Image.new("RGB", (64, 64)), "seed": 1}
+
+        tools = AgentToolManager(
+            ChatConfig(model_name="m", write_root=workspace),
+            context,
+            image_tool=AgentImageTool(
+                generate=gen, max_dimension=2048, max_prompt_chars=100
+            ),
+        )
+        result = await tools.call_tool(
+            "generate_image", {"prompt": "x", "filename": "art/logo.png"}
+        )
+        assert isinstance(result, ToolError)
+        assert list(outside.iterdir()) == []
+
+    async def test_images_path_is_a_file(self, context, workspace):
+        (workspace / "images").write_text("not a dir")
+        tools = _tools(context, workspace, FakeGenerator())
+        result = await tools.call_tool(
+            "generate_image", {"prompt": "x", "width": 64, "height": 64}
+        )
+        assert isinstance(result, ToolError)
+        assert "None" not in result.message
+
+
 class TestErrors:
-    async def test_value_error_is_user_tool_error(self, context, workspace):
+    async def test_backend_value_error_is_not_a_user_error(self, context, workspace):
+        # Args are validated up front, so a ValueError from generate_image is
+        # configuration (text model, missing extra) the model can't fix.
         gen = FakeGenerator(exc=ValueError("Model 'm' is not an image model."))
         tools = _tools(context, workspace, gen)
         result = await tools.call_tool("generate_image", {"prompt": "x"})
         assert isinstance(result, ToolError)
+        assert result.is_user_error is False
         assert "not an image model" in result.message
 
     async def test_backend_error_is_tool_error(self, context, workspace):
@@ -311,6 +379,98 @@ class TestCancellation:
         result = await asyncio.wait_for(task, 1)
         assert isinstance(result, ToolError)
         assert "cancel" in result.message.lower()
+
+    async def test_run_cancel_aborts_call_blocked_before_denoise(
+        self, context, workspace
+    ):
+        """A cancel while generate_image is loading the model / queued on the
+        inference lock (never polling the per-step event) must still abort
+        promptly by cancelling the task."""
+        started = asyncio.Event()
+        task_cancelled = asyncio.Event()
+
+        async def gen(prompt, **kwargs):
+            started.set()
+            try:
+                await asyncio.Event().wait()  # blocked, never polls
+            except asyncio.CancelledError:
+                task_cancelled.set()
+                raise
+
+        tools = AgentToolManager(
+            ChatConfig(model_name="m", write_root=workspace),
+            context,
+            image_tool=AgentImageTool(
+                generate=gen, max_dimension=2048, max_prompt_chars=100
+            ),
+        )
+        call = asyncio.create_task(tools.call_tool("generate_image", {"prompt": "x"}))
+        await asyncio.wait_for(started.wait(), 1)
+        context.cancel_event.set()
+        result = await asyncio.wait_for(call, 1)
+        assert isinstance(result, ToolError)
+        assert "cancel" in result.message.lower()
+        assert task_cancelled.is_set()
+
+    async def test_tool_call_cancel_propagates_to_generation(self, context, workspace):
+        started = asyncio.Event()
+        task_cancelled = asyncio.Event()
+
+        async def gen(prompt, **kwargs):
+            started.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                assert kwargs["cancel_event"].is_set()
+                task_cancelled.set()
+                raise
+
+        tools = AgentToolManager(
+            ChatConfig(model_name="m", write_root=workspace),
+            context,
+            image_tool=AgentImageTool(
+                generate=gen, max_dimension=2048, max_prompt_chars=100
+            ),
+        )
+        call = asyncio.create_task(tools.call_tool("generate_image", {"prompt": "x"}))
+        await asyncio.wait_for(started.wait(), 1)
+        call.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await call
+        assert task_cancelled.is_set()
+
+    async def test_wallclock_budget_aborts_generation(self, context, workspace):
+        task_cancelled = asyncio.Event()
+
+        async def gen(prompt, **kwargs):
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                task_cancelled.set()
+                raise
+
+        context.time_remaining = lambda: 0.05
+        tools = AgentToolManager(
+            ChatConfig(model_name="m", write_root=workspace),
+            context,
+            image_tool=AgentImageTool(
+                generate=gen, max_dimension=2048, max_prompt_chars=100
+            ),
+        )
+        result = await asyncio.wait_for(
+            tools.call_tool("generate_image", {"prompt": "x"}), 1
+        )
+        assert isinstance(result, ToolError)
+        assert "budget" in result.message
+        assert task_cancelled.is_set()
+
+    async def test_exhausted_budget_does_not_generate(self, context, workspace):
+        gen = FakeGenerator()
+        context.time_remaining = lambda: 0.0
+        tools = _tools(context, workspace, gen)
+        result = await tools.call_tool("generate_image", {"prompt": "x"})
+        assert isinstance(result, ToolError)
+        assert gen.calls == []
 
     async def test_already_cancelled_run_does_not_generate(self, context, workspace):
         gen = FakeGenerator()
@@ -392,6 +552,16 @@ class TestServiceWiring:
         manager = SimpleNamespace(registry=SimpleNamespace(resolve=boom))
         sess = self._session(
             store, tmp_path, manager, agent_image_model="bad!", max_loaded_models=2
+        )
+        assert "generate_image" not in sess.builtin.tool_names
+
+    def test_not_offered_when_file_writes_denied(self, store, tmp_path):
+        sess = self._session(
+            store,
+            tmp_path,
+            agent_image_model="qwen-image",
+            agent_file_write_policy="deny",
+            max_loaded_models=2,
         )
         assert "generate_image" not in sess.builtin.tool_names
 

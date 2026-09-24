@@ -211,6 +211,32 @@ class TestBudgets:
         assert result["status"] == "failed"
         assert result["reason"] == "wallclock_timeout"
 
+    async def test_exposes_time_remaining_to_tools(self, store):
+        """Long tool calls (generate_image, #725) read the remaining wallclock
+        budget from the context; it accounts for prior runtime on resume."""
+        await store.create_run(run_id="r1", goal="G", model="m", config={})
+        await store.append_checkpoint(
+            "r1", [{"role": "system", "content": "s"}], iterations=1, tokens=0
+        )
+        await store.update_run("r1", status="interrupted", runtime_seconds=3.0)
+        seen: list[float | None] = []
+        ctx = _ctx(store)
+
+        class Probe(FakeSession):
+            async def send_message(self, user_text):
+                seen.append(ctx.time_remaining() if ctx.time_remaining else None)
+                async for ev in super().send_message(user_text):
+                    yield ev
+
+        orch = Orchestrator(
+            session=Probe([_finish_turn()]),
+            context=ctx,
+            budgets=Budgets(max_iterations=99, wallclock_timeout=10.0),
+            clock=_clock([0.0, 2.0]),
+        )
+        await orch.run(resume=True)
+        assert seen == [5.0]  # 10 - (3 prior + 2 this session)
+
     async def test_wallclock_is_cumulative_across_resume(self, store):
         """Prior active runtime counts toward the timeout on resume, so a run
         can't extend past its limit by resuming."""
