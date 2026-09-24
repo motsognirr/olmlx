@@ -399,6 +399,38 @@ class TestErrors:
         assert result.is_user_error is False
         assert "not an image model" in result.message
 
+    @pytest.mark.parametrize("payload", [None, {}, {"seed": 1}])
+    async def test_malformed_backend_result_is_tool_error(
+        self, context, workspace, payload
+    ):
+        async def gen(prompt, **kwargs):
+            return payload
+
+        tools = AgentToolManager(
+            ChatConfig(model_name="m", write_root=workspace),
+            context,
+            image_tool=AgentImageTool(
+                generate=gen, max_dimension=2048, max_prompt_chars=100
+            ),
+        )
+        result = await tools.call_tool("generate_image", {"prompt": "x"})
+        assert isinstance(result, ToolError)
+
+    def test_agent_tools_import_does_not_load_mflux(self):
+        # The optional [image] extra must not be needed just to build an
+        # agent session.
+        import subprocess
+        import sys
+
+        code = (
+            "import sys, olmlx.engine.agent.tools; "
+            "print(any(m.split('.')[0] == 'mflux' for m in sys.modules))"
+        )
+        out = subprocess.run(
+            [sys.executable, "-c", code], capture_output=True, text=True, check=True
+        )
+        assert out.stdout.strip() == "False"
+
     async def test_backend_error_is_tool_error(self, context, workspace):
         from olmlx.engine.inference import ImageGenerationError
 

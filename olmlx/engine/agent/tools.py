@@ -30,7 +30,6 @@ from typing import TYPE_CHECKING, Any, Awaitable, Callable
 from olmlx.chat.builtin_tools import BuiltinToolManager, _resolve_path
 from olmlx.chat.config import ChatConfig
 from olmlx.chat.errors import ToolError
-from olmlx.engine.image_gen import IMAGE_FORMATS
 
 if TYPE_CHECKING:
     from olmlx.engine.agent.orchestrator import AgentContext
@@ -206,8 +205,15 @@ _GENERATE_IMAGE_DEF = {
     },
 }
 
-#: Output-file suffix -> ``image_gen.encode_image`` format.
-_IMAGE_SUFFIX_FORMATS = {f".{fmt}": fmt for fmt in IMAGE_FORMATS} | {".jpg": "jpeg"}
+
+def _image_suffix_formats() -> dict[str, str]:
+    """Output-file suffix -> ``image_gen.encode_image`` format (lazy import,
+    like the rest of the image stack in this module)."""
+    from olmlx.engine.image_gen import IMAGE_FORMATS
+
+    return {f".{fmt}": fmt for fmt in IMAGE_FORMATS} | {".jpg": "jpeg"}
+
+
 _IMAGE_DEFAULT_SIZE = 1024
 
 
@@ -262,11 +268,12 @@ def _image_filename(filename: Any) -> tuple[str | None, str]:
     suffix = Path(filename).suffix.lower()
     if not suffix:
         return filename + ".png", "png"
-    fmt = _IMAGE_SUFFIX_FORMATS.get(suffix)
+    formats = _image_suffix_formats()
+    fmt = formats.get(suffix)
     if fmt is None:
         raise _ImageArgError(
             f"unsupported image extension {suffix!r}; "
-            f"use one of {', '.join(sorted(_IMAGE_SUFFIX_FORMATS))}"
+            f"use one of {', '.join(sorted(formats))}"
         )
     return filename, fmt
 
@@ -674,11 +681,15 @@ class AgentToolManager(BuiltinToolManager):
                 # wait for the worker so it never outlives the call.
                 await _abort_generation(gen, cancel)
 
-        seed = out["seed"]
+        try:
+            seed, image = out["seed"], out["image"]
+        except (KeyError, TypeError):
+            logger.warning("generate_image returned %r", type(out).__name__)
+            return _err("Image generation returned no image.", user=False)
         stem = f"images/{self._context.run_id[:8]}-{seed}"
 
         def _save() -> Path:
-            data = encode_image(out["image"], fmt)
+            data = encode_image(image, fmt)
             if name is not None:
                 return _write_new(name, workspace, data)
             n = 0
