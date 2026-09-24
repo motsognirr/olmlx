@@ -536,7 +536,7 @@ class Settings(BaseSettings):
     #: actions. ``auto`` (default) routes each such call through an LLM safety
     #: judge; ``allow`` trusts them unconditionally; ``deny`` blocks them.
     #: ``agent_shell_policy`` governs ``bash``; ``agent_file_write_policy``
-    #: governs ``write_file`` and ``edit_file``. All other tools stay allowed.
+    #: governs ``write_file``, ``edit_file`` and ``generate_image``. All other tools stay allowed.
     agent_shell_policy: Literal["allow", "auto", "deny"] = "auto"
     agent_file_write_policy: Literal["allow", "auto", "deny"] = "auto"
     #: Confine agent file writes to this directory — absolute-path escapes are

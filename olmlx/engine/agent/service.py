@@ -319,6 +319,9 @@ class AgentService:
                     "bash": ToolPolicy(s.agent_shell_policy),
                     "write_file": ToolPolicy(s.agent_file_write_policy),
                     "edit_file": ToolPolicy(s.agent_file_write_policy),
+                    # Writes model-chosen files too (#725), so it follows the
+                    # same posture; "deny" additionally never offers it.
+                    "generate_image": ToolPolicy(s.agent_file_write_policy),
                 },
             ),
             llm_judge=self._make_tool_safety_judge(run["model"], run["goal"]),

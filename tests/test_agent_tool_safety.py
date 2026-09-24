@@ -139,6 +139,8 @@ class TestAgentSessionPolicy:
         assert ts.get_policy("bash") == ToolPolicy.AUTO
         assert ts.get_policy("write_file") == ToolPolicy.AUTO
         assert ts.get_policy("edit_file") == ToolPolicy.AUTO
+        # generate_image writes files too (#725): same posture.
+        assert ts.get_policy("generate_image") == ToolPolicy.AUTO
         # Safe tools stay ALLOW so the agent still runs autonomously.
         assert ts.get_policy("read_file") == ToolPolicy.ALLOW
         assert ts.get_policy("web_fetch") == ToolPolicy.ALLOW

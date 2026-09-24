@@ -706,7 +706,8 @@ class AgentToolManager(BuiltinToolManager):
             return _err(str(exc), user=True)
         except _NameTaken as exc:
             return _err(f"{exc} already exists; choose a different filename", user=True)
-        except (OSError, ValueError) as exc:
+        except Exception as exc:
+            logger.warning("generate_image save failed", exc_info=True)
             return _err(f"Error saving image: {exc}", user=False)
         return (
             f"Saved {params['width']}x{params['height']} image to {path} (seed {seed})."
