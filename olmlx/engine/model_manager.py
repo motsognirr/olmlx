@@ -46,10 +46,14 @@ from olmlx.engine.model_load_utils import (  # noqa: F401
     _sanitize_model_config_in_place,
     _ensure_tokenizer_eos_in_stops,
     _materialize_module_buffers,
+    _materialize_image_model,
     _load_with_model_type_fallback,
     _quantize_language_tower,
     _load_gemma4_unified_text,
     _maybe_load_gemma4_unified_text,
+)
+from olmlx.engine.image_gen import (  # noqa: F401
+    translate_mflux_errors as _translate_mflux_import_errors,
 )
 from olmlx.engine.cache_capabilities import (  # noqa: F401
     _is_serializable_cache,
@@ -225,7 +229,8 @@ class ModelManager(SpeculativeLoaderMixin):
         # adapters) still use it. The base's own close drops it once its last
         # adapter is gone (``_adapter_child_refs`` keeps the base pinned until
         # then). Skipping here mirrors the grammar-tokenizer-identity invariant.
-        if not (lm.is_whisper or lm.is_tts or lm.adapter_base):
+        # Image models (#723) likewise carry no tokenizer.
+        if not (lm.is_whisper or lm.is_tts or lm.is_image or lm.adapter_base):
             try:
                 from olmlx.engine import grammar as _grammar
 
@@ -456,8 +461,8 @@ class ModelManager(SpeculativeLoaderMixin):
     # route through mlx-vlm; flash models carry an SSD weight store / prefetcher
     # that a structural copy would alias unsafely; distributed models are
     # sharded; speculative decoders own a separate lifecycle/stream; KV-quant
-    # caches deepcopy-share Metal-bound buffers; whisper/tts/reranker aren't
-    # chat LMs.
+    # caches deepcopy-share Metal-bound buffers; whisper/tts/reranker/image
+    # models aren't chat LMs.
     @staticmethod
     def _reject_adapter_base(base_lm: "LoadedModel") -> None:
         reason = None
@@ -467,8 +472,13 @@ class ModelManager(SpeculativeLoaderMixin):
             reason = "flash / flash-MoE models"
         elif base_lm.is_distributed:
             reason = "distributed (sharded) models"
-        elif base_lm.is_whisper or base_lm.is_tts or base_lm.is_reranker:
-            reason = "whisper / tts / reranker models"
+        elif (
+            base_lm.is_whisper
+            or base_lm.is_tts
+            or base_lm.is_reranker
+            or base_lm.is_image
+        ):
+            reason = "whisper / tts / reranker / image models"
         elif base_lm.speculative_decoder is not None:
             reason = "speculative-decoding models"
         elif base_lm.kv_cache_quant:
@@ -808,8 +818,21 @@ class ModelManager(SpeculativeLoaderMixin):
                 # not-yet-cached model; run it off the event loop so the whole
                 # server doesn't freeze for the round trip (#614). It is
                 # recomputed on the worker thread in ``_load_model`` anyway.
-                _model_kind = await asyncio.to_thread(self._detect_model_kind, hf_path)
-                if _model_kind in ("whisper", "tts", "reranker"):
+                #
+                # Image models (#723) are declared, never sniffed: the kind
+                # comes from THIS entry's ``type: "image"`` marker (resolved by
+                # name, so two entries sharing an hf_path keep their own
+                # ``image_quantize``) and is threaded to the loader, never
+                # re-derived from hf_path. ``is True``: a MagicMock registry's
+                # model_config must not route every model to the image loader.
+                image_config = model_config if model_config.is_image is True else None
+                if image_config is not None:
+                    _model_kind = "image"
+                else:
+                    _model_kind = await asyncio.to_thread(
+                        self._detect_model_kind, hf_path
+                    )
+                if _model_kind in ("whisper", "tts", "reranker", "image"):
                     kv_cache_quant = None
                     kv_eviction = None
                 # KV quant and eviction are mutually exclusive (quant bounds
@@ -996,6 +1019,7 @@ class ModelManager(SpeculativeLoaderMixin):
                         flash_config,
                         flash_moe_config,
                         weight_quant_str,
+                        image_config,
                     )
                     timeout = settings.model_load_timeout
                     is_distributed = False
@@ -1176,6 +1200,7 @@ class ModelManager(SpeculativeLoaderMixin):
                         is_whisper=(_model_kind == "whisper"),
                         is_tts=(_model_kind == "tts"),
                         is_reranker=(_model_kind == "reranker"),
+                        is_image=(_model_kind == "image"),
                         speculative_decoder=_spec_decoder,
                         weight_store=_weight_store,
                         template_caps=caps,
@@ -1423,6 +1448,11 @@ class ModelManager(SpeculativeLoaderMixin):
 
     def _detect_model_kind(self, hf_path: str) -> str:
         """Return 'text', 'vlm', or 'unknown' by checking config.json against installed libraries."""
+        # Never returns "image": image models (#723) are declared via
+        # models.json and threaded through as ``image_config`` — their
+        # diffusers layout has no top-level config.json, and mflux's name
+        # resolver is a substring matcher that maps Qwen/Qwen3-* text models
+        # to Qwen-Image, so sniffing is not an option.
         config = None
         # Check local store first
         if self.store is not None:
@@ -1872,9 +1902,9 @@ class ModelManager(SpeculativeLoaderMixin):
         TurboQuant/Spectral factories would otherwise pull calibration data
         off disk on every model load only to throw the result away.
         """
-        if lm.is_whisper or lm.is_tts or lm.is_reranker:
-            # Whisper / TTS / cross-encoder rerankers have no LLM-style prompt
-            # cache; nothing to probe.
+        if lm.is_whisper or lm.is_tts or lm.is_reranker or lm.is_image:
+            # Whisper / TTS / cross-encoder rerankers / image models have no
+            # LLM-style prompt cache; nothing to probe.
             return
         try:
             from mlx_lm.models.cache import make_prompt_cache
@@ -2600,8 +2630,15 @@ class ModelManager(SpeculativeLoaderMixin):
         flash_config: ResolvedFlashConfig | None = None,
         flash_moe_config: FlashMoeConfig | None = None,
         weight_quant_str: str | None = None,
+        image_config: Any = None,
     ) -> tuple[Any, Any, bool, TemplateCaps, Any]:
         """Load a model, using config.json inspection to choose the right library.
+
+        *image_config* is the models.json ``ModelConfig`` of a declared
+        ``type: "image"`` entry (#723); when set, the repo is validated against
+        mflux's supported variants, downloaded into the store like any other
+        model, and loaded by the mflux image loader (no config.json
+        inspection).
 
         *model_exp* is the resolved ExperimentalSettings for this model.
         Falls back to global defaults if not provided.
@@ -2646,6 +2683,19 @@ class ModelManager(SpeculativeLoaderMixin):
             flash_moe_config = ModelConfig(hf_path=hf_path).resolved_flash_moe()
         spec_enabled = spec_config.enabled
 
+        # Image models (#723) go through the store like every other model.
+        # Validate the declared repo against mflux's supported variants BEFORE
+        # downloading, so a typo can't pull tens of GB of the wrong thing.
+        if image_config is not None:
+            if getattr(self, "_distributed_group", None) is not None:
+                raise ValueError(
+                    f"Image model '{hf_path}' is not supported in distributed mode."
+                )
+            with _translate_mflux_import_errors(hf_path):
+                from olmlx.engine import image_gen
+
+                image_gen.resolve_image_variant(hf_path)
+
         # Ensure model is downloaded to the store
         load_path: str = hf_path
         if self.store is not None:
@@ -2670,6 +2720,9 @@ class ModelManager(SpeculativeLoaderMixin):
                     hf_path,
                 )
                 manifest.save(local_dir / "manifest.json")
+
+        if image_config is not None:
+            return self._load_model_image(hf_path, image_config, load_path)
 
         # Check for flash-MoE-prepared model
         if self._is_flash_moe_enabled(flash_moe_config):
@@ -2902,6 +2955,24 @@ class ModelManager(SpeculativeLoaderMixin):
         _materialize_module_buffers(model)
         return model, None, False, TemplateCaps(), None
 
+    def _load_model_image(self, hf_path: str, image_config: Any, load_path: str):
+        """Load an mflux text-to-image model (issue #723) from *load_path*.
+
+        *load_path* is the store directory ``_load_model`` downloaded the repo
+        into; mflux reads the diffusers layout from it and never downloads.
+        Returns the 5-tuple shape ``_load_model`` uses
+        ``(model, tokenizer, is_vlm, caps, speculative_decoder)``. Image models
+        have no tokenizer / chat template / speculative decoder — the image
+        path drives ``model.generate_image`` directly.
+        """
+        from olmlx.engine import image_gen
+
+        quantize = image_config.image_quantize if image_config is not None else None
+        with _translate_mflux_import_errors(hf_path):
+            model = image_gen.load_image_model(hf_path, quantize, load_path)
+        _materialize_image_model(model)
+        return model, None, False, TemplateCaps(), None
+
     def _load_model_tts(self, hf_path: str, load_path: str):
         """Load a TTS model (Kokoro) via mlx-audio (issue #367).
 
@@ -2984,6 +3055,7 @@ class ModelManager(SpeculativeLoaderMixin):
         flash_config: ResolvedFlashConfig | None = None,
         flash_moe_config: FlashMoeConfig | None = None,
         weight_quant_str: str | None = None,
+        image_config: Any = None,
     ) -> tuple[Any, Any, bool, TemplateCaps, bool, Any]:
         """Load a model and optionally shard it for distributed inference.
 
@@ -3007,6 +3079,7 @@ class ModelManager(SpeculativeLoaderMixin):
             flash_config=flash_config,
             flash_moe_config=flash_moe_config,
             weight_quant_str=weight_quant_str,
+            image_config=image_config,
         )
         is_distributed = False
 

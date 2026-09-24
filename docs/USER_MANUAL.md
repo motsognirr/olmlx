@@ -37,6 +37,7 @@ olmlx is a drop-in replacement for the Ollama API server, built on Apple's [MLX]
 - **Vision-language models** — process images alongside text with VLM support
 - **Reranking** — cross-encoder document reranking via `/v1/rerank`
 - **Audio** — speech-to-text (Whisper) and text-to-speech (Kokoro) via `/v1/audio/*`
+- **Image generation** — text-to-image (mflux Qwen-Image) via `/v1/images/generations`
 - **Interactive terminal chat** — full-featured chat with MCP tool servers and skills
 - **Prompt caching** — KV cache reuse across requests for faster time-to-first-token
 - **LLM in a Flash** — SSD-based inference for running larger models with limited memory
@@ -110,6 +111,7 @@ Other extras:
 |-------|---------|---------|
 | `audio` | `/v1/audio/speech` text-to-speech (Kokoro) | `mlx-audio`, `misaki[en]`, spaCy `en_core_web_sm` (several GB) |
 | `voice` | `olmlx chat --voice` push-to-talk | everything in `audio`, plus `sounddevice` (PortAudio) |
+| `image` | `/v1/images/generations` text-to-image (Qwen-Image via mflux) | `mflux` (+ torch, opencv, matplotlib; ~150–250 MB) |
 | `otel` | OpenTelemetry tracing | OTel SDK + OTLP HTTP exporter |
 
 Audio *transcription* (`/v1/audio/transcriptions`, Whisper) is part of the
@@ -600,6 +602,28 @@ curl http://localhost:11434/api/chat -d '{
 ```
 
 Images must be raw base64 without a `data:image/...;base64,` prefix.
+
+### Image Generation Models
+
+Text-to-image models (Qwen-Image-2.1, Qwen-Image-2512, served on
+`/v1/images/generations` via mflux; needs the `image` extra) are **declared**,
+never auto-detected — their diffusers-layout repos have no top-level
+`config.json`. Mark the entry with `"type": "image"` and use the exact repo id:
+
+```json
+{
+  "qwen-image:2.1": { "type": "image", "hf_path": "Qwen/Qwen-Image-2.1", "image_quantize": 8 }
+}
+```
+
+Storage is the same as for every other model: `olmlx models pull qwen-image:2.1`
+(or the first request) downloads the repo into `OLMLX_MODELS_DIR`
+(`~/.olmlx/models/Qwen_Qwen-Image-2.1/`), and the model is loaded from there —
+olmlx never uses the Hugging Face cache (`~/.cache/huggingface`) for model
+weights. The store recognizes a diffusers download by its `model_index.json`
+and lists it with `family: "image"`; `olmlx models delete` removes it. Budget
+~33 GB of disk for Qwen-Image-2.1. See the README's *Image Generation* section
+for the request format.
 
 ### Modelfile Support
 

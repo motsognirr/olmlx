@@ -661,3 +661,91 @@ class TestSpecDraftWeightMaterialization:
         assert res.get("error") is None, (
             f"_load_eagle_decoder left draft weights lazy: {res.get('error')!r}"
         )
+
+
+# ---------------------------------------------------------------------------
+# mflux image models (#723) — weights + buffers materialized on the load thread
+# ---------------------------------------------------------------------------
+
+
+def _image_model_class(weights_file):
+    """An mflux-shaped model: ``QwenImage21``'s annotated non-underscore
+    ``vae``/``transformer``/``text_encoder`` submodules, weights applied via
+    ``load_weights`` from ``mx.load`` with no eval (as mflux's WeightApplier
+    does), plus a lazy underscore buffer like a precomputed RoPE table."""
+    import mlx.nn as nn
+
+    class _Part(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.proj = nn.Linear(8, 8, bias=False)
+
+    class _Transformer(_Part):
+        def __init__(self):
+            super().__init__()
+            self._pos_freqs = mx.arange(16).astype(mx.float16) * 0.5  # lazy
+
+    class FakeQwenImage21(nn.Module):
+        def __init__(self, quantize=None, model_path=None, model_config=None):
+            super().__init__()
+            self.vae = _Part()
+            self.transformer = _Transformer()
+            self.text_encoder = _Part()
+            if weights_file is not None:
+                self.load_weights(list(mx.load(str(weights_file)).items()))
+
+    return FakeQwenImage21
+
+
+def _write_image_weights(tmp_path):
+    from mlx.utils import tree_flatten
+
+    donor = _image_model_class(None)()
+    mx.eval(donor.parameters())
+    wf = tmp_path / "image.safetensors"
+    mx.save_safetensors(str(wf), dict(tree_flatten(donor.parameters())))
+    return wf
+
+
+def _eval_image_model_on_worker(model):
+    buffers = _underscore_array_leaves(model)
+    assert buffers, "fake image model lost its underscore buffer"
+
+    def work():
+        mx.eval(model.parameters())
+        mx.eval([b + 0 for b in buffers])
+        return True
+
+    return _run_in_thread(work)
+
+
+@pytest.mark.usefixtures("metal_default_device")
+class TestImageModelMaterialization:
+    """mflux applies weights with no eval, and was developed as a
+    single-threaded CLI where load and forward share a thread — so a
+    load-thread-bound lazy weight is masked upstream. olmlx loads on one
+    ``asyncio.to_thread`` worker and generates on another."""
+
+    def test_unmaterialized_image_model_crashes_cross_thread(self, tmp_path):
+        # Negative control: without the loader-side eval the first
+        # cross-thread eval of the image model fails.
+        model = _image_model_class(_write_image_weights(tmp_path))()
+        res = _eval_image_model_on_worker(model)
+        assert res.get("error") is not None, (
+            "expected lazy image-model weights to be load-thread-bound — if "
+            "this passes, _materialize_image_model may be unnecessary"
+        )
+        assert "Stream" in str(res["error"])
+
+    def test_load_model_image_materializes(self, tmp_path, monkeypatch):
+        from olmlx.engine.model_manager import ModelManager
+        from tests.test_images_load import _stub_mflux
+
+        cls = _image_model_class(_write_image_weights(tmp_path))
+        _stub_mflux(monkeypatch, qwen21_cls=cls)
+        mgr = ModelManager.__new__(ModelManager)
+        model, *_ = mgr._load_model_image("Qwen/Qwen-Image-2.1", None, str(tmp_path))
+        res = _eval_image_model_on_worker(model)
+        assert res.get("error") is None, (
+            f"_load_model_image left weights/buffers lazy: {res.get('error')!r}"
+        )

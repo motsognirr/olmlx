@@ -32,6 +32,7 @@ from olmlx.routers import (
     chat,
     embed,
     generate,
+    images,
     manage,
     models,
     openai,
@@ -596,6 +597,7 @@ def create_app() -> FastAPI:
     app.include_router(openai.router)
     app.include_router(responses.router)
     app.include_router(audio.router)
+    app.include_router(images.router)
     app.include_router(anthropic.router)
     app.include_router(metrics_router.router)
 

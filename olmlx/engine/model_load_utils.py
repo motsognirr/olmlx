@@ -197,6 +197,27 @@ def _materialize_module_buffers(model: Any) -> None:
         mx.eval(buffers)
 
 
+def _materialize_image_model(model: Any) -> None:
+    """Eager-eval an mflux image model's weights and buffers on the load thread.
+
+    mflux builds its modules and applies (optionally on-the-fly quantized)
+    weights without an eval, so every weight is a lazy op bound to the load
+    thread's stream — the same trap as the dflash/eagle draft loaders (#718).
+    Image load and generation are separate ``asyncio.to_thread`` calls, so the
+    first denoise step would evaluate load-thread-bound weights from another
+    thread and raise ``There is no Stream(gpu, N) in current thread``. mflux
+    was developed as a single-threaded CLI (load + forward on one thread),
+    which masks this upstream.
+
+    ``QwenImage``/``QwenImage21`` hold ``vae``/``transformer``/``text_encoder``
+    under *non-underscore* keys, so ``parameters()`` reaches the full tree;
+    ``_materialize_module_buffers`` covers any underscore-keyed buffers
+    (e.g. precomputed RoPE frequencies) that ``parameters()`` skips.
+    """
+    mx.eval(model.parameters())
+    _materialize_module_buffers(model)
+
+
 def _load_with_model_type_fallback(mlx_lm, load_path, **kwargs):
     """Load model + tokenizer, remapping unrecognised model_type if needed.
 

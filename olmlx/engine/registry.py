@@ -235,6 +235,14 @@ def _validate_timeout(name: str, value: Any) -> float:
 
 _VALID_SYNC_MODES: frozenset[str] = frozenset(get_args(SyncMode))
 
+#: Explicit ``"type"`` markers a models.json *model* entry may carry (#723).
+#: ``"panel"`` is also a valid ``type`` but is routed to ``PanelConfig`` by the
+#: registry before ``ModelConfig.from_entry`` ever sees it.
+ModelType = Literal["image"]
+_VALID_MODEL_TYPES: frozenset[str] = frozenset(get_args(ModelType))
+#: mflux's accepted ``--quantize`` bit widths (``QUANTIZE_CHOICES``).
+_VALID_IMAGE_QUANTIZE: frozenset[int] = frozenset({3, 4, 5, 6, 8})
+
 
 def _validate_sync_mode(value: Any) -> SyncMode:
     if not isinstance(value, str) or value not in _VALID_SYNC_MODES:
@@ -460,6 +468,18 @@ class ModelConfig:
     #: (``OLMLX_BATCH_FAIRNESS_QUANTUM``). A non-negative number; ``None``
     #: defers to the global setting.
     batch_fairness_quantum: float | None = None
+    #: Explicit model-kind marker (#723). ``"image"`` declares an mflux
+    #: text-to-image model served on ``/v1/images/generations``. Image models
+    #: are never auto-detected: their diffusers layout has no top-level
+    #: ``config.json``, and mflux's name resolver is a loose substring matcher
+    #: that maps plain ``Qwen/Qwen3-*`` text models to a Qwen-Image base.
+    #: ``None`` means an ordinary (sniffed) model. ``"panel"`` entries are
+    #: parsed separately by the registry and never reach ``ModelConfig``.
+    type: ModelType | None = None
+    #: mflux on-the-fly quantization bits for an image model (3/4/5/6/8).
+    #: Only valid with ``type: "image"``; ``None`` loads full precision (or
+    #: keeps a pre-quantized checkpoint's stored bits).
+    image_quantize: int | None = None
     #: Unrecognized keys from the JSON entry, preserved for round-trip fidelity.
     _extra: dict[str, Any] = field(default_factory=dict, repr=False)
 
@@ -683,6 +703,31 @@ class ModelConfig:
                 "'batch_fairness_quantum' must be a finite non-negative number "
                 f"or None, got {self.batch_fairness_quantum!r}"
             )
+        if self.type is not None and self.type not in _VALID_MODEL_TYPES:
+            raise ValueError(
+                f"'type' must be one of {sorted(_VALID_MODEL_TYPES)} (or "
+                f'"panel" for a panel entry), got {self.type!r}'
+            )
+        if self.image_quantize is not None:
+            if (
+                isinstance(self.image_quantize, bool)
+                or not isinstance(self.image_quantize, int)
+                or self.image_quantize not in _VALID_IMAGE_QUANTIZE
+            ):
+                raise ValueError(
+                    f"'image_quantize' must be one of "
+                    f"{sorted(_VALID_IMAGE_QUANTIZE)} or None, "
+                    f"got {self.image_quantize!r}"
+                )
+            if self.type != "image":
+                raise ValueError(
+                    "'image_quantize' is only valid on a 'type': 'image' entry"
+                )
+
+    @property
+    def is_image(self) -> bool:
+        """True for an explicitly declared text-to-image model (#723)."""
+        return self.type == "image"
 
     def resolved_speculative(self) -> SpeculativeConfig:
         """Resolve speculative config: per-model overrides global settings.
@@ -1055,6 +1100,8 @@ class ModelConfig:
             batch_prefill_size_raw = entry.get("batch_prefill_size")
             batch_prefill_step_raw = entry.get("batch_prefill_step")
             batch_fairness_quantum_raw = entry.get("batch_fairness_quantum")
+            model_type_raw = entry.get("type")
+            image_quantize_raw = entry.get("image_quantize")
 
             kv_cache_quant_raw = entry.get("kv_cache_quant")
             if kv_cache_quant_raw is not None:
@@ -1143,6 +1190,8 @@ class ModelConfig:
                 batch_prefill_size=batch_prefill_size_raw,
                 batch_prefill_step=batch_prefill_step_raw,
                 batch_fairness_quantum=batch_fairness_quantum_raw,
+                type=model_type_raw,
+                image_quantize=image_quantize_raw,
                 _extra=extra,
             )
         raise TypeError(
@@ -1189,11 +1238,17 @@ class ModelConfig:
             and self.batch_prefill_size is None
             and self.batch_prefill_step is None
             and self.batch_fairness_quantum is None
+            and self.type is None
+            and self.image_quantize is None
             and not self._extra
         ):
             return self.hf_path
         # Put hf_path first for readability, then known keys, then extra
         result: dict[str, Any] = {"hf_path": self.hf_path}
+        if self.type is not None:
+            result["type"] = self.type
+        if self.image_quantize is not None:
+            result["image_quantize"] = self.image_quantize
         if self.experimental:
             result["experimental"] = self.experimental
         if self.options:
@@ -1599,6 +1654,17 @@ class ModelRegistry:
             normalized = self.normalize_name(name)
             if normalized in self._mappings:
                 return self._mappings[normalized]
+            # A declared image model (#723) addressed by its repo id instead of
+            # its alias: image models are never sniffed, so a marker-less
+            # synthetic config would route it as a text model (a wrong 400 on
+            # /v1/images, and a full diffusers download before failing on the
+            # text paths). First declared match wins.
+            # Compare tag-stripped like every other hf_path consumer
+            # (``_strip_ollama_tag``; inlined — importing it from the store
+            # would be an import cycle).
+            for mc in self._mappings.values():
+                if mc.is_image and mc.hf_path.partition(":")[0] == name:
+                    return mc
             return ModelConfig(hf_path=name)
         validate_model_name(name)
         normalized = self.normalize_name(name)

@@ -567,6 +567,58 @@ class TTSGenerationError(RuntimeError):
 _TTS_PASSTHROUGH_ERRORS = (MemoryError,)
 
 
+def _reject_non_lm_model(lm: LoadedModel, model_name: str, surface: str) -> None:
+    """Raise ``ValueError`` (-> 400) if *lm* is not a text/VLM language model.
+
+    Whisper / TTS / reranker / image models load with ``tokenizer=None`` (or a
+    non-generative head), so on the chat / completion / embedding paths they
+    would otherwise die deep in templating with an opaque 500. ``is True``
+    (identity) so MagicMock-backed test models don't trip it.
+    """
+    for flag, kind, endpoint in (
+        ("is_image", "an image model", "/v1/images/generations"),
+        ("is_whisper", "a Whisper STT model", "/v1/audio/transcriptions"),
+        ("is_tts", "a TTS model", "/v1/audio/speech"),
+        ("is_reranker", "a reranker", "/v1/rerank"),
+    ):
+        if getattr(lm, flag, False) is True:
+            raise ValueError(
+                f"Model '{model_name}' is {kind} and cannot be used for "
+                f"{surface}; use {endpoint}."
+            )
+
+
+def _reject_declared_image_before_load(
+    manager: ModelManager, model_name: str, surface: str
+) -> None:
+    """Reject a models.json ``type: "image"`` entry *before* loading it.
+
+    ``_reject_non_lm_model`` needs the loaded model's kind flags, but loading
+    an image model (~20 GB) just to refuse the request would evict the chat
+    models the client actually wanted. Image models are declared, so their
+    kind is known from the registry entry up front. Resolution errors are left
+    for ``ensure_loaded`` to report as usual.
+    """
+    try:
+        mc = manager.registry.resolve(model_name)
+    except Exception:
+        return
+    if getattr(mc, "is_image", False) is True:
+        raise ValueError(
+            f"Model '{model_name}' is an image model and cannot be used for "
+            f"{surface}; use /v1/images/generations."
+        )
+
+
+class ImageGenerationError(RuntimeError):
+    """Raised when the mflux backend fails mid-generation (#723).
+
+    A ``RuntimeError`` (-> HTTP 500), not a ``ValueError``, for the same reason
+    as ``TTSGenerationError``: a third-party ``ValueError`` from inside the
+    diffusion loop must not be reported as a client error (400).
+    """
+
+
 _DEFERRED_CLEANUP_TIMEOUT = 600  # 10 minutes max wait for stuck thread
 _DEFERRED_WAIT_TIMEOUT = 30.0  # max wait for deferred cleanup before rejecting
 
@@ -1193,6 +1245,7 @@ async def generate_completion(
     """
     stats = TimingStats()
 
+    _reject_declared_image_before_load(manager, model_name, "text completion")
     with Timer() as load_timer:
         lm = await manager.ensure_loaded(model_name, keep_alive, pin=True)
     stats.load_duration = load_timer.duration_ns
@@ -1205,6 +1258,7 @@ async def generate_completion(
     # template / kwargs setup doesn't leak the pin.
     pin_released_or_transferred = False
     try:
+        _reject_non_lm_model(lm, model_name, "text completion")
         # /api/generate defaults thinking OFF when unspecified (None), unlike the
         # chat route's "think unless tools".  Coerce once so the template
         # instruction and the downstream thinking_expected signal stay consistent
@@ -2483,6 +2537,7 @@ def _batch_eligible(
         or lm.is_whisper
         or lm.is_tts
         or lm.is_reranker
+        or lm.is_image
         or lm.is_distributed
         or lm.is_flash
         or lm.is_flash_moe
@@ -4333,6 +4388,7 @@ async def generate_chat(
     """Generate a chat completion."""
     stats = TimingStats()
 
+    _reject_declared_image_before_load(manager, model_name, "chat")
     with Timer() as load_timer:
         lm = await manager.ensure_loaded(model_name, keep_alive, pin=True)
     stats.load_duration = load_timer.duration_ns
@@ -4345,6 +4401,7 @@ async def generate_chat(
     # template / kwargs setup doesn't leak the pin.
     pin_released_or_transferred = False
     try:
+        _reject_non_lm_model(lm, model_name, "chat")
         # Per-model default for enable_thinking applies when the request
         # didn't set the flag. Request value, when present, still wins.
         # See issue #400.
@@ -4723,9 +4780,11 @@ async def generate_embeddings(
     Returns ``(embeddings, total_tokens)`` where ``total_tokens`` is the summed
     token count across all inputs (for OpenAI ``usage.prompt_tokens``).
     """
+    _reject_declared_image_before_load(manager, model_name, "embeddings")
     lm = await manager.ensure_loaded(model_name, keep_alive, pin=True)
 
     try:
+        _reject_non_lm_model(lm, model_name, "embeddings")
         async with _inference_locked(
             lm.inference_queue_timeout, sync_mode=lm.sync_mode
         ):
@@ -4882,6 +4941,7 @@ async def generate_rerank(
     keep_alive: int | str | None = None,
 ) -> dict:
     """Score documents against a query with a cross-encoder reranker (#369)."""
+    _reject_declared_image_before_load(manager, model_name, "reranking")
     lm = await manager.ensure_loaded(model_name, keep_alive, pin=True)
     try:
         if not getattr(lm, "is_reranker", False):
@@ -4958,6 +5018,7 @@ async def generate_transcription(
     # patch() targets) via importlib so ModelHolder injection lands correctly.
     whisper_transcribe = importlib.import_module("mlx_whisper.transcribe")
 
+    _reject_declared_image_before_load(manager, model_name, "transcription")
     lm = await manager.ensure_loaded(model_name, keep_alive, pin=True)
 
     try:
@@ -5049,6 +5110,7 @@ async def generate_speech(
     ``TTSGenerationError`` (a ``RuntimeError``, -> HTTP 500) if the mlx-audio
     backend fails mid-generation — that is never the client's fault (#703).
     """
+    _reject_declared_image_before_load(manager, model_name, "speech synthesis")
     lm = await manager.ensure_loaded(model_name, keep_alive, pin=True)
     try:
         if not lm.is_tts:
@@ -5138,3 +5200,178 @@ async def generate_speech(
                     await worker
     finally:
         lm.release_ref()
+
+
+async def generate_image(
+    manager: ModelManager,
+    model_name: str,
+    prompt: str,
+    *,
+    width: int,
+    height: int,
+    seed: int | None = None,
+    steps: int | None = None,
+    guidance: float | None = None,
+    negative_prompt: str | None = None,
+    keep_alive: str | None = None,
+    cancel_event: threading.Event | None = None,
+) -> dict:
+    """Generate one image with a managed mflux model (issue #723).
+
+    Returns ``{"image": PIL.Image.Image, "seed": int}``. The whole denoise loop
+    runs on one worker thread under the inference lock. *cancel_event* (set by
+    the router on client disconnect) is checked by an mflux in-loop callback
+    after every diffusion step; cancelling this coroutine sets it too and then
+    **waits for the worker to stop** before the lock is released, so a dying
+    denoise loop never overlaps the next request on Metal.
+
+    Raises ``ValueError`` (-> 400) for a non-image model, ``ImageGenerationError``
+    (-> 500) if mflux fails, and ``ImageGenerationCancelled`` when cancelled
+    via *cancel_event*.
+    """
+    import secrets
+
+    from olmlx.engine import image_gen
+    from olmlx.engine.registry import ModelConfig
+
+    # Image models are declared, so a non-image entry is known up front:
+    # refuse it before ensure_loaded evicts models to load a chat LLM just to
+    # return a 400. Unknown names fall through to ensure_loaded's not-found.
+    try:
+        declared = manager.registry.resolve(model_name)
+    except Exception:
+        declared = None
+    if isinstance(declared, ModelConfig) and not declared.is_image:
+        raise ValueError(
+            f"Model '{model_name}' is not an image model. "
+            "/v1/images/generations requires a models.json entry declared "
+            'with "type": "image" (e.g. hf_path "Qwen/Qwen-Image-2.1").'
+        )
+
+    lm = await manager.ensure_loaded(model_name, keep_alive, pin=True)
+    try:
+        if not lm.is_image:
+            raise ValueError(
+                f"Model '{model_name}' is not an image model. "
+                "/v1/images/generations requires a models.json entry declared "
+                'with "type": "image" (e.g. hf_path "Qwen/Qwen-Image-2.1").'
+            )
+        if seed is None:
+            seed = secrets.randbelow(2**31)
+        cancel = cancel_event if cancel_event is not None else threading.Event()
+
+        async with _inference_locked(
+            lm.inference_queue_timeout, sync_mode=lm.sync_mode
+        ):
+            with (
+                _tracing.span(
+                    "inference",
+                    model=lm.name,
+                    surface=surface_var.get(),
+                    strategy="none",
+                ),
+                _inference_ref(lm, keep_alive=keep_alive, adopt=True),
+            ):
+
+                def _run():
+                    try:
+                        image = image_gen.generate_image(
+                            lm.model,
+                            prompt,
+                            seed=seed,
+                            width=width,
+                            height=height,
+                            steps=steps,
+                            guidance=guidance,
+                            negative_prompt=negative_prompt,
+                            cancel_event=cancel,
+                        )
+                    except (image_gen.ImageGenerationCancelled, MemoryError):
+                        raise
+                    except Exception as exc:
+                        logger.error(
+                            "Image backend failed during generation for %s",
+                            lm.name,
+                            exc_info=exc,
+                        )
+                        raise ImageGenerationError(
+                            f"{type(exc).__name__}: {exc}"
+                        ) from exc
+                    finally:
+                        # Fence this worker's GPU work before the thread
+                        # exits (the loop thread never syncs worker streams).
+                        try:
+                            mx.synchronize()
+                        except Exception:
+                            logger.warning(
+                                "image post-generation sync failed", exc_info=True
+                            )
+                    return image
+
+                inf_timeout = (
+                    lm.inference_timeout
+                    if lm.inference_timeout is not None
+                    else settings.inference_timeout
+                )
+                if not isinstance(inf_timeout, (int, float)):
+                    inf_timeout = None  # MagicMock settings in tests
+                worker = asyncio.ensure_future(asyncio.to_thread(_run))
+                try:
+                    image = await asyncio.wait_for(
+                        asyncio.shield(worker), timeout=inf_timeout
+                    )
+                except asyncio.TimeoutError:
+                    # The per-step cancel event is the enforcement hook:
+                    # stop the denoise loop, then report the timeout.
+                    cancel.set()
+                    await _drain_image_worker(worker)
+                    raise ImageGenerationError(
+                        f"image generation exceeded inference_timeout ({inf_timeout}s)"
+                    ) from None
+                except asyncio.CancelledError:
+                    cancel.set()
+                    await _drain_image_worker(worker)
+                    raise
+                return {"image": image, "seed": seed}
+    finally:
+        lm.release_ref()
+
+
+# Upper bound on waiting for a cancelled image worker to stop. It normally
+# stops within one diffusion step, but the text-encoder forward and VAE decode
+# are single long calls that never poll the cancel event.
+_IMAGE_DRAIN_TIMEOUT = 600.0
+
+
+def _retrieve_exception(fut: asyncio.Future) -> None:
+    if not fut.cancelled():
+        fut.exception()
+
+
+async def _drain_image_worker(worker: asyncio.Future) -> None:
+    """Wait (bounded) for a cancelled image worker to actually stop.
+
+    The caller holds the inference lock; returning before the worker thread
+    exits would release it while the denoise loop still runs on Metal, so we
+    wait up to ``_IMAGE_DRAIN_TIMEOUT``. Past that the worker is abandoned
+    with a loud error rather than wedging every other request behind the lock
+    forever. Repeated cancellation of the caller is absorbed (the caller
+    re-raises the original ``CancelledError`` afterwards).
+    """
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + _IMAGE_DRAIN_TIMEOUT
+    while not worker.done():
+        remaining = deadline - loop.time()
+        if remaining <= 0:
+            logger.error(
+                "Image worker did not stop within %.0fs of cancellation; "
+                "releasing the inference lock while it is still running",
+                _IMAGE_DRAIN_TIMEOUT,
+            )
+            worker.add_done_callback(_retrieve_exception)
+            return
+        try:
+            await asyncio.wait({worker}, timeout=remaining)
+        except asyncio.CancelledError:
+            continue
+    _retrieve_exception(worker)  # mark retrieved; the caller's error propagates
