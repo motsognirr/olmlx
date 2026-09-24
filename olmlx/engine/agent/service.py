@@ -79,6 +79,7 @@ class AgentService:
         self._id_factory = id_factory or (lambda: uuid.uuid4().hex)
         self._handles: dict[str, _RunHandle] = {}
         self._warned_image_slots = False
+        self._warned_image_model = False
         self._delegate_runner = DelegateRunner(self)
 
     async def startup(self) -> None:
@@ -337,9 +338,27 @@ class AgentService:
         """
         from olmlx.engine.agent.tools import AgentImageTool
 
+        from olmlx.engine.registry import ModelConfig
+
         s = self._settings
         image_model = s.agent_image_model
         if not image_model:
+            return None
+        # Only advertise the tool for a declared image entry: an undeclared or
+        # text model would otherwise fail (or trigger a load) on first use.
+        registry = getattr(self._manager_getter(), "registry", None)
+        try:
+            entry = registry.resolve(image_model) if registry is not None else None
+        except Exception:
+            entry = None
+        if not (isinstance(entry, ModelConfig) and entry.is_image is True):
+            if not self._warned_image_model:
+                self._warned_image_model = True
+                logger.warning(
+                    "agent_image_model=%r is not a models.json entry declared "
+                    'with "type": "image"; generate_image is disabled.',
+                    image_model,
+                )
             return None
         if s.max_loaded_models < 2 and not self._warned_image_slots:
             self._warned_image_slots = True

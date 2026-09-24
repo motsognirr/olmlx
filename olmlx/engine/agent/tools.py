@@ -563,7 +563,7 @@ class AgentToolManager(BuiltinToolManager):
                 tool_name="generate_image",
                 is_user_error=True,
             )
-        except OSError as exc:
+        except (OSError, ValueError) as exc:
             return ToolError(
                 message=f"Error saving image: {exc}",
                 tool_name="generate_image",

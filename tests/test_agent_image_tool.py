@@ -14,6 +14,7 @@ from olmlx.engine.agent.service import AgentService
 from olmlx.engine.agent.store import AgentStore
 from olmlx.engine.agent.tools import AgentImageTool, AgentToolManager
 from olmlx.engine.image_gen import ImageGenerationCancelled
+from olmlx.engine.registry import ModelConfig
 
 
 @pytest.fixture
@@ -259,6 +260,32 @@ class TestErrors:
         )
 
 
+class TestSaveErrors:
+    async def test_nul_in_filename_is_tool_error(self, context, workspace):
+        gen = FakeGenerator()
+        tools = _tools(context, workspace, gen)
+        result = await tools.call_tool(
+            "generate_image", {"prompt": "x", "filename": "a\x00b.png"}
+        )
+        assert isinstance(result, ToolError)
+        assert result.is_user_error is True
+        assert gen.calls == []
+
+    async def test_encode_value_error_is_tool_error(
+        self, context, workspace, monkeypatch
+    ):
+        def bad_encode(image, fmt):
+            raise ValueError("cannot encode")
+
+        monkeypatch.setattr("olmlx.engine.image_gen.encode_image", bad_encode)
+        tools = _tools(context, workspace, FakeGenerator())
+        result = await tools.call_tool(
+            "generate_image", {"prompt": "x", "width": 64, "height": 64}
+        )
+        assert isinstance(result, ToolError)
+        assert "cannot encode" in result.message
+
+
 class TestCancellation:
     async def test_run_cancel_sets_generation_cancel_event(self, context, workspace):
         started = asyncio.Event()
@@ -294,14 +321,39 @@ class TestCancellation:
         assert gen.calls == []
 
 
+class _FakeRegistry:
+    def __init__(self, entries):
+        self._entries = entries
+
+    def resolve(self, name):
+        return self._entries.get(name)
+
+
+def _manager(**entries):
+    from types import SimpleNamespace
+
+    return SimpleNamespace(registry=_FakeRegistry(entries))
+
+
+_IMAGE_ENTRY = ModelConfig.from_entry(
+    {"type": "image", "hf_path": "Qwen/Qwen-Image-2.1"}
+)
+_TEXT_ENTRY = ModelConfig.from_entry({"hf_path": "Qwen/Qwen3-8B"})
+
+
 class TestServiceWiring:
-    def _session(self, store, tmp_path, **over):
+    def _service(self, store, tmp_path, manager=None, **over):
         over.setdefault("agent_skills_dir", tmp_path / "skills")
-        svc = AgentService(
+        if manager is None:
+            manager = _manager(**{"qwen-image": _IMAGE_ENTRY})
+        return AgentService(
             store=store,
-            manager_getter=lambda: object(),
+            manager_getter=lambda: manager,
             settings=Settings(**over),
         )
+
+    def _session(self, store, tmp_path, manager=None, **over):
+        svc = self._service(store, tmp_path, manager, **over)
         run = {"model": "m", "goal": "g"}
         return svc._default_session(run, AgentContext(run_id="r1", store=store))
 
@@ -315,6 +367,34 @@ class TestServiceWiring:
         )
         assert "generate_image" in sess.builtin.tool_names
 
+    @pytest.mark.parametrize("name", ["missing", "qwen3"])
+    def test_not_offered_for_undeclared_or_text_model(
+        self, store, tmp_path, caplog, name
+    ):
+        manager = _manager(**{"qwen-image": _IMAGE_ENTRY, "qwen3": _TEXT_ENTRY})
+        with caplog.at_level("WARNING", logger="olmlx.engine.agent.service"):
+            sess = self._session(
+                store,
+                tmp_path,
+                manager,
+                agent_image_model=name,
+                max_loaded_models=2,
+            )
+        assert "generate_image" not in sess.builtin.tool_names
+        assert any("agent_image_model" in r.getMessage() for r in caplog.records)
+
+    def test_registry_error_disables_tool(self, store, tmp_path):
+        from types import SimpleNamespace
+
+        def boom(name):
+            raise ValueError("invalid model name")
+
+        manager = SimpleNamespace(registry=SimpleNamespace(resolve=boom))
+        sess = self._session(
+            store, tmp_path, manager, agent_image_model="bad!", max_loaded_models=2
+        )
+        assert "generate_image" not in sess.builtin.tool_names
+
     def test_warns_when_model_slots_too_few(self, store, tmp_path, caplog):
         with caplog.at_level("WARNING", logger="olmlx.engine.agent.service"):
             self._session(
@@ -326,7 +406,7 @@ class TestServiceWiring:
         self, store, tmp_path, monkeypatch
     ):
         calls = []
-        sentinel_manager = object()
+        manager = _manager(**{"qwen-image": _IMAGE_ENTRY})
 
         async def fake_generate_image(manager, model_name, prompt, **kwargs):
             calls.append((manager, model_name, prompt, kwargs))
@@ -336,24 +416,19 @@ class TestServiceWiring:
             "olmlx.engine.inference.generate_image", fake_generate_image
         )
         ws = tmp_path / "ws"
-        svc = AgentService(
-            store=store,
-            manager_getter=lambda: sentinel_manager,
-            settings=Settings(
-                agent_skills_dir=tmp_path / "skills",
-                agent_image_model="qwen-image",
-                agent_workspace_dir=ws,
-                max_loaded_models=2,
-            ),
-        )
-        sess = svc._default_session(
-            {"model": "m", "goal": "g"}, AgentContext(run_id="r1", store=store)
+        sess = self._session(
+            store,
+            tmp_path,
+            manager,
+            agent_image_model="qwen-image",
+            agent_workspace_dir=ws,
+            max_loaded_models=2,
         )
         result = await sess.builtin.call_tool(
             "generate_image", {"prompt": "hi", "width": 64, "height": 64}
         )
         assert isinstance(result, str), result
-        assert calls[0][0] is sentinel_manager
+        assert calls[0][0] is manager
         assert calls[0][1] == "qwen-image"
         assert calls[0][2] == "hi"
         assert (ws / "images" / "r1-5.png").exists()
