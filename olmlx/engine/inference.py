@@ -567,6 +567,60 @@ class TTSGenerationError(RuntimeError):
 _TTS_PASSTHROUGH_ERRORS = (MemoryError,)
 
 
+class ContextLengthExceededError(ValueError):
+    """The prompt fills or exceeds the model's context window (#715).
+
+    A ``ValueError`` so every surface reports it as a 400; app.py gives it the
+    OpenAI ``context_length_exceeded`` code.
+    """
+
+    pass
+
+
+# Every token covers at least one UTF-8 byte of prompt text, so a prompt whose
+# byte length is this far under the window can't fill it — the check skips the
+# extra tokenization pass for it. The margin absorbs tokens that cover no byte
+# (an added BOS, SentencePiece's dummy prefix). Tests raise it to force the
+# tokenizing branch.
+_CONTEXT_CHECK_BYTE_MARGIN = 16
+
+
+def _reject_prompt_over_context(
+    lm: LoadedModel,
+    prompt: str | list[int],
+    prompt_tokens: list[int] | None = None,
+) -> None:
+    """Raise ContextLengthExceededError if *prompt* leaves no room to generate.
+
+    Runs before the inference lock is taken: an over-window prompt used to be
+    handed to generation, which hung forever holding the lock and wedged every
+    later request (#715). For a VLM the text tokenizer undercounts (no image
+    patch tokens), so the count is a lower bound; a prompt it rejects really
+    is too long.
+    """
+    limit = lm.context_length
+    if not isinstance(limit, int) or isinstance(limit, bool) or limit <= 0:
+        return
+    if prompt_tokens is not None:
+        n = len(prompt_tokens)
+    elif isinstance(prompt, list):
+        n = len(prompt)
+    else:
+        if len(prompt.encode("utf-8")) + _CONTEXT_CHECK_BYTE_MARGIN < limit:
+            return
+        try:
+            n = len(tokenize_for_cache(lm.text_tokenizer, prompt))
+        except Exception:
+            logger.debug("Context-window check skipped: tokenization failed")
+            return
+    if n >= limit:
+        raise ContextLengthExceededError(
+            f"Prompt is {n} tokens, which does not fit the context window of "
+            f"model {lm.name!r} ({limit} tokens). Shorten the prompt or "
+            "conversation, or use a model with a longer context."
+        )
+
+
 def _reject_non_lm_model(lm: LoadedModel, model_name: str, surface: str) -> None:
     """Raise ``ValueError`` (-> 400) if *lm* is not a text/VLM language model.
 
@@ -1367,6 +1421,7 @@ async def generate_completion(
             )
             gen_prompt = context_input_tokens
         collect_generated_tokens = context_input_tokens is not None
+        _reject_prompt_over_context(lm, gen_prompt)
 
         if stream:
             gen = _stream_completion(
@@ -4601,6 +4656,8 @@ async def generate_chat(
                 lm.is_speculative,
                 make_prompt_cache is not None,
             )
+
+        _reject_prompt_over_context(lm, prompt, prompt_tokens)
 
         # Tell streaming routers whether to wait for a (possibly orphaned, see
         # #307) `</think>` token — shares the rules with `_apply_chat_template`.

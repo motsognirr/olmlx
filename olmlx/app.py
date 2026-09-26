@@ -16,7 +16,7 @@ from starlette.middleware.base import BaseHTTPMiddleware
 
 from olmlx.config import settings
 from olmlx.context import request_id_var, surface_var
-from olmlx.engine.inference import ServerBusyError
+from olmlx.engine.inference import ContextLengthExceededError, ServerBusyError
 from olmlx.engine.model_manager import (
     ModelLoadTimeoutError,
     ModelManager,
@@ -482,6 +482,23 @@ def create_app() -> FastAPI:
             "invalid_request_error",
             "invalid_request_error",
             "invalid_value",
+        )
+
+    @app.exception_handler(ContextLengthExceededError)
+    async def context_length_error_handler(
+        request: Request, exc: ContextLengthExceededError
+    ):
+        # A ValueError subclass (400), but with OpenAI's dedicated code so
+        # SDK clients can tell "prompt too long" from other bad input (#715).
+        msg = str(exc)
+        logger.warning("Context length exceeded on %s: %s", request.url.path, msg)
+        return _make_error_response(
+            request.url.path,
+            400,
+            msg,
+            "invalid_request_error",
+            "invalid_request_error",
+            "context_length_exceeded",
         )
 
     @app.exception_handler(MemoryError)

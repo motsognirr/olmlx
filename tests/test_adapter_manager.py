@@ -151,6 +151,13 @@ class TestAdapterLoad:
         assert base._adapter_child_refs == 1
         assert base.active_refs == 0
 
+    async def test_adapter_inherits_base_context_length(self, adapter_manager):
+        # Same architecture as the base, so the same over-window guard (#715).
+        manager, base = adapter_manager
+        base.context_length = 32768
+        lm = await manager.ensure_loaded("qwen3-8b:my-lora")
+        assert lm.context_length == 32768
+
     async def test_two_adapters_share_one_base(self, adapter_manager):
         manager, base = adapter_manager
         # Register and load a second adapter on the same base.

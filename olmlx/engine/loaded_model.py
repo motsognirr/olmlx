@@ -223,6 +223,11 @@ class LoadedModel:
     # MoE-quantized targets where chunked prefill triggers GatedDeltaNet
     # numerical drift across expert-routing thresholds).
     prompt_cache: bool | None = None
+    # Context window in tokens (``resolve_context_length``), recorded at load
+    # for text/VLM models. ``generate_chat``/``generate_completion`` reject a
+    # prompt that fills it before taking the inference lock (#715). None means
+    # unknown, which disables the check.
+    context_length: int | None = None
     # Per-model override for continuous batching. ``_batch_eligible``
     # consults this in place of ``settings.batching`` when set; None defers
     # to the global toggle. Mechanical eligibility (cache layout, model
