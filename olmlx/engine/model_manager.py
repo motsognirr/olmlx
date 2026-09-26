@@ -38,6 +38,7 @@ if TYPE_CHECKING:
     from olmlx.models.store import ModelStore
 
 from olmlx.models.store import _dir_size, _strip_ollama_tag
+from olmlx.engine.kv_budget import resolve_context_length
 
 # Extracted helper modules (#split-large-modules). Re-exported here so
 # `from olmlx.engine.model_manager import X` and facade-level monkeypatch
@@ -588,6 +589,7 @@ class ModelManager(SpeculativeLoaderMixin):
                     enable_thinking=base_lm.enable_thinking,
                     reasoning_effort=base_lm.reasoning_effort,
                     prompt_cache=base_lm.prompt_cache,
+                    context_length=base_lm.context_length,
                     # Continuous batching is not validated for the structurally
                     # modified (LoRALinear) adapter model, so adapters serve via
                     # the per-request path. Out of scope for issue #362.
@@ -1188,6 +1190,11 @@ class ModelManager(SpeculativeLoaderMixin):
                     _shard_dir = await asyncio.to_thread(
                         self._find_shard_dir, hf_path, kv_cache_quant
                     )
+                    _context_length = (
+                        self._read_context_length(hf_path, tokenizer, is_vlm)
+                        if _model_kind not in ("whisper", "tts", "reranker", "image")
+                        else None
+                    )
                     lm = LoadedModel(
                         name=normalized,
                         hf_path=hf_path,
@@ -1218,6 +1225,7 @@ class ModelManager(SpeculativeLoaderMixin):
                         enable_thinking=model_config.enable_thinking,
                         reasoning_effort=model_config.reasoning_effort,
                         prompt_cache=model_config.prompt_cache,
+                        context_length=_context_length,
                         batching=model_config.batching,
                         batch_completion_size=model_config.batch_completion_size,
                         batch_prefill_size=model_config.batch_prefill_size,
@@ -2084,6 +2092,30 @@ class ModelManager(SpeculativeLoaderMixin):
                     lm.name,
                     exc_info=True,
                 )
+
+    def _read_context_length(
+        self, hf_path: str, tokenizer: Any, is_vlm: bool
+    ) -> int | None:
+        """Context window for a freshly loaded text/VLM model (#715).
+
+        Reads the store's config.json (KB-sized, already on disk after the
+        load) plus the tokenizer's ``model_max_length``; any failure yields
+        None, which disables the over-window check rather than guessing.
+        """
+        config = None
+        if self.store is not None:
+            try:
+                config_path = self.store.local_path(hf_path) / "config.json"
+                config = json.loads(config_path.read_text())
+            except (OSError, ValueError):
+                config = None
+        # mlx-vlm returns a processor; the length lives on its text tokenizer.
+        tok = getattr(tokenizer, "tokenizer", tokenizer) if is_vlm else tokenizer
+        try:
+            return resolve_context_length(config, tok)
+        except Exception:
+            logger.debug("Could not resolve context length for %s", hf_path)
+            return None
 
     def _find_spectral_dir(
         self, hf_path: str, kv_cache_quant: str | None
