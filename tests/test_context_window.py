@@ -58,6 +58,29 @@ class TestResolveContextLength:
         }
         assert resolve_context_length(cfg) == 131072
 
+    def test_llama32_rope_scaling_does_not_inflate(self):
+        # Llama 3.2: factor 32 x original 8192 = 262144, but llama3 scaling
+        # doesn't extend the window — max_position_embeddings is the window.
+        cfg = {
+            "max_position_embeddings": 131072,
+            "rope_scaling": {
+                "rope_type": "llama3",
+                "factor": 32.0,
+                "original_max_position_embeddings": 8192,
+            },
+        }
+        assert resolve_context_length(cfg) == 131072
+
+    def test_non_extending_rope_type_without_mpe_is_unknown(self):
+        cfg = {
+            "rope_scaling": {
+                "rope_type": "longrope",
+                "factor": 32.0,
+                "original_max_position_embeddings": 4096,
+            }
+        }
+        assert resolve_context_length(cfg) is None
+
     def test_tokenizer_model_max_length_wins_when_larger(self):
         # Qwen2.5: config says 32768, tokenizer_config says 131072 (the value
         # in the #715 log). Take the more permissive declared limit.
