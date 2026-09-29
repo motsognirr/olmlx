@@ -1190,8 +1190,12 @@ class ModelManager(SpeculativeLoaderMixin):
                     _shard_dir = await asyncio.to_thread(
                         self._find_shard_dir, hf_path, kv_cache_quant
                     )
+                    # KB-sized config read, but still off the loop like the
+                    # neighbouring probes.
                     _context_length = (
-                        self._read_context_length(hf_path, tokenizer, is_vlm)
+                        await asyncio.to_thread(
+                            self._read_context_length, hf_path, tokenizer, is_vlm
+                        )
                         if _model_kind not in ("whisper", "tts", "reranker", "image")
                         else None
                     )
@@ -2112,10 +2116,24 @@ class ModelManager(SpeculativeLoaderMixin):
         # mlx-vlm returns a processor; the length lives on its text tokenizer.
         tok = getattr(tokenizer, "tokenizer", tokenizer) if is_vlm else tokenizer
         try:
-            return resolve_context_length(config, tok)
+            resolved = resolve_context_length(config, tok)
+            config_window = resolve_context_length(config)
         except Exception:
             logger.debug("Could not resolve context length for %s", hf_path)
             return None
+        if config_window is not None and resolved != config_window:
+            # The larger (tokenizer) limit wins so long-context use keeps
+            # working, but prompts between the two are past the config's
+            # positional window — make that gap visible.
+            logger.info(
+                "%s: config.json declares a %d-token window but the tokenizer "
+                "allows %d; rejecting prompts only at %d tokens",
+                hf_path,
+                config_window,
+                resolved,
+                resolved,
+            )
+        return resolved
 
     def _find_spectral_dir(
         self, hf_path: str, kv_cache_quant: str | None

@@ -310,6 +310,35 @@ class TestLoaderRecordsContextLength:
         lm = await manager.ensure_loaded("new")
         assert lm.context_length == 131072
 
+    def test_logs_when_tokenizer_widens_config_window(
+        self, registry, mock_store, caplog
+    ):
+        manager = ModelManager(registry, mock_store)
+        local = mock_store.local_path("qwen/repo")
+        local.mkdir(parents=True)
+        (local / "config.json").write_text(
+            json.dumps({"max_position_embeddings": 32768})
+        )
+        tok = SimpleNamespace(model_max_length=131072)
+        with caplog.at_level("INFO", logger="olmlx.engine.model_manager"):
+            assert manager._read_context_length("qwen/repo", tok, False) == 131072
+        assert any(
+            "32768" in r.getMessage() and "131072" in r.getMessage()
+            for r in caplog.records
+        )
+
+    def test_no_log_when_limits_agree(self, registry, mock_store, caplog):
+        manager = ModelManager(registry, mock_store)
+        local = mock_store.local_path("llama/repo")
+        local.mkdir(parents=True)
+        (local / "config.json").write_text(
+            json.dumps({"max_position_embeddings": 8192})
+        )
+        tok = SimpleNamespace(model_max_length=8192)
+        with caplog.at_level("INFO", logger="olmlx.engine.model_manager"):
+            assert manager._read_context_length("llama/repo", tok, False) == 8192
+        assert not any("declares" in r.getMessage() for r in caplog.records)
+
     def test_missing_config_is_none(self, registry, mock_store):
         manager = ModelManager(registry, mock_store)
         assert manager._read_context_length("absent/repo", MagicMock(), False) is None
