@@ -2117,10 +2117,16 @@ class ModelManager(SpeculativeLoaderMixin):
         tok = getattr(tokenizer, "tokenizer", tokenizer) if is_vlm else tokenizer
         try:
             resolved = resolve_context_length(config, tok)
+        except Exception:
+            logger.debug(
+                "Could not resolve context length for %s", hf_path, exc_info=True
+            )
+            return None
+        try:
             config_window = resolve_context_length(config)
         except Exception:
-            logger.debug("Could not resolve context length for %s", hf_path)
-            return None
+            # Diagnostic only — never let it disable the check.
+            config_window = None
         if config_window is not None and resolved != config_window:
             # The larger (tokenizer) limit wins so long-context use keeps
             # working, but prompts between the two are past the config's

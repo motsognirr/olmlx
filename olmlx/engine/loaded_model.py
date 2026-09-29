@@ -228,6 +228,9 @@ class LoadedModel:
     # prompt that fills it before taking the inference lock (#715). None means
     # unknown, which disables the check.
     context_length: int | None = None
+    # Memo for ``_kv_eviction_bounds_cache``: whether ``kv_eviction`` really
+    # swaps in the bounded cache (pure full-attention layout). None = unprobed.
+    kv_eviction_effective: bool | None = None
     # Per-model override for continuous batching. ``_batch_eligible``
     # consults this in place of ``settings.batching`` when set; None defers
     # to the global toggle. Mechanical eligibility (cache layout, model

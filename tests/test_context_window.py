@@ -163,12 +163,14 @@ class TestGenerateChatRejectsOverWindow:
         assert result["text"] == "ok"
 
     @pytest.mark.asyncio
-    async def test_kv_eviction_model_skips_check(self, mock_manager, monkeypatch):
+    async def test_active_kv_eviction_skips_check(self, mock_manager, monkeypatch):
         # StreamingLLM sink+window eviction (#505) exists to serve prompts
-        # longer than the nominal window; its KV is bounded, so no reject.
+        # longer than the nominal window; when it actually bounds the cache
+        # (prompt-cache path, pure full-attention model) there's no reject.
         lm = mock_manager._loaded["qwen3:latest"]
         lm.context_length = 100
         lm.kv_eviction = "4:64"
+        lm.kv_eviction_effective = True
         _set_prompt_tokens(lm, 150)
         monkeypatch.setattr(inf, "_CONTEXT_CHECK_BYTE_MARGIN", 10**9)
         with patch.object(
@@ -179,6 +181,60 @@ class TestGenerateChatRejectsOverWindow:
             )
         assert result["text"] == "ok"
         full.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_kv_eviction_without_prompt_cache_still_rejected(
+        self, mock_manager, monkeypatch
+    ):
+        # With the prompt cache off, generation builds mlx-lm's default
+        # (unbounded) cache — the eviction cache is never used.
+        lm = mock_manager._loaded["qwen3:latest"]
+        lm.context_length = 100
+        lm.kv_eviction = "4:64"
+        lm.kv_eviction_effective = True
+        lm.prompt_cache = False
+        _set_prompt_tokens(lm, 150)
+        monkeypatch.setattr(inf, "_CONTEXT_CHECK_BYTE_MARGIN", 10**9)
+        with patch.object(inf, "_full_completion", AsyncMock()) as full:
+            with pytest.raises(ContextLengthExceededError):
+                await generate_chat(
+                    mock_manager,
+                    "qwen3",
+                    [{"role": "user", "content": "hi"}],
+                    stream=False,
+                )
+        full.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_ineffective_kv_eviction_still_rejected(
+        self, mock_manager, monkeypatch
+    ):
+        # Hybrid/SWA models: _make_eviction_prompt_cache skips eviction and
+        # returns the default cache, so the window still applies.
+        lm = mock_manager._loaded["qwen3:latest"]
+        lm.context_length = 100
+        lm.kv_eviction = "4:64"
+        lm.kv_eviction_effective = False
+        _set_prompt_tokens(lm, 150)
+        monkeypatch.setattr(inf, "_CONTEXT_CHECK_BYTE_MARGIN", 10**9)
+        with pytest.raises(ContextLengthExceededError):
+            await generate_chat(
+                mock_manager, "qwen3", [{"role": "user", "content": "hi"}], stream=False
+            )
+
+    @pytest.mark.asyncio
+    async def test_completion_kv_eviction_still_rejected(
+        self, mock_manager, monkeypatch
+    ):
+        # generate_completion never uses the prompt cache, so no eviction.
+        lm = mock_manager._loaded["qwen3:latest"]
+        lm.context_length = 100
+        lm.kv_eviction = "4:64"
+        lm.kv_eviction_effective = True
+        _set_prompt_tokens(lm, 150)
+        monkeypatch.setattr(inf, "_CONTEXT_CHECK_BYTE_MARGIN", 10**9)
+        with pytest.raises(ContextLengthExceededError):
+            await generate_completion(mock_manager, "qwen3", "Hello", stream=False)
 
     @pytest.mark.asyncio
     async def test_short_prompt_skips_tokenization(self, mock_manager):
@@ -372,3 +428,54 @@ class TestLoaderRecordsContextLength:
             name="x", hf_path="x", model=MagicMock(), tokenizer=MagicMock()
         )
         assert lm.context_length is None
+
+
+class TestKvEvictionBoundsCache:
+    """``_kv_eviction_bounds_cache`` mirrors ``_make_eviction_prompt_cache``."""
+
+    def _lm(self, layers):
+        from mlx_lm.models.cache import KVCache  # noqa: F401
+
+        model = SimpleNamespace(make_cache=lambda: layers)
+        return LoadedModel(
+            name="m",
+            hf_path="m",
+            model=model,
+            tokenizer=MagicMock(),
+            kv_eviction="4:64",
+        )
+
+    def test_pure_full_attention_is_bounded(self):
+        from mlx_lm.models.cache import KVCache
+
+        lm = self._lm([KVCache(), KVCache()])
+        assert inf._kv_eviction_bounds_cache(lm) is True
+        assert lm.kv_eviction_effective is True  # memoized
+
+    def test_hybrid_is_not_bounded(self):
+        from mlx_lm.models.cache import KVCache, RotatingKVCache
+
+        lm = self._lm([KVCache(), RotatingKVCache(max_size=8)])
+        assert inf._kv_eviction_bounds_cache(lm) is False
+
+    def test_no_eviction_or_quant(self):
+        from mlx_lm.models.cache import KVCache
+
+        lm = self._lm([KVCache()])
+        lm.kv_eviction = None
+        assert inf._kv_eviction_bounds_cache(lm) is False
+        lm.kv_eviction = "4:64"
+        lm.kv_cache_quant = "turboquant:4"
+        assert inf._kv_eviction_bounds_cache(lm) is False
+
+    def test_vlm_is_not_bounded(self):
+        from mlx_lm.models.cache import KVCache
+
+        lm = self._lm([KVCache()])
+        lm.is_vlm = True
+        assert inf._kv_eviction_bounds_cache(lm) is False
+
+    def test_probe_failure_is_not_bounded(self):
+        lm = self._lm([])
+        lm.model = SimpleNamespace(make_cache=MagicMock(side_effect=RuntimeError))
+        assert inf._kv_eviction_bounds_cache(lm) is False

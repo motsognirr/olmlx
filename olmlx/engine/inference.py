@@ -585,10 +585,41 @@ class ContextLengthExceededError(ValueError):
 _CONTEXT_CHECK_BYTE_MARGIN = 16
 
 
+def _kv_eviction_bounds_cache(lm: LoadedModel) -> bool:
+    """True when ``lm.kv_eviction`` really yields the bounded eviction cache.
+
+    Mirrors ``_make_prompt_cache_for_lm`` / ``_make_eviction_prompt_cache``:
+    KV quant wins over eviction, the VLM path never builds that cache, and
+    eviction only applies to pure full-attention layouts (hybrid/SWA/GDN get
+    the default cache). The layout probe is memoized on the model.
+    """
+    if (
+        lm.kv_eviction is None
+        or lm.kv_cache_quant is not None
+        or lm.is_vlm
+        or make_prompt_cache is None
+        or KVCache is None
+        or RotatingKVCache is None
+    ):
+        return False
+    if lm.kv_eviction_effective is None:
+        try:
+            default = make_prompt_cache(_get_model_for_cache(lm.model, lm.is_vlm))
+            lm.kv_eviction_effective = bool(default) and all(
+                type(layer) is KVCache for layer in default
+            )
+        except Exception:
+            logger.debug("kv_eviction layout probe failed for %s", lm.name)
+            lm.kv_eviction_effective = False
+    return lm.kv_eviction_effective is True
+
+
 def _reject_prompt_over_context(
     lm: LoadedModel,
     prompt: str | list[int],
     prompt_tokens: list[int] | None = None,
+    *,
+    eviction_bounded: bool = False,
 ) -> None:
     """Raise ContextLengthExceededError if *prompt* leaves no room to generate.
 
@@ -601,9 +632,11 @@ def _reject_prompt_over_context(
     limit = lm.context_length
     if not isinstance(limit, int) or isinstance(limit, bool) or limit <= 0:
         return
-    # StreamingLLM sink+window eviction (#505) bounds the KV cache and exists
-    # precisely to serve prompts longer than the nominal window.
-    if lm.kv_eviction is not None:
+    # StreamingLLM sink+window eviction (#505) exists to serve prompts longer
+    # than the nominal window — but only when this request's generation path
+    # actually builds the bounded cache (the caller decides; see
+    # ``_kv_eviction_bounds_cache``). Otherwise the window still applies.
+    if eviction_bounded:
         return
     if prompt_tokens is not None:
         n = len(prompt_tokens)
@@ -4661,7 +4694,14 @@ async def generate_chat(
                 make_prompt_cache is not None,
             )
 
-        _reject_prompt_over_context(lm, prompt, prompt_tokens)
+        # Eviction only bounds the cache on the text prompt-cache path, which
+        # builds it via ``_make_prompt_cache_for_lm``.
+        _reject_prompt_over_context(
+            lm,
+            prompt,
+            prompt_tokens,
+            eviction_bounded=use_prompt_cache and _kv_eviction_bounds_cache(lm),
+        )
 
         # Tell streaming routers whether to wait for a (possibly orphaned, see
         # #307) `</think>` token — shares the rules with `_apply_chat_template`.
