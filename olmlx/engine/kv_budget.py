@@ -304,3 +304,89 @@ def build_context_input_tokens(
     if bos_id is not None and prompt_tokens and prompt_tokens[0] == bos_id:
         prompt_tokens = prompt_tokens[1:]
     return list(context) + prompt_tokens
+
+
+# config.json keys that declare a model's positional window, across the HF
+# architectures mlx-lm/mlx-vlm serve (GPT-2 ``n_positions``, MPT
+# ``max_seq_len``, ChatGLM ``seq_length``, ...).
+_CONTEXT_LENGTH_KEYS = (
+    "max_position_embeddings",
+    "n_positions",
+    "max_seq_len",
+    "max_sequence_length",
+    "seq_length",
+    "n_ctx",
+)
+# RoPE-scaling types whose ``factor`` multiplies the positional window.
+_WINDOW_EXTENDING_ROPE_TYPES = ("yarn", "linear", "dynamic")
+# transformers reports ``int(1e30)`` for "no limit"; anything this large is
+# not a real window.
+_TOKENIZER_MAX_LENGTH_SENTINEL = 10_000_000
+
+
+def _positive_int(value: Any) -> int | None:
+    # bool is an int subclass; a ``true`` in config.json is not a length.
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int) and value > 0:
+        return value
+    if isinstance(value, float) and value > 0 and value.is_integer():
+        return int(value)
+    return None
+
+
+def _config_context_candidates(cfg: dict) -> list[int]:
+    out: list[int] = []
+    mpe = None
+    for key in _CONTEXT_LENGTH_KEYS:
+        v = _positive_int(cfg.get(key))
+        if v is not None:
+            out.append(v)
+            if key == "max_position_embeddings":
+                mpe = v
+    # A window-extending RoPE-scaling block (``rope_parameters`` in newer
+    # transformers) can push the window past ``max_position_embeddings`` —
+    # Qwen2.5's recommended YaRN block keeps 32768 there and adds factor=4.
+    # Other types (``llama3``, ``longrope``, ...) already report the extended
+    # window in ``max_position_embeddings``; their ``factor`` isn't a window
+    # multiplier (Llama 3.2: 32 x 8192 = 262144 vs a real 131072), so only the
+    # extending types contribute a candidate.
+    for scaling_key in ("rope_scaling", "rope_parameters"):
+        scaling = cfg.get(scaling_key)
+        if not isinstance(scaling, dict):
+            continue
+        factor = scaling.get("factor")
+        if isinstance(factor, bool) or not isinstance(factor, (int, float)):
+            continue
+        if factor <= 1:
+            continue
+        rope_type = scaling.get("rope_type") or scaling.get("type")
+        if rope_type not in _WINDOW_EXTENDING_ROPE_TYPES:
+            continue
+        original = _positive_int(scaling.get("original_max_position_embeddings"))
+        if original is not None:
+            out.append(int(original * factor))
+        elif mpe is not None:
+            out.append(int(mpe * factor))
+    return out
+
+
+def resolve_context_length(config: dict | None, tokenizer: Any = None) -> int | None:
+    """Return the model's context window in tokens, or None when unknown.
+
+    Considers the top-level config.json, a nested ``text_config`` (VLMs and
+    multimodal wrappers), RoPE-scaling extensions, and the tokenizer's
+    ``model_max_length``, returning the **largest** declared limit. The value
+    backs a hard request rejection (#715), so it errs permissive: a prompt is
+    only refused when it is beyond every limit the model declares.
+    """
+    candidates: list[int] = []
+    if isinstance(config, dict):
+        candidates.extend(_config_context_candidates(config))
+        text_cfg = config.get("text_config")
+        if isinstance(text_cfg, dict):
+            candidates.extend(_config_context_candidates(text_cfg))
+    tok_max = _positive_int(getattr(tokenizer, "model_max_length", None))
+    if tok_max is not None and tok_max < _TOKENIZER_MAX_LENGTH_SENTINEL:
+        candidates.append(tok_max)
+    return max(candidates) if candidates else None

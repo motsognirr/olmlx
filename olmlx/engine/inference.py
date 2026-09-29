@@ -567,6 +567,129 @@ class TTSGenerationError(RuntimeError):
 _TTS_PASSTHROUGH_ERRORS = (MemoryError,)
 
 
+class ContextLengthExceededError(ValueError):
+    """The prompt fills or exceeds the model's context window (#715).
+
+    A ``ValueError`` so every surface reports it as a 400; app.py gives it the
+    OpenAI ``context_length_exceeded`` code.
+    """
+
+    pass
+
+
+# Every token covers at least one UTF-8 byte of prompt text, so a prompt whose
+# byte length is this far under the window can't fill it — the check skips the
+# extra tokenization pass for it. The margin absorbs tokens that cover no byte
+# (an added BOS, SentencePiece's dummy prefix). Tests raise it to force the
+# tokenizing branch.
+_CONTEXT_CHECK_BYTE_MARGIN = 16
+
+
+def _kv_eviction_bounds_cache(lm: LoadedModel) -> bool:
+    """True when ``lm.kv_eviction`` really yields the bounded eviction cache.
+
+    Mirrors ``_make_prompt_cache_for_lm`` / ``_make_eviction_prompt_cache``:
+    KV quant wins over eviction, the VLM path never builds that cache, and
+    eviction only applies to pure full-attention layouts (hybrid/SWA/GDN get
+    the default cache). The layout probe is memoized on the model.
+    """
+    if (
+        lm.kv_eviction is None
+        or lm.kv_cache_quant is not None
+        or lm.is_vlm
+        or make_prompt_cache is None
+        or KVCache is None
+        or RotatingKVCache is None
+    ):
+        return False
+    if lm.kv_eviction_effective is None:
+        try:
+            default = make_prompt_cache(_get_model_for_cache(lm.model, lm.is_vlm))
+        except Exception:
+            # Not memoized: a transient failure must not pin "not bounded"
+            # (a 400 for every over-window prompt) for the model's residency.
+            logger.debug("kv_eviction layout probe failed for %s", lm.name)
+            return False
+        lm.kv_eviction_effective = bool(default) and all(
+            type(layer) is KVCache for layer in default
+        )
+    return lm.kv_eviction_effective is True
+
+
+def _reject_prompt_over_context(
+    lm: LoadedModel,
+    prompt: str | list[int],
+    prompt_tokens: list[int] | None = None,
+    *,
+    eviction_bounded: bool = False,
+) -> None:
+    """Raise ContextLengthExceededError if *prompt* leaves no room to generate.
+
+    ``generate_chat``/``generate_completion`` call it before the inference lock
+    is taken: an over-window prompt used to be handed to generation, which hung
+    forever holding the lock and wedged every later request (#715). The one
+    under-lock caller, ``_recheck_window_if_eviction_cache_lost``, runs it
+    after the KV preflight but still before generation starts. For a VLM the text tokenizer undercounts (no image
+    patch tokens), so the count is a lower bound; a prompt it rejects really
+    is too long.
+    """
+    limit = lm.context_length
+    if not isinstance(limit, int) or isinstance(limit, bool) or limit <= 0:
+        return
+    # StreamingLLM sink+window eviction (#505) exists to serve prompts longer
+    # than the nominal window — but only when this request's generation path
+    # actually builds the bounded cache (the caller decides; see
+    # ``_kv_eviction_bounds_cache``). Otherwise the window still applies.
+    if eviction_bounded:
+        return
+    if prompt_tokens is not None:
+        n = len(prompt_tokens)
+    elif isinstance(prompt, list):
+        n = len(prompt)
+    else:
+        if len(prompt.encode("utf-8")) + _CONTEXT_CHECK_BYTE_MARGIN < limit:
+            return
+        try:
+            n = len(tokenize_for_cache(lm.text_tokenizer, prompt))
+        except Exception:
+            logger.debug("Context-window check skipped: tokenization failed")
+            return
+    if n >= limit:
+        raise ContextLengthExceededError(
+            f"Prompt is {n} tokens, which does not fit the context window of "
+            f"model {lm.name!r} ({limit} tokens). Shorten the prompt or "
+            "conversation, or use a model with a longer context."
+        )
+
+
+def _recheck_window_if_eviction_cache_lost(
+    lm: LoadedModel,
+    gen_kwargs: dict,
+    prompt: str | list[int],
+    full_prompt_tokens: list[int] | None,
+    use_prompt_cache: bool,
+) -> None:
+    """Re-run the window check when an exempted kv_eviction request lost its cache.
+
+    ``generate_chat`` exempts a ``kv_eviction`` request from the pre-lock
+    window check on the assumption that generation uses the bounded eviction
+    cache. Cache setup can skip installing it under memory pressure, and the
+    KV preflight can pop it; generation then builds mlx-lm's unbounded
+    default cache, so the window applies after all. Called after the
+    preflight, before generation starts. Non-streaming requests get the usual
+    400; on the streaming path the router has already sent its 200, so (like
+    the preflight's ``MemoryError``) it surfaces as the router's in-stream
+    error event and the stream ends before any tokens.
+    """
+    if not use_prompt_cache or "prompt_cache" in gen_kwargs:
+        return
+    if not _kv_eviction_bounds_cache(lm):
+        return  # not exempted — already checked before the lock
+    _reject_prompt_over_context(
+        lm, full_prompt_tokens if full_prompt_tokens is not None else prompt
+    )
+
+
 def _reject_non_lm_model(lm: LoadedModel, model_name: str, surface: str) -> None:
     """Raise ``ValueError`` (-> 400) if *lm* is not a text/VLM language model.
 
@@ -1098,7 +1221,8 @@ def _make_eviction_prompt_cache(model: Any, sink: int, window: int) -> list:
     mask/rope work.
 
     Eviction is applied **only to pure full-attention models** — those whose
-    default cache is all plain ``KVCache``. Hybrid/SWA/GDN models (any
+    default cache is all plain ``KVCache``. ``_kv_eviction_bounds_cache``
+    repeats this rule for the #715 over-window exemption; keep the two in sync. Hybrid/SWA/GDN models (any
     ``RotatingKVCache`` already present, or ``ArraysCache`` recurrent state)
     are left untouched: a single per-forward mask is built from ``cache[0]``,
     so a mixed list would mis-mask, and recurrent layers can't be windowed.
@@ -1367,6 +1491,7 @@ async def generate_completion(
             )
             gen_prompt = context_input_tokens
         collect_generated_tokens = context_input_tokens is not None
+        _reject_prompt_over_context(lm, gen_prompt)
 
         if stream:
             gen = _stream_completion(
@@ -3277,6 +3402,10 @@ async def _stream_completion(
         )
         prompt = pf.prompt
         memory_limit = pf.memory_limit
+        if not lm.is_vlm:
+            _recheck_window_if_eviction_cache_lost(
+                lm, gen_kwargs, prompt, full_prompt_tokens, use_prompt_cache
+            )
 
         # Yield cache stats after the pre-flight check so routers can
         # use them.  This starts the HTTP response — no 503 after this.
@@ -3870,6 +3999,9 @@ async def _full_completion(
                         cache_id=cache_id,
                     )
                     prompt = pf.prompt
+                    _recheck_window_if_eviction_cache_lost(
+                        lm, gen_kwargs, prompt, full_prompt_tokens, use_prompt_cache
+                    )
 
                 result_dict = await _full_completion_inner(
                     lm,
@@ -4601,6 +4733,21 @@ async def generate_chat(
                 lm.is_speculative,
                 make_prompt_cache is not None,
             )
+
+        # Eviction only bounds the cache on the text prompt-cache path, which
+        # builds it via ``_make_prompt_cache_for_lm``.
+        _reject_prompt_over_context(
+            lm,
+            prompt,
+            prompt_tokens,
+            # context_length first: skip the one-time layout probe when the
+            # check is off anyway (unknown window).
+            eviction_bounded=(
+                use_prompt_cache
+                and lm.context_length is not None
+                and _kv_eviction_bounds_cache(lm)
+            ),
+        )
 
         # Tell streaming routers whether to wait for a (possibly orphaned, see
         # #307) `</think>` token — shares the rules with `_apply_chat_template`.

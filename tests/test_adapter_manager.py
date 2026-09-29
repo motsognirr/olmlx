@@ -151,6 +151,23 @@ class TestAdapterLoad:
         assert base._adapter_child_refs == 1
         assert base.active_refs == 0
 
+    async def test_adapter_inherits_base_context_length(self, adapter_manager):
+        # Same architecture as the base, so the same over-window guard (#715).
+        manager, base = adapter_manager
+        base.context_length = 32768
+        lm = await manager.ensure_loaded("qwen3-8b:my-lora")
+        assert lm.context_length == 32768
+
+    async def test_adapter_inherits_base_kv_eviction(self, adapter_manager):
+        # The prompt cache is built from the model's layers, which a LoRA
+        # adapter doesn't change, so the adapter gets the base's bounded
+        # sink+window cache and the #715 eviction exemption with it.
+        manager, base = adapter_manager
+        base.kv_eviction = "4:1024"
+        lm = await manager.ensure_loaded("qwen3-8b:my-lora")
+        assert lm.kv_eviction == "4:1024"
+        assert lm.kv_eviction_effective is None  # probed on the adapter itself
+
     async def test_two_adapters_share_one_base(self, adapter_manager):
         manager, base = adapter_manager
         # Register and load a second adapter on the same base.

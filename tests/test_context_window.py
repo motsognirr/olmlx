@@ -1,0 +1,640 @@
+"""Prompts longer than the model's context window are rejected up front (#715).
+
+An over-window prompt used to be handed to generation, where it hung forever
+while holding the global inference lock — wedging every later request. It must
+now fail fast with a 400 *before* the lock is taken.
+"""
+
+import json
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock, patch
+
+import pytest
+
+import olmlx.engine.inference as inf
+from olmlx.engine.inference import (
+    ContextLengthExceededError,
+    generate_chat,
+    generate_completion,
+)
+from olmlx.engine.kv_budget import resolve_context_length
+from olmlx.engine.model_manager import LoadedModel, ModelManager
+from olmlx.engine.registry import ModelConfig
+from olmlx.engine.template_caps import TemplateCaps
+
+
+class TestResolveContextLength:
+    def test_max_position_embeddings(self):
+        assert resolve_context_length({"max_position_embeddings": 32768}) == 32768
+
+    def test_nested_text_config(self):
+        cfg = {"text_config": {"max_position_embeddings": 131072}}
+        assert resolve_context_length(cfg) == 131072
+
+    def test_alternate_keys(self):
+        assert resolve_context_length({"n_positions": 2048}) == 2048
+        assert resolve_context_length({"max_seq_len": 4096}) == 4096
+
+    def test_yarn_rope_scaling_extends_window(self):
+        cfg = {
+            "max_position_embeddings": 32768,
+            "rope_scaling": {
+                "type": "yarn",
+                "factor": 4.0,
+                "original_max_position_embeddings": 32768,
+            },
+        }
+        assert resolve_context_length(cfg) == 131072
+
+    def test_llama3_rope_scaling_does_not_inflate(self):
+        # Llama 3.1: max_position_embeddings is already the extended window.
+        cfg = {
+            "max_position_embeddings": 131072,
+            "rope_scaling": {
+                "rope_type": "llama3",
+                "factor": 8.0,
+                "original_max_position_embeddings": 8192,
+            },
+        }
+        assert resolve_context_length(cfg) == 131072
+
+    def test_llama32_rope_scaling_does_not_inflate(self):
+        # Llama 3.2: factor 32 x original 8192 = 262144, but llama3 scaling
+        # doesn't extend the window — max_position_embeddings is the window.
+        cfg = {
+            "max_position_embeddings": 131072,
+            "rope_scaling": {
+                "rope_type": "llama3",
+                "factor": 32.0,
+                "original_max_position_embeddings": 8192,
+            },
+        }
+        assert resolve_context_length(cfg) == 131072
+
+    def test_non_extending_rope_type_without_mpe_is_unknown(self):
+        cfg = {
+            "rope_scaling": {
+                "rope_type": "longrope",
+                "factor": 32.0,
+                "original_max_position_embeddings": 4096,
+            }
+        }
+        assert resolve_context_length(cfg) is None
+
+    def test_tokenizer_model_max_length_wins_when_larger(self):
+        # Qwen2.5: config says 32768, tokenizer_config says 131072 (the value
+        # in the #715 log). Take the more permissive declared limit.
+        tok = SimpleNamespace(model_max_length=131072)
+        assert resolve_context_length({"max_position_embeddings": 32768}, tok) == (
+            131072
+        )
+
+    def test_tokenizer_sentinel_ignored(self):
+        tok = SimpleNamespace(model_max_length=int(1e30))
+        assert resolve_context_length({"max_position_embeddings": 4096}, tok) == 4096
+        assert resolve_context_length(None, tok) is None
+
+    def test_unknown_is_none(self):
+        assert resolve_context_length(None) is None
+        assert resolve_context_length({}) is None
+        assert resolve_context_length({"max_position_embeddings": "big"}) is None
+        assert resolve_context_length({"max_position_embeddings": True}) is None
+        assert resolve_context_length({"max_position_embeddings": 0}) is None
+
+    def test_magicmock_tokenizer_ignored(self):
+        assert resolve_context_length({"n_ctx": 1024}, MagicMock()) == 1024
+
+
+def _set_prompt_tokens(lm: LoadedModel, n: int) -> None:
+    lm.tokenizer.encode = MagicMock(return_value=list(range(n)))
+    lm.tokenizer.bos_token = None
+
+
+class TestGenerateChatRejectsOverWindow:
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("stream", [False, True])
+    @pytest.mark.parametrize("prompt_cache", [True, False])
+    async def test_over_window_rejected_before_generation(
+        self, mock_manager, monkeypatch, stream, prompt_cache
+    ):
+        lm = mock_manager._loaded["qwen3:latest"]
+        lm.context_length = 100
+        lm.prompt_cache = prompt_cache
+        _set_prompt_tokens(lm, 150)
+        # Force the tokenize fallback even for the short test prompt string.
+        monkeypatch.setattr(inf, "_CONTEXT_CHECK_BYTE_MARGIN", 10**9)
+        full = AsyncMock()
+        streamed = MagicMock()
+        with (
+            patch.object(inf, "_full_completion", full),
+            patch.object(inf, "_stream_completion", streamed),
+            patch.object(inf, "_acquire_inference_lock") as lock,
+        ):
+            with pytest.raises(ContextLengthExceededError) as ei:
+                await generate_chat(
+                    mock_manager,
+                    "qwen3",
+                    [{"role": "user", "content": "hi"}],
+                    stream=stream,
+                )
+        assert isinstance(ei.value, ValueError)  # -> 400 via the app handler
+        assert "150" in str(ei.value) and "100" in str(ei.value)
+        full.assert_not_called()
+        streamed.assert_not_called()
+        lock.assert_not_called()
+        assert lm.active_refs == 0  # pin released
+
+    @pytest.mark.asyncio
+    async def test_prompt_exactly_at_window_rejected(self, mock_manager, monkeypatch):
+        # No room left for even one generated token.
+        lm = mock_manager._loaded["qwen3:latest"]
+        lm.context_length = 100
+        _set_prompt_tokens(lm, 100)
+        monkeypatch.setattr(inf, "_CONTEXT_CHECK_BYTE_MARGIN", 10**9)
+        with pytest.raises(ContextLengthExceededError):
+            await generate_chat(
+                mock_manager, "qwen3", [{"role": "user", "content": "hi"}], stream=False
+            )
+
+    @pytest.mark.asyncio
+    async def test_under_window_proceeds(self, mock_manager, monkeypatch):
+        lm = mock_manager._loaded["qwen3:latest"]
+        lm.context_length = 100
+        _set_prompt_tokens(lm, 99)
+        monkeypatch.setattr(inf, "_CONTEXT_CHECK_BYTE_MARGIN", 10**9)
+        with patch.object(
+            inf, "_full_completion", AsyncMock(return_value={"text": "ok"})
+        ) as full:
+            result = await generate_chat(
+                mock_manager, "qwen3", [{"role": "user", "content": "hi"}], stream=False
+            )
+        assert result["text"] == "ok"
+        full.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_unknown_window_skips_check(self, mock_manager, monkeypatch):
+        lm = mock_manager._loaded["qwen3:latest"]
+        lm.context_length = None
+        _set_prompt_tokens(lm, 10**6)
+        monkeypatch.setattr(inf, "_CONTEXT_CHECK_BYTE_MARGIN", 10**9)
+        with patch.object(
+            inf, "_full_completion", AsyncMock(return_value={"text": "ok"})
+        ):
+            result = await generate_chat(
+                mock_manager, "qwen3", [{"role": "user", "content": "hi"}], stream=False
+            )
+        assert result["text"] == "ok"
+
+    @pytest.mark.asyncio
+    async def test_active_kv_eviction_skips_check(self, mock_manager, monkeypatch):
+        # StreamingLLM sink+window eviction (#505) exists to serve prompts
+        # longer than the nominal window; when it actually bounds the cache
+        # (prompt-cache path, pure full-attention model) there's no reject.
+        lm = mock_manager._loaded["qwen3:latest"]
+        lm.context_length = 100
+        lm.kv_eviction = "4:64"
+        lm.kv_eviction_effective = True
+        _set_prompt_tokens(lm, 150)
+        monkeypatch.setattr(inf, "_CONTEXT_CHECK_BYTE_MARGIN", 10**9)
+        with patch.object(
+            inf, "_full_completion", AsyncMock(return_value={"text": "ok"})
+        ) as full:
+            result = await generate_chat(
+                mock_manager, "qwen3", [{"role": "user", "content": "hi"}], stream=False
+            )
+        assert result["text"] == "ok"
+        full.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_kv_eviction_without_prompt_cache_still_rejected(
+        self, mock_manager, monkeypatch
+    ):
+        # With the prompt cache off, generation builds mlx-lm's default
+        # (unbounded) cache — the eviction cache is never used.
+        lm = mock_manager._loaded["qwen3:latest"]
+        lm.context_length = 100
+        lm.kv_eviction = "4:64"
+        lm.kv_eviction_effective = True
+        lm.prompt_cache = False
+        _set_prompt_tokens(lm, 150)
+        monkeypatch.setattr(inf, "_CONTEXT_CHECK_BYTE_MARGIN", 10**9)
+        with patch.object(inf, "_full_completion", AsyncMock()) as full:
+            with pytest.raises(ContextLengthExceededError):
+                await generate_chat(
+                    mock_manager,
+                    "qwen3",
+                    [{"role": "user", "content": "hi"}],
+                    stream=False,
+                )
+        full.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_ineffective_kv_eviction_still_rejected(
+        self, mock_manager, monkeypatch
+    ):
+        # Hybrid/SWA models: _make_eviction_prompt_cache skips eviction and
+        # returns the default cache, so the window still applies.
+        lm = mock_manager._loaded["qwen3:latest"]
+        lm.context_length = 100
+        lm.kv_eviction = "4:64"
+        lm.kv_eviction_effective = False
+        _set_prompt_tokens(lm, 150)
+        monkeypatch.setattr(inf, "_CONTEXT_CHECK_BYTE_MARGIN", 10**9)
+        with pytest.raises(ContextLengthExceededError):
+            await generate_chat(
+                mock_manager, "qwen3", [{"role": "user", "content": "hi"}], stream=False
+            )
+
+    @pytest.mark.asyncio
+    async def test_completion_kv_eviction_still_rejected(
+        self, mock_manager, monkeypatch
+    ):
+        # generate_completion never uses the prompt cache, so no eviction.
+        lm = mock_manager._loaded["qwen3:latest"]
+        lm.context_length = 100
+        lm.kv_eviction = "4:64"
+        lm.kv_eviction_effective = True
+        _set_prompt_tokens(lm, 150)
+        monkeypatch.setattr(inf, "_CONTEXT_CHECK_BYTE_MARGIN", 10**9)
+        with pytest.raises(ContextLengthExceededError):
+            await generate_completion(mock_manager, "qwen3", "Hello", stream=False)
+
+    @pytest.mark.asyncio
+    async def test_short_prompt_skips_tokenization(self, mock_manager):
+        # A prompt whose UTF-8 byte length is well under the window can't
+        # exceed it, so no extra tokenization pass is paid for it.
+        lm = mock_manager._loaded["qwen3:latest"]
+        lm.context_length = 100_000
+        lm.prompt_cache = False
+        _set_prompt_tokens(lm, 10**6)  # would be rejected if tokenized
+        with patch.object(
+            inf, "_full_completion", AsyncMock(return_value={"text": "ok"})
+        ):
+            result = await generate_chat(
+                mock_manager, "qwen3", [{"role": "user", "content": "hi"}], stream=False
+            )
+        assert result["text"] == "ok"
+        lm.tokenizer.encode.assert_not_called()
+
+
+class TestGenerateCompletionRejectsOverWindow:
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("stream", [False, True])
+    async def test_over_window_rejected(self, mock_manager, monkeypatch, stream):
+        lm = mock_manager._loaded["qwen3:latest"]
+        lm.context_length = 100
+        _set_prompt_tokens(lm, 150)
+        monkeypatch.setattr(inf, "_CONTEXT_CHECK_BYTE_MARGIN", 10**9)
+        full = AsyncMock()
+        streamed = MagicMock()
+        with (
+            patch.object(inf, "_full_completion", full),
+            patch.object(inf, "_stream_completion", streamed),
+        ):
+            with pytest.raises(ContextLengthExceededError):
+                await generate_completion(mock_manager, "qwen3", "Hello", stream=stream)
+        full.assert_not_called()
+        streamed.assert_not_called()
+        assert lm.active_refs == 0
+
+    @pytest.mark.asyncio
+    async def test_prior_context_counts_toward_window(self, mock_manager):
+        # /api/generate `context` continuation: the prepended prior tokens are
+        # prefilled too, so they count against the window.
+        lm = mock_manager._loaded["qwen3:latest"]
+        lm.context_length = 100
+        _set_prompt_tokens(lm, 10)
+        with patch.object(inf, "_full_completion", AsyncMock()) as full:
+            with pytest.raises(ContextLengthExceededError):
+                await generate_completion(
+                    mock_manager,
+                    "qwen3",
+                    "Hello",
+                    stream=False,
+                    return_context=True,
+                    context=list(range(95)),
+                )
+        full.assert_not_called()
+
+
+class TestHttpSurface:
+    @pytest.mark.asyncio
+    async def test_openai_chat_returns_400(self, app_client, mock_manager, monkeypatch):
+        lm = mock_manager._loaded["qwen3:latest"]
+        lm.context_length = 100
+        _set_prompt_tokens(lm, 150)
+        monkeypatch.setattr(inf, "_CONTEXT_CHECK_BYTE_MARGIN", 10**9)
+        resp = await app_client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "qwen3",
+                "messages": [{"role": "user", "content": "hi"}],
+                "max_tokens": 10,
+            },
+        )
+        assert resp.status_code == 400
+        err = resp.json()["error"]
+        assert err["code"] == "context_length_exceeded"
+        assert "context window" in err["message"]
+
+    @pytest.mark.asyncio
+    async def test_ollama_chat_returns_400(self, app_client, mock_manager, monkeypatch):
+        lm = mock_manager._loaded["qwen3:latest"]
+        lm.context_length = 100
+        _set_prompt_tokens(lm, 150)
+        monkeypatch.setattr(inf, "_CONTEXT_CHECK_BYTE_MARGIN", 10**9)
+        resp = await app_client.post(
+            "/api/chat",
+            json={
+                "model": "qwen3",
+                "messages": [{"role": "user", "content": "hi"}],
+                "stream": False,
+            },
+        )
+        assert resp.status_code == 400
+
+    @pytest.mark.asyncio
+    async def test_anthropic_messages_returns_400(
+        self, app_client, mock_manager, monkeypatch
+    ):
+        lm = mock_manager._loaded["qwen3:latest"]
+        lm.context_length = 100
+        _set_prompt_tokens(lm, 150)
+        monkeypatch.setattr(inf, "_CONTEXT_CHECK_BYTE_MARGIN", 10**9)
+        resp = await app_client.post(
+            "/v1/messages",
+            json={
+                "model": "qwen3",
+                "max_tokens": 10,
+                "messages": [{"role": "user", "content": "hi"}],
+            },
+        )
+        assert resp.status_code == 400
+        assert resp.json()["error"]["type"] == "invalid_request_error"
+
+
+class TestLoaderRecordsContextLength:
+    @pytest.mark.asyncio
+    async def test_ensure_loaded_reads_store_config(
+        self, registry, mock_store, monkeypatch
+    ):
+        monkeypatch.setattr(
+            "olmlx.engine.model_manager.settings.model_load_timeout", None
+        )
+        manager = ModelManager(registry, mock_store)
+        manager.registry.resolve = MagicMock(  # type: ignore[method-assign]
+            return_value=ModelConfig(hf_path="new/repo")
+        )
+        manager.registry.normalize_name = MagicMock(  # type: ignore[method-assign]
+            side_effect=lambda n: f"{n}:latest"
+        )
+        local = mock_store.local_path("new/repo")
+        local.mkdir(parents=True)
+        (local / "config.json").write_text(
+            json.dumps({"model_type": "qwen2", "max_position_embeddings": 32768})
+        )
+
+        tokenizer = MagicMock()
+        tokenizer.chat_template = None
+        tokenizer.model_max_length = 131072
+
+        def _shard(*args, **kwargs):
+            return (MagicMock(), tokenizer, False, TemplateCaps(), False, None)
+
+        monkeypatch.setattr(manager, "_load_model_and_shard", _shard)
+        monkeypatch.setattr(manager, "_probe_cache_capabilities", AsyncMock())
+
+        lm = await manager.ensure_loaded("new")
+        assert lm.context_length == 131072
+
+    def test_logs_when_tokenizer_widens_config_window(
+        self, registry, mock_store, caplog
+    ):
+        manager = ModelManager(registry, mock_store)
+        local = mock_store.local_path("qwen/repo")
+        local.mkdir(parents=True)
+        (local / "config.json").write_text(
+            json.dumps({"max_position_embeddings": 32768})
+        )
+        tok = SimpleNamespace(model_max_length=131072)
+        with caplog.at_level("INFO", logger="olmlx.engine.model_manager"):
+            assert manager._read_context_length("qwen/repo", tok, False) == 131072
+        assert any(
+            "32768" in r.getMessage() and "131072" in r.getMessage()
+            for r in caplog.records
+        )
+
+    def test_no_log_when_limits_agree(self, registry, mock_store, caplog):
+        manager = ModelManager(registry, mock_store)
+        local = mock_store.local_path("llama/repo")
+        local.mkdir(parents=True)
+        (local / "config.json").write_text(
+            json.dumps({"max_position_embeddings": 8192})
+        )
+        tok = SimpleNamespace(model_max_length=8192)
+        with caplog.at_level("INFO", logger="olmlx.engine.model_manager"):
+            assert manager._read_context_length("llama/repo", tok, False) == 8192
+        assert not any("declares" in r.getMessage() for r in caplog.records)
+
+    def test_absolute_local_path_reads_its_own_config(
+        self, registry, mock_store, tmp_path
+    ):
+        # models.json entries may point at a local directory; its config.json
+        # lives there, not under the store (mirrors _build_speculative_decoder).
+        model_dir = tmp_path / "my-local-model"
+        model_dir.mkdir()
+        (model_dir / "config.json").write_text(
+            json.dumps({"max_position_embeddings": 4096})
+        )
+        manager = ModelManager(registry, mock_store)
+        tok = SimpleNamespace(model_max_length=int(1e30))
+        assert manager._read_context_length(str(model_dir), tok, False) == 4096
+
+    def test_missing_config_is_none(self, registry, mock_store):
+        manager = ModelManager(registry, mock_store)
+        assert manager._read_context_length("absent/repo", MagicMock(), False) is None
+
+    def test_vlm_uses_inner_tokenizer(self, registry, mock_store):
+        manager = ModelManager(registry, mock_store)
+        processor = SimpleNamespace(tokenizer=SimpleNamespace(model_max_length=8192))
+        assert manager._read_context_length("absent/repo", processor, True) == 8192
+
+    def test_direct_construction_default_is_unknown(self):
+        # Unknown window -> the check is disabled rather than guessed.
+        lm = LoadedModel(
+            name="x", hf_path="x", model=MagicMock(), tokenizer=MagicMock()
+        )
+        assert lm.context_length is None
+
+
+class TestKvEvictionBoundsCache:
+    """``_kv_eviction_bounds_cache`` mirrors ``_make_eviction_prompt_cache``."""
+
+    def _lm(self, layers):
+        from mlx_lm.models.cache import KVCache  # noqa: F401
+
+        model = SimpleNamespace(make_cache=lambda: layers)
+        return LoadedModel(
+            name="m",
+            hf_path="m",
+            model=model,
+            tokenizer=MagicMock(),
+            kv_eviction="4:64",
+        )
+
+    def test_pure_full_attention_is_bounded(self):
+        from mlx_lm.models.cache import KVCache
+
+        lm = self._lm([KVCache(), KVCache()])
+        assert inf._kv_eviction_bounds_cache(lm) is True
+        assert lm.kv_eviction_effective is True  # memoized
+
+    def test_hybrid_is_not_bounded(self):
+        from mlx_lm.models.cache import KVCache, RotatingKVCache
+
+        lm = self._lm([KVCache(), RotatingKVCache(max_size=8)])
+        assert inf._kv_eviction_bounds_cache(lm) is False
+
+    def test_no_eviction_or_quant(self):
+        from mlx_lm.models.cache import KVCache
+
+        lm = self._lm([KVCache()])
+        lm.kv_eviction = None
+        assert inf._kv_eviction_bounds_cache(lm) is False
+        lm.kv_eviction = "4:64"
+        lm.kv_cache_quant = "turboquant:4"
+        assert inf._kv_eviction_bounds_cache(lm) is False
+
+    def test_vlm_is_not_bounded(self):
+        from mlx_lm.models.cache import KVCache
+
+        lm = self._lm([KVCache()])
+        lm.is_vlm = True
+        assert inf._kv_eviction_bounds_cache(lm) is False
+
+    def test_probe_failure_is_not_bounded(self):
+        lm = self._lm([])
+        lm.model = SimpleNamespace(make_cache=MagicMock(side_effect=RuntimeError))
+        assert inf._kv_eviction_bounds_cache(lm) is False
+
+    def test_probe_failure_is_not_memoized(self):
+        # A transient failure must not pin "not bounded" for the model's
+        # whole residency — the next request probes again.
+        from mlx_lm.models.cache import KVCache
+
+        lm = self._lm([])
+        make_cache = MagicMock(side_effect=[RuntimeError, [KVCache()]])
+        lm.model = SimpleNamespace(make_cache=make_cache)
+        assert inf._kv_eviction_bounds_cache(lm) is False
+        assert lm.kv_eviction_effective is None
+        assert inf._kv_eviction_bounds_cache(lm) is True
+
+
+class TestEvictionCacheLostRecheck:
+    """An exempted kv_eviction request whose bounded cache is dropped before
+    generation (setup skipped it, or the memory preflight popped it) falls
+    back to mlx-lm's unbounded default cache — the window check must re-run.
+    """
+
+    def _lm(self, mock_manager):
+        lm = mock_manager._loaded["qwen3:latest"]
+        lm.context_length = 100
+        lm.kv_eviction = "4:64"
+        lm.kv_eviction_effective = True
+        return lm
+
+    def test_cache_present_passes(self, mock_manager):
+        lm = self._lm(mock_manager)
+        inf._recheck_window_if_eviction_cache_lost(
+            lm, {"prompt_cache": object()}, list(range(150)), None, True
+        )
+
+    def test_cache_dropped_rejects(self, mock_manager):
+        lm = self._lm(mock_manager)
+        with pytest.raises(ContextLengthExceededError):
+            inf._recheck_window_if_eviction_cache_lost(
+                lm, {}, "suffix", list(range(150)), True
+            )
+
+    def test_cache_dropped_under_window_passes(self, mock_manager):
+        lm = self._lm(mock_manager)
+        inf._recheck_window_if_eviction_cache_lost(lm, {}, list(range(50)), None, True)
+
+    def test_not_exempted_skips(self, mock_manager):
+        # Non-eviction requests were already checked before the lock.
+        lm = self._lm(mock_manager)
+        inf._recheck_window_if_eviction_cache_lost(
+            lm, {}, list(range(150)), None, False
+        )
+        lm.kv_eviction_effective = False
+        inf._recheck_window_if_eviction_cache_lost(lm, {}, list(range(150)), None, True)
+
+    @pytest.mark.asyncio
+    async def test_full_completion_rejects_when_preflight_drops_cache(
+        self, mock_manager
+    ):
+        lm = self._lm(mock_manager)
+        tokens = list(range(150))
+        setup = inf._CacheSetupResult(
+            prompt=tokens, full_prompt_tokens=tokens, cache_setup_done=True
+        )
+
+        async def _preflight(lm_, prompt, max_tokens, gen_kwargs, **kw):
+            gen_kwargs.pop("prompt_cache", None)  # memory-pressure drop
+            return inf._PreflightResult(prompt=prompt)
+
+        async def _setup(lm_, prompt, gen_kwargs, **kw):
+            gen_kwargs["prompt_cache"] = object()
+            return setup
+
+        inner = AsyncMock()
+        with (
+            patch.object(inf, "_setup_prompt_cache", _setup),
+            patch.object(inf, "_kv_cache_preflight_check", _preflight),
+            patch.object(inf, "_full_completion_inner", inner),
+            patch.object(inf, "_batch_eligible", return_value=False),
+        ):
+            with pytest.raises(ContextLengthExceededError):
+                await inf._full_completion(
+                    lm,
+                    tokens,
+                    10,
+                    {},
+                    inf.TimingStats(),
+                    use_prompt_cache=True,
+                    prompt_tokens=tokens,
+                )
+        inner.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_stream_completion_rejects_when_setup_skips_cache(self, mock_manager):
+        lm = self._lm(mock_manager)
+        tokens = list(range(150))
+
+        async def _setup(lm_, prompt, gen_kwargs, **kw):
+            # memory-pressure skip: no prompt_cache installed
+            return inf._CacheSetupResult(prompt=tokens, full_prompt_tokens=tokens)
+
+        async def _preflight(lm_, prompt, max_tokens, gen_kwargs, **kw):
+            return inf._PreflightResult(prompt=prompt)
+
+        stream = MagicMock()
+        with (
+            patch.object(inf, "_setup_prompt_cache", _setup),
+            patch.object(inf, "_kv_cache_preflight_check", _preflight),
+            patch.object(inf, "async_mlx_stream", stream),
+            patch.object(inf, "_batch_eligible", return_value=False),
+        ):
+            gen = inf._stream_completion(
+                lm,
+                tokens,
+                10,
+                {},
+                inf.TimingStats(),
+                use_prompt_cache=True,
+                prompt_tokens=tokens,
+            )
+            with pytest.raises(ContextLengthExceededError):
+                async for _ in gen:
+                    pass
+        stream.assert_not_called()
