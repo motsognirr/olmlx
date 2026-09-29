@@ -590,6 +590,11 @@ class ModelManager(SpeculativeLoaderMixin):
                     reasoning_effort=base_lm.reasoning_effort,
                     prompt_cache=base_lm.prompt_cache,
                     context_length=base_lm.context_length,
+                    # The prompt cache is built from the model's layers, which
+                    # a LoRA adapter doesn't change, so the base's sink+window
+                    # eviction (#505) applies unchanged — and with it the #715
+                    # over-window exemption.
+                    kv_eviction=base_lm.kv_eviction,
                     # Continuous batching is not validated for the structurally
                     # modified (LoRALinear) adapter model, so adapters serve via
                     # the per-request path. Out of scope for issue #362.

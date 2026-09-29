@@ -605,12 +605,14 @@ def _kv_eviction_bounds_cache(lm: LoadedModel) -> bool:
     if lm.kv_eviction_effective is None:
         try:
             default = make_prompt_cache(_get_model_for_cache(lm.model, lm.is_vlm))
-            lm.kv_eviction_effective = bool(default) and all(
-                type(layer) is KVCache for layer in default
-            )
         except Exception:
+            # Not memoized: a transient failure must not pin "not bounded"
+            # (a 400 for every over-window prompt) for the model's residency.
             logger.debug("kv_eviction layout probe failed for %s", lm.name)
-            lm.kv_eviction_effective = False
+            return False
+        lm.kv_eviction_effective = bool(default) and all(
+            type(layer) is KVCache for layer in default
+        )
     return lm.kv_eviction_effective is True
 
 
@@ -623,9 +625,11 @@ def _reject_prompt_over_context(
 ) -> None:
     """Raise ContextLengthExceededError if *prompt* leaves no room to generate.
 
-    Runs before the inference lock is taken: an over-window prompt used to be
-    handed to generation, which hung forever holding the lock and wedged every
-    later request (#715). For a VLM the text tokenizer undercounts (no image
+    ``generate_chat``/``generate_completion`` call it before the inference lock
+    is taken: an over-window prompt used to be handed to generation, which hung
+    forever holding the lock and wedged every later request (#715). The one
+    under-lock caller, ``_recheck_window_if_eviction_cache_lost``, runs it
+    after the KV preflight but still before generation starts. For a VLM the text tokenizer undercounts (no image
     patch tokens), so the count is a lower bound; a prompt it rejects really
     is too long.
     """
@@ -1217,7 +1221,8 @@ def _make_eviction_prompt_cache(model: Any, sink: int, window: int) -> list:
     mask/rope work.
 
     Eviction is applied **only to pure full-attention models** — those whose
-    default cache is all plain ``KVCache``. Hybrid/SWA/GDN models (any
+    default cache is all plain ``KVCache``. ``_kv_eviction_bounds_cache``
+    repeats this rule for the #715 over-window exemption; keep the two in sync. Hybrid/SWA/GDN models (any
     ``RotatingKVCache`` already present, or ``ArraysCache`` recurrent state)
     are left untouched: a single per-forward mask is built from ``cache[0]``,
     so a mixed list would mis-mask, and recurrent layers can't be windowed.

@@ -517,6 +517,18 @@ class TestKvEvictionBoundsCache:
         lm.model = SimpleNamespace(make_cache=MagicMock(side_effect=RuntimeError))
         assert inf._kv_eviction_bounds_cache(lm) is False
 
+    def test_probe_failure_is_not_memoized(self):
+        # A transient failure must not pin "not bounded" for the model's
+        # whole residency — the next request probes again.
+        from mlx_lm.models.cache import KVCache
+
+        lm = self._lm([])
+        make_cache = MagicMock(side_effect=[RuntimeError, [KVCache()]])
+        lm.model = SimpleNamespace(make_cache=make_cache)
+        assert inf._kv_eviction_bounds_cache(lm) is False
+        assert lm.kv_eviction_effective is None
+        assert inf._kv_eviction_bounds_cache(lm) is True
+
 
 class TestEvictionCacheLostRecheck:
     """An exempted kv_eviction request whose bounded cache is dropped before
