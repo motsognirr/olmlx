@@ -601,6 +601,10 @@ def _reject_prompt_over_context(
     limit = lm.context_length
     if not isinstance(limit, int) or isinstance(limit, bool) or limit <= 0:
         return
+    # StreamingLLM sink+window eviction (#505) bounds the KV cache and exists
+    # precisely to serve prompts longer than the nominal window.
+    if lm.kv_eviction is not None:
+        return
     if prompt_tokens is not None:
         n = len(prompt_tokens)
     elif isinstance(prompt, list):

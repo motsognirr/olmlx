@@ -163,6 +163,24 @@ class TestGenerateChatRejectsOverWindow:
         assert result["text"] == "ok"
 
     @pytest.mark.asyncio
+    async def test_kv_eviction_model_skips_check(self, mock_manager, monkeypatch):
+        # StreamingLLM sink+window eviction (#505) exists to serve prompts
+        # longer than the nominal window; its KV is bounded, so no reject.
+        lm = mock_manager._loaded["qwen3:latest"]
+        lm.context_length = 100
+        lm.kv_eviction = "4:64"
+        _set_prompt_tokens(lm, 150)
+        monkeypatch.setattr(inf, "_CONTEXT_CHECK_BYTE_MARGIN", 10**9)
+        with patch.object(
+            inf, "_full_completion", AsyncMock(return_value={"text": "ok"})
+        ) as full:
+            result = await generate_chat(
+                mock_manager, "qwen3", [{"role": "user", "content": "hi"}], stream=False
+            )
+        assert result["text"] == "ok"
+        full.assert_called_once()
+
+    @pytest.mark.asyncio
     async def test_short_prompt_skips_tokenization(self, mock_manager):
         # A prompt whose UTF-8 byte length is well under the window can't
         # exceed it, so no extra tokenization pass is paid for it.
