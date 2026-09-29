@@ -672,7 +672,10 @@ def _recheck_window_if_eviction_cache_lost(
     cache. Cache setup can skip installing it under memory pressure, and the
     KV preflight can pop it; generation then builds mlx-lm's unbounded
     default cache, so the window applies after all. Called after the
-    preflight, before generation starts (still a clean 400).
+    preflight, before generation starts. Non-streaming requests get the usual
+    400; on the streaming path the router has already sent its 200, so (like
+    the preflight's ``MemoryError``) it surfaces as the router's in-stream
+    error event and the stream ends before any tokens.
     """
     if not use_prompt_cache or "prompt_cache" in gen_kwargs:
         return
@@ -4732,7 +4735,13 @@ async def generate_chat(
             lm,
             prompt,
             prompt_tokens,
-            eviction_bounded=use_prompt_cache and _kv_eviction_bounds_cache(lm),
+            # context_length first: skip the one-time layout probe when the
+            # check is off anyway (unknown window).
+            eviction_bounded=(
+                use_prompt_cache
+                and lm.context_length is not None
+                and _kv_eviction_bounds_cache(lm)
+            ),
         )
 
         # Tell streaming routers whether to wait for a (possibly orphaned, see

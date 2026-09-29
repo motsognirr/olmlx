@@ -2102,15 +2102,22 @@ class ModelManager(SpeculativeLoaderMixin):
     ) -> int | None:
         """Context window for a freshly loaded text/VLM model (#715).
 
-        Reads the store's config.json (KB-sized, already on disk after the
+        Reads the model's config.json (KB-sized, already on disk after the
         load) plus the tokenizer's ``model_max_length``; any failure yields
         None, which disables the over-window check rather than guessing.
         """
+        # A models.json entry may be an absolute local directory, whose
+        # config.json lives there rather than under the store (same rule as
+        # ``_build_speculative_decoder``'s bundled-draft probe).
+        model_dir: Path | None = None
+        if Path(hf_path).is_absolute():
+            model_dir = Path(hf_path)
+        elif self.store is not None:
+            model_dir = self.store.local_path(hf_path)
         config = None
-        if self.store is not None:
+        if model_dir is not None:
             try:
-                config_path = self.store.local_path(hf_path) / "config.json"
-                config = json.loads(config_path.read_text())
+                config = json.loads((model_dir / "config.json").read_text())
             except (OSError, ValueError):
                 config = None
         # mlx-vlm returns a processor; the length lives on its text tokenizer.

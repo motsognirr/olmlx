@@ -436,6 +436,20 @@ class TestLoaderRecordsContextLength:
             assert manager._read_context_length("llama/repo", tok, False) == 8192
         assert not any("declares" in r.getMessage() for r in caplog.records)
 
+    def test_absolute_local_path_reads_its_own_config(
+        self, registry, mock_store, tmp_path
+    ):
+        # models.json entries may point at a local directory; its config.json
+        # lives there, not under the store (mirrors _build_speculative_decoder).
+        model_dir = tmp_path / "my-local-model"
+        model_dir.mkdir()
+        (model_dir / "config.json").write_text(
+            json.dumps({"max_position_embeddings": 4096})
+        )
+        manager = ModelManager(registry, mock_store)
+        tok = SimpleNamespace(model_max_length=int(1e30))
+        assert manager._read_context_length(str(model_dir), tok, False) == 4096
+
     def test_missing_config_is_none(self, registry, mock_store):
         manager = ModelManager(registry, mock_store)
         assert manager._read_context_length("absent/repo", MagicMock(), False) is None
