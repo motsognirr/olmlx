@@ -658,6 +658,31 @@ def _reject_prompt_over_context(
         )
 
 
+def _recheck_window_if_eviction_cache_lost(
+    lm: LoadedModel,
+    gen_kwargs: dict,
+    prompt: str | list[int],
+    full_prompt_tokens: list[int] | None,
+    use_prompt_cache: bool,
+) -> None:
+    """Re-run the window check when an exempted kv_eviction request lost its cache.
+
+    ``generate_chat`` exempts a ``kv_eviction`` request from the pre-lock
+    window check on the assumption that generation uses the bounded eviction
+    cache. Cache setup can skip installing it under memory pressure, and the
+    KV preflight can pop it; generation then builds mlx-lm's unbounded
+    default cache, so the window applies after all. Called after the
+    preflight, before generation starts (still a clean 400).
+    """
+    if not use_prompt_cache or "prompt_cache" in gen_kwargs:
+        return
+    if not _kv_eviction_bounds_cache(lm):
+        return  # not exempted — already checked before the lock
+    _reject_prompt_over_context(
+        lm, full_prompt_tokens if full_prompt_tokens is not None else prompt
+    )
+
+
 def _reject_non_lm_model(lm: LoadedModel, model_name: str, surface: str) -> None:
     """Raise ``ValueError`` (-> 400) if *lm* is not a text/VLM language model.
 
@@ -3369,6 +3394,10 @@ async def _stream_completion(
         )
         prompt = pf.prompt
         memory_limit = pf.memory_limit
+        if not lm.is_vlm:
+            _recheck_window_if_eviction_cache_lost(
+                lm, gen_kwargs, prompt, full_prompt_tokens, use_prompt_cache
+            )
 
         # Yield cache stats after the pre-flight check so routers can
         # use them.  This starts the HTTP response — no 503 after this.
@@ -3962,6 +3991,9 @@ async def _full_completion(
                         cache_id=cache_id,
                     )
                     prompt = pf.prompt
+                    _recheck_window_if_eviction_cache_lost(
+                        lm, gen_kwargs, prompt, full_prompt_tokens, use_prompt_cache
+                    )
 
                 result_dict = await _full_completion_inner(
                     lm,

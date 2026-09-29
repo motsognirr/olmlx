@@ -502,3 +502,113 @@ class TestKvEvictionBoundsCache:
         lm = self._lm([])
         lm.model = SimpleNamespace(make_cache=MagicMock(side_effect=RuntimeError))
         assert inf._kv_eviction_bounds_cache(lm) is False
+
+
+class TestEvictionCacheLostRecheck:
+    """An exempted kv_eviction request whose bounded cache is dropped before
+    generation (setup skipped it, or the memory preflight popped it) falls
+    back to mlx-lm's unbounded default cache — the window check must re-run.
+    """
+
+    def _lm(self, mock_manager):
+        lm = mock_manager._loaded["qwen3:latest"]
+        lm.context_length = 100
+        lm.kv_eviction = "4:64"
+        lm.kv_eviction_effective = True
+        return lm
+
+    def test_cache_present_passes(self, mock_manager):
+        lm = self._lm(mock_manager)
+        inf._recheck_window_if_eviction_cache_lost(
+            lm, {"prompt_cache": object()}, list(range(150)), None, True
+        )
+
+    def test_cache_dropped_rejects(self, mock_manager):
+        lm = self._lm(mock_manager)
+        with pytest.raises(ContextLengthExceededError):
+            inf._recheck_window_if_eviction_cache_lost(
+                lm, {}, "suffix", list(range(150)), True
+            )
+
+    def test_cache_dropped_under_window_passes(self, mock_manager):
+        lm = self._lm(mock_manager)
+        inf._recheck_window_if_eviction_cache_lost(lm, {}, list(range(50)), None, True)
+
+    def test_not_exempted_skips(self, mock_manager):
+        # Non-eviction requests were already checked before the lock.
+        lm = self._lm(mock_manager)
+        inf._recheck_window_if_eviction_cache_lost(
+            lm, {}, list(range(150)), None, False
+        )
+        lm.kv_eviction_effective = False
+        inf._recheck_window_if_eviction_cache_lost(lm, {}, list(range(150)), None, True)
+
+    @pytest.mark.asyncio
+    async def test_full_completion_rejects_when_preflight_drops_cache(
+        self, mock_manager
+    ):
+        lm = self._lm(mock_manager)
+        tokens = list(range(150))
+        setup = inf._CacheSetupResult(
+            prompt=tokens, full_prompt_tokens=tokens, cache_setup_done=True
+        )
+
+        async def _preflight(lm_, prompt, max_tokens, gen_kwargs, **kw):
+            gen_kwargs.pop("prompt_cache", None)  # memory-pressure drop
+            return inf._PreflightResult(prompt=prompt)
+
+        async def _setup(lm_, prompt, gen_kwargs, **kw):
+            gen_kwargs["prompt_cache"] = object()
+            return setup
+
+        inner = AsyncMock()
+        with (
+            patch.object(inf, "_setup_prompt_cache", _setup),
+            patch.object(inf, "_kv_cache_preflight_check", _preflight),
+            patch.object(inf, "_full_completion_inner", inner),
+            patch.object(inf, "_batch_eligible", return_value=False),
+        ):
+            with pytest.raises(ContextLengthExceededError):
+                await inf._full_completion(
+                    lm,
+                    tokens,
+                    10,
+                    {},
+                    inf.TimingStats(),
+                    use_prompt_cache=True,
+                    prompt_tokens=tokens,
+                )
+        inner.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_stream_completion_rejects_when_setup_skips_cache(self, mock_manager):
+        lm = self._lm(mock_manager)
+        tokens = list(range(150))
+
+        async def _setup(lm_, prompt, gen_kwargs, **kw):
+            # memory-pressure skip: no prompt_cache installed
+            return inf._CacheSetupResult(prompt=tokens, full_prompt_tokens=tokens)
+
+        async def _preflight(lm_, prompt, max_tokens, gen_kwargs, **kw):
+            return inf._PreflightResult(prompt=prompt)
+
+        stream = MagicMock()
+        with (
+            patch.object(inf, "_setup_prompt_cache", _setup),
+            patch.object(inf, "_kv_cache_preflight_check", _preflight),
+            patch.object(inf, "async_mlx_stream", stream),
+            patch.object(inf, "_batch_eligible", return_value=False),
+        ):
+            gen = inf._stream_completion(
+                lm,
+                tokens,
+                10,
+                {},
+                inf.TimingStats(),
+                use_prompt_cache=True,
+                prompt_tokens=tokens,
+            )
+            with pytest.raises(ContextLengthExceededError):
+                async for _ in gen:
+                    pass
+        stream.assert_not_called()
