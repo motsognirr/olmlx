@@ -877,3 +877,134 @@ class TestListLocalWithoutManifest:
         empty_dir.mkdir(parents=True)
         results = mock_store.list_local()
         assert len(results) == 0
+
+
+# Real Qwen2.5-0.5B-Instruct-4bit config: ~494M params. The pre-#667 formula
+# reported 77M, which old manifest.json files still carry (#702).
+_QWEN25_05B_CONFIG = {
+    "model_type": "qwen2",
+    "hidden_size": 896,
+    "num_hidden_layers": 24,
+    "vocab_size": 151936,
+    "intermediate_size": 4864,
+    "num_attention_heads": 14,
+    "num_key_value_heads": 2,
+    "tie_word_embeddings": True,
+    "quantization": {"bits": 4, "group_size": 64},
+}
+
+
+def _write_stale_model(store: ModelStore, hf_path: str) -> Path:
+    """A model dir whose manifest.json predates #667's estimator fix."""
+    local_dir = store.local_path(hf_path)
+    local_dir.mkdir(parents=True)
+    (local_dir / "config.json").write_text(json.dumps(_QWEN25_05B_CONFIG))
+    stale = {
+        "name": "qwen2.5:0.5b",
+        "hf_path": hf_path,
+        "size": 123456,
+        "modified_at": "2026-01-01T00:00:00+00:00",
+        "digest": "sha256:abcdefabcdef",
+        "format": "mlx",
+        "family": "qwen2",
+        "parameter_size": "77M",
+        "quantization_level": "4-bit",
+    }
+    (local_dir / "manifest.json").write_text(json.dumps(stale))
+    return local_dir
+
+
+class TestStaleManifestRefresh:
+    """#702: a manifest.json written by an older estimator must be re-derived
+    (family/parameter_size/quantization_level only) instead of trusted forever."""
+
+    HF = "mlx-community/Qwen2.5-0.5B-Instruct-4bit"
+
+    def _assert_refreshed(self, m: ModelManifest, local_dir: Path):
+        from olmlx.models.store import _ESTIMATOR_VERSION
+
+        assert m.parameter_size == "494M"
+        assert m.estimator_version == _ESTIMATOR_VERSION
+        # Expensive / identity fields are left untouched.
+        assert m.size == 123456
+        assert m.digest == "sha256:abcdefabcdef"
+        assert m.modified_at == "2026-01-01T00:00:00+00:00"
+        assert m.hf_path == self.HF
+        on_disk = json.loads((local_dir / "manifest.json").read_text())
+        assert on_disk["parameter_size"] == "494M"
+        assert on_disk["estimator_version"] == _ESTIMATOR_VERSION
+        assert on_disk["size"] == 123456
+
+    def test_list_local_rederives_stale_manifest_parameter_size(self, mock_store):
+        local_dir = _write_stale_model(mock_store, self.HF)
+        results = mock_store.list_local()
+        assert len(results) == 1
+        self._assert_refreshed(results[0], local_dir)
+
+    def test_show_rederives_stale_manifest_parameter_size(self, mock_store):
+        local_dir = _write_stale_model(mock_store, self.HF)
+        result = mock_store.show(self.HF)
+        assert result is not None
+        self._assert_refreshed(result, local_dir)
+
+    def test_list_local_does_not_rewrite_current_manifest(self, mock_store):
+        from olmlx.models.store import _ESTIMATOR_VERSION
+
+        local_dir = _write_stale_model(mock_store, self.HF)
+        path = local_dir / "manifest.json"
+        data = json.loads(path.read_text())
+        # A deliberately "wrong" value: a current-version stamp is trusted.
+        data["parameter_size"] = "1.0B"
+        data["estimator_version"] = _ESTIMATOR_VERSION
+        path.write_text(json.dumps(data))
+        before = path.read_bytes()
+        before_mtime = path.stat().st_mtime_ns
+
+        results = mock_store.list_local()
+        assert results[0].parameter_size == "1.0B"
+        assert path.read_bytes() == before
+        assert path.stat().st_mtime_ns == before_mtime
+
+    def test_stale_manifest_without_marker_is_left_alone(self, mock_store):
+        """No config.json to re-derive from -> keep the stored metadata rather
+        than blanking it."""
+        local_dir = _write_stale_model(mock_store, self.HF)
+        (local_dir / "config.json").unlink()
+        before = (local_dir / "manifest.json").read_bytes()
+        results = mock_store.list_local()
+        assert results[0].parameter_size == "77M"
+        assert results[0].family == "qwen2"
+        assert (local_dir / "manifest.json").read_bytes() == before
+
+    def test_refresh_survives_save_failure(self, mock_store, monkeypatch):
+        _write_stale_model(mock_store, self.HF)
+
+        def _boom(self, path):
+            raise OSError("disk full")
+
+        monkeypatch.setattr(ModelManifest, "save", _boom)
+        results = mock_store.list_local()
+        assert results[0].parameter_size == "494M"
+
+    def test_derive_manifest_stamps_estimator_version(self, tmp_path):
+        from olmlx.models.store import _ESTIMATOR_VERSION, _derive_manifest
+
+        (tmp_path / "config.json").write_text(json.dumps(_QWEN25_05B_CONFIG))
+        m = _derive_manifest(tmp_path, "x:latest", "x/y")
+        assert m.estimator_version == _ESTIMATOR_VERSION
+
+    @pytest.mark.asyncio
+    async def test_pull_stamps_current_estimator_version(self, mock_store):
+        from unittest.mock import patch
+
+        from olmlx.models.store import _ESTIMATOR_VERSION
+
+        with patch(
+            "huggingface_hub.snapshot_download",
+            side_effect=_fake_download_for(mock_store, "Qwen/Qwen3-8B-MLX"),
+        ):
+            async for _ in mock_store.pull("qwen3"):
+                pass
+        manifest_path = mock_store.local_path("Qwen/Qwen3-8B-MLX") / "manifest.json"
+        on_disk = json.loads(manifest_path.read_text())
+        assert on_disk["estimator_version"] == _ESTIMATOR_VERSION

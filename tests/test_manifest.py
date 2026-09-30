@@ -157,3 +157,17 @@ class TestModelManifest:
         path.write_text(json.dumps(data))
         m = ModelManifest.load(path)
         assert m.size == 0
+
+    def test_load_missing_estimator_version_defaults_to_zero(self, tmp_path):
+        """Pre-#702 manifests carry no ``estimator_version``; they must load
+        with version 0 so the store flags them as stale (#702)."""
+        path = tmp_path / "manifest.json"
+        data = {
+            "name": "test:latest",
+            "hf_path": "test/model",
+            "parameter_size": "77M",
+        }
+        path.write_text(json.dumps(data))
+        m = ModelManifest.load(path)
+        assert m.estimator_version == 0
+        assert m.parameter_size == "77M"

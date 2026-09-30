@@ -117,6 +117,13 @@ def _has_model_marker(model_dir: Path) -> bool:
     return any((model_dir / name).exists() for name in _MODEL_MARKER_FILES)
 
 
+#: Version of the metadata derivation in :func:`_extract_metadata` /
+#: :func:`_estimate_param_count`, stamped into every written manifest. BUMP
+#: THIS whenever the family / parameter_size / quantization_level derivation
+#: changes, or existing manifest.json files keep the old values forever (#702).
+_ESTIMATOR_VERSION = 1
+
+
 def _extract_metadata(model_dir: Path) -> dict:
     """Extract model metadata from config.json if available."""
     config_path = model_dir / "config.json"
@@ -217,7 +224,40 @@ def _derive_manifest(local_dir: Path, name: str, hf_path: str) -> ModelManifest:
         family=meta["family"],
         parameter_size=meta["parameter_size"],
         quantization_level=meta["quantization_level"],
+        estimator_version=_ESTIMATOR_VERSION,
     )
+
+
+def _refresh_if_stale(
+    manifest: ModelManifest, model_dir: Path, manifest_path: Path
+) -> ModelManifest:
+    """Re-derive the estimator-owned fields of a manifest written by an older
+    :data:`_ESTIMATOR_VERSION` (#702).
+
+    Only ``family`` / ``parameter_size`` / ``quantization_level`` are
+    recomputed — a ``config.json`` read — so this stays cheap on the
+    ``/api/tags`` polling path; ``size`` / ``digest`` / ``modified_at`` are kept
+    (recomputing ``size`` would walk the whole directory). A directory with no
+    model marker to derive from is left as-is rather than blanked. Persisting
+    the refresh is best-effort: a failed save still returns the fresh values.
+    """
+    if manifest.estimator_version >= _ESTIMATOR_VERSION:
+        return manifest
+    if not _has_model_marker(model_dir):
+        return manifest
+    meta = _extract_metadata(model_dir)
+    refreshed = replace(
+        manifest,
+        family=meta["family"],
+        parameter_size=meta["parameter_size"],
+        quantization_level=meta["quantization_level"],
+        estimator_version=_ESTIMATOR_VERSION,
+    )
+    try:
+        refreshed.save(manifest_path)
+    except Exception:
+        logger.debug("Failed to save refreshed manifest: %s", manifest_path)
+    return refreshed
 
 
 class ModelStore:
@@ -552,6 +592,7 @@ class ModelStore:
                 family=meta["family"],
                 parameter_size=meta["parameter_size"],
                 quantization_level=meta["quantization_level"],
+                estimator_version=_ESTIMATOR_VERSION,
             )
             manifest.save(local_dir / "manifest.json")
 
@@ -601,10 +642,12 @@ class ModelStore:
                 manifest_path = d / "manifest.json"
                 if manifest_path.exists():
                     try:
-                        models.append(ModelManifest.load(manifest_path))
-                        continue
+                        loaded = ModelManifest.load(manifest_path)
                     except Exception:
                         logger.warning("Failed to load manifest: %s", manifest_path)
+                    else:
+                        models.append(_refresh_if_stale(loaded, d, manifest_path))
+                        continue
                 # No valid manifest — try to derive one from the model files
                 if _has_model_marker(d):
                     manifest: ModelManifest | None = None
@@ -633,7 +676,10 @@ class ModelStore:
             return None
         model_dir, has_manifest = resolved
         if has_manifest:
-            return ModelManifest.load(model_dir / "manifest.json")
+            manifest_path = model_dir / "manifest.json"
+            return _refresh_if_stale(
+                ModelManifest.load(manifest_path), model_dir, manifest_path
+            )
         # Derive manifest on demand and backfill so subsequent calls are fast.
         normalized = self.registry.normalize_name(name)
         resolved_cfg = self.registry.resolve(name)

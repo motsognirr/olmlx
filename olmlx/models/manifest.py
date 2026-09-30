@@ -17,6 +17,10 @@ class ModelManifest:
     family: str = ""
     parameter_size: str = ""
     quantization_level: str = ""
+    # Version of the metadata estimator (store._ESTIMATOR_VERSION) that wrote
+    # family/parameter_size/quantization_level. Missing on pre-#702 manifests,
+    # so it loads as 0 and the store re-derives those fields (#702).
+    estimator_version: int = 0
 
     def to_dict(self) -> dict:
         return asdict(self)
