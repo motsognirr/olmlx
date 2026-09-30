@@ -28,7 +28,7 @@ from olmlx.routers.streaming_common import (
     parse_buffered_output,
     with_keepalive_pings,
 )
-from olmlx.routers.thinking_split import flush_split_thinking, split_thinking_parts
+from olmlx.routers.thinking_split import flush_split_thinking, split_chunk_parts
 from olmlx.engine.tool_parser import (
     _make_tool_use_id,
     parse_model_output,
@@ -657,9 +657,7 @@ async def _stream_thinking_state_machine(result):
             stop_sequence = chunk.get("stop_sequence")
             break
 
-        for channel, fragment in split_thinking_parts(
-            chunk.get("text", ""), split_state
-        ):
+        for channel, fragment in split_chunk_parts(chunk, split_state):
             for event in _route(channel, fragment):
                 yield event
 

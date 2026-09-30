@@ -1,6 +1,5 @@
 """Tests for gpt-oss channel token parsing and streaming filter."""
 
-import asyncio
 from unittest.mock import MagicMock
 
 from olmlx.engine.template_caps import TemplateCaps, detect_caps
@@ -285,37 +284,30 @@ class TestParseGptOssChannels:
 
 
 class TestGptOssStreamFilter:
-    def _make_token(self, text):
-        """Create a mock StreamToken."""
-        from olmlx.utils.streaming import StreamToken
+    """``_GptOssChannelFilter.feed`` returns ``(thinking, content)`` per token.
 
-        return StreamToken(
-            text=text,
-            token=None,
-            prompt_tokens=0,
-            generation_tokens=0,
-            prompt_tps=0.0,
-            generation_tps=0.0,
-        )
+    Analysis-channel text streams live on the thinking side (#713) — the
+    engine yields it as structured ``{"thinking": ...}`` chunks, never as
+    in-band ``<think>`` markup a reasoning trace could break out of.
+    """
 
-    def _run_filter(self, token_texts):
-        """Run the streaming filter on a list of token text strings, return yielded texts."""
-        from olmlx.engine.inference import _gpt_oss_filter
+    @staticmethod
+    def _run_filter(token_texts):
+        """Feed token texts through the filter; return the non-empty
+        ``(channel, text)`` outputs in order."""
+        from olmlx.engine.logits_processors import _GptOssChannelFilter
 
-        async def mock_stream():
-            for t in token_texts:
-                yield self._make_token(t)
+        filt = _GptOssChannelFilter()
+        out = []
+        for t in token_texts:
+            thinking, content = filt.feed(t)
+            if thinking:
+                out.append(("thinking", thinking))
+            if content:
+                out.append(("content", content))
+        return out
 
-        async def collect():
-            result = []
-            async for tok in _gpt_oss_filter(mock_stream()):
-                result.append(tok.text)
-            return result
-
-        return asyncio.run(collect())
-
-    def test_final_channel_passes_through(self):
-        """Only text from final channel should be yielded."""
+    def test_analysis_streams_as_thinking_then_final_as_content(self):
         tokens = [
             "<|start|>",
             "assistant",
@@ -334,43 +326,52 @@ class TestGptOssStreamFilter:
             " text",
             "<|end|>",
         ]
-        result = self._run_filter(tokens)
-        # The analysis channel surfaces as one <think> block ahead of the
-        # final-channel tokens, so the routers' thinking splitter can route
-        # it to message.thinking / an Anthropic thinking block (#713).
-        assert result == ["<think>thinking here</think>", "visible", " text"]
+        assert self._run_filter(tokens) == [
+            ("thinking", "thinking"),
+            ("thinking", " here"),
+            ("content", "visible"),
+            ("content", " text"),
+        ]
 
-    def test_multiple_analysis_blocks_join_like_non_streaming(self):
-        """Repeated analysis blocks flush as one <think> block, newline-joined
-        (mirrors ``_parse_gpt_oss_channels``)."""
+    def test_think_close_tag_in_analysis_stays_thinking(self):
+        """Reasoning that mentions ``</think>`` must not leak into content."""
+        tokens = [
+            "<|channel|>",
+            "analysis",
+            "<|message|>",
+            "The tag </think>",
+            " ends reasoning.",
+            "<|end|>",
+            "<|channel|>",
+            "final",
+            "<|message|>",
+            "answer",
+        ]
+        assert self._run_filter(tokens) == [
+            ("thinking", "The tag </think>"),
+            ("thinking", " ends reasoning."),
+            ("content", "answer"),
+        ]
+
+    def test_analysis_only_streams_as_thinking(self):
+        """Analysis with no final channel is still thinking — it was already
+        streamed live, so it can't be promoted to content afterwards."""
         tokens = [
             "<|start|>",
             "assistant",
             "<|channel|>",
             "analysis",
             "<|message|>",
-            "first",
+            "just",
+            " thinking",
             "<|end|>",
-            "<|start|>",
-            "assistant",
-            "<|channel|>",
-            "analysis",
-            "<|message|>",
-            "second",
-            "<|end|>",
-            "<|start|>",
-            "assistant",
-            "<|channel|>",
-            "final",
-            "<|message|>",
-            "answer",
-            "<|return|>",
         ]
-        result = self._run_filter(tokens)
-        assert result == ["<think>first\nsecond</think>", "answer"]
+        assert self._run_filter(tokens) == [
+            ("thinking", "just"),
+            ("thinking", " thinking"),
+        ]
 
-    def test_analysis_after_final_flushed_at_end(self):
-        """Analysis that arrives after the final channel isn't dropped."""
+    def test_analysis_after_final_is_thinking(self):
         tokens = [
             "<|channel|>",
             "final",
@@ -383,73 +384,18 @@ class TestGptOssStreamFilter:
             "late",
             "<|end|>",
         ]
-        result = self._run_filter(tokens)
-        assert result == ["answer", "<think>late</think>"]
-
-    def test_analysis_then_truncated_before_final_falls_back(self):
-        """Analysis closed but the stream ended before any final channel:
-        promote to visible text, matching the non-streaming parity rule."""
-        tokens = [
-            "<|start|>",
-            "assistant",
-            "<|channel|>",
-            "analysis",
-            "<|message|>",
-            "just",
-            " thinking",
-            "<|end|>",
-            "<|start|>",
-            "assistant",
+        assert self._run_filter(tokens) == [
+            ("content", "answer"),
+            ("thinking", "late"),
         ]
-        result = self._run_filter(tokens)
-        assert result == ["just thinking"]
-
-    def test_only_analysis_falls_back(self):
-        """If only analysis channel, analysis content should be yielded as fallback."""
-        tokens = [
-            "<|start|>",
-            "assistant",
-            "<|channel|>",
-            "analysis",
-            "<|message|>",
-            "just",
-            " thinking",
-            "<|end|>",
-        ]
-        result = self._run_filter(tokens)
-        assert result == ["just thinking"]
 
     def test_no_channel_tokens_passthrough(self):
         """Plain text without channel tokens should pass through."""
-        tokens = ["Hello", " world", "!"]
-        result = self._run_filter(tokens)
-        assert result == ["Hello", " world", "!"]
-
-    def test_multiple_analysis_blocks_fallback_joins_like_non_streaming(self):
-        """Analysis-only output with several blocks promotes to content
-        stripped + newline-joined, exactly as ``_parse_gpt_oss_channels``."""
-        from olmlx.engine.tool_parser import _parse_gpt_oss_channels
-
-        tokens = [
-            "<|start|>",
-            "assistant",
-            "<|channel|>",
-            "analysis",
-            "<|message|>",
-            "first ",
-            "<|end|>",
-            "<|start|>",
-            "assistant",
-            "<|channel|>",
-            "analysis",
-            "<|message|>",
-            " second",
-            "<|end|>",
+        assert self._run_filter(["Hello", " world", "!"]) == [
+            ("content", "Hello"),
+            ("content", " world"),
+            ("content", "!"),
         ]
-        result = "".join(self._run_filter(tokens))
-        expected = _parse_gpt_oss_channels("".join(tokens), has_tools=False)
-        assert expected is not None
-        assert result == expected[1] == "first\nsecond"
 
     def test_return_token_ends_block(self):
         """<|return|> should end a block like <|end|>."""
@@ -461,19 +407,25 @@ class TestGptOssStreamFilter:
             "<|message|>",
             "answer",
             "<|return|>",
+            "trailing",
         ]
-        result = self._run_filter(tokens)
-        assert result == ["answer"]
+        assert self._run_filter(tokens) == [("content", "answer")]
 
-    def test_commentary_channel_suppressed(self):
-        """Commentary channel content should be suppressed."""
+    def test_commentary_tool_call_suppressed(self):
+        """Commentary addressed to a function is a tool call, not text."""
         tokens = [
             "<|start|>",
             "assistant",
             "<|channel|>",
             "commentary",
+            " to",
+            "=functions",
+            ".get_weather",
+            " ",
+            "<|constrain|>",
+            "json",
             "<|message|>",
-            '{"tool": "call"}',
+            '{"city": "Paris"}',
             "<|call|>",
             "<|start|>",
             "assistant",
@@ -483,17 +435,38 @@ class TestGptOssStreamFilter:
             "done",
             "<|end|>",
         ]
-        result = self._run_filter(tokens)
-        assert result == ["done"]
+        assert self._run_filter(tokens) == [("content", "done")]
 
-    def test_streamed_thinking_matches_non_streaming_parse(self):
-        """Streaming output split by the routers' thinking splitter must
-        match ``_parse_gpt_oss_channels`` on the raw text (#713)."""
+    def test_recipientless_commentary_is_visible_preamble(self):
+        """Commentary without ``to=functions.X`` is user-visible preamble
+        (#621), same as the non-streaming parser."""
+        tokens = [
+            "<|start|>",
+            "assistant",
+            "<|channel|>",
+            "commentary",
+            "<|message|>",
+            "I will now",
+            " update the files.",
+            "<|end|>",
+        ]
+        assert self._run_filter(tokens) == [
+            ("content", "I will now"),
+            ("content", " update the files."),
+        ]
+
+    def test_full_text_accumulates_all_tokens(self):
+        from olmlx.engine.logits_processors import _GptOssChannelFilter
+
+        filt = _GptOssChannelFilter()
+        for t in ["<|channel|>", "final", "<|message|>", "hi"]:
+            filt.feed(t)
+        assert filt.get_full_text() == "<|channel|>final<|message|>hi"
+
+    def test_streamed_split_matches_non_streaming_parse(self):
+        """Streamed thinking/content must match ``_parse_gpt_oss_channels`` on
+        the raw text for the normal analysis + preamble + final shape."""
         from olmlx.engine.tool_parser import _parse_gpt_oss_channels
-        from olmlx.routers.thinking_split import (
-            flush_split_thinking,
-            split_thinking_streaming,
-        )
 
         tokens = [
             "<|start|>",
@@ -513,19 +486,12 @@ class TestGptOssStreamFilter:
             " is 56.",
             "<|return|>",
         ]
-        # Feed chunk-by-chunk, exactly as the streaming routers do.
-        state: dict = {}
-        thinking = visible = ""
-        for chunk in self._run_filter(tokens):
-            t, v = split_thinking_streaming(chunk, state)
-            thinking += t
-            visible += v
-        t, v = flush_split_thinking(state)
-        thinking += t
-        visible += v
+        out = self._run_filter(tokens)
+        thinking = "".join(t for ch, t in out if ch == "thinking")
+        content = "".join(t for ch, t in out if ch == "content")
         expected = _parse_gpt_oss_channels("".join(tokens), has_tools=False)
         assert expected is not None
-        assert (thinking.strip(), visible.strip()) == expected[:2]
+        assert (thinking, content) == expected[:2]
 
 
 # ---------------------------------------------------------------------------
@@ -535,17 +501,13 @@ class TestGptOssStreamFilter:
 
 class TestGptOssStreamingThinking:
     async def test_stream_completion_surfaces_analysis_as_thinking(self, mock_manager):
-        """The streaming engine path must not drop the analysis channel when a
-        final channel follows: it arrives as a <think> block that the routers'
-        splitter routes to thinking, with only the final text as content."""
+        """The streaming engine path must not drop the analysis channel: it
+        streams as structured ``{"thinking": ...}`` chunks, with only the
+        final-channel text in ``text`` chunks."""
         from dataclasses import replace
         from unittest.mock import AsyncMock, patch
 
         from olmlx.engine.inference import _stream_completion
-        from olmlx.routers.thinking_split import (
-            flush_split_thinking,
-            split_thinking_streaming,
-        )
         from olmlx.utils.streaming import CancellableStream, StreamToken
         from olmlx.utils.timing import TimingStats
 
@@ -600,17 +562,8 @@ class TestGptOssStreamingThinking:
             async for c in _stream_completion(lm, "Hi", 32, {}, TimingStats()):
                 chunks.append(c)
 
-        state: dict = {}
-        thinking = content = ""
-        for c in chunks:
-            if c.get("done") or "text" not in c:
-                continue
-            t, v = split_thinking_streaming(c["text"], state)
-            thinking += t
-            content += v
-        t, v = flush_split_thinking(state)
-        thinking += t
-        content += v
+        thinking = "".join(c.get("thinking", "") for c in chunks)
+        content = "".join(c.get("text", "") for c in chunks if not c.get("done"))
 
         assert thinking == "7*8=56"
         assert content == "It is 56."

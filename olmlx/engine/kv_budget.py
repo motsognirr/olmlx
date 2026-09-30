@@ -38,7 +38,6 @@ except ImportError:  # pragma: no cover
 # module (#454); re-exported here so existing call sites and the tests that
 # import them from ``olmlx.engine.inference`` keep working.
 from olmlx.engine.logits_processors import (
-    _gpt_oss_filter as _gpt_oss_filter,
     _GPT_OSS_STRUCTURAL_TOKENS as _GPT_OSS_STRUCTURAL_TOKENS,
     _resolve_model_vocab_size as _resolve_model_vocab_size,
 )

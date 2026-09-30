@@ -62,7 +62,6 @@ from olmlx.engine.logits_processors import (
     _GptOssChannelFilter,
     _install_grammar_processor,
     _install_thinking_budget_processor,
-    _gpt_oss_filter as _gpt_oss_filter,
     _GPT_OSS_STRUCTURAL_TOKENS as _GPT_OSS_STRUCTURAL_TOKENS,
     _resolve_model_vocab_size as _resolve_model_vocab_size,
     # Re-exported for tests that import them from here; the in-module
@@ -3283,6 +3282,23 @@ def _prefill_coverage(
     return covered, fresh, covered > 0
 
 
+def _channel_chunks(
+    channel_filter: _GptOssChannelFilter, text: str
+) -> list[dict[str, Any]]:
+    """Route one gpt-oss token through the channel filter into stream chunks.
+
+    Analysis text is a structured ``{"thinking": ...}`` chunk (#713) — never
+    in-band ``<think>`` markup, which a reasoning trace mentioning ``</think>``
+    could break out of. Routers route it to their thinking field.
+    """
+    thinking, content = channel_filter.feed(text)
+    if thinking:
+        return [{"thinking": thinking, "done": False}]
+    if content:
+        return [{"text": content, "done": False}]
+    return []
+
+
 async def _stream_completion(
     lm: LoadedModel,
     prompt: str | list[int],
@@ -3607,10 +3623,13 @@ async def _stream_completion(
                         token_part, stop_hit = stop_scanner.feed(token.text or "")
                         if stop_hit:
                             if token_part:
-                                if channel_filter is not None:
-                                    token_part = channel_filter.feed(token_part)
-                                if token_part:
+                                if channel_filter is None:
                                     yield {"text": token_part, "done": False}
+                                else:
+                                    for chunk in _channel_chunks(
+                                        channel_filter, token_part
+                                    ):
+                                        yield chunk
                             # Cancel the worker so it stops decoding past-stop
                             # tokens into the shared prompt_cache — otherwise it
                             # keeps mutating the very object we are about to
@@ -3626,8 +3645,9 @@ async def _stream_completion(
                     # reconstruct the full unfiltered output.
                     if channel_filter is None:
                         yield {"text": token.text, "done": False}
-                    elif out_text := channel_filter.feed(token.text):
-                        yield {"text": out_text, "done": False}
+                    else:
+                        for chunk in _channel_chunks(channel_filter, token.text):
+                            yield chunk
 
                     if inf_timeout is not None:
                         elapsed = time.monotonic() - inf_start
@@ -3641,11 +3661,7 @@ async def _stream_completion(
                             stream.cancel()
                             break
 
-            # Fallback: analysis promoted to content if no final channel was
-            # produced, else any analysis left after it as a <think> block
             if channel_filter is not None:
-                for text in channel_filter.get_fallback_texts():
-                    yield {"text": text, "done": False}
                 # Capture raw text for tool call parsing (will be included in done chunk)
                 raw_text = channel_filter.get_full_text()
             else:

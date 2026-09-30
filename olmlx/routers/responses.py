@@ -23,7 +23,7 @@ from olmlx.routers.common import (
     resolve_openai_think,
     resolve_tool_choice,
 )
-from olmlx.routers.thinking_split import flush_split_thinking, split_thinking_parts
+from olmlx.routers.thinking_split import flush_split_thinking, split_chunk_parts
 from olmlx.schemas.responses import ResponsesRequest, ResponsesResponse
 from olmlx.utils.images import normalize_image_block
 
@@ -648,9 +648,7 @@ async def _stream_response(
             if "thinking_expected" in chunk:
                 split_state["thinking_expected"] = bool(chunk["thinking_expected"])
                 continue
-            for channel, fragment in split_thinking_parts(
-                chunk.get("text", ""), split_state
-            ):
+            for channel, fragment in split_chunk_parts(chunk, split_state):
                 for event in route(channel, fragment):
                     yield event
 
