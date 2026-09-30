@@ -4,7 +4,8 @@
 ``data:image/...;base64,...`` data URIs (PIL sniffs the real format, so the
 declared media type in a data URI is cosmetic).  This module converts the
 OpenAI (``image_url``) and Anthropic (``image`` + ``source``) content-block
-shapes into one of those forms (issue #428).
+shapes into one of those forms (issue #428), and wraps the Ollama-native
+``images`` field's raw base64 strings into data URIs (issue #714).
 """
 
 from __future__ import annotations
@@ -46,3 +47,19 @@ def normalize_image_block(block: dict[str, Any]) -> str:
         raise ValueError(f"unsupported image source type: {stype!r}")
 
     raise ValueError(f"not an image block: type={btype!r}")
+
+
+_LOADABLE_PREFIXES = ("data:", "http://", "https://")
+
+
+def ensure_image_data_uri(ref: str) -> str:
+    """Wrap a raw base64 image (Ollama's ``images`` field) in a data URI.
+
+    Ollama clients send bare base64 with no ``data:`` prefix, which
+    ``load_image`` would otherwise try to ``open()`` as a file path.  Refs that
+    are already data URIs or http(s) URLs — what the OpenAI/Anthropic/Responses
+    routers put in the same field — pass through unchanged.
+    """
+    if ref.startswith(_LOADABLE_PREFIXES):
+        return ref
+    return f"data:image/png;base64,{ref}"

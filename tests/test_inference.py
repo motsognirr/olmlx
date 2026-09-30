@@ -886,24 +886,65 @@ class TestExtractImages:
         messages = [{"role": "user", "content": "hi"}]
         assert _extract_images(messages) is None
 
-    def test_with_images(self):
+    def test_raw_base64_wrapped_as_data_uri(self):
+        """Ollama-native images are bare base64 — must become data URIs (#714)."""
         messages = [
-            {"role": "user", "content": "describe", "images": ["img1.jpg", "img2.png"]},
+            {"role": "user", "content": "describe", "images": ["QUJD", "REVG"]},
         ]
         result = _extract_images(messages)
-        assert result == ["img1.jpg", "img2.png"]
+        assert result == ["data:image/png;base64,QUJD", "data:image/png;base64,REVG"]
 
     def test_multiple_messages(self):
         messages = [
-            {"role": "user", "content": "first", "images": ["a.jpg"]},
-            {"role": "user", "content": "second", "images": ["b.jpg"]},
+            {"role": "user", "content": "first", "images": ["QUJD"]},
+            {"role": "user", "content": "second", "images": ["REVG"]},
         ]
         result = _extract_images(messages)
-        assert result == ["a.jpg", "b.jpg"]
+        assert result == ["data:image/png;base64,QUJD", "data:image/png;base64,REVG"]
+
+    def test_prenormalized_refs_not_double_wrapped(self):
+        """OpenAI/Anthropic/Responses refs arrive pre-normalized via the same field."""
+        messages = [
+            {
+                "role": "user",
+                "content": "x",
+                "images": ["data:image/jpeg;base64,QUJD", "QUJD"],
+            },
+            {"role": "user", "content": "y", "images": ["https://x/y.png"]},
+        ]
+        result = _extract_images(messages)
+        assert result == [
+            "data:image/jpeg;base64,QUJD",
+            "data:image/png;base64,QUJD",
+            "https://x/y.png",
+        ]
 
     def test_empty_images_list(self):
         messages = [{"role": "user", "content": "hi", "images": []}]
         assert _extract_images(messages) is None
+
+
+class TestGenerateCompletionImages:
+    @pytest.mark.asyncio
+    async def test_raw_base64_images_normalized_before_generation(self, mock_manager):
+        """/api/generate passes req.images straight to generate_completion,
+        bypassing _extract_images — it must normalize them too (#714)."""
+        import olmlx.engine.inference as inf
+
+        full = AsyncMock(return_value={"text": "ok"})
+        with patch.object(inf, "_full_completion", full):
+            await inf.generate_completion(
+                mock_manager,
+                "qwen3",
+                "describe",
+                stream=False,
+                images=["QUJD", "https://x/y.png"],
+            )
+        full.assert_called_once()
+        assert full.call_args.args[5] == [
+            "data:image/png;base64,QUJD",
+            "https://x/y.png",
+        ]
 
 
 class TestInjectToolsIntoSystem:

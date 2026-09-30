@@ -95,6 +95,7 @@ from olmlx.engine.template_caps import TemplateCaps
 from olmlx.utils import metrics as _metrics
 from olmlx.utils import tracing as _tracing
 from olmlx.utils.audio_input import cleanup_temp_audio, materialize_audio
+from olmlx.utils.images import ensure_image_data_uri
 from olmlx.utils.streaming import async_mlx_stream, materialize_lazy_cache_state
 from olmlx.utils.timing import Timer, TimingStats
 
@@ -1264,11 +1265,11 @@ def _make_prompt_cache_for_lm(lm: LoadedModel) -> list:
 
 
 def _extract_images(messages: list[dict]) -> list[str] | None:
-    """Extract image URLs/paths from message content."""
+    """Extract image refs from messages as ``load_image``-ready strings (#714)."""
     images = []
     for msg in messages:
         if msg.get("images"):
-            images.extend(msg["images"])
+            images.extend(ensure_image_data_uri(ref) for ref in msg["images"])
     return images if images else None
 
 
@@ -1368,6 +1369,9 @@ async def generate_completion(
     image patches.
     """
     stats = TimingStats()
+    if images:
+        # /api/generate hands req.images straight here, bypassing _extract_images.
+        images = [ensure_image_data_uri(ref) for ref in images]
 
     _reject_declared_image_before_load(manager, model_name, "text completion")
     with Timer() as load_timer:
