@@ -1064,6 +1064,51 @@ class TestMergeLeadingSystemMessages:
         ]
         assert _merge_leading_system_messages(msgs) == msgs
 
+    def test_all_empty_keeps_first_message_as_is(self):
+        # No content anywhere in the run: don't fabricate a content field.
+        msgs = [
+            {"role": "system"},
+            {"role": "system"},
+            {"role": "user", "content": "q"},
+        ]
+        assert _merge_leading_system_messages(msgs) == [
+            {"role": "system"},
+            {"role": "user", "content": "q"},
+        ]
+
+    def test_preserves_first_message_fields(self):
+        msgs = [
+            {"role": "system", "name": "policy", "content": "a"},
+            {"role": "system", "content": "b"},
+        ]
+        assert _merge_leading_system_messages(msgs) == [
+            {"role": "system", "name": "policy", "content": "a\n\nb"}
+        ]
+
+    def test_attachments_do_not_block_fold(self):
+        # A system turn carrying images must still fold, or strict templates
+        # raise on the second system turn. Attachments are concatenated.
+        msgs = [
+            {"role": "system", "content": "a", "images": ["i1"]},
+            {"role": "system", "content": "b", "images": ["i2"], "audio": ["a1"]},
+            {"role": "user", "content": "q"},
+        ]
+        assert _merge_leading_system_messages(msgs) == [
+            {
+                "role": "system",
+                "content": "a\n\nb",
+                "images": ["i1", "i2"],
+                "audio": ["a1"],
+            },
+            {"role": "user", "content": "q"},
+        ]
+
+    def test_does_not_mutate_input(self):
+        first = {"role": "system", "content": "a", "images": ["i1"]}
+        msgs = [first, {"role": "system", "content": "b", "images": ["i2"]}]
+        _merge_leading_system_messages(msgs)
+        assert first == {"role": "system", "content": "a", "images": ["i1"]}
+
     def test_single_system_unchanged(self):
         msgs = [{"role": "system", "content": "a"}, {"role": "user", "content": "q"}]
         assert _merge_leading_system_messages(msgs) == msgs

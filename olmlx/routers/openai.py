@@ -391,19 +391,24 @@ def _merge_leading_system_messages(messages: list[dict]) -> list[dict]:
     beginning." on the second one. Only the leading run is folded; a
     mid-conversation system turn keeps its position. Runs after
     ``_normalize_multimodal_messages``, so content is a string or absent.
+    The first turn's other fields (e.g. ``name``) are kept, and any
+    ``images``/``audio`` across the run are concatenated.
     """
     run = 0
-    while (
-        run < len(messages)
-        and messages[run].get("role") == "system"
-        and not messages[run].get("images")
-        and not messages[run].get("audio")
-    ):
+    while run < len(messages) and messages[run].get("role") == "system":
         run += 1
     if run < 2:
         return messages
-    parts = [m["content"] for m in messages[:run] if m.get("content")]
-    return [{"role": "system", "content": "\n\n".join(parts)}, *messages[run:]]
+    leading = messages[:run]
+    merged = dict(leading[0])
+    parts = [m["content"] for m in leading if m.get("content")]
+    if parts:
+        merged["content"] = "\n\n".join(parts)
+    for key in ("images", "audio"):
+        items = [x for m in leading for x in (m.get(key) or [])]
+        if items:
+            merged[key] = items
+    return [merged, *messages[run:]]
 
 
 @router.post(
