@@ -262,6 +262,39 @@ class TestInstallThinkingBudget:
         proc(mx.array([1]), _logits())
         assert _forced_id(proc(mx.array([1, 7]), _logits())) == CLOSE
 
+    def test_thinking_expected_without_open_marker_is_not_forced(self):
+        """``thinking_expected`` is a request-level flag, not evidence that a
+        think block is open in the output. A model that answers directly
+        (no opener in the prompt tail or the generation) must not get a
+        close marker forced into the middle of its answer."""
+        gk = {}
+        assert self._install(
+            _lm(), gk, budget=1, thinking_expected=True, prompt="hello"
+        )
+        proc = gk["logits_processors"][-1]
+        proc(mx.array([1]), _logits())
+        assert _forced_id(proc(mx.array([1, 7]), _logits())) is None
+
+    def test_thinking_expected_model_emitted_open_is_forced(self):
+        """Templates that leave the opener to the model (Qwen3 hybrid,
+        GLM) still get enforced once the model emits it."""
+        gk = {}
+        assert self._install(
+            _lm(), gk, budget=2, thinking_expected=True, prompt="hello"
+        )
+        proc = gk["logits_processors"][-1]
+        proc(mx.array([1]), _logits())
+        proc(mx.array([1, OPEN]), _logits())
+        assert _forced_id(proc(mx.array([1, OPEN, 7]), _logits())) == CLOSE
+
+    def test_uninspectable_prompt_falls_back_to_thinking_expected(self):
+        """With no string prompt to inspect, keep the request-level flag."""
+        gk = {}
+        assert self._install(_lm(), gk, budget=1, thinking_expected=True, prompt=None)
+        proc = gk["logits_processors"][-1]
+        proc(mx.array([1]), _logits())
+        assert _forced_id(proc(mx.array([1, 7]), _logits())) == CLOSE
+
 
 class TestGenerateChatWiring:
     @pytest.mark.asyncio

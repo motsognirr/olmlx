@@ -508,10 +508,16 @@ def _install_thinking_budget_processor(
         )
         return False
     start_seq, end_seq = markers
+    # Only force a close on positive evidence of an open block: the prompt
+    # ending in the opener (Qwen3.5/DeepSeek-R1-style templates, with or
+    # without an enable_thinking switch) or the model emitting it (replayed
+    # by the processor). ``thinking_expected`` is only a request-level flag —
+    # trusting it would force ``</think>`` into a direct answer from a model
+    # that skipped thinking, and the routers' orphan-close handling (#307)
+    # would then reclassify that answer as thinking. It is the fallback only
+    # when there is no string prompt to inspect.
     initially_open = bool(thinking_expected)
-    if not initially_open and isinstance(prompt, str):
-        # Templates without an enable_thinking switch (DeepSeek-R1 style) can
-        # still open the think block in the generation prompt.
+    if isinstance(prompt, str):
         try:
             start_text = tokenizer.decode(list(start_seq))
         except Exception:
