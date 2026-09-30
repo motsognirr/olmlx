@@ -113,6 +113,28 @@ class TestThinkingBudgetProcessor:
         outs = _drive(proc, [7, 7], as_list=True)
         assert _forced_id(outs[2]) == CLOSE
 
+    def test_batched_token_buffer_history(self):
+        """Drive the processor exactly as mlx-lm's ``GenerationBatch._step``
+        does: a per-sequence ``TokenBuffer`` seeded with the prompt, updated
+        with the previous step's input token, whose fetched 1-D array is the
+        history each processor call sees."""
+        from mlx_lm.models.cache import TokenBuffer
+
+        proc = _make_thinking_budget_processor(
+            3, (OPEN,), (CLOSE,), initially_open=True
+        )
+        buf = TokenBuffer([1, 2, 3])
+        inputs = mx.array([3])  # the last prompt token feeds the first step
+        generated = [7, 7, 7]
+        outs = []
+        for k in range(len(generated) + 1):
+            history = buf.update_and_fetch(inputs)
+            outs.append(proc(history, _logits()))
+            if k < len(generated):
+                inputs = mx.array([generated[k]])
+        assert [_forced_id(o) for o in outs[:3]] == [None, None, None]
+        assert _forced_id(outs[3]) == CLOSE
+
     def test_zero_budget_forces_first_token(self):
         proc = _make_thinking_budget_processor(
             0, (OPEN,), (CLOSE,), initially_open=True
@@ -239,6 +261,18 @@ class TestInstallThinkingBudget:
         gk = {}
         assert self._install(_lm(**{attr: True}), gk) is False
         assert "logits_processors" not in gk
+
+    @pytest.mark.parametrize("attr", ["is_distributed", "is_speculative"])
+    def test_unsupported_model_kinds_do_not_warn(self, attr, caplog):
+        """Anthropic clients (Claude Code) send a budget on every request, so
+        a per-request WARNING for an unenforceable model kind is spam the
+        operator can't act on."""
+        import logging
+
+        with caplog.at_level(logging.DEBUG, logger="olmlx"):
+            self._install(_lm(**{attr: True}), {})
+        assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
+        assert any("not enforced" in r.getMessage() for r in caplog.records)
 
     def test_grammar_active_skips(self):
         gk = {}

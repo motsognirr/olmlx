@@ -497,7 +497,10 @@ def _install_thinking_budget_processor(
     elif grammar_active:
         reason = "grammar-constrained decoding"
     if reason is not None:
-        logger.warning("Thinking budget %d not enforced: %s", thinking_budget, reason)
+        # info, not warning: Anthropic clients send a budget on every request,
+        # so a per-request warning for a model kind that can never enforce it
+        # is noise the operator cannot act on.
+        logger.info("Thinking budget %d not enforced: %s", thinking_budget, reason)
         return False
     tokenizer = lm.text_tokenizer
     markers = _resolve_think_markers(tokenizer)
