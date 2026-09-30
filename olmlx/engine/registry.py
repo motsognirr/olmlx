@@ -224,6 +224,12 @@ def _validate_options(options: dict) -> None:
             raise ValueError(
                 f"Option '{key}' must be {expected}, got {type(value).__name__}"
             )
+    # Per-model defaults are merged in after request validation, so a
+    # models.json ``num_predict: 0`` would bypass ModelOptions' check (#709).
+    if options.get("num_predict") == 0:
+        raise ValueError(
+            "Option 'num_predict' must be >= 1, or -1 (infinite) / -2 (fill context)"
+        )
 
 
 def _validate_timeout(name: str, value: Any) -> float:

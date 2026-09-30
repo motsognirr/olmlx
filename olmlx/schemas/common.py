@@ -49,6 +49,12 @@ class ModelOptions(BaseModel):
     def validate_num_predict(cls, v: int | None) -> int | None:
         if v is None or v < 0:
             return v  # special values -1 (infinite) and -2 (fill context)
+        if v == 0:
+            # mlx-lm's decode loop never runs with max_tokens=0 and crashes
+            # with an UnboundLocalError (#709) — reject like OpenAI's ge=1.
+            raise ValueError(
+                "num_predict must be >= 1, or -1 (infinite) / -2 (fill context)"
+            )
         return validate_token_limit(v, "num_predict")
 
     top_k: int | None = Field(None, ge=0)

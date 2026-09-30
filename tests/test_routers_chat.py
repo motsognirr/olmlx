@@ -1232,6 +1232,29 @@ class TestUnknownRoleRejected:
         assert "role" in body
 
 
+class TestNumPredictZeroRejected:
+    """#709: ``num_predict: 0`` must be a 400 before any inference runs."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("stream", [True, False])
+    async def test_api_chat_rejects_num_predict_zero(self, app_client, stream):
+        with patch(
+            "olmlx.routers.chat.generate_chat", new_callable=AsyncMock
+        ) as mock_gen:
+            resp = await app_client.post(
+                "/api/chat",
+                json={
+                    "model": "qwen3",
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "stream": stream,
+                    "options": {"num_predict": 0},
+                },
+            )
+        assert resp.status_code == 400
+        assert "num_predict" in resp.text
+        mock_gen.assert_not_called()
+
+
 class TestXCacheIDHeader:
     @pytest.mark.asyncio
     async def test_header_passed_to_generate_chat(self, app_client):

@@ -1283,6 +1283,17 @@ class TestRegistryModelConfig:
                 }
             )
 
+    def test_option_num_predict_zero_rejected(self):
+        """#709: a models.json ``num_predict: 0`` default is merged in after
+        request validation, so it must be rejected at config-parse time."""
+        with pytest.raises(ValueError, match="num_predict"):
+            ModelConfig.from_entry(
+                {
+                    "hf_path": "org/model",
+                    "options": {"num_predict": 0},
+                }
+            )
+
     def test_invalid_hf_path_in_dict_rejected(self):
         """Invalid hf_path in dict entry is rejected at parse time."""
         with pytest.raises(ValueError, match="owner/repo"):

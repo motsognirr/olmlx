@@ -448,3 +448,26 @@ class TestEmptyPromptRejected:
         assert resp.status_code == 400
         body = resp.text.lower()
         assert "prompt" in body
+
+
+class TestNumPredictZeroRejected:
+    """#709: ``num_predict: 0`` must be a 400 before any inference runs."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("stream", [True, False])
+    async def test_api_generate_rejects_num_predict_zero(self, app_client, stream):
+        with patch(
+            "olmlx.routers.generate.generate_completion", new_callable=AsyncMock
+        ) as mock_gen:
+            resp = await app_client.post(
+                "/api/generate",
+                json={
+                    "model": "qwen3",
+                    "prompt": "hi",
+                    "stream": stream,
+                    "options": {"num_predict": 0},
+                },
+            )
+        assert resp.status_code == 400
+        assert "num_predict" in resp.text
+        mock_gen.assert_not_called()
