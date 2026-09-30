@@ -171,3 +171,33 @@ class TestModelManifest:
         m = ModelManifest.load(path)
         assert m.estimator_version == 0
         assert m.parameter_size == "77M"
+
+    def test_save_is_atomic_on_write_failure(self, tmp_path, monkeypatch):
+        """A crash mid-write must leave the previous manifest intact rather
+        than a truncated file (list_local/show now write on read, #702)."""
+        path = tmp_path / "manifest.json"
+        ModelManifest(name="old:latest", hf_path="a/b", parameter_size="77M").save(path)
+        before = path.read_bytes()
+
+        real_dump = json.dump
+
+        def _partial_dump(obj, f, **kw):
+            f.write('{"name": "trunc')
+            raise OSError("disk full")
+
+        monkeypatch.setattr(json, "dump", _partial_dump)
+        try:
+            ModelManifest(name="new:latest", hf_path="a/b").save(path)
+        except OSError:
+            pass
+        monkeypatch.setattr(json, "dump", real_dump)
+
+        assert path.read_bytes() == before
+        assert ModelManifest.load(path).parameter_size == "77M"
+        # No stray temp files left behind.
+        assert [p.name for p in tmp_path.iterdir()] == ["manifest.json"]
+
+    def test_save_preserves_world_readable_mode(self, tmp_path):
+        path = tmp_path / "manifest.json"
+        ModelManifest(name="a:latest", hf_path="a/b").save(path)
+        assert path.stat().st_mode & 0o777 == 0o644

@@ -1008,3 +1008,29 @@ class TestStaleManifestRefresh:
         manifest_path = mock_store.local_path("Qwen/Qwen3-8B-MLX") / "manifest.json"
         on_disk = json.loads(manifest_path.read_text())
         assert on_disk["estimator_version"] == _ESTIMATOR_VERSION
+
+    def test_refresh_keeps_old_values_when_rederivation_yields_nothing(
+        self, mock_store
+    ):
+        """A config.json that is unparseable (e.g. mid-rewrite) or yields no
+        estimate must not permanently blank previously-populated fields."""
+        local_dir = _write_stale_model(mock_store, self.HF)
+        (local_dir / "config.json").write_text("{not json")
+        results = mock_store.list_local()
+        assert results[0].parameter_size == "77M"
+        assert results[0].family == "qwen2"
+        assert results[0].quantization_level == "4-bit"
+        on_disk = json.loads((local_dir / "manifest.json").read_text())
+        assert on_disk["parameter_size"] == "77M"
+        assert on_disk["family"] == "qwen2"
+        # Not stamped current: a later read retries once config.json parses.
+        assert "estimator_version" not in on_disk
+
+    def test_refresh_keeps_old_field_when_estimate_is_empty(self, mock_store):
+        """A parseable config.json with no dims to estimate from keeps the old
+        parameter_size instead of blanking it; other fields still refresh."""
+        local_dir = _write_stale_model(mock_store, self.HF)
+        (local_dir / "config.json").write_text(json.dumps({"model_type": "qwen3"}))
+        results = mock_store.list_local()
+        assert results[0].parameter_size == "77M"
+        assert results[0].family == "qwen3"

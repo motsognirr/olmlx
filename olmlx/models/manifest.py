@@ -1,6 +1,8 @@
 import dataclasses
 import json
 import hashlib
+import os
+import tempfile
 import typing
 from dataclasses import dataclass, asdict
 from pathlib import Path
@@ -26,9 +28,29 @@ class ModelManifest:
         return asdict(self)
 
     def save(self, path: Path):
+        """Write atomically (temp file + ``os.replace``): manifests are also
+        rewritten on the read path (#702) and by other processes (the CLI), so
+        a reader must never observe a truncated file."""
         path.parent.mkdir(parents=True, exist_ok=True)
-        with open(path, "w") as f:
-            json.dump(self.to_dict(), f, indent=2)
+        fd, tmp = tempfile.mkstemp(
+            dir=path.parent, prefix=f".{path.name}.", suffix=".tmp"
+        )
+        try:
+            # mkstemp creates 0600; keep the existing file's mode (or 0644).
+            try:
+                mode = path.stat().st_mode & 0o777
+            except OSError:
+                mode = 0o644
+            os.chmod(tmp, mode)
+            with os.fdopen(fd, "w") as f:
+                json.dump(self.to_dict(), f, indent=2)
+            os.replace(tmp, path)
+        except BaseException:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
 
     @classmethod
     def load(cls, path: Path) -> "ModelManifest":

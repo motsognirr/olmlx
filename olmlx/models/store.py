@@ -238,19 +238,28 @@ def _refresh_if_stale(
     recomputed — a ``config.json`` read — so this stays cheap on the
     ``/api/tags`` polling path; ``size`` / ``digest`` / ``modified_at`` are kept
     (recomputing ``size`` would walk the whole directory). A directory with no
-    model marker to derive from is left as-is rather than blanked. Persisting
-    the refresh is best-effort: a failed save still returns the fresh values.
+    model marker to derive from is left as-is rather than blanked, as is one
+    whose ``config.json`` does not parse (it may be mid-rewrite) — without a
+    version stamp, so a later read retries. A field the estimator cannot
+    derive (empty result) keeps its stored value. Persisting the refresh is
+    best-effort: a failed save still returns the fresh values.
     """
     if manifest.estimator_version >= _ESTIMATOR_VERSION:
         return manifest
     if not _has_model_marker(model_dir):
         return manifest
+    config_path = model_dir / "config.json"
+    if config_path.exists():
+        try:
+            json.loads(config_path.read_text())
+        except Exception:
+            return manifest
     meta = _extract_metadata(model_dir)
     refreshed = replace(
         manifest,
-        family=meta["family"],
-        parameter_size=meta["parameter_size"],
-        quantization_level=meta["quantization_level"],
+        family=meta["family"] or manifest.family,
+        parameter_size=meta["parameter_size"] or manifest.parameter_size,
+        quantization_level=meta["quantization_level"] or manifest.quantization_level,
         estimator_version=_ESTIMATOR_VERSION,
     )
     try:
