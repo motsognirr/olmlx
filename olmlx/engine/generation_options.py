@@ -1,7 +1,8 @@
 """Sampling-defaults layering and generate-kwargs assembly (extracted from inference.py)."""
 
 import logging
-from typing import TYPE_CHECKING
+import secrets
+from typing import TYPE_CHECKING, Callable
 
 import mlx.core as mx
 
@@ -29,7 +30,13 @@ except ImportError:  # pragma: no cover
     )
 
 try:
-    from mlx_lm.sample_utils import make_logits_processors, make_sampler
+    from mlx_lm.sample_utils import (
+        apply_min_p,
+        apply_top_k,
+        apply_top_p,
+        make_logits_processors,
+        make_sampler,
+    )
 except ImportError:  # pragma: no cover
     make_sampler = None  # type: ignore[assignment]
     make_logits_processors = None  # type: ignore[assignment]
@@ -150,6 +157,16 @@ def _build_generate_kwargs(options: dict | None, is_vlm: bool = False) -> dict:
         for ollama_key, mlx_key in vlm_mappings.items():
             if ollama_key in options:
                 kwargs[mlx_key] = options[ollama_key]
+        # mlx-vlm's default sampler has the same off-main-thread compiled-RNG
+        # bug as mlx-lm's (#708); hand it ours. ``temperature`` etc. stay in
+        # kwargs — mlx-vlm ignores them for sampling once ``sampler`` is set.
+        if "temperature" in options and make_sampler is not None:
+            kwargs["sampler"] = _make_thread_safe_sampler(
+                temp=options["temperature"],
+                top_p=options.get("top_p", 0.0),
+                top_k=options.get("top_k", 0),
+                min_p=options.get("min_p", 0.0),
+            )
         # Forward stop sequences for downstream (popped before passing to mlx-vlm)
         if "stop" in options and options["stop"]:
             raw = options["stop"]
@@ -171,7 +188,7 @@ def _build_generate_kwargs(options: dict | None, is_vlm: bool = False) -> dict:
         if sampler_args and "temp" in sampler_args:
             if make_sampler is None:
                 raise RuntimeError("mlx-lm is not installed; cannot build sampler")
-            kwargs["sampler"] = make_sampler(**sampler_args)
+            kwargs["sampler"] = _make_thread_safe_sampler(**sampler_args)
         elif sampler_args:
             logger.warning(
                 "top_k/top_p/min_p provided without temperature; no sampler "
@@ -221,8 +238,49 @@ def _build_generate_kwargs(options: dict | None, is_vlm: bool = False) -> dict:
     return kwargs
 
 
+def _make_thread_safe_sampler(
+    temp: float = 0.0,
+    top_p: float = 0.0,
+    min_p: float = 0.0,
+    top_k: int = 0,
+) -> Callable[[mx.array], mx.array]:
+    """Drop-in for ``mlx_lm.sample_utils.make_sampler`` that samples correctly
+    on worker threads (#708).
+
+    mlx-lm's ``categorical_sampling`` is ``mx.compile``'d with
+    ``inputs=outputs=mx.random.state`` — the state list captured on the
+    *importing* thread. MLX random state is thread-local, so on our generation
+    worker threads the compiled draw neither reads nor advances that thread's
+    state: every token gets identical noise and ``mx.random.seed`` is a no-op.
+    The draw here is uncompiled, so it uses the calling thread's state. The
+    top-p/min-p/top-k filters are deterministic and reused from mlx-lm.
+    """
+    if temp == 0:
+        return lambda x: mx.argmax(x, axis=-1)
+
+    filters: list[Callable[[mx.array], mx.array]] = []
+    if 0 < top_p < 1.0:
+        filters.append(lambda x: apply_top_p(x, top_p))
+    if min_p != 0.0:
+        filters.append(lambda x: apply_min_p(x, min_p, 1))
+    if top_k > 0:
+        filters.append(lambda x: apply_top_k(x, top_k))
+
+    def sampler(logprobs: mx.array) -> mx.array:
+        for f in filters:
+            logprobs = f(logprobs)
+        return mx.random.categorical(logprobs * (1 / temp))
+
+    return sampler
+
+
 def _apply_seed(kwargs: dict, *, consume: bool = True) -> None:
     """Read ``seed`` from *kwargs* and set the MLX RNG state.
+
+    Without a ``seed``, the RNG is seeded from OS entropy: MLX random state is
+    thread-local and every fresh thread starts from the same default state, so
+    an unseeded request would otherwise replay the same sample sequence as
+    every other request landing on a fresh thread (#708).
 
     Must be called from the inference thread, not the event loop.
 
@@ -234,5 +292,6 @@ def _apply_seed(kwargs: dict, *, consume: bool = True) -> None:
                  is left in place (VLMs forward it to mlx-vlm).
     """
     seed = kwargs.pop("seed", None) if consume else kwargs.get("seed", None)
-    if seed is not None:
-        mx.random.seed(seed)
+    if seed is None:
+        seed = secrets.randbits(64)
+    mx.random.seed(seed)

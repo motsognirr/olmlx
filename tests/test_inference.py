@@ -375,8 +375,10 @@ class TestBuildGenerateKwargs:
         assert isinstance(result["logits_processors"], list)
 
     def test_temperature_vlm_unchanged(self):
-        """VLM: sampling params passed directly (not via sampler)."""
+        """VLM: sampling params passed directly, plus our thread-safe sampler
+        (mlx-vlm's own compiled sampler is broken off the main thread, #708)."""
         result = _build_generate_kwargs({"temperature": 0.7}, is_vlm=True)
+        assert callable(result.pop("sampler"))
         assert result == {"temperature": 0.7}
 
     def test_vlm_all_params_direct(self):
@@ -384,6 +386,11 @@ class TestBuildGenerateKwargs:
         result = _build_generate_kwargs({"temperature": 0.5, "top_p": 0.9}, is_vlm=True)
         assert result["temperature"] == 0.5
         assert result["top_p"] == 0.9
+        assert callable(result["sampler"])
+
+    def test_vlm_no_temperature_no_sampler(self):
+        """VLM without temperature: mlx-vlm keeps its greedy default."""
+        result = _build_generate_kwargs({"top_p": 0.9}, is_vlm=True)
         assert "sampler" not in result
 
     def test_all_mappings(self):
@@ -873,12 +880,17 @@ class TestApplySeed:
         assert "seed" in kwargs
         mock_mx.random.seed.assert_called_once_with(42)
 
-    def test_apply_seed_no_seed(self):
-        """_apply_seed with no seed key should be a no-op."""
-        kwargs = {"max_tokens": 100}
-        with patch("olmlx.engine.generation_options.mx") as mock_mx:
-            _apply_seed(kwargs)
-        mock_mx.random.seed.assert_not_called()
+    def test_apply_seed_no_seed_uses_entropy(self):
+        """No seed → seed from OS entropy, fresh per request (#708)."""
+        seeds = []
+        for _ in range(2):
+            kwargs = {"max_tokens": 100}
+            with patch("olmlx.engine.generation_options.mx") as mock_mx:
+                _apply_seed(kwargs)
+            mock_mx.random.seed.assert_called_once()
+            seeds.append(mock_mx.random.seed.call_args.args[0])
+            assert kwargs == {"max_tokens": 100}
+        assert seeds[0] != seeds[1]
 
 
 class TestExtractImages:

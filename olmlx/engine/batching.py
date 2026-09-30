@@ -46,6 +46,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import queue
+import secrets
 import threading
 import time
 from collections.abc import Awaitable
@@ -388,6 +389,13 @@ class BatchScheduler:
     # -- worker (dedicated thread, holds the GPU) ------------------------
 
     def _worker(self) -> None:
+        # MLX random state is thread-local and every fresh thread starts from
+        # the same default state; seed from OS entropy so batched sampling
+        # doesn't replay one fixed sequence (#708). Seeded requests never
+        # batch (_batch_eligible), so this can't clobber a caller's seed.
+        import mlx.core as mx
+
+        mx.random.seed(secrets.randbits(64))
         active: dict[int, BatchSequence] = {}
         # Created lazily on first admission: a busy period that admits
         # nothing (pause latched at entry, or every inbox item already
