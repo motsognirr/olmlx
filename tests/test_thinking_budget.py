@@ -113,6 +113,37 @@ class TestThinkingBudgetProcessor:
         outs = _drive(proc, [7, 7], as_list=True)
         assert _forced_id(outs[2]) == CLOSE
 
+    def test_partial_close_at_boundary_is_completed_not_restarted(self):
+        """A multi-token close already begun at the budget boundary must be
+        finished from where it stopped, not re-forced from its first token
+        (which would emit a duplicated/malformed marker)."""
+        proc = _make_thinking_budget_processor(
+            3, (OPEN,), (CLOSE, 10), initially_open=True
+        )
+        outs = _drive(proc, [7, 7, CLOSE, 10, 7])
+        assert _forced_id(outs[3]) == 10
+        assert _forced_id(outs[4]) is None
+        assert _forced_id(outs[5]) is None
+
+    def test_partial_open_at_boundary_is_rechecked(self):
+        """A multi-token opener (Gemma-4 ``<|channel>thought``) straddling the
+        budget boundary must not make the processor go inert: once the opener
+        completes the block is open and must be closed."""
+        proc = _make_thinking_budget_processor(
+            2, (OPEN, 11), (CLOSE,), initially_open=False
+        )
+        outs = _drive(proc, [7, OPEN, 11, 7])
+        assert _forced_id(outs[2]) is None  # tail ends in a partial opener
+        assert _forced_id(outs[3]) == CLOSE  # opener completed -> force close
+        assert _forced_id(outs[4]) is None
+
+    def test_partial_open_prefix_that_never_completes_goes_inert(self):
+        proc = _make_thinking_budget_processor(
+            2, (OPEN, 11), (CLOSE,), initially_open=False
+        )
+        outs = _drive(proc, [7, OPEN, 7, 7, 7])
+        assert [_forced_id(o) for o in outs] == [None] * 6
+
     def test_batched_token_buffer_history(self):
         """Drive the processor exactly as mlx-lm's ``GenerationBatch._step``
         does: a per-sequence ``TokenBuffer`` seeded with the prompt, updated
@@ -217,6 +248,16 @@ class TestResolveThinkMarkers:
 
     def test_magicmock_attrs_not_mistaken_for_markers(self):
         tok = MagicMock()
+        tok.get_vocab.return_value = {}
+        assert _resolve_think_markers(tok) is None
+
+    def test_non_int_marker_ids_degrade_to_not_enforced(self):
+        """A marker-shape mismatch from the third-party wrapper must degrade
+        to "no markers" (budget not enforced), not raise out of every
+        budget-carrying request."""
+        tok = MagicMock()
+        tok.think_start_tokens = ("<think>",)
+        tok.think_end_tokens = (None,)
         tok.get_vocab.return_value = {}
         assert _resolve_think_markers(tok) is None
 

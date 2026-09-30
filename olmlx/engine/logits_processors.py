@@ -344,7 +344,12 @@ def _resolve_think_markers(
     end = getattr(tokenizer, "think_end_tokens", None)
     if isinstance(start, (tuple, list)) and isinstance(end, (tuple, list)):
         if start and end:
-            return tuple(int(t) for t in start), tuple(int(t) for t in end)
+            # Third-party contract: degrade to "no markers" on a shape
+            # mismatch rather than failing every budget-carrying request.
+            try:
+                return tuple(int(t) for t in start), tuple(int(t) for t in end)
+            except (TypeError, ValueError):
+                pass
     get_vocab = getattr(tokenizer, "get_vocab", None)
     if get_vocab is None:
         return None
@@ -379,6 +384,14 @@ def _thinking_open_after(
         else:
             i += 1
     return state
+
+
+def _partial_marker_suffix(generated: list[int], seq: tuple[int, ...]) -> int:
+    """Length of the longest *proper* prefix of *seq* ending *generated* (0 if none)."""
+    for n in range(min(len(seq) - 1, len(generated)), 0, -1):
+        if tuple(generated[-n:]) == seq[:n]:
+            return n
+    return 0
 
 
 def _generated_tail(tokens, k: int) -> list[int]:
@@ -451,9 +464,16 @@ def _make_thinking_budget_processor(
                 return logits
             generated = _generated_tail(tokens, k)
             if not _thinking_open_after(generated, start_seq, end_seq, initially_open):
+                # A multi-token opener (Gemma-4 ``<|channel>thought``) may be
+                # straddling the boundary: stay armed and re-check next call
+                # rather than going inert before it completes.
+                if _partial_marker_suffix(generated, start_seq):
+                    return logits
                 done = True
                 return logits
-            forcing = 0
+            # Finish a multi-token close the model already began instead of
+            # restarting it (which would emit a duplicated, malformed marker).
+            forcing = _partial_marker_suffix(generated, end_seq)
         token_id = end_seq[forcing]
         forcing += 1
         if forcing >= len(end_seq):

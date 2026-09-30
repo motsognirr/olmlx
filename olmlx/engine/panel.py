@@ -474,6 +474,11 @@ async def panel_generate_chat(
     their own caching).
     """
     panel = _resolve_panel(manager, model_name)
+    if thinking_budget is not None:
+        # info, not warning: Anthropic clients send a budget every request.
+        logger.info(
+            "Thinking budget %d not enforced for panel %s", thinking_budget, model_name
+        )
     if stream:
         return _panel_stream(
             manager,
