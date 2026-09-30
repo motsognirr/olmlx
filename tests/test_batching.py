@@ -1808,3 +1808,35 @@ class TestBatchingSettings:
         monkeypatch.setenv(var, "0")
         with pytest.raises(ValueError):
             Settings()
+
+
+class TestBatchWorkerEntropy:
+    async def test_fresh_worker_threads_draw_distinct_randomness(self):
+        """Each busy period seeds its worker's RNG from OS entropy (#708).
+
+        MLX random state is thread-local and every fresh thread starts from the
+        same default state, so without seeding the batch worker would replay an
+        identical sample sequence on every fresh executor thread.
+        """
+        from concurrent.futures import ThreadPoolExecutor
+
+        import mlx.core as mx
+
+        from olmlx.engine.batching import BatchRequest
+
+        loop = asyncio.get_running_loop()
+        draws: list[list[float]] = []
+        for _ in range(2):
+            period: list[float] = []
+            draws.append(period)
+            # A new single-thread executor guarantees a never-used thread.
+            loop.set_default_executor(ThreadPoolExecutor(max_workers=1))
+            sched, _gpu, _gens = _make_scheduler(
+                [[(10, None), (0, "stop")]],
+                on_next=lambda _gen, p=period: p.append(mx.random.uniform().item()),
+            )
+            seq = await sched.submit(BatchRequest(tokens=[1], max_tokens=4))
+            await _collect(seq)
+            sched.close()
+        assert draws[0] and draws[1]
+        assert draws[0][0] != draws[1][0]
