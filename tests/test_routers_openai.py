@@ -678,6 +678,92 @@ class TestStripThinkingStreaming:
         assert resp.status_code == 400
 
     @pytest.mark.asyncio
+    async def test_embeddings_dimensions_truncates_and_renormalizes(self, app_client):
+        # #712: ``dimensions`` was silently dropped by the schema, so the full
+        # native-width vector came back. OpenAI semantics: keep the first N
+        # components, then re-normalize to unit length.
+        with patch(
+            "olmlx.routers.openai.generate_embeddings", new_callable=AsyncMock
+        ) as mock_emb:
+            mock_emb.return_value = ([[3.0, 4.0, 12.0], [0.0, 2.0, 5.0]], 4)
+            resp = await app_client.post(
+                "/v1/embeddings",
+                json={"model": "qwen3", "input": ["a", "b"], "dimensions": 2},
+            )
+
+        assert resp.status_code == 200
+        data = resp.json()["data"]
+        assert data[0]["embedding"] == pytest.approx([0.6, 0.8])
+        assert data[1]["embedding"] == pytest.approx([0.0, 1.0])
+
+    @pytest.mark.asyncio
+    async def test_embeddings_dimensions_base64(self, app_client):
+        import base64
+        import struct
+
+        with patch(
+            "olmlx.routers.openai.generate_embeddings", new_callable=AsyncMock
+        ) as mock_emb:
+            mock_emb.return_value = ([[3.0, 4.0, 12.0]], 2)
+            resp = await app_client.post(
+                "/v1/embeddings",
+                json={
+                    "model": "qwen3",
+                    "input": "hello",
+                    "dimensions": 2,
+                    "encoding_format": "base64",
+                },
+            )
+
+        assert resp.status_code == 200
+        raw = base64.b64decode(resp.json()["data"][0]["embedding"])
+        assert len(raw) == 2 * 4
+        assert struct.unpack("<2f", raw) == pytest.approx([0.6, 0.8])
+
+    @pytest.mark.asyncio
+    async def test_embeddings_dimensions_zero_vector_not_nan(self, app_client):
+        with patch(
+            "olmlx.routers.openai.generate_embeddings", new_callable=AsyncMock
+        ) as mock_emb:
+            mock_emb.return_value = ([[0.0, 0.0, 1.0]], 2)
+            resp = await app_client.post(
+                "/v1/embeddings",
+                json={"model": "qwen3", "input": "hello", "dimensions": 2},
+            )
+
+        assert resp.status_code == 200
+        assert resp.json()["data"][0]["embedding"] == [0.0, 0.0]
+
+    @pytest.mark.asyncio
+    async def test_embeddings_dimensions_larger_than_native_rejected(self, app_client):
+        with patch(
+            "olmlx.routers.openai.generate_embeddings", new_callable=AsyncMock
+        ) as mock_emb:
+            mock_emb.return_value = ([[0.1, 0.2, 0.3]], 2)
+            resp = await app_client.post(
+                "/v1/embeddings",
+                json={"model": "qwen3", "input": "hello", "dimensions": 4},
+            )
+
+        assert resp.status_code == 400
+        assert "dimensions" in resp.json()["error"]["message"]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("dims", [0, -1])
+    async def test_embeddings_dimensions_non_positive_rejected(self, app_client, dims):
+        with patch(
+            "olmlx.routers.openai.generate_embeddings", new_callable=AsyncMock
+        ) as mock_emb:
+            resp = await app_client.post(
+                "/v1/embeddings",
+                json={"model": "qwen3", "input": "hello", "dimensions": dims},
+            )
+
+        assert resp.status_code == 400
+        assert "dimensions" in resp.json()["error"]["message"]
+        mock_emb.assert_not_called()
+
+    @pytest.mark.asyncio
     async def test_completions_streaming(self, app_client):
         async def mock_stream(*args, **kwargs):
             async def gen():

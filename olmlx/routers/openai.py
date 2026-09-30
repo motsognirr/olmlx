@@ -1,6 +1,7 @@
 import base64
 import json
 import logging
+import math
 import re
 import struct
 import time
@@ -722,6 +723,31 @@ async def openai_list_models(request: Request):
     return OpenAIModelList(data=data)
 
 
+def _truncate_embeddings(
+    embeddings: list[list[float]], dimensions: int
+) -> list[list[float]]:
+    """Apply OpenAI ``dimensions``: keep the first N components, then L2-normalize.
+
+    A value larger than the model's native width is a client error (400),
+    matching OpenAI. An all-zero prefix is returned as-is rather than NaN.
+    """
+    native = min((len(e) for e in embeddings), default=0)
+    if dimensions > native:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"dimensions={dimensions} exceeds the model's native embedding "
+                f"dimension ({native})"
+            ),
+        )
+    out: list[list[float]] = []
+    for emb in embeddings:
+        head = emb[:dimensions]
+        norm = math.sqrt(sum(x * x for x in head))
+        out.append([x / norm for x in head] if norm > 0 else head)
+    return out
+
+
 @router.post(
     "/v1/embeddings",
     response_model=OpenAIEmbeddingResponse,
@@ -731,6 +757,8 @@ async def openai_embeddings(req: OpenAIEmbeddingRequest, request: Request):
     manager = request.app.state.model_manager
     texts = req.input if isinstance(req.input, list) else [req.input]
     embeddings, prompt_tokens = await generate_embeddings(manager, req.model, texts)
+    if req.dimensions is not None:
+        embeddings = _truncate_embeddings(embeddings, req.dimensions)
     if req.encoding_format == "base64":
         # OpenAI's base64 format packs each embedding as little-endian
         # float32 bytes, then base64-encodes the result into a string.
