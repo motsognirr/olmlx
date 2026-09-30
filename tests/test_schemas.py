@@ -277,7 +277,9 @@ class TestOllamaNativeImages:
 
         assert Message(role="user", content="x").images is None
 
-    @pytest.mark.parametrize("bad", ["", "/tmp/cat.png", "not base64!", "caf\u00e9"])
+    @pytest.mark.parametrize(
+        "bad", ["", "/tmp/cat.png", "not base64!", "caf\u00e9", "A===", "QU=D"]
+    )
     def test_chat_message_invalid_base64_rejected(self, bad):
         """Paths/garbage get a clear 400 at the boundary, not an opaque
         failure inside mlx_vlm."""
