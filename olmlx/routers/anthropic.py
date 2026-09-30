@@ -777,16 +777,17 @@ async def anthropic_messages(req: AnthropicMessagesRequest, request: Request):
     cache_id = request.headers.get("x-cache-id", "")[:256]
 
     enable_thinking: bool | None = None
+    # Enforced engine-side as a cap on the think block (#716).
+    thinking_budget: int | None = None
     if req.thinking is not None:
         enable_thinking = _THINKING_TYPE_MAP.get(req.thinking.type)
+        thinking_budget = req.thinking.budget_tokens
         logger.debug(
-            "enable_thinking=%s (thinking.type=%s)", enable_thinking, req.thinking.type
+            "enable_thinking=%s thinking_budget=%s (thinking.type=%s)",
+            enable_thinking,
+            thinking_budget,
+            req.thinking.type,
         )
-        if req.thinking.budget_tokens is not None:
-            logger.info(
-                "budget_tokens=%d received but not supported (thinking is on/off only)",
-                req.thinking.budget_tokens,
-            )
 
     if req.stream:
         result = await dispatch(
@@ -799,6 +800,7 @@ async def anthropic_messages(req: AnthropicMessagesRequest, request: Request):
             max_tokens=req.max_tokens,
             cache_id=cache_id,
             enable_thinking=enable_thinking,
+            thinking_budget=thinking_budget,
         )
 
         async def stream_sse():
@@ -938,6 +940,7 @@ async def anthropic_messages(req: AnthropicMessagesRequest, request: Request):
             max_tokens=req.max_tokens,
             cache_id=cache_id,
             enable_thinking=enable_thinking,
+            thinking_budget=thinking_budget,
         )
         text = result.get("text", "")
         stats = result.get("stats")

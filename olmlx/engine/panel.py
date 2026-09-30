@@ -465,11 +465,12 @@ async def panel_generate_chat(
     cache_id: str = "",
     enable_thinking: bool | None = None,
     grammar_spec: GrammarSpec | None = None,
+    thinking_budget: int | None = None,
 ) -> AsyncGenerator[dict, None] | dict:
     """Drop-in, ``generate_chat``-compatible entry point for a panel model.
 
-    ``cache_id`` and ``grammar_spec`` are accepted for signature parity
-    but not applied to the panel as a whole (the judge/panelists manage
+    ``cache_id``, ``grammar_spec`` and ``thinking_budget`` are accepted for
+    signature parity but not applied to the panel as a whole (the judge/panelists manage
     their own caching).
     """
     panel = _resolve_panel(manager, model_name)
