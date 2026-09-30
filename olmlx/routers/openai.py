@@ -391,8 +391,9 @@ def _merge_leading_system_messages(messages: list[dict]) -> list[dict]:
     beginning." on the second one. Only the leading run is folded; a
     mid-conversation system turn keeps its position. Runs after
     ``_normalize_multimodal_messages``, so content is a string or absent.
-    The first turn's other fields (e.g. ``name``) are kept, and any
-    ``images``/``audio`` across the run are concatenated.
+    The first turn's other fields are kept (``name`` only when all folded
+    turns share it), and any ``images``/``audio`` across the run are
+    concatenated.
     """
     run = 0
     while run < len(messages) and messages[run].get("role") == "system":
@@ -404,6 +405,10 @@ def _merge_leading_system_messages(messages: list[dict]) -> list[dict]:
     parts = [m["content"] for m in leading if m.get("content")]
     if parts:
         merged["content"] = "\n\n".join(parts)
+    # Keep ``name`` only if every folded turn agrees; otherwise the first
+    # turn's name would claim the later turns' instructions.
+    if len({m.get("name") for m in leading}) > 1:
+        merged.pop("name", None)
     for key in ("images", "audio"):
         items = [x for m in leading for x in (m.get(key) or [])]
         if items:

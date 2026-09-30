@@ -1076,13 +1076,31 @@ class TestMergeLeadingSystemMessages:
             {"role": "user", "content": "q"},
         ]
 
-    def test_preserves_first_message_fields(self):
+    def test_keeps_name_shared_by_all_folded_turns(self):
+        msgs = [
+            {"role": "system", "name": "policy", "content": "a"},
+            {"role": "system", "name": "policy", "content": "b"},
+        ]
+        assert _merge_leading_system_messages(msgs) == [
+            {"role": "system", "name": "policy", "content": "a\n\nb"}
+        ]
+
+    def test_drops_name_when_folded_turns_disagree(self):
+        # Keeping the first turn's name would re-attribute the second turn's
+        # instructions to it.
+        msgs = [
+            {"role": "system", "name": "policy", "content": "a"},
+            {"role": "system", "name": "style", "content": "b"},
+        ]
+        assert _merge_leading_system_messages(msgs) == [
+            {"role": "system", "content": "a\n\nb"}
+        ]
         msgs = [
             {"role": "system", "name": "policy", "content": "a"},
             {"role": "system", "content": "b"},
         ]
         assert _merge_leading_system_messages(msgs) == [
-            {"role": "system", "name": "policy", "content": "a\n\nb"}
+            {"role": "system", "content": "a\n\nb"}
         ]
 
     def test_attachments_do_not_block_fold(self):
