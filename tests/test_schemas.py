@@ -455,6 +455,16 @@ class TestOpenAISchemas:
     def test_chat_message_accepts_known_roles(self, role):
         assert OpenAIChatMessage(role=role, content="x").role == role
 
+    def test_chat_message_maps_developer_to_system(self):
+        # Newer OpenAI clients send "developer" in place of "system". No chat
+        # template renders "developer", so map it rather than 400 or drop it.
+        assert OpenAIChatMessage(role="developer", content="x").role == "system"
+
+    def test_chat_message_rejects_function_role(self):
+        # Deprecated "function" role has no downstream rendering.
+        with pytest.raises(ValidationError, match="role"):
+            OpenAIChatMessage(role="function", content="x")
+
     def test_chat_request_defaults(self):
         req = OpenAIChatRequest(
             model="test",

@@ -972,6 +972,29 @@ class TestEmptyInputRejected:
         assert resp.status_code == 400
         assert "role" in resp.json()["error"]["message"]
 
+    @pytest.mark.asyncio
+    async def test_chat_maps_developer_role_to_system(self, app_client):
+        # Newer OpenAI clients send "developer" instead of "system"; it must
+        # reach the engine as a system message, not 400 or vanish.
+        stats = TimingStats(prompt_eval_count=10, eval_count=5)
+        with patch(
+            "olmlx.routers.openai.generate_chat", new_callable=AsyncMock
+        ) as mock_gen:
+            mock_gen.return_value = {"text": "ok", "done": True, "stats": stats}
+            resp = await app_client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "qwen3",
+                    "messages": [
+                        {"role": "developer", "content": "be terse"},
+                        {"role": "user", "content": "hi"},
+                    ],
+                },
+            )
+        assert resp.status_code == 200, resp.text
+        messages = mock_gen.call_args.args[2]
+        assert messages[0] == {"role": "system", "content": "be terse"}
+
 
 class TestXCacheIDHeader:
     @pytest.mark.asyncio
