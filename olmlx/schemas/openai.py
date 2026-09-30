@@ -217,7 +217,8 @@ class OpenAIEmbeddingRequest(BaseModel):
     input: str | list[str]
     encoding_format: Literal["float", "base64"] = "float"
     # OpenAI semantics: keep the first N components, re-normalized to unit
-    # length. The upper bound (the model's native width) is only known after
+    # length. This applies whenever it is set, even at the native width, so the
+    # output scale doesn't depend on the model. The upper bound (the model's native width) is only known after
     # the forward pass, so the router enforces it (#712).
     dimensions: int | None = Field(default=None, gt=0)
 

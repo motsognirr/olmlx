@@ -697,22 +697,22 @@ class TestStripThinkingStreaming:
         assert data[1]["embedding"] == pytest.approx([0.0, 1.0])
 
     @pytest.mark.asyncio
-    async def test_embeddings_dimensions_equal_to_native_is_identity(self, app_client):
-        # olmlx's embeddings are mean-pooled, not unit-norm. Requesting the
-        # full native width truncates nothing, so it must return exactly what
-        # omitting ``dimensions`` returns — re-normalizing here would make
-        # dot-product/euclidean comparisons against stored vectors diverge.
+    async def test_embeddings_dimensions_equal_to_native_is_unit_norm(self, app_client):
+        # olmlx's native embeddings are mean-pooled, not unit-norm. Whenever
+        # ``dimensions`` is supplied the result is unit-norm — including at the
+        # full native width — so a fixed ``dimensions=N`` request gets vectors
+        # on one scale regardless of which model's width it happens to match.
         with patch(
             "olmlx.routers.openai.generate_embeddings", new_callable=AsyncMock
         ) as mock_emb:
-            mock_emb.return_value = ([[0.1, 0.2, 0.3]], 2)
+            mock_emb.return_value = ([[3.0, 4.0]], 2)
             resp = await app_client.post(
                 "/v1/embeddings",
-                json={"model": "qwen3", "input": "hello", "dimensions": 3},
+                json={"model": "qwen3", "input": "hello", "dimensions": 2},
             )
 
         assert resp.status_code == 200
-        assert resp.json()["data"][0]["embedding"] == [0.1, 0.2, 0.3]
+        assert resp.json()["data"][0]["embedding"] == pytest.approx([0.6, 0.8])
 
     @pytest.mark.asyncio
     async def test_embeddings_dimensions_base64(self, app_client):
