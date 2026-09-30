@@ -11,7 +11,6 @@ shapes into one of those forms (issue #428), and wraps the Ollama-native
 from __future__ import annotations
 
 import base64
-import binascii
 from typing import Any
 
 
@@ -70,10 +69,11 @@ def ensure_image_data_uri(ref: str) -> str:
         return ref
     data = ref.replace("\r", "").replace("\n", "")
     try:
-        if not data:
-            raise binascii.Error("empty")
-        base64.b64decode(data, validate=True)
-    except binascii.Error:
+        # binascii.Error (bad base64) subclasses the ValueError b64decode
+        # raises for non-ASCII input, so one handler covers both.
+        if not data or not base64.b64decode(data, validate=True):
+            raise ValueError
+    except ValueError:
         raise ValueError(
             "images entries must be raw base64-encoded image data"
         ) from None
