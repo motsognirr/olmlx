@@ -402,7 +402,7 @@ class TestGptOssStreamFilter:
             "assistant",
         ]
         result = self._run_filter(tokens)
-        assert result == ["just", " thinking"]
+        assert result == ["just thinking"]
 
     def test_only_analysis_falls_back(self):
         """If only analysis channel, analysis content should be yielded as fallback."""
@@ -417,13 +417,39 @@ class TestGptOssStreamFilter:
             "<|end|>",
         ]
         result = self._run_filter(tokens)
-        assert result == ["just", " thinking"]
+        assert result == ["just thinking"]
 
     def test_no_channel_tokens_passthrough(self):
         """Plain text without channel tokens should pass through."""
         tokens = ["Hello", " world", "!"]
         result = self._run_filter(tokens)
         assert result == ["Hello", " world", "!"]
+
+    def test_multiple_analysis_blocks_fallback_joins_like_non_streaming(self):
+        """Analysis-only output with several blocks promotes to content
+        stripped + newline-joined, exactly as ``_parse_gpt_oss_channels``."""
+        from olmlx.engine.tool_parser import _parse_gpt_oss_channels
+
+        tokens = [
+            "<|start|>",
+            "assistant",
+            "<|channel|>",
+            "analysis",
+            "<|message|>",
+            "first ",
+            "<|end|>",
+            "<|start|>",
+            "assistant",
+            "<|channel|>",
+            "analysis",
+            "<|message|>",
+            " second",
+            "<|end|>",
+        ]
+        result = "".join(self._run_filter(tokens))
+        expected = _parse_gpt_oss_channels("".join(tokens), has_tools=False)
+        assert expected is not None
+        assert result == expected[1] == "first\nsecond"
 
     def test_return_token_ends_block(self):
         """<|return|> should end a block like <|end|>."""

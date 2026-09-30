@@ -246,15 +246,18 @@ class _GptOssChannelFilter:
         self._analysis_blocks: list[list[str]] = []
         self._full_text_parts: list[str] = []
 
-    def _flush_analysis(self) -> str:
-        """Drain buffered analysis blocks as a single ``<think>`` block.
-
-        Blocks are stripped and newline-joined like ``_parse_gpt_oss_channels``.
-        """
+    def _drain_analysis(self) -> str:
+        """Drain buffered analysis blocks, stripped and newline-joined like
+        ``_parse_gpt_oss_channels``."""
         thinking = "\n".join(
             text for block in self._analysis_blocks if (text := "".join(block).strip())
         )
         self._analysis_blocks = []
+        return thinking
+
+    def _flush_analysis(self) -> str:
+        """Drain buffered analysis blocks as a single ``<think>`` block."""
+        thinking = self._drain_analysis()
         return f"<think>{thinking}</think>" if thinking else ""
 
     def feed(self, text: str) -> str:
@@ -315,9 +318,7 @@ class _GptOssChannelFilter:
         Without a final channel the buffered analysis texts are promoted to
         visible content; after one, leftover analysis is a ``<think>`` block.
         """
-        if not self._saw_final:
-            return [text for block in self._analysis_blocks for text in block]
-        flushed = self._flush_analysis()
+        flushed = self._flush_analysis() if self._saw_final else self._drain_analysis()
         return [flushed] if flushed else []
 
     def get_full_text(self) -> str:
