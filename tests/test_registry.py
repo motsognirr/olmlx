@@ -1296,6 +1296,32 @@ class TestRegistryModelConfig:
                 }
             )
 
+    def test_option_num_predict_above_token_limit_rejected(self, monkeypatch):
+        """#709: per-model defaults bypass ModelOptions, so the configured
+        ``max_tokens_limit`` cap is enforced at config-parse time too."""
+        monkeypatch.setattr("olmlx.config.settings.max_tokens_limit", 1000)
+        with pytest.raises(ValueError, match="num_predict 1001 exceeds"):
+            ModelConfig.from_entry(
+                {"hf_path": "org/model", "options": {"num_predict": 1001}}
+            )
+
+    @pytest.mark.parametrize(
+        "options",
+        [
+            {"top_p": 2.0},
+            {"top_k": -1},
+            {"temperature": -1.0},
+            {"repeat_last_n": -5},
+            {"min_p": 1.5},
+        ],
+    )
+    def test_option_out_of_range_rejected(self, options):
+        """Per-model options are merged after request validation, so they get
+        the same ModelOptions range checks as request options."""
+        (key,) = options
+        with pytest.raises(ValueError, match=key):
+            ModelConfig.from_entry({"hf_path": "org/model", "options": options})
+
     @pytest.mark.parametrize("value", [-2, -1, 1, 128])
     def test_option_num_predict_valid_values_accepted(self, value):
         cfg = ModelConfig.from_entry(

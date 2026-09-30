@@ -13,7 +13,10 @@ from typing import Any, Literal, NamedTuple, get_args
 
 import logging
 
+from pydantic import ValidationError
+
 from olmlx.config import FlashMoeConfig, SyncMode, settings
+from olmlx.schemas.common import ModelOptions
 from olmlx.utils.loop_affinity import assert_loop_thread
 
 SpeculativeStrategy = Literal[
@@ -224,13 +227,18 @@ def _validate_options(options: dict) -> None:
             raise ValueError(
                 f"Option '{key}' must be {expected}, got {type(value).__name__}"
             )
-    # Per-model defaults are merged in after request validation, so enforce
-    # ModelOptions' num_predict range here too (#709).
-    num_predict = options.get("num_predict")
-    if num_predict is not None and (num_predict == 0 or num_predict < -2):
-        raise ValueError(
-            "Option 'num_predict' must be >= 1, or -1 (infinite) / -2 (fill context)"
+    # Per-model defaults are merged in after request validation, so apply the
+    # same ModelOptions range checks here — otherwise e.g. ``num_predict: 0``
+    # would bypass them and crash generation (#709).
+    try:
+        ModelOptions.model_validate(options)
+    except ValidationError as e:
+        details = "; ".join(
+            f"{'.'.join(str(p) for p in err['loc'])}: "
+            f"{err['msg'].removeprefix('Value error, ')}"
+            for err in e.errors()
         )
+        raise ValueError(f"Invalid option value(s): {details}") from None
 
 
 def _validate_timeout(name: str, value: Any) -> float:
