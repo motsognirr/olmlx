@@ -1034,3 +1034,26 @@ class TestStaleManifestRefresh:
         results = mock_store.list_local()
         assert results[0].parameter_size == "77M"
         assert results[0].family == "qwen3"
+
+    @pytest.mark.parametrize("payload", ["null", "[]", '"x"'])
+    def test_non_mapping_config_is_not_stamped(self, mock_store, payload):
+        """Valid-but-non-dict JSON is an unsuccessful refresh: the manifest
+        must stay unstamped so a restored config.json is picked up later."""
+        local_dir = _write_stale_model(mock_store, self.HF)
+        (local_dir / "config.json").write_text(payload)
+        results = mock_store.list_local()
+        assert results[0].parameter_size == "77M"
+        on_disk = json.loads((local_dir / "manifest.json").read_text())
+        assert "estimator_version" not in on_disk
+
+    @pytest.mark.parametrize("quant", [None, "4bit", [4]])
+    def test_non_dict_quantization_does_not_break_list_or_show(self, mock_store, quant):
+        """A config.json with a non-dict ``quantization`` must not make
+        /api/tags or /api/show fail now that refresh runs on the read path."""
+        local_dir = _write_stale_model(mock_store, self.HF)
+        cfg = dict(_QWEN25_05B_CONFIG, quantization=quant)
+        (local_dir / "config.json").write_text(json.dumps(cfg))
+        results = mock_store.list_local()
+        assert len(results) == 1
+        assert results[0].parameter_size == "494M"
+        assert mock_store.show(self.HF) is not None

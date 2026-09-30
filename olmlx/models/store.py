@@ -124,18 +124,25 @@ def _has_model_marker(model_dir: Path) -> bool:
 _ESTIMATOR_VERSION = 1
 
 
-def _extract_metadata(model_dir: Path) -> dict:
-    """Extract model metadata from config.json if available."""
+def _extract_metadata(model_dir: Path, cfg: dict | None = None) -> dict:
+    """Extract model metadata from config.json if available.
+
+    *cfg* is an already-parsed ``config.json`` (skips re-reading it).
+    """
     config_path = model_dir / "config.json"
     meta = {"family": "", "parameter_size": "", "quantization_level": ""}
-    if not config_path.exists() and (model_dir / "model_index.json").exists():
+    if (
+        cfg is None
+        and not config_path.exists()
+        and (model_dir / "model_index.json").exists()
+    ):
         meta["family"] = "image"  # diffusers pipeline (#723)
         return meta
-    cfg = None
-    if config_path.exists():
+    if cfg is not None or config_path.exists():
         try:
-            with open(config_path) as f:
-                cfg = json.load(f)
+            if cfg is None:
+                with open(config_path) as f:
+                    cfg = json.load(f)
             meta["family"] = cfg.get("model_type", "")
             params = _estimate_param_count(cfg)
             if params:
@@ -157,8 +164,8 @@ def _extract_metadata(model_dir: Path) -> dict:
         except Exception:
             pass
     # Also check config.json for MLX quantization info (reuse already-loaded cfg)
-    if cfg and "quantization" in cfg:
-        q = cfg["quantization"]
+    q = cfg.get("quantization") if isinstance(cfg, dict) else None
+    if isinstance(q, dict):
         bits = q.get("bits", "")
         if bits:
             meta["quantization_level"] = f"{bits}-bit"
@@ -239,7 +246,8 @@ def _refresh_if_stale(
     ``/api/tags`` polling path; ``size`` / ``digest`` / ``modified_at`` are kept
     (recomputing ``size`` would walk the whole directory). A directory with no
     model marker to derive from is left as-is rather than blanked, as is one
-    whose ``config.json`` does not parse (it may be mid-rewrite) — without a
+    whose ``config.json`` does not parse to a mapping (it may be mid-rewrite)
+    or whose re-derivation raises — without a
     version stamp, so a later read retries. A field the estimator cannot
     derive (empty result) keeps its stored value. Persisting the refresh is
     best-effort: a failed save still returns the fresh values.
@@ -249,12 +257,19 @@ def _refresh_if_stale(
     if not _has_model_marker(model_dir):
         return manifest
     config_path = model_dir / "config.json"
+    cfg = None
     if config_path.exists():
         try:
-            json.loads(config_path.read_text())
+            cfg = json.loads(config_path.read_text())
         except Exception:
             return manifest
-    meta = _extract_metadata(model_dir)
+        if not isinstance(cfg, dict):
+            return manifest
+    try:
+        meta = _extract_metadata(model_dir, cfg=cfg)
+    except Exception:
+        logger.debug("Failed to re-derive manifest metadata: %s", model_dir)
+        return manifest
     refreshed = replace(
         manifest,
         family=meta["family"] or manifest.family,

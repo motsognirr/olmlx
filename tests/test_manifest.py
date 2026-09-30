@@ -197,7 +197,56 @@ class TestModelManifest:
         # No stray temp files left behind.
         assert [p.name for p in tmp_path.iterdir()] == ["manifest.json"]
 
-    def test_save_preserves_world_readable_mode(self, tmp_path):
-        path = tmp_path / "manifest.json"
+    def test_save_new_file_in_public_dir_is_world_readable(self, tmp_path):
+        d = tmp_path / "public"
+        d.mkdir()
+        d.chmod(0o755)
+        path = d / "manifest.json"
         ModelManifest(name="a:latest", hf_path="a/b").save(path)
         assert path.stat().st_mode & 0o777 == 0o644
+
+    def test_save_preserves_existing_file_mode(self, tmp_path):
+        path = tmp_path / "manifest.json"
+        path.write_text("{}")
+        path.chmod(0o640)
+        ModelManifest(name="a:latest", hf_path="a/b").save(path)
+        assert path.stat().st_mode & 0o777 == 0o640
+
+    def test_save_new_file_honours_directory_mode(self, tmp_path):
+        """A private (0700) store dir gets private (0600) manifests, as the old
+        umask-honouring open(path, "w") would have produced."""
+        d = tmp_path / "private"
+        d.mkdir(mode=0o700)
+        d.chmod(0o700)
+        path = d / "manifest.json"
+        ModelManifest(name="a:latest", hf_path="a/b").save(path)
+        assert path.stat().st_mode & 0o777 == 0o600
+
+    def test_save_closes_fd_when_chmod_fails(self, tmp_path, monkeypatch):
+        import os
+        import tempfile
+
+        import pytest
+
+        fds = []
+        real_mkstemp = tempfile.mkstemp
+
+        def _rec(*a, **kw):
+            fd, name = real_mkstemp(*a, **kw)
+            fds.append(fd)
+            return fd, name
+
+        def _eperm(*a, **kw):
+            raise PermissionError("EPERM")
+
+        monkeypatch.setattr(tempfile, "mkstemp", _rec)
+        monkeypatch.setattr(os, "fchmod", _eperm)
+        monkeypatch.setattr(os, "chmod", _eperm)
+        with pytest.raises(PermissionError):
+            ModelManifest(name="a:latest", hf_path="a/b").save(
+                tmp_path / "manifest.json"
+            )
+        assert fds
+        with pytest.raises(OSError):
+            os.fstat(fds[0])
+        assert list(tmp_path.iterdir()) == []

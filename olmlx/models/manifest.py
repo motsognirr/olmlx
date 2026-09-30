@@ -36,13 +36,16 @@ class ModelManifest:
             dir=path.parent, prefix=f".{path.name}.", suffix=".tmp"
         )
         try:
-            # mkstemp creates 0600; keep the existing file's mode (or 0644).
-            try:
-                mode = path.stat().st_mode & 0o777
-            except OSError:
-                mode = 0o644
-            os.chmod(tmp, mode)
             with os.fdopen(fd, "w") as f:
+                # mkstemp creates 0600. Keep an existing file's mode; for a
+                # new file use the store dir's mode minus exec bits, which
+                # tracks the umask it was created under (a private 0700 dir
+                # gets 0600 manifests, a 0755 dir gets 0644).
+                try:
+                    mode = path.stat().st_mode & 0o777
+                except OSError:
+                    mode = path.parent.stat().st_mode & 0o666
+                os.fchmod(f.fileno(), mode)
                 json.dump(self.to_dict(), f, indent=2)
             os.replace(tmp, path)
         except BaseException:
