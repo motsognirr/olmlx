@@ -36,7 +36,12 @@ class ModelManifest:
             dir=path.parent, prefix=f".{path.name}.", suffix=".tmp"
         )
         try:
-            with os.fdopen(fd, "w") as f:
+            try:
+                f = os.fdopen(fd, "w")
+            except BaseException:
+                os.close(fd)
+                raise
+            with f:
                 # mkstemp creates 0600. Keep an existing file's mode; for a
                 # new file use the store dir's mode minus exec bits, which
                 # tracks the umask it was created under (a private 0700 dir

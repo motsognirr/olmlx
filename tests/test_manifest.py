@@ -250,3 +250,30 @@ class TestModelManifest:
         with pytest.raises(OSError):
             os.fstat(fds[0])
         assert list(tmp_path.iterdir()) == []
+
+    def test_save_closes_fd_when_fdopen_fails(self, tmp_path, monkeypatch):
+        import os
+        import tempfile
+
+        import pytest
+
+        fds = []
+        real_mkstemp = tempfile.mkstemp
+
+        def _rec(*a, **kw):
+            fd, name = real_mkstemp(*a, **kw)
+            fds.append(fd)
+            return fd, name
+
+        def _fail(*a, **kw):
+            raise OSError("fdopen failed")
+
+        monkeypatch.setattr(tempfile, "mkstemp", _rec)
+        monkeypatch.setattr(os, "fdopen", _fail)
+        with pytest.raises(OSError):
+            ModelManifest(name="a:latest", hf_path="a/b").save(
+                tmp_path / "manifest.json"
+            )
+        with pytest.raises(OSError):
+            os.fstat(fds[0])
+        assert list(tmp_path.iterdir()) == []

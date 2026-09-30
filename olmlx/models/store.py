@@ -247,7 +247,7 @@ def _refresh_if_stale(
     (recomputing ``size`` would walk the whole directory). A directory with no
     model marker to derive from is left as-is rather than blanked, as is one
     whose ``config.json`` does not parse to a mapping (it may be mid-rewrite)
-    or whose re-derivation raises — without a
+    — without a
     version stamp, so a later read retries. A field the estimator cannot
     derive (empty result) keeps its stored value. Persisting the refresh is
     best-effort: a failed save still returns the fresh values.
@@ -265,6 +265,8 @@ def _refresh_if_stale(
             return manifest
         if not isinstance(cfg, dict):
             return manifest
+    # _extract_metadata swallows its own errors today; the guard keeps a
+    # future regression there from failing /api/tags and /api/show.
     try:
         meta = _extract_metadata(model_dir, cfg=cfg)
     except Exception:
