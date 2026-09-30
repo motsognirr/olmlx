@@ -728,6 +728,9 @@ def _truncate_embeddings(
 ) -> list[list[float]]:
     """Apply OpenAI ``dimensions``: keep the first N components, then L2-normalize.
 
+    Normalization only happens when components are actually dropped: olmlx's
+    embeddings are mean-pooled (not unit-norm), so ``dimensions`` equal to the
+    native width returns the vector unchanged — identical to omitting it.
     A value larger than the model's native width is a client error (400),
     matching OpenAI. An all-zero prefix is returned as-is rather than NaN.
     """
@@ -742,6 +745,9 @@ def _truncate_embeddings(
         )
     out: list[list[float]] = []
     for emb in embeddings:
+        if dimensions >= len(emb):
+            out.append(emb)
+            continue
         head = emb[:dimensions]
         norm = math.sqrt(sum(x * x for x in head))
         out.append([x / norm for x in head] if norm > 0 else head)
