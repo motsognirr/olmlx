@@ -1206,6 +1206,7 @@ class TestConsumerCacheRoundTrip:
             cache_id="cid",
         )
         assert chunks[-1]["done_reason"] == "stop"
+        assert chunks[-1]["stop_sequence"] == "<12>"
         text = "".join(
             c.get("text", "") for c in chunks[:-1] if not c.get("cache_info")
         )
@@ -1426,6 +1427,7 @@ class TestFullCompletionBatched:
         assert result["text"] == "<10><11>"
         assert result["finish_reason"] == "stop"
         assert result["done_reason"] == "stop"
+        assert result["stop_sequence"] == "<12>"
 
 
 # ---------------------------------------------------------------------------

@@ -679,7 +679,12 @@ class TestStopSequenceHandling:
         result = await _full_completion(lm, "prompt", 50, gen_kwargs, stats)
         assert result["text"] == "A B C "
         assert result["finish_reason"] == "stop"
-        assert "done_reason" not in result
+        # #711: the stop hit replaces "length" with "stop" (matching the
+        # streaming done chunk) rather than dropping done_reason, so the
+        # Anthropic router maps it to stop_reason "stop_sequence", and the
+        # matched string is surfaced for its stop_sequence field.
+        assert result["done_reason"] == "stop"
+        assert result["stop_sequence"] == "D"
 
     @patch("olmlx.engine.inference._inference_locked")
     @patch("olmlx.engine.inference._inference_ref")
@@ -6307,6 +6312,42 @@ class TestFinishReasonLength:
         assert done_chunk.get("done_reason") == "length"
         text_chunks = [c for c in chunks if not c.get("done") and "text" in c]
         assert len(text_chunks) == 3
+
+    @pytest.mark.asyncio
+    async def test_exclusive_path_stop_hit_reports_matched_sequence(self, mock_manager):
+        """#711: a stop-sequence hit on the exclusive streaming path sets
+        done_reason='stop' and names the matched sequence in the done chunk."""
+        lm = mock_manager._loaded["qwen3:latest"]
+        lm.inference_timeout = None
+
+        mock_stream = self._make_stream(5)
+
+        with (
+            patch("olmlx.engine.inference.mx"),
+            patch("olmlx.engine.inference.settings") as mock_settings,
+            patch("olmlx.engine.inference.async_mlx_stream", return_value=mock_stream),
+        ):
+            mock_settings.inference_queue_timeout = None
+            mock_settings.inference_timeout = None
+            mock_settings.prompt_cache = False
+            mock_settings.memory_limit_fraction = 0.9
+            mock_settings.sync_mode = "full"
+            gen = await generate_completion(
+                mock_manager,
+                "qwen3",
+                "Hello",
+                options={"stop": ["ZZZ", "tok2"]},
+                max_tokens=10,
+                stream=True,
+            )
+            chunks = []
+            async for chunk in gen:
+                chunks.append(chunk)
+
+        done_chunk = chunks[-1]
+        assert done_chunk["done"] is True
+        assert done_chunk.get("done_reason") == "stop"
+        assert done_chunk.get("stop_sequence") == "tok2"
 
     @pytest.mark.asyncio
     async def test_exclusive_path_no_length_on_eos_before_limit(self, mock_manager):

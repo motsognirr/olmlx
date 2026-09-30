@@ -38,6 +38,9 @@ class BufferedModelOutput:
     full_text: str = ""
     raw_text: str = ""
     done_reason: str | None = None
+    # The client stop sequence that ended generation (set with
+    # done_reason="stop"), for the Anthropic stop_sequence field (#711).
+    stop_sequence: str | None = None
     stats: Any | None = None
     thinking_expected: bool = False
 
@@ -127,6 +130,7 @@ async def buffer_stream(
             # calls survive the visible-text filter.
             out.raw_text = chunk.get("raw_text", "") or ""
             out.done_reason = chunk.get("done_reason")
+            out.stop_sequence = chunk.get("stop_sequence")
             out.stats = chunk.get("stats")
             break
         if "thinking_expected" in chunk:

@@ -5,7 +5,11 @@ streaming paths, and one whole-text helper (truncate_at_stop) for the
 non-streaming path — replacing three divergent inline copies.
 """
 
-from olmlx.engine.stop_sequences import StopScanner, truncate_at_stop
+from olmlx.engine.stop_sequences import (
+    StopScanner,
+    truncate_at_stop,
+    truncate_at_stop_match,
+)
 
 
 class TestStopScanner:
@@ -76,6 +80,55 @@ class TestTruncateAtStop:
 
     def test_empty_stop_ignored(self):
         assert truncate_at_stop("abc", [""]) == ("abc", False)
+
+
+class TestMatchedStopSequence:
+    """#711: the Anthropic surface reports *which* stop sequence matched."""
+
+    def test_scanner_records_matched_sequence(self):
+        s = StopScanner(["END", "STOP"])
+        assert s.matched is None
+        s.feed("a ST")
+        assert s.matched is None
+        s.feed("OP b END")
+        assert s.matched == "STOP"
+
+    def test_scanner_earliest_match_reported(self):
+        s = StopScanner(["zz", "b"])
+        s.feed("abzz")
+        assert s.matched == "b"
+
+    def test_scanner_same_position_tie_uses_list_order(self):
+        s = StopScanner(["abc", "ab"])
+        s.feed("xabcd")
+        assert s.matched == "abc"
+
+    def test_scanner_no_match_leaves_none(self):
+        s = StopScanner(["X"])
+        s.feed("abc")
+        assert s.matched is None
+
+    def test_whole_text_reports_matched_sequence(self):
+        assert truncate_at_stop_match("a STOP b END", ["END", "STOP"]) == (
+            "a ",
+            "STOP",
+        )
+
+    def test_whole_text_no_match(self):
+        assert truncate_at_stop_match("abc", ["X"]) == ("abc", None)
+        assert truncate_at_stop_match("abc", None) == ("abc", None)
+
+    def test_whole_text_same_position_tie_matches_scanner(self):
+        # Both variants must agree so streaming and non-streaming report the
+        # same stop_sequence.
+        assert truncate_at_stop_match("xabcd", ["abc", "ab"]) == ("x", "abc")
+
+    def test_whole_text_skips_thinking_matches(self):
+        text = "<think>one three</think>\nvisible three"
+        assert truncate_at_stop_match(text, ["three"], thinking_aware=True) == (
+            text[: text.index("visible three") + len("visible ")],
+            "three",
+        )
 
 
 class TestStopScannerThinkingAware:

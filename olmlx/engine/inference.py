@@ -90,7 +90,7 @@ from olmlx.engine.chat_templating import (
     _NATIVE_TOOL_HINT as _NATIVE_TOOL_HINT,
 )
 from olmlx.context import surface_var
-from olmlx.engine.stop_sequences import StopScanner, truncate_at_stop
+from olmlx.engine.stop_sequences import StopScanner, truncate_at_stop_match
 from olmlx.engine.template_caps import TemplateCaps
 from olmlx.utils import metrics as _metrics
 from olmlx.utils import tracing as _tracing
@@ -3215,6 +3215,8 @@ async def _stream_completion_batched(
             done_chunk["done_reason"] = "timeout"
         elif stop_hit:
             done_chunk["done_reason"] = "stop"
+            # Which sequence matched, for the Anthropic stop_sequence field (#711).
+            done_chunk["stop_sequence"] = stop_scanner.matched
         elif max_tokens_hit:
             # Scheduler exhausted the token budget — mirrors exclusive path.
             done_chunk["done_reason"] = "length"
@@ -3743,6 +3745,8 @@ async def _stream_completion(
             done_chunk["done_reason"] = "timeout"
         elif stop_hit:
             done_chunk["done_reason"] = "stop"
+            # Which sequence matched, for the Anthropic stop_sequence field (#711).
+            done_chunk["stop_sequence"] = stop_scanner.matched
         elif max_tokens > 0 and stats.eval_count >= max_tokens:
             # Stream terminated at the token budget (no EOS / stop sequence).
             # "length" mirrors OpenAI's finish_reason and the batched path.
@@ -3873,6 +3877,7 @@ async def _full_completion_batched(
                 result["done_reason"] = reason
                 if reason == "stop":
                     result["finish_reason"] = "stop"
+                    result["stop_sequence"] = chunk.get("stop_sequence")
         else:
             text_parts.append(chunk.get("text") or "")
     result["text"] = "".join(text_parts)
@@ -4083,18 +4088,21 @@ async def _full_completion(
                                 exc_info=True,
                             )
     if stop_sequences and result_dict:
-        text, hit = truncate_at_stop(
+        text, matched_stop = truncate_at_stop_match(
             result_dict.get("text", ""),
             stop_sequences,
             thinking_aware=thinking_expected,
         )
-        if hit:
+        if matched_stop is not None:
             result_dict["finish_reason"] = "stop"
             # The stop sequence is applied post-hoc, so mlx-lm may have run on to
             # max_tokens and set done_reason="length". A stop-sequence hit means
-            # the visible generation ended at the stop, so "stop" wins — drop the
-            # length marker that routers key on.
-            result_dict.pop("done_reason", None)
+            # the visible generation ended at the stop, so "stop" wins. Set it
+            # (rather than just dropping "length") so the result matches the
+            # streaming done chunk — the Anthropic router keys stop_reason
+            # "stop_sequence" on done_reason == "stop" (#711).
+            result_dict["done_reason"] = "stop"
+            result_dict["stop_sequence"] = matched_stop
             # mlx-lm generated (and counted) tokens past the stop sequence; the
             # client only sees the truncated text, so report its token count as
             # eval_count instead of the full max_tokens run. add_special_tokens
@@ -4266,7 +4274,7 @@ async def _full_completion_inner(
             # post-hoc — the latter wastes GPU time under the inference lock and
             # stores post-stop tokens in the prompt cache (#613). The full text
             # (including the stop marker) is kept so the caller's post-hoc
-            # truncate_at_stop still trims it and sets finish_reason.
+            # truncate_at_stop_match still trims it and sets finish_reason.
             stop_scanner = (
                 StopScanner(stop_sequences, thinking_aware=thinking_expected)
                 if stop_sequences
