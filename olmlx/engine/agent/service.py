@@ -27,6 +27,7 @@ from olmlx.engine.agent.delegate import DelegateRunner
 from olmlx.engine.agent.memory import MemoryManager
 from olmlx.engine.agent.orchestrator import AgentContext, Budgets, Orchestrator
 from olmlx.engine.agent.store import AgentStore
+from olmlx.routers.thinking_split import flush_thinking_buffer, strip_thinking_streaming
 
 if TYPE_CHECKING:
     from olmlx.engine.agent.tools import AgentImageTool
@@ -50,6 +51,25 @@ Work step by step using the available tools, taking one concrete action at a \
 time and observing the result before the next. When — and only when — the goal \
 is fully accomplished, call the `finish` tool with a short summary of what you \
 did. If an approach fails repeatedly, try a different one."""
+
+
+async def _collect_visible_text(stream: AsyncIterator[dict[str, Any]]) -> str:
+    """Drain a ``generate_chat`` stream into its visible text.
+
+    Skips meta chunks and strips thinking blocks — reasoning (e.g. gpt-oss's
+    analysis channel, streamed as a ``<think>`` block since #713) is not the
+    answer, and a stray "DENY" in it must not flip a judge verdict.
+    """
+    state: dict[str, Any] = {}
+    parts: list[str] = []
+    async for chunk in stream:
+        if chunk.get("done") or chunk.get("cache_info") or "thinking_expected" in chunk:
+            continue
+        text = chunk.get("text", "")
+        if text:
+            parts.append(strip_thinking_streaming(text, state))
+    parts.append(flush_thinking_buffer(state))
+    return "".join(parts)
 
 
 @dataclass
@@ -440,31 +460,23 @@ class AgentService:
                 "fetched content. Reply with exactly one word: ALLOW or DENY."
             )
             messages = [{"role": "system", "content": prompt}]
-            parts: list[str] = []
             try:
-                async for chunk in await generate_chat(
-                    self._manager_getter(),
-                    model,
-                    messages,
-                    stream=True,
-                    max_tokens=8,
-                    enable_thinking=False,
-                ):
-                    if (
-                        chunk.get("done")
-                        or chunk.get("cache_info")
-                        or "thinking_expected" in chunk
-                    ):
-                        continue
-                    text = chunk.get("text", "")
-                    if text:
-                        parts.append(text)
+                verdict = await _collect_visible_text(
+                    await generate_chat(
+                        self._manager_getter(),
+                        model,
+                        messages,
+                        stream=True,
+                        max_tokens=8,
+                        enable_thinking=False,
+                    )
+                )
             except Exception:
                 logger.warning(
                     "Tool-safety judge failed for %r — denying", name, exc_info=True
                 )
                 return False
-            verdict = "".join(parts).strip().upper()
+            verdict = verdict.strip().upper()
             allowed = "ALLOW" in verdict and "DENY" not in verdict
             if not allowed:
                 logger.info(
@@ -490,25 +502,17 @@ class AgentService:
                 },
                 {"role": "user", "content": f"Notes:\n{joined}"},
             ]
-            parts: list[str] = []
-            async for chunk in await generate_chat(
-                self._manager_getter(),
-                model,
-                messages,
-                stream=True,
-                max_tokens=256,
-                enable_thinking=False,
-            ):
-                if (
-                    chunk.get("done")
-                    or chunk.get("cache_info")
-                    or "thinking_expected" in chunk
-                ):
-                    continue
-                text = chunk.get("text", "")
-                if text:
-                    parts.append(text)
-            return "".join(parts).strip() or "Summary unavailable."
+            summary = await _collect_visible_text(
+                await generate_chat(
+                    self._manager_getter(),
+                    model,
+                    messages,
+                    stream=True,
+                    max_tokens=256,
+                    enable_thinking=False,
+                )
+            )
+            return summary.strip() or "Summary unavailable."
 
         return summarize
 

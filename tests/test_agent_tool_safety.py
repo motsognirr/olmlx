@@ -241,6 +241,28 @@ class TestToolSafetyJudge:
         assert await judge("bash", {"command": "rm -rf /"}, None) is False
 
     @pytest.mark.asyncio
+    async def test_verdict_ignores_thinking_block(self, store, tmp_path, monkeypatch):
+        """Streamed reasoning (e.g. gpt-oss analysis as a <think> block, #713)
+        must not feed the verdict — a "DENY" inside it isn't the answer."""
+        svc = _service(store, tmp_path)
+        judge = svc._make_tool_safety_judge("m", "goal")
+        monkeypatch.setattr(
+            "olmlx.engine.inference.generate_chat",
+            _fake_generate_chat("<think>Should I DENY? No, ls is safe.</think>ALLOW"),
+        )
+        assert await judge("bash", {"command": "ls"}, None) is True
+
+    @pytest.mark.asyncio
+    async def test_summarizer_drops_thinking_block(self, store, tmp_path, monkeypatch):
+        svc = _service(store, tmp_path)
+        summarize = svc._make_summarizer("m")
+        monkeypatch.setattr(
+            "olmlx.engine.inference.generate_chat",
+            _fake_generate_chat("<think>compress these</think>Did X, then Y."),
+        )
+        assert await summarize(["did X", "did Y"]) == "Did X, then Y."
+
+    @pytest.mark.asyncio
     async def test_denies_on_unparseable(self, store, tmp_path, monkeypatch):
         svc = _service(store, tmp_path)
         judge = svc._make_tool_safety_judge("m", "goal")

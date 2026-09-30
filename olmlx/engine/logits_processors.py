@@ -7,6 +7,7 @@ frequency/presence penalties) plus the gpt-oss channel filter that strips
 re-imports these names so existing call sites and tests are unchanged.
 """
 
+import dataclasses
 import logging
 from typing import TYPE_CHECKING
 
@@ -216,10 +217,15 @@ _GPT_OSS_STRUCTURAL_TOKENS = frozenset(
 class _GptOssChannelFilter:
     """Stateful filter for gpt-oss channel tokens.
 
-    Call ``should_yield(text)`` for each token. Returns True if the token's text
-    should be sent to the client. After the stream ends, call
-    ``get_fallback_texts()`` — if non-empty, yield those as fallback (the model
-    produced analysis but no final channel).
+    Call ``feed(text)`` for each token; it returns the text to send to the
+    client (``""`` for nothing). Final-channel tokens pass through verbatim.
+    Analysis-channel text is buffered and flushed as one ``<think>...</think>``
+    block when the final channel starts, so the routers' shared thinking
+    splitter routes it to ``message.thinking`` / a ``thinking`` block (#713).
+    After the stream ends, yield ``get_fallback_texts()``: the analysis text
+    promoted to visible content when no final channel was produced (the same
+    rule ``_parse_gpt_oss_channels`` applies to non-streaming output), or a
+    trailing ``<think>`` block for analysis that arrived after the final one.
 
     This is a class (not an async generator) so the caller can iterate the raw
     stream for prompt-cache token accumulation while only yielding filtered text.
@@ -236,67 +242,83 @@ class _GptOssChannelFilter:
         self._channel = None
         self._saw_any_channel = False
         self._saw_final = False
-        self._analysis_texts: list[str] = []
+        # One entry per analysis block, each a list of token texts.
+        self._analysis_blocks: list[list[str]] = []
         self._full_text_parts: list[str] = []
 
-    def should_yield(self, text: str) -> bool:
-        """Process one token's text and return whether it should be yielded."""
+    def _flush_analysis(self) -> str:
+        """Drain buffered analysis blocks as a single ``<think>`` block.
+
+        Blocks are stripped and newline-joined like ``_parse_gpt_oss_channels``.
+        """
+        thinking = "\n".join(
+            text for block in self._analysis_blocks if (text := "".join(block).strip())
+        )
+        self._analysis_blocks = []
+        return f"<think>{thinking}</think>" if thinking else ""
+
+    def feed(self, text: str) -> str:
+        """Process one token's text and return the text to yield (may be empty)."""
         self._full_text_parts.append(text)
 
         if text == "<|start|>":
             self._state = self._AFTER_START
             self._saw_any_channel = True
-            return False
+            return ""
 
         if text == "<|channel|>":
             self._state = self._EXPECT_CHANNEL
             self._saw_any_channel = True
-            return False
+            return ""
 
         if self._state == self._AFTER_START:
-            return False
+            return ""
 
         if self._state == self._EXPECT_CHANNEL:
             self._channel = text.strip()
             self._state = self._IN_BLOCK
-            if self._channel == "final":
+            if self._channel == "analysis":
+                self._analysis_blocks.append([])
+            elif self._channel == "final":
                 self._saw_final = True
-            return False
+                return self._flush_analysis()
+            return ""
 
         if text == "<|message|>" and self._state == self._IN_BLOCK:
             self._state = self._CONTENT
-            return False
+            return ""
 
         if text in ("<|end|>", "<|call|>", "<|return|>"):
             self._state = self._INIT
             self._channel = None
-            return False
+            return ""
 
         if self._state == self._CONTENT and self._channel == "final":
-            return True
+            return text
 
-        if (
-            self._state == self._CONTENT
-            and self._channel == "analysis"
-            and not self._saw_final
-        ):
-            self._analysis_texts.append(text)
-            return False
+        if self._state == self._CONTENT and self._channel == "analysis":
+            self._analysis_blocks[-1].append(text)
+            return ""
 
         if (
             self._state == self._INIT
             and not self._saw_any_channel
             and text not in _GPT_OSS_STRUCTURAL_TOKENS
         ):
-            return True
+            return text
 
-        return False
+        return ""
 
     def get_fallback_texts(self) -> list[str]:
-        """Return buffered analysis texts if no final channel was seen."""
-        if not self._saw_final and self._analysis_texts:
-            return self._analysis_texts
-        return []
+        """Return what's left to yield once the stream has ended.
+
+        Without a final channel the buffered analysis texts are promoted to
+        visible content; after one, leftover analysis is a ``<think>`` block.
+        """
+        if not self._saw_final:
+            return [text for block in self._analysis_blocks for text in block]
+        flushed = self._flush_analysis()
+        return [flushed] if flushed else []
 
     def get_full_text(self) -> str:
         """Return the complete raw text accumulated during streaming."""
@@ -306,19 +328,14 @@ class _GptOssChannelFilter:
 async def _gpt_oss_filter(token_stream):
     """Async generator wrapper for backward compatibility with tests."""
     filt = _GptOssChannelFilter()
-    buffered = []
+    last = None
     async for token in token_stream:
-        if filt.should_yield(token.text):
-            yield token
-        else:
-            buffered.append(token)
-    for text in filt.get_fallback_texts():
-        # Find matching token from buffer
-        for tok in buffered:
-            if tok.text == text:
-                yield tok
-                buffered.remove(tok)
-                break
+        last = token
+        if out := filt.feed(token.text):
+            yield dataclasses.replace(token, text=out)
+    if last is not None:
+        for text in filt.get_fallback_texts():
+            yield dataclasses.replace(last, text=text)
 
 
 # ---------------------------------------------------------------------------

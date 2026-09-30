@@ -335,7 +335,74 @@ class TestGptOssStreamFilter:
             "<|end|>",
         ]
         result = self._run_filter(tokens)
-        assert result == ["visible", " text"]
+        # The analysis channel surfaces as one <think> block ahead of the
+        # final-channel tokens, so the routers' thinking splitter can route
+        # it to message.thinking / an Anthropic thinking block (#713).
+        assert result == ["<think>thinking here</think>", "visible", " text"]
+
+    def test_multiple_analysis_blocks_join_like_non_streaming(self):
+        """Repeated analysis blocks flush as one <think> block, newline-joined
+        (mirrors ``_parse_gpt_oss_channels``)."""
+        tokens = [
+            "<|start|>",
+            "assistant",
+            "<|channel|>",
+            "analysis",
+            "<|message|>",
+            "first",
+            "<|end|>",
+            "<|start|>",
+            "assistant",
+            "<|channel|>",
+            "analysis",
+            "<|message|>",
+            "second",
+            "<|end|>",
+            "<|start|>",
+            "assistant",
+            "<|channel|>",
+            "final",
+            "<|message|>",
+            "answer",
+            "<|return|>",
+        ]
+        result = self._run_filter(tokens)
+        assert result == ["<think>first\nsecond</think>", "answer"]
+
+    def test_analysis_after_final_flushed_at_end(self):
+        """Analysis that arrives after the final channel isn't dropped."""
+        tokens = [
+            "<|channel|>",
+            "final",
+            "<|message|>",
+            "answer",
+            "<|end|>",
+            "<|channel|>",
+            "analysis",
+            "<|message|>",
+            "late",
+            "<|end|>",
+        ]
+        result = self._run_filter(tokens)
+        assert result == ["answer", "<think>late</think>"]
+
+    def test_analysis_then_truncated_before_final_falls_back(self):
+        """Analysis closed but the stream ended before any final channel:
+        promote to visible text, matching the non-streaming parity rule."""
+        tokens = [
+            "<|start|>",
+            "assistant",
+            "<|channel|>",
+            "analysis",
+            "<|message|>",
+            "just",
+            " thinking",
+            "<|end|>",
+            "<|start|>",
+            "assistant",
+        ]
+        result = self._run_filter(tokens)
+        assert result == ["just", " thinking"]
 
     def test_only_analysis_falls_back(self):
         """If only analysis channel, analysis content should be yielded as fallback."""
@@ -392,3 +459,135 @@ class TestGptOssStreamFilter:
         ]
         result = self._run_filter(tokens)
         assert result == ["done"]
+
+    def test_streamed_thinking_matches_non_streaming_parse(self):
+        """Streaming output split by the routers' thinking splitter must
+        match ``_parse_gpt_oss_channels`` on the raw text (#713)."""
+        from olmlx.engine.tool_parser import _parse_gpt_oss_channels
+        from olmlx.routers.thinking_split import (
+            flush_split_thinking,
+            split_thinking_streaming,
+        )
+
+        tokens = [
+            "<|start|>",
+            "assistant",
+            "<|channel|>",
+            "analysis",
+            "<|message|>",
+            "7 times 8",
+            " is 56.",
+            "<|end|>",
+            "<|start|>",
+            "assistant",
+            "<|channel|>",
+            "final",
+            "<|message|>",
+            "The answer",
+            " is 56.",
+            "<|return|>",
+        ]
+        # Feed chunk-by-chunk, exactly as the streaming routers do.
+        state: dict = {}
+        thinking = visible = ""
+        for chunk in self._run_filter(tokens):
+            t, v = split_thinking_streaming(chunk, state)
+            thinking += t
+            visible += v
+        t, v = flush_split_thinking(state)
+        thinking += t
+        visible += v
+        expected = _parse_gpt_oss_channels("".join(tokens), has_tools=False)
+        assert expected is not None
+        assert (thinking.strip(), visible.strip()) == expected[:2]
+
+
+# ---------------------------------------------------------------------------
+# Streaming completion end-to-end (engine) — #713
+# ---------------------------------------------------------------------------
+
+
+class TestGptOssStreamingThinking:
+    async def test_stream_completion_surfaces_analysis_as_thinking(self, mock_manager):
+        """The streaming engine path must not drop the analysis channel when a
+        final channel follows: it arrives as a <think> block that the routers'
+        splitter routes to thinking, with only the final text as content."""
+        from dataclasses import replace
+        from unittest.mock import AsyncMock, patch
+
+        from olmlx.engine.inference import _stream_completion
+        from olmlx.routers.thinking_split import (
+            flush_split_thinking,
+            split_thinking_streaming,
+        )
+        from olmlx.utils.streaming import CancellableStream, StreamToken
+        from olmlx.utils.timing import TimingStats
+
+        lm = mock_manager._loaded["qwen3:latest"]
+        lm.template_caps = replace(lm.template_caps, has_channel_format=True)
+
+        texts = [
+            "<|channel|>",
+            "analysis",
+            "<|message|>",
+            "7*8",
+            "=56",
+            "<|end|>",
+            "<|start|>",
+            "assistant",
+            "<|channel|>",
+            "final",
+            "<|message|>",
+            "It is",
+            " 56.",
+            "<|return|>",
+        ]
+        token_iter = iter(
+            StreamToken(
+                text=t,
+                token=i,
+                prompt_tokens=3,
+                generation_tokens=i + 1,
+                prompt_tps=0.0,
+                generation_tps=0.0,
+            )
+            for i, t in enumerate(texts)
+        )
+
+        async def anext_impl():
+            try:
+                return next(token_iter)
+            except StopIteration:
+                raise StopAsyncIteration
+
+        mock_stream = MagicMock(spec=CancellableStream)
+        mock_stream.drain_and_join = AsyncMock()
+        mock_stream._thread = None
+        mock_stream.__aiter__ = lambda self: self
+        mock_stream.__anext__ = lambda self: anext_impl()
+
+        chunks = []
+        with (
+            patch("olmlx.engine.inference.mx", MagicMock()),
+            patch("olmlx.engine.inference.async_mlx_stream", return_value=mock_stream),
+        ):
+            async for c in _stream_completion(lm, "Hi", 32, {}, TimingStats()):
+                chunks.append(c)
+
+        state: dict = {}
+        thinking = content = ""
+        for c in chunks:
+            if c.get("done") or "text" not in c:
+                continue
+            t, v = split_thinking_streaming(c["text"], state)
+            thinking += t
+            content += v
+        t, v = flush_split_thinking(state)
+        thinking += t
+        content += v
+
+        assert thinking == "7*8=56"
+        assert content == "It is 56."
+        # raw_text on the done chunk is unchanged (tools-mode parsing).
+        done = [c for c in chunks if c.get("done")]
+        assert done and done[-1]["raw_text"] == "".join(texts)

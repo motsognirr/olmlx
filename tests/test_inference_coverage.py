@@ -694,35 +694,54 @@ class TestAddNativeToolHint:
 # _GptOssChannelFilter                                                         #
 # --------------------------------------------------------------------------- #
 class TestGptOssChannelFilter:
+    @staticmethod
+    def _feed_all(filt, seq):
+        return [out for t in seq if (out := filt.feed(t))]
+
     def test_final_channel_content_yielded(self):
         filt = _GptOssChannelFilter()
         seq = ["<|channel|>", "final", "<|message|>", "answer"]
-        yielded = [t for t in seq if filt.should_yield(t)]
-        assert yielded == ["answer"]
+        assert self._feed_all(filt, seq) == ["answer"]
         assert filt.get_fallback_texts() == []
 
     def test_analysis_buffered_and_used_as_fallback_when_no_final(self):
         filt = _GptOssChannelFilter()
         seq = ["<|channel|>", "analysis", "<|message|>", "thinking..."]
-        yielded = [t for t in seq if filt.should_yield(t)]
-        assert yielded == []  # analysis is not yielded inline
+        assert self._feed_all(filt, seq) == []  # analysis is not yielded inline
         # No final channel → analysis text is the fallback.
         assert filt.get_fallback_texts() == ["thinking..."]
+
+    def test_analysis_flushed_as_think_block_when_final_starts(self):
+        filt = _GptOssChannelFilter()
+        seq = [
+            "<|channel|>",
+            "analysis",
+            "<|message|>",
+            "hmm",
+            "<|end|>",
+            "<|channel|>",
+            "final",
+            "<|message|>",
+            "answer",
+        ]
+        assert self._feed_all(filt, seq) == ["<think>hmm</think>", "answer"]
+        # Already flushed — nothing left for the end-of-stream fallback.
+        assert filt.get_fallback_texts() == []
 
     def test_no_channel_plain_text_yielded(self):
         filt = _GptOssChannelFilter()
         # Plain non-structural text in init state is passed through.
-        assert filt.should_yield("hello") is True
+        assert filt.feed("hello") == "hello"
 
     def test_structural_tokens_never_yielded(self):
         filt = _GptOssChannelFilter()
-        assert filt.should_yield("<|start|>") is False
-        assert filt.should_yield("<|end|>") is False
+        assert filt.feed("<|start|>") == ""
+        assert filt.feed("<|end|>") == ""
 
     def test_full_text_accumulates_all_tokens(self):
         filt = _GptOssChannelFilter()
         for t in ["<|channel|>", "final", "<|message|>", "hi"]:
-            filt.should_yield(t)
+            filt.feed(t)
         assert filt.get_full_text() == "<|channel|>final<|message|>hi"
 
 

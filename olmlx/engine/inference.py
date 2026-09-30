@@ -3607,9 +3607,9 @@ async def _stream_completion(
                         token_part, stop_hit = stop_scanner.feed(token.text or "")
                         if stop_hit:
                             if token_part:
-                                if channel_filter is None:
-                                    yield {"text": token_part, "done": False}
-                                elif channel_filter.should_yield(token_part):
+                                if channel_filter is not None:
+                                    token_part = channel_filter.feed(token_part)
+                                if token_part:
                                     yield {"text": token_part, "done": False}
                             # Cancel the worker so it stops decoding past-stop
                             # tokens into the shared prompt_cache — otherwise it
@@ -3626,8 +3626,8 @@ async def _stream_completion(
                     # reconstruct the full unfiltered output.
                     if channel_filter is None:
                         yield {"text": token.text, "done": False}
-                    elif channel_filter.should_yield(token.text):
-                        yield {"text": token.text, "done": False}
+                    elif out_text := channel_filter.feed(token.text):
+                        yield {"text": out_text, "done": False}
 
                     if inf_timeout is not None:
                         elapsed = time.monotonic() - inf_start
@@ -3641,7 +3641,8 @@ async def _stream_completion(
                             stream.cancel()
                             break
 
-            # Fallback: yield analysis content if no final channel was produced
+            # Fallback: analysis promoted to content if no final channel was
+            # produced, else any analysis left after it as a <think> block
             if channel_filter is not None:
                 for text in channel_filter.get_fallback_texts():
                     yield {"text": text, "done": False}
