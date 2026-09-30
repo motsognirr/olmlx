@@ -227,10 +227,11 @@ def _validate_options(options: dict) -> None:
             raise ValueError(
                 f"Option '{key}' must be {expected}, got {type(value).__name__}"
             )
-    # Per-model defaults are merged in after request validation, so apply the
-    # same ModelOptions range checks here — otherwise e.g. ``num_predict: 0``
-    # would bypass them and crash generation (#709). ``max_tokens_limit`` is
-    # exempt: it caps client-supplied lengths, not operator config.
+    # Per-model defaults are merged in after request validation, so apply
+    # ModelOptions' range checks to the (narrower, whitelisted) keys above —
+    # otherwise e.g. ``num_predict: 0`` would bypass them and crash generation
+    # (#709). ``max_tokens_limit`` is exempt: it caps client-supplied lengths,
+    # not operator config, which may deliberately set a larger default.
     try:
         ModelOptions.model_validate(options, context={SKIP_TOKEN_LIMIT: True})
     except ValidationError as e:
