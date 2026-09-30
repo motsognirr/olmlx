@@ -494,6 +494,8 @@ class ModelConfig:
         # construction (tests, programmatic callers) bypasses it. Keep
         # this in lockstep with ``Settings.speculative_tokens``'s
         # ``Field(gt=0)`` and the empty-string check in ``from_entry``.
+        if self.options:
+            _validate_options(self.options)
         if self.speculative_tokens is not None and (
             isinstance(self.speculative_tokens, bool)
             or not isinstance(self.speculative_tokens, int)

@@ -1294,6 +1294,14 @@ class TestRegistryModelConfig:
                 }
             )
 
+    def test_option_num_predict_zero_rejected_on_direct_construction(self):
+        """#709: direct construction (e.g. ``add_mapping(model_config=...)``)
+        bypasses ``from_entry``, so ``__post_init__`` validates options too —
+        otherwise 0 reaches the engine and the persisted entry is dropped
+        on the next ``load()``."""
+        with pytest.raises(ValueError, match="num_predict"):
+            ModelConfig(hf_path="org/model", options={"num_predict": 0})
+
     def test_invalid_hf_path_in_dict_rejected(self):
         """Invalid hf_path in dict entry is rejected at parse time."""
         with pytest.raises(ValueError, match="owner/repo"):
