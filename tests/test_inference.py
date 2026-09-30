@@ -886,20 +886,23 @@ class TestExtractImages:
         messages = [{"role": "user", "content": "hi"}]
         assert _extract_images(messages) is None
 
-    def test_with_images(self):
-        messages = [
-            {"role": "user", "content": "describe", "images": ["img1.jpg", "img2.png"]},
-        ]
-        result = _extract_images(messages)
-        assert result == ["img1.jpg", "img2.png"]
-
     def test_multiple_messages(self):
         messages = [
-            {"role": "user", "content": "first", "images": ["a.jpg"]},
-            {"role": "user", "content": "second", "images": ["b.jpg"]},
+            {
+                "role": "user",
+                "content": "first",
+                "images": ["data:image/png;base64,QQ=="],
+            },
+            {"role": "user", "content": "second", "images": ["https://x/y.png"]},
         ]
         result = _extract_images(messages)
-        assert result == ["a.jpg", "b.jpg"]
+        assert result == ["data:image/png;base64,QQ==", "https://x/y.png"]
+
+    def test_local_path_passes_through(self):
+        """OpenAI/Anthropic image refs share this field and may be file paths —
+        the raw-base64 wrap belongs to the Ollama schemas, not here (#714)."""
+        messages = [{"role": "user", "content": "x", "images": ["/tmp/a.png"]}]
+        assert _extract_images(messages) == ["/tmp/a.png"]
 
     def test_empty_images_list(self):
         messages = [{"role": "user", "content": "hi", "images": []}]

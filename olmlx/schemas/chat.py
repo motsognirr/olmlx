@@ -2,6 +2,7 @@ from typing import Any
 
 from pydantic import BaseModel, Field, field_validator
 
+from olmlx.utils.images import ensure_image_data_uris
 from olmlx.schemas.common import ModelName, ModelOptions
 
 
@@ -26,6 +27,12 @@ class Message(BaseModel):
     images: list[str] | None = None
     audio: list[str] | None = None
     tool_calls: list[ToolCall] | None = None
+
+    @field_validator("images")
+    @classmethod
+    def wrap_raw_base64_images(cls, v: list[str] | None) -> list[str] | None:
+        # Ollama sends raw base64; mlx_vlm would open() it as a path (#714).
+        return ensure_image_data_uris(v)
 
     @field_validator("role")
     @classmethod

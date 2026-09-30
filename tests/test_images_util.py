@@ -46,3 +46,28 @@ def test_unsupported_source_type_raises():
 def test_not_an_image_block_raises():
     with pytest.raises(ValueError, match="not an image block"):
         normalize_image_block({"type": "text", "text": "hi"})
+
+
+# --- Ollama-native ``images`` field (#714) ---------------------------------
+# Ollama clients send raw base64 (no ``data:`` prefix); mlx_vlm's load_image
+# would treat that as a file path.
+
+
+def test_raw_base64_wrapped_as_data_uri():
+    from olmlx.utils.images import ensure_image_data_uri
+
+    assert ensure_image_data_uri("iVBORw0KGgo=") == "data:image/png;base64,iVBORw0KGgo="
+
+
+@pytest.mark.parametrize(
+    "ref",
+    [
+        "data:image/jpeg;base64,/9j/4AAQ",
+        "http://example.com/a.png",
+        "https://example.com/a.png",
+    ],
+)
+def test_already_loadable_refs_pass_through(ref):
+    from olmlx.utils.images import ensure_image_data_uri
+
+    assert ensure_image_data_uri(ref) == ref
