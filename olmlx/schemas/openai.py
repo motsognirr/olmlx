@@ -18,6 +18,11 @@ if TYPE_CHECKING:
 
 # --- Chat Completions ---
 
+# Roles chat_templating.py / the model chat templates actually render. Any other
+# role (incl. OpenAI's "developer"/"function") renders to nothing, silently
+# dropping the turn, so reject it up front (#710, mirrors chat.py #696).
+_VALID_ROLES = frozenset({"system", "user", "assistant", "tool"})
+
 
 class OpenAIChatMessage(BaseModel):
     role: str
@@ -25,6 +30,13 @@ class OpenAIChatMessage(BaseModel):
     name: str | None = None
     tool_calls: list[dict[str, Any]] | None = None
     tool_call_id: str | None = None
+
+    @field_validator("role")
+    @classmethod
+    def validate_role(cls, v: str) -> str:
+        if v not in _VALID_ROLES:
+            raise ValueError(f"role must be one of {sorted(_VALID_ROLES)}, got {v!r}")
+        return v
 
     @model_validator(mode="after")
     def _content_required(self) -> "OpenAIChatMessage":

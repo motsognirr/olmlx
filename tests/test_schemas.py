@@ -445,6 +445,16 @@ class TestOpenAISchemas:
         msg = OpenAIChatMessage(role="user", content="hi")
         assert msg.tool_calls is None
 
+    def test_chat_message_rejects_unknown_role(self):
+        # #710: an unrecognized role renders to nothing in the chat template,
+        # silently dropping the turn. Reject it instead.
+        with pytest.raises(ValidationError, match="role"):
+            OpenAIChatMessage(role="bogus_role", content="x")
+
+    @pytest.mark.parametrize("role", ["system", "user", "assistant", "tool"])
+    def test_chat_message_accepts_known_roles(self, role):
+        assert OpenAIChatMessage(role=role, content="x").role == role
+
     def test_chat_request_defaults(self):
         req = OpenAIChatRequest(
             model="test",
@@ -695,6 +705,23 @@ class TestOpenAISchemas:
 
 
 class TestAnthropicSchemas:
+    def test_message_rejects_unknown_role(self):
+        # #710: an unrecognized role would be silently dropped from the prompt.
+        with pytest.raises(ValidationError, match="role"):
+            AnthropicMessage(role="bogus_role", content="x")
+
+    def test_message_rejects_tool_role(self):
+        # Anthropic tool results are tool_result blocks in a user message,
+        # never a top-level "tool" role.
+        with pytest.raises(ValidationError, match="role"):
+            AnthropicMessage(role="tool", content="x")
+
+    @pytest.mark.parametrize("role", ["system", "user", "assistant"])
+    def test_message_accepts_known_roles(self, role):
+        # "system" is kept: the router folds inline system messages into the
+        # leading system block (Claude Code sends them that way).
+        assert AnthropicMessage(role=role, content="x").role == role
+
     def test_tool_input_schema(self):
         schema = AnthropicToolInputSchema(
             properties={"x": {"type": "string"}},

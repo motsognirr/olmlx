@@ -959,6 +959,19 @@ class TestEmptyInputRejected:
         body = resp.text.lower()
         assert "content" in body
 
+    @pytest.mark.asyncio
+    async def test_chat_rejects_unknown_role(self, app_client):
+        # #710: unknown roles must 400, not silently drop the turn.
+        resp = await app_client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "qwen3",
+                "messages": [{"role": "bogus_role", "content": "hi"}],
+            },
+        )
+        assert resp.status_code == 400
+        assert "role" in resp.json()["error"]["message"]
+
 
 class TestXCacheIDHeader:
     @pytest.mark.asyncio
