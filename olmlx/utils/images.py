@@ -60,10 +60,14 @@ def ensure_image_data_uri(ref: str) -> str:
     ``load_image`` would otherwise try to ``open()`` as a file path.  Refs that
     are already data URIs or http(s) URLs pass through unchanged.
 
-    Raises ``ValueError`` for anything else that isn't valid base64 (a file
-    path, an empty string), so it becomes a 400 at the API boundary instead of
-    an opaque failure inside mlx_vlm.  Line breaks are dropped first, as Go's
-    ``encoding/base64`` (real Ollama) ignores them.
+    Raises ``ValueError`` for anything else that isn't valid base64 (e.g. an
+    empty string, or a typical file path — the ``.`` in an extension is outside
+    the base64 alphabet), so it becomes a 400 at the API boundary instead of an
+    opaque failure inside mlx_vlm.  This is a syntax check only: a string that
+    happens to be well-formed base64 (``abcd``, ``/tmp/img``) is indistinguishable
+    from image data and fails later, at image decode.  Sniffing magic bytes was
+    rejected because some PIL formats (e.g. TGA) have none.  Line breaks are
+    dropped first, as Go's ``encoding/base64`` (real Ollama) ignores them.
     """
     if ref.startswith(_LOADABLE_PREFIXES):
         return ref
