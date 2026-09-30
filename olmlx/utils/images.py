@@ -10,6 +10,8 @@ shapes into one of those forms (issue #428), and wraps the Ollama-native
 
 from __future__ import annotations
 
+import base64
+import binascii
 from typing import Any
 
 
@@ -57,9 +59,34 @@ def ensure_image_data_uri(ref: str) -> str:
 
     Ollama clients send bare base64 with no ``data:`` prefix, which
     ``load_image`` would otherwise try to ``open()`` as a file path.  Refs that
-    are already data URIs or http(s) URLs — what the OpenAI/Anthropic/Responses
-    routers put in the same field — pass through unchanged.
+    are already data URIs or http(s) URLs pass through unchanged.
+
+    Raises ``ValueError`` for anything else that isn't valid base64 (a file
+    path, an empty string), so it becomes a 400 at the API boundary instead of
+    an opaque failure inside mlx_vlm.  Line breaks are dropped first, as Go's
+    ``encoding/base64`` (real Ollama) ignores them.
     """
     if ref.startswith(_LOADABLE_PREFIXES):
         return ref
-    return f"data:image/png;base64,{ref}"
+    data = ref.replace("\r", "").replace("\n", "")
+    try:
+        if not data:
+            raise binascii.Error("empty")
+        base64.b64decode(data, validate=True)
+    except binascii.Error:
+        raise ValueError(
+            "images entries must be raw base64-encoded image data"
+        ) from None
+    return f"data:image/png;base64,{data}"
+
+
+def ensure_image_data_uris(refs: list[str] | None) -> list[str] | None:
+    """Apply :func:`ensure_image_data_uri` to an Ollama ``images`` list.
+
+    Only the Ollama schemas call this: their ``images`` field is documented as
+    raw base64.  The OpenAI/Anthropic refs that share ``msg["images"]`` further
+    down may be local file paths, so the shared engine path must not wrap.
+    """
+    if refs is None:
+        return None
+    return [ensure_image_data_uri(ref) for ref in refs]

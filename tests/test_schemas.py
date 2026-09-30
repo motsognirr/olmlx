@@ -256,6 +256,57 @@ class TestChatSchemas:
         assert req.keep_alive == "5m"
 
 
+class TestOllamaNativeImages:
+    """Ollama's ``images`` field is raw base64; wrap it into a data URI that
+    mlx_vlm's load_image can decode instead of opening it as a path (#714)."""
+
+    def test_chat_message_raw_base64_wrapped(self):
+        from olmlx.schemas.chat import Message
+
+        m = Message(role="user", content="x", images=["QUJD"])
+        assert m.images == ["data:image/png;base64,QUJD"]
+
+    def test_chat_message_data_uri_not_double_wrapped(self):
+        from olmlx.schemas.chat import Message
+
+        m = Message(role="user", content="x", images=["data:image/jpeg;base64,QQ=="])
+        assert m.images == ["data:image/jpeg;base64,QQ=="]
+
+    def test_chat_message_no_images(self):
+        from olmlx.schemas.chat import Message
+
+        assert Message(role="user", content="x").images is None
+
+    @pytest.mark.parametrize("bad", ["", "/tmp/cat.png", "not base64!"])
+    def test_chat_message_invalid_base64_rejected(self, bad):
+        """Paths/garbage get a clear 400 at the boundary, not an opaque
+        failure inside mlx_vlm."""
+        from olmlx.schemas.chat import Message
+
+        with pytest.raises(ValidationError, match="base64"):
+            Message(role="user", content="x", images=[bad])
+
+    def test_chat_message_line_wrapped_base64_accepted(self):
+        """MIME-style encoders wrap base64 at 76 columns; Ollama (Go's
+        encoding/base64) ignores the newlines, so do we."""
+        from olmlx.schemas.chat import Message
+
+        m = Message(role="user", content="x", images=["QUJD\nREVG\r\n"])
+        assert m.images == ["data:image/png;base64,QUJDREVG"]
+
+    def test_generate_request_invalid_base64_rejected(self):
+        from olmlx.schemas.generate import GenerateRequest
+
+        with pytest.raises(ValidationError, match="base64"):
+            GenerateRequest(model="m", prompt="x", images=["/tmp/cat.png"])
+
+    def test_generate_request_raw_base64_wrapped(self):
+        from olmlx.schemas.generate import GenerateRequest
+
+        r = GenerateRequest(model="m", prompt="x", images=["QUJD"])
+        assert r.images == ["data:image/png;base64,QUJD"]
+
+
 class TestModelSchemas:
     def test_model_details_defaults(self):
         d = ModelDetails()
