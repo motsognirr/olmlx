@@ -250,6 +250,54 @@ class TestScaledRopeBufferMaterializationWiring:
             f"strict-fallback load left scaled-RoPE _freqs lazy: {res.get('error')!r}"
         )
 
+    def test_text_fallback_materializes_buffers(self, monkeypatch):
+        import mlx_lm
+
+        from olmlx.engine import model_load_utils
+
+        model = _yarn_rope_model()
+        mx.eval(model.parameters())
+        monkeypatch.setattr(mlx_lm, "load", lambda *a, **k: (model, object()))
+        monkeypatch.setattr(
+            model_load_utils, "_ensure_tokenizer_eos_in_stops", lambda tok: None
+        )
+
+        out_model, _ = model_load_utils._load_with_model_type_fallback(
+            mlx_lm, "/nonexistent/fake/path"
+        )
+        assert out_model is model
+        res = _rope_forward_on_worker(out_model)
+        assert res.get("error") is None, (
+            f"text load left scaled-RoPE _freqs lazy: {res.get('error')!r}"
+        )
+
+    def test_gemma4_unified_text_materializes_buffers(self, monkeypatch):
+        # mlx-community gemma4_unified checkpoints (gemma-4-12B-it-4bit) take an
+        # early-return branch of _load_with_model_type_fallback. Their
+        # full-attention layers use ProportionalRoPE, whose lazy ``_freqs``
+        # crashed the first forward with "There is no Stream(gpu, 0) in
+        # current thread" when the branch skipped buffer materialization.
+        import mlx_lm
+
+        from olmlx.engine import model_load_utils
+
+        model = _yarn_rope_model()
+        mx.eval(model.parameters())
+        monkeypatch.setattr(
+            model_load_utils,
+            "_maybe_load_gemma4_unified_text",
+            lambda path: (model, object()),
+        )
+
+        out_model, _ = model_load_utils._load_with_model_type_fallback(
+            mlx_lm, "/nonexistent/fake/path"
+        )
+        assert out_model is model
+        res = _rope_forward_on_worker(out_model)
+        assert res.get("error") is None, (
+            f"gemma4_unified load left scaled-RoPE _freqs lazy: {res.get('error')!r}"
+        )
+
 
 def _whisper_buffer_model():
     """A minimal module tree carrying mlx_whisper's two lazy underscore buffers.

@@ -235,9 +235,11 @@ def _load_with_model_type_fallback(mlx_lm, load_path, **kwargs):
     # multimodal weights must be dropped to load the language tower. The loader
     # materializes weights eagerly and ignores kwargs like ``lazy`` — these
     # checkpoints are dense text towers, so the lazy flash-MoE caller never
-    # routes here.
+    # routes here. Its full-attention layers use ProportionalRoPE, whose lazy
+    # ``_freqs`` buffer needs the same load-thread materialization as below.
     gemma4_unified = _maybe_load_gemma4_unified_text(str(load_path))
     if gemma4_unified is not None:
+        _materialize_module_buffers(gemma4_unified[0])
         return gemma4_unified
 
     _sanitize_model_config_in_place(load_path)
