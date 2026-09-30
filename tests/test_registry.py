@@ -1296,14 +1296,23 @@ class TestRegistryModelConfig:
                 }
             )
 
-    def test_option_num_predict_above_token_limit_rejected(self, monkeypatch):
-        """#709: per-model defaults bypass ModelOptions, so the configured
-        ``max_tokens_limit`` cap is enforced at config-parse time too."""
+    def test_option_num_predict_above_token_limit_accepted(self, monkeypatch):
+        """``max_tokens_limit`` caps client-supplied lengths only; an
+        operator-set per-model default above it must not drop the entry."""
         monkeypatch.setattr("olmlx.config.settings.max_tokens_limit", 1000)
-        with pytest.raises(ValueError, match="num_predict 1001 exceeds"):
-            ModelConfig.from_entry(
-                {"hf_path": "org/model", "options": {"num_predict": 1001}}
-            )
+        cfg = ModelConfig.from_entry(
+            {"hf_path": "org/model", "options": {"num_predict": 1001}}
+        )
+        assert cfg.options["num_predict"] == 1001
+
+    def test_request_num_predict_above_token_limit_still_rejected(self, monkeypatch):
+        from pydantic import ValidationError
+
+        from olmlx.schemas.common import ModelOptions
+
+        monkeypatch.setattr("olmlx.config.settings.max_tokens_limit", 1000)
+        with pytest.raises(ValidationError, match="exceeds configured limit"):
+            ModelOptions(num_predict=1001)
 
     @pytest.mark.parametrize(
         "options",
@@ -1321,6 +1330,15 @@ class TestRegistryModelConfig:
         (key,) = options
         with pytest.raises(ValueError, match=key):
             ModelConfig.from_entry({"hf_path": "org/model", "options": options})
+
+    def test_valid_option_keys_are_declared_model_options_fields(self):
+        """``ModelOptions`` allows extras, which it never range-checks — every
+        per-model option key must be a declared field or its bounds are
+        silently skipped by ``_validate_options``."""
+        from olmlx.engine.registry import VALID_OPTION_KEYS
+        from olmlx.schemas.common import ModelOptions
+
+        assert VALID_OPTION_KEYS <= set(ModelOptions.model_fields)
 
     @pytest.mark.parametrize("value", [-2, -1, 1, 128])
     def test_option_num_predict_valid_values_accepted(self, value):

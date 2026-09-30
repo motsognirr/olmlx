@@ -16,7 +16,7 @@ import logging
 from pydantic import ValidationError
 
 from olmlx.config import FlashMoeConfig, SyncMode, settings
-from olmlx.schemas.common import ModelOptions
+from olmlx.schemas.common import SKIP_TOKEN_LIMIT, ModelOptions
 from olmlx.utils.loop_affinity import assert_loop_thread
 
 SpeculativeStrategy = Literal[
@@ -229,9 +229,10 @@ def _validate_options(options: dict) -> None:
             )
     # Per-model defaults are merged in after request validation, so apply the
     # same ModelOptions range checks here — otherwise e.g. ``num_predict: 0``
-    # would bypass them and crash generation (#709).
+    # would bypass them and crash generation (#709). ``max_tokens_limit`` is
+    # exempt: it caps client-supplied lengths, not operator config.
     try:
-        ModelOptions.model_validate(options)
+        ModelOptions.model_validate(options, context={SKIP_TOKEN_LIMIT: True})
     except ValidationError as e:
         details = "; ".join(
             f"{'.'.join(str(p) for p in err['loc'])}: "
@@ -994,9 +995,8 @@ class ModelConfig:
             experimental = dict(entry.get("experimental", {}))
             if experimental:
                 _validate_experimental_overrides(experimental)
+            # Validated by ``__post_init__`` (shared with direct construction).
             options = dict(entry.get("options", {}))
-            if options:
-                _validate_options(options)
             keep_alive_raw = entry.get("keep_alive")
             if keep_alive_raw is not None:
                 keep_alive = str(keep_alive_raw)

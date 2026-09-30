@@ -1,6 +1,6 @@
 from typing import Annotated, overload
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationInfo, field_validator
 
 ModelName = Annotated[str, Field(min_length=1, max_length=256)]
 
@@ -35,6 +35,11 @@ def validate_non_empty_text_input(
     return v
 
 
+#: ``ModelOptions`` validation-context key that skips the ``max_tokens_limit``
+#: cap — set by the registry for operator-configured per-model options.
+SKIP_TOKEN_LIMIT = "skip_token_limit"
+
+
 class ModelOptions(BaseModel):
     """Ollama model options / parameters."""
 
@@ -46,7 +51,7 @@ class ModelOptions(BaseModel):
 
     @field_validator("num_predict")
     @classmethod
-    def validate_num_predict(cls, v: int | None) -> int | None:
+    def validate_num_predict(cls, v: int | None, info: ValidationInfo) -> int | None:
         if v is None or v < 0:
             return v  # special values -1 (infinite) and -2 (fill context)
         if v == 0:
@@ -55,6 +60,10 @@ class ModelOptions(BaseModel):
             raise ValueError(
                 "num_predict must be >= 1, or -1 (infinite) / -2 (fill context)"
             )
+        if info.context and info.context.get(SKIP_TOKEN_LIMIT):
+            # Operator-set per-model defaults (models.json) are not capped;
+            # max_tokens_limit bounds client-supplied lengths only.
+            return v
         return validate_token_limit(v, "num_predict")
 
     top_k: int | None = Field(None, ge=0)
