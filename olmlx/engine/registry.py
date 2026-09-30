@@ -224,9 +224,10 @@ def _validate_options(options: dict) -> None:
             raise ValueError(
                 f"Option '{key}' must be {expected}, got {type(value).__name__}"
             )
-    # Per-model defaults are merged in after request validation, so a
-    # models.json ``num_predict: 0`` would bypass ModelOptions' check (#709).
-    if options.get("num_predict") == 0:
+    # Per-model defaults are merged in after request validation, so enforce
+    # ModelOptions' num_predict range here too (#709).
+    num_predict = options.get("num_predict")
+    if num_predict is not None and (num_predict == 0 or num_predict < -2):
         raise ValueError(
             "Option 'num_predict' must be >= 1, or -1 (infinite) / -2 (fill context)"
         )
@@ -491,11 +492,11 @@ class ModelConfig:
 
     def __post_init__(self) -> None:
         # ``from_entry`` already validates JSON inputs, but direct
-        # construction (tests, programmatic callers) bypasses it. Keep
-        # this in lockstep with ``Settings.speculative_tokens``'s
-        # ``Field(gt=0)`` and the empty-string check in ``from_entry``.
+        # construction (tests, programmatic callers) bypasses it.
         if self.options:
             _validate_options(self.options)
+        # Keep this in lockstep with ``Settings.speculative_tokens``'s
+        # ``Field(gt=0)`` and the empty-string check in ``from_entry``.
         if self.speculative_tokens is not None and (
             isinstance(self.speculative_tokens, bool)
             or not isinstance(self.speculative_tokens, int)

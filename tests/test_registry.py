@@ -1283,16 +1283,25 @@ class TestRegistryModelConfig:
                 }
             )
 
-    def test_option_num_predict_zero_rejected(self):
-        """#709: a models.json ``num_predict: 0`` default is merged in after
-        request validation, so it must be rejected at config-parse time."""
+    @pytest.mark.parametrize("value", [0, -3])
+    def test_option_num_predict_out_of_range_rejected(self, value):
+        """#709: models.json ``num_predict`` defaults are merged in after
+        request validation, so the request-side range (>= 1, -1, -2) must be
+        enforced at config-parse time."""
         with pytest.raises(ValueError, match="num_predict"):
             ModelConfig.from_entry(
                 {
                     "hf_path": "org/model",
-                    "options": {"num_predict": 0},
+                    "options": {"num_predict": value},
                 }
             )
+
+    @pytest.mark.parametrize("value", [-2, -1, 1, 128])
+    def test_option_num_predict_valid_values_accepted(self, value):
+        cfg = ModelConfig.from_entry(
+            {"hf_path": "org/model", "options": {"num_predict": value}}
+        )
+        assert cfg.options["num_predict"] == value
 
     def test_option_num_predict_zero_rejected_on_direct_construction(self):
         """#709: direct construction (e.g. ``add_mapping(model_config=...)``)
