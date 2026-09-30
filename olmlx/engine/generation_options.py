@@ -40,6 +40,7 @@ try:
 except ImportError:  # pragma: no cover
     make_sampler = None  # type: ignore[assignment]
     make_logits_processors = None  # type: ignore[assignment]
+    apply_min_p = apply_top_k = apply_top_p = None  # type: ignore[assignment]
     logging.getLogger(__name__).warning(
         "mlx-lm sample_utils unavailable (mlx-lm < 0.30.7?) — sampler/logits_processors disabled"
     )
