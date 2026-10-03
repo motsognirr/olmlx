@@ -106,6 +106,14 @@ class _FlashMoEQwen3Next(_FlashMoEBase):
 
     def __init__(self, original_moe, flash_moe: FlashMoE):
         super().__init__(original_moe, flash_moe)
+        if not hasattr(original_moe, "norm_topk_prob"):
+            raise NotImplementedError(
+                f"{type(original_moe).__name__} has a linear gate and "
+                "shared_expert_gate but no norm_topk_prob, so it is not an "
+                "mlx-lm Qwen3-Next block; if it is an mlx-vlm Qwen3.5-family "
+                "block, its _shared_expert_scale hook (which selects "
+                "_FlashMoEQwen35Vlm) may have been renamed upstream."
+            )
         self.gate = original_moe.gate
         self.top_k = original_moe.top_k
         self.norm_topk_prob = original_moe.norm_topk_prob

@@ -352,3 +352,37 @@ def test_fingerprint_error_treated_as_stale(tmp_path, monkeypatch):
 
     monkeypatch.setattr(qwen4_exp_ple, "_source_fingerprint", boom)
     assert qwen4_exp_ple._view_is_current(model_dir, view) is False
+
+
+def test_store_dir_size_ignores_zero_inodes(tmp_path, monkeypatch):
+    """Filesystems without real inodes report st_ino == 0 for every file;
+    those must not be collapsed into one."""
+    import os as _os
+
+    from olmlx.models import store
+
+    (tmp_path / "a.bin").write_bytes(b"x" * 100)
+    (tmp_path / "b.bin").write_bytes(b"y" * 200)
+    real_stat = _os.stat_result
+
+    orig = type(tmp_path).stat
+
+    def fake_stat(self, *a, **k):
+        st = orig(self, *a, **k)
+        return real_stat(
+            (
+                st.st_mode,
+                0,
+                st.st_dev,
+                st.st_nlink,
+                st.st_uid,
+                st.st_gid,
+                st.st_size,
+                st.st_atime,
+                st.st_mtime,
+                st.st_ctime,
+            )
+        )
+
+    monkeypatch.setattr(type(tmp_path), "stat", fake_stat)
+    assert store._dir_size(tmp_path) == 300

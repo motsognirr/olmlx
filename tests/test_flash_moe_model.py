@@ -1497,3 +1497,23 @@ class TestFlashMoeQwen4ExpVlm:
         assert wrapped.language_model is language_model
         assert isinstance(language_model.layers[0].mlp, _FlashMoEQwen35Vlm)
         assert wrapped.layers is language_model.layers
+
+
+def test_qwen3_next_branch_without_norm_topk_prob_raises_clearly():
+    """A Qwen3.5-family mlx-vlm block that no longer matches the
+    _FlashMoEQwen35Vlm dispatch (e.g. upstream renamed _shared_expert_scale)
+    must fail with an actionable error, not a bare AttributeError."""
+    from unittest.mock import MagicMock
+
+    from olmlx.engine.flash.flash_moe_model import _FlashMoEQwen3Next
+
+    class _Block(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.gate = nn.Linear(4, 2, bias=False)
+            self.top_k = 1
+            self.shared_expert = nn.Linear(4, 4)
+            self.shared_expert_gate = nn.Linear(4, 1, bias=False)
+
+    with pytest.raises(NotImplementedError, match="norm_topk_prob"):
+        _FlashMoEQwen3Next(_Block(), MagicMock())

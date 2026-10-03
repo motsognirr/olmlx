@@ -200,10 +200,13 @@ def _dir_size(path: Path) -> int:
     for f in path.rglob("*"):
         if f.is_file():
             st = f.stat()
-            key = (st.st_dev, st.st_ino)
-            if key in seen:
-                continue
-            seen.add(key)
+            # st_ino == 0: the filesystem has no real inodes (some FUSE /
+            # network mounts) — count every file rather than collapsing them.
+            if st.st_ino:
+                key = (st.st_dev, st.st_ino)
+                if key in seen:
+                    continue
+                seen.add(key)
             total += st.st_size
     return total
 
