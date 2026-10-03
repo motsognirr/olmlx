@@ -319,3 +319,36 @@ def test_warns_when_qwen4_exp_has_no_ple_shards(tmp_path, caplog):
     with caplog.at_level("WARNING", logger="olmlx.engine.qwen4_exp_ple"):
         assert ensure_external_ple_view(model_dir) is None
     assert "no PLE shards" in caplog.text
+
+
+def test_warns_when_qwen4_exp_has_no_index(tmp_path, caplog):
+    model_dir = tmp_path / "model"
+    _write_checkpoint(model_dir)
+    (model_dir / "model.safetensors.index.json").unlink()
+    with caplog.at_level("WARNING", logger="olmlx.engine.qwen4_exp_ple"):
+        assert ensure_external_ple_view(model_dir) is None
+    assert "index" in caplog.text
+
+
+@pytest.mark.parametrize(
+    "bad", [[], "x", {"model_type": "qwen4_exp", "text_config": []}]
+)
+def test_malformed_config_returns_none(tmp_path, bad):
+    model_dir = tmp_path / "model"
+    _write_checkpoint(model_dir)
+    (model_dir / "config.json").write_text(json.dumps(bad))
+    assert ensure_external_ple_view(model_dir) is None
+
+
+def test_fingerprint_error_treated_as_stale(tmp_path, monkeypatch):
+    from olmlx.engine import qwen4_exp_ple
+
+    model_dir = tmp_path / "model"
+    _write_checkpoint(model_dir)
+    view = ensure_external_ple_view(model_dir)
+
+    def boom(_):
+        raise PermissionError("denied")
+
+    monkeypatch.setattr(qwen4_exp_ple, "_source_fingerprint", boom)
+    assert qwen4_exp_ple._view_is_current(model_dir, view) is False

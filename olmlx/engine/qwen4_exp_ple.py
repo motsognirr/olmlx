@@ -40,14 +40,31 @@ _PLE_MARKER = ".ple.ple_embedding.ngram_embedding.shards."
 def _needs_view(model_dir: Path) -> bool:
     try:
         config = json.loads((model_dir / "config.json").read_text())
-        index = json.loads((model_dir / "model.safetensors.index.json").read_text())
     except (OSError, ValueError):
         return False
-    if config.get("model_type") != "qwen4_exp":
+    if not isinstance(config, dict) or config.get("model_type") != "qwen4_exp":
         return False
-    if (config.get("text_config") or {}).get("ple_storage"):
+    text_config = config.get("text_config")
+    if not isinstance(text_config, dict):
+        return False  # malformed; let the loader report it
+    if text_config.get("ple_storage"):
         return False  # checkpoint is already an external-PLE view
-    if any(_PLE_MARKER in key for key in index.get("weight_map", {})):
+    try:
+        index = json.loads((model_dir / "model.safetensors.index.json").read_text())
+        weight_map = index["weight_map"]
+        if not isinstance(weight_map, dict):
+            raise TypeError("weight_map is not a mapping")
+    except (OSError, ValueError, KeyError, TypeError) as exc:
+        # mlx-vlm's view builder needs the shard index; without it the PLE
+        # tables load as ordinary (wired) parameters — make that visible.
+        logger.warning(
+            "qwen4_exp checkpoint %s has no usable safetensors index (%s); "
+            "loading without the external PLE view",
+            model_dir,
+            exc,
+        )
+        return False
+    if any(_PLE_MARKER in key for key in weight_map):
         return True
     # A qwen4_exp checkpoint without recognizable PLE shards: either a variant
     # without PLE, or an upstream key rename that stopped the marker matching —
@@ -92,9 +109,9 @@ def _view_is_current(model_dir: Path, view: Path) -> bool:
         for name in ("config.json", "ple-store.json", "model.safetensors.index.json"):
             if not (view / name).is_file():
                 return False
+        return recorded == _source_fingerprint(model_dir)
     except (OSError, ValueError):
         return False
-    return recorded == _source_fingerprint(model_dir)
 
 
 def _build_view(model_dir: Path, target: Path) -> None:
