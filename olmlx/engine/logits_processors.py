@@ -319,3 +319,242 @@ async def _gpt_oss_filter(token_stream):
                 yield tok
                 buffered.remove(tok)
                 break
+
+
+# ---------------------------------------------------------------------------
+# Thinking budget (Anthropic ``thinking.budget_tokens``, issue #716)
+# ---------------------------------------------------------------------------
+
+# Vocab fallback for tokenizers that aren't mlx-lm ``TokenizerWrapper``s (the
+# wrapper exposes ``think_start_tokens``/``think_end_tokens`` directly).
+_THINK_MARKER_FALLBACKS = (("<think>", "</think>"),)
+
+
+def _resolve_think_markers(
+    tokenizer,
+) -> tuple[tuple[int, ...], tuple[int, ...]] | None:
+    """Return ``(think_start_ids, think_end_ids)`` for *tokenizer*, or None.
+
+    Prefers mlx-lm's ``TokenizerWrapper`` detection (single-token
+    ``<think>``/``</think>``, multi-token Gemma-4 ``<|channel>thought`` /
+    ``<channel|>``), falling back to a vocab lookup. The ``isinstance``
+    checks keep a MagicMock tokenizer from masquerading as having markers.
+    """
+    start = getattr(tokenizer, "think_start_tokens", None)
+    end = getattr(tokenizer, "think_end_tokens", None)
+    if isinstance(start, (tuple, list)) and isinstance(end, (tuple, list)):
+        if start and end:
+            # Third-party contract: degrade to "no markers" on a shape
+            # mismatch rather than failing every budget-carrying request.
+            try:
+                return tuple(int(t) for t in start), tuple(int(t) for t in end)
+            except (TypeError, ValueError):
+                pass
+    get_vocab = getattr(tokenizer, "get_vocab", None)
+    if get_vocab is None:
+        return None
+    try:
+        vocab = get_vocab()
+    except Exception:
+        return None
+    if not isinstance(vocab, dict):
+        return None
+    for s, e in _THINK_MARKER_FALLBACKS:
+        if s in vocab and e in vocab:
+            return (int(vocab[s]),), (int(vocab[e]),)
+    return None
+
+
+def _thinking_open_after(
+    generated: list[int],
+    start_seq: tuple[int, ...],
+    end_seq: tuple[int, ...],
+    initially_open: bool,
+) -> bool:
+    """Replay think open/close markers over *generated*; True if still open."""
+    state = initially_open
+    i, n = 0, len(generated)
+    while i < n:
+        if tuple(generated[i : i + len(end_seq)]) == end_seq:
+            state = False
+            i += len(end_seq)
+        elif tuple(generated[i : i + len(start_seq)]) == start_seq:
+            state = True
+            i += len(start_seq)
+        else:
+            i += 1
+    return state
+
+
+def _partial_marker_suffix(generated: list[int], seq: tuple[int, ...]) -> int:
+    """Length of the longest *proper* prefix of *seq* ending *generated* (0 if none)."""
+    for n in range(min(len(seq) - 1, len(generated)), 0, -1):
+        if tuple(generated[-n:]) == seq[:n]:
+            return n
+    return 0
+
+
+def _generated_tail(tokens, k: int) -> list[int]:
+    """Last *k* entries of a processor token history as a Python list.
+
+    ``generate_step`` passes an ``mx.array``; the batched path passes a
+    per-sequence buffer. Either way the last *k* entries are exactly the
+    tokens generated so far (the history begins at the prompt tail).
+    """
+    if k <= 0:
+        return []
+    tail = tokens[-k:]
+    if hasattr(tail, "tolist"):
+        tail = tail.tolist()
+    return [int(t) for t in tail]
+
+
+def _force_token(logits: mx.array, token_id: int) -> mx.array:
+    """A logits row that can only sample *token_id*.
+
+    Built fresh (not masked from *logits*) so an earlier processor that
+    already sent *token_id* to ``-inf`` can't yield an all-``-inf`` row (NaN
+    logsumexp). ``mx.depends`` keeps the model forward in the graph: without
+    it the step's forward — and its KV-cache / recurrent-state writes — would
+    not be evaluated by the step's ``mx.eval``, leaving a lazy graph bound to
+    the generation worker's stream that could be stored and later evaluated
+    from a different thread (the #499 thread-local-stream hazard).
+    """
+    vocab = logits.shape[-1]
+    forced = mx.where(
+        mx.arange(vocab) == token_id,
+        mx.array(0.0, dtype=logits.dtype),
+        mx.array(-mx.inf, dtype=logits.dtype),
+    )
+    forced = mx.broadcast_to(forced, logits.shape)
+    return mx.depends(forced, logits)
+
+
+def _make_thinking_budget_processor(
+    budget: int,
+    start_seq: tuple[int, ...],
+    end_seq: tuple[int, ...],
+    *,
+    initially_open: bool,
+):
+    """Logits processor that ends an open think block after *budget* tokens.
+
+    Relies on the processor contract shared by mlx-lm's ``generate_step``,
+    mlx-vlm's ``generate_step`` and the batched ``GenerationBatch``: exactly
+    one call per sampled token, with the history's last ``k`` entries being
+    the ``k`` tokens generated so far. Below the budget it is a pure
+    pass-through (no host sync — the decode pipeline is untouched). At call
+    ``budget`` it syncs the generated tokens *once* and replays the think
+    markers; if a think block is still open it forces *end_seq* one token per
+    call, then goes inert so the model writes its answer. If thinking already
+    closed (or never opened), it goes inert immediately.
+    """
+    calls = 0
+    forcing: int | None = None
+    done = False
+
+    def thinking_budget_processor(tokens, logits: mx.array) -> mx.array:
+        nonlocal calls, forcing, done
+        k = calls
+        calls += 1
+        if done:
+            return logits
+        if forcing is None:
+            if k < budget:
+                return logits
+            generated = _generated_tail(tokens, k)
+            if not _thinking_open_after(generated, start_seq, end_seq, initially_open):
+                # A multi-token opener (Gemma-4 ``<|channel>thought``) may be
+                # straddling the boundary: stay armed and re-check next call
+                # rather than going inert before it completes.
+                if _partial_marker_suffix(generated, start_seq):
+                    return logits
+                done = True
+                return logits
+            # Finish a multi-token close the model already began instead of
+            # restarting it (which would emit a duplicated, malformed marker).
+            forcing = _partial_marker_suffix(generated, end_seq)
+        token_id = end_seq[forcing]
+        forcing += 1
+        if forcing >= len(end_seq):
+            done = True
+        if token_id >= logits.shape[-1]:
+            done = True
+            return logits
+        return _force_token(logits, token_id)
+
+    return thinking_budget_processor
+
+
+def _install_thinking_budget_processor(
+    lm: "LoadedModel",
+    gen_kwargs: dict,
+    thinking_budget: int | None,
+    *,
+    thinking_expected: bool,
+    prompt: str | list | None,
+    grammar_active: bool,
+) -> bool:
+    """Install the #716 thinking-budget processor on *gen_kwargs*.
+
+    Returns True when installed. Not enforced (logged) for distributed models
+    (callables can't cross the worker broadcast), speculative models (their
+    decoders ignore ``logits_processors``, like sampling/penalties), grammar
+    requests (forcing a close token the grammar rejects would desync its
+    matcher), and tokenizers with no detectable think markers (e.g. gpt-oss
+    Harmony channels).
+    """
+    if thinking_budget is None:
+        return False
+    if thinking_budget < 0:
+        logger.warning("Ignoring negative thinking budget %d", thinking_budget)
+        return False
+    reason = None
+    if lm.is_distributed is True:
+        reason = "distributed mode"
+    elif lm.is_speculative is True:
+        reason = "speculative decoding (decoders ignore logits processors)"
+    elif grammar_active:
+        reason = "grammar-constrained decoding"
+    if reason is not None:
+        # info, not warning: Anthropic clients send a budget on every request,
+        # so a per-request warning for a model kind that can never enforce it
+        # is noise the operator cannot act on.
+        logger.info("Thinking budget %d not enforced: %s", thinking_budget, reason)
+        return False
+    tokenizer = lm.text_tokenizer
+    markers = _resolve_think_markers(tokenizer)
+    if markers is None:
+        logger.info(
+            "Thinking budget %d not enforced: tokenizer has no think markers",
+            thinking_budget,
+        )
+        return False
+    start_seq, end_seq = markers
+    # Only force a close on positive evidence of an open block: the prompt
+    # ending in the opener (Qwen3.5/DeepSeek-R1-style templates, with or
+    # without an enable_thinking switch) or the model emitting it (replayed
+    # by the processor). ``thinking_expected`` is only a request-level flag —
+    # trusting it would force ``</think>`` into a direct answer from a model
+    # that skipped thinking, and the routers' orphan-close handling (#307)
+    # would then reclassify that answer as thinking. It is the fallback only
+    # when there is no string prompt to inspect.
+    initially_open = bool(thinking_expected)
+    if isinstance(prompt, str):
+        try:
+            start_text = tokenizer.decode(list(start_seq))
+        except Exception:
+            start_text = None
+        if isinstance(start_text, str) and start_text:
+            initially_open = prompt.rstrip().endswith(start_text)
+    processor = _make_thinking_budget_processor(
+        thinking_budget, start_seq, end_seq, initially_open=initially_open
+    )
+    existing = gen_kwargs.get("logits_processors", [])
+    gen_kwargs["logits_processors"] = list(existing) + [processor]
+    logger.info(
+        "Thinking budget active: %d tokens (open at start=%s)",
+        thinking_budget,
+        initially_open,
+    )
+    return True

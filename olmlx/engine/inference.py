@@ -61,6 +61,7 @@ from olmlx.engine.grammar import GrammarSpec
 from olmlx.engine.logits_processors import (
     _GptOssChannelFilter,
     _install_grammar_processor,
+    _install_thinking_budget_processor,
     _gpt_oss_filter as _gpt_oss_filter,
     _GPT_OSS_STRUCTURAL_TOKENS as _GPT_OSS_STRUCTURAL_TOKENS,
     _resolve_model_vocab_size as _resolve_model_vocab_size,
@@ -4473,6 +4474,7 @@ async def generate_chat(
     enable_thinking: bool | None = ...,
     reasoning_effort: str | None = ...,
     grammar_spec: GrammarSpec | None = ...,
+    thinking_budget: int | None = ...,
 ) -> AsyncGenerator[dict, None]: ...
 
 
@@ -4491,6 +4493,7 @@ async def generate_chat(
     enable_thinking: bool | None = ...,
     reasoning_effort: str | None = ...,
     grammar_spec: GrammarSpec | None = ...,
+    thinking_budget: int | None = ...,
 ) -> dict: ...
 
 
@@ -4508,6 +4511,7 @@ async def generate_chat(
     enable_thinking: bool | None = ...,
     reasoning_effort: str | None = ...,
     grammar_spec: GrammarSpec | None = ...,
+    thinking_budget: int | None = ...,
 ) -> AsyncGenerator[dict, None] | dict: ...
 
 
@@ -4524,8 +4528,15 @@ async def generate_chat(
     enable_thinking: bool | None = None,
     reasoning_effort: str | None = None,
     grammar_spec: GrammarSpec | None = None,
+    thinking_budget: int | None = None,
 ) -> AsyncGenerator[dict, None] | dict:
-    """Generate a chat completion."""
+    """Generate a chat completion.
+
+    ``thinking_budget`` (Anthropic ``thinking.budget_tokens``, #716) caps the
+    think block: once that many tokens are generated with it still open, the
+    tokenizer's think-close sequence is forced and the model continues with
+    its answer.
+    """
     stats = TimingStats()
 
     _reject_declared_image_before_load(manager, model_name, "chat")
@@ -4760,6 +4771,18 @@ async def generate_chat(
         # Tell streaming routers whether to wait for a (possibly orphaned, see
         # #307) `</think>` token — shares the rules with `_apply_chat_template`.
         thinking_expected = _resolve_thinking_active(caps, tools, enable_thinking)
+
+        # Enforce the Anthropic thinking budget (#716) via a request-scoped
+        # logits processor. It runs inside generate_step on the generation
+        # worker, so it stays on generation_stream like every other processor.
+        _install_thinking_budget_processor(
+            lm,
+            gen_kwargs,
+            thinking_budget,
+            thinking_expected=thinking_expected,
+            prompt=prompt,
+            grammar_active=grammar_active,
+        )
 
         # Build the chat template kwargs used for segmented tokenization in the
         # checkpoint cache path.  These must match the kwargs that produced

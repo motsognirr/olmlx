@@ -454,6 +454,33 @@ class TestPanelGenerateChatNonStream:
         assert captured.get("reasoning_effort") == "low"
 
     @pytest.mark.asyncio
+    async def test_thinking_budget_ignored_is_logged(self, monkeypatch, caplog):
+        """Panels don't enforce the Anthropic thinking budget (#716); that
+        must be observable in the log rather than silently dropped."""
+        import logging
+
+        async def _ok(manager, model_name, messages, **kwargs):
+            assert "thinking_budget" not in kwargs
+            return {"text": "final", "done": True, "stats": None}
+
+        monkeypatch.setattr(panel_mod, "generate_chat", _ok)
+        monkeypatch.setattr(panel_mod, "_resolve_panel", lambda m, n: _make_panel())
+        with caplog.at_level(logging.INFO, logger="olmlx.engine.panel"):
+            await panel_mod.panel_generate_chat(
+                manager=None,
+                model_name="p:latest",
+                messages=[{"role": "user", "content": "hi"}],
+                tools=None,
+                stream=False,
+                thinking_budget=1024,
+            )
+        assert any(
+            "thinking budget" in r.getMessage().lower()
+            and "not enforced" in r.getMessage()
+            for r in caplog.records
+        )
+
+    @pytest.mark.asyncio
     async def test_final_turn_returns_judge_answer(self, monkeypatch):
         responses = {
             "c": '{"route": "default"}',
