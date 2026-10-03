@@ -539,6 +539,18 @@ class TestBudgetMustBeBelowMaxTokens:
         )
         assert req.thinking.type == "disabled"
 
+    @pytest.mark.parametrize("thinking_type", ["adaptive", "future-mode"])
+    def test_non_enabled_thinking_budget_not_checked(self, thinking_type):
+        """Anthropic's budget < max_tokens rule is defined for
+        ``type: enabled`` only. Adaptive and unknown (forward-compat) types
+        must not be 400'd on it — such a budget can never trigger before
+        ``max_tokens`` anyway, so rejecting it would only break clients."""
+        req = self._req(
+            max_tokens=100,
+            thinking={"type": thinking_type, "budget_tokens": 5000},
+        )
+        assert req.thinking.type == thinking_type
+
     def test_count_tokens_not_checked(self):
         """count_tokens takes no max_tokens (it defaults to a placeholder 1),
         so a thinking budget there must not be compared against it."""

@@ -142,12 +142,15 @@ class AnthropicMessagesRequest(BaseModel):
     def validate_budget_below_max_tokens(self) -> "AnthropicMessagesRequest":
         # Match Anthropic (#743): budget_tokens must be < max_tokens, else 400
         # invalid_request_error. Anthropic's 1024 minimum is deliberately NOT
-        # enforced — small budgets are legitimate for local models.
+        # enforced — small budgets are legitimate for local models. Gated on
+        # type == "enabled" (the only type Anthropic defines the rule for):
+        # adaptive / forward-compat types must not be 400'd, and a budget
+        # >= max_tokens can never trigger before max_tokens anyway.
         thinking = self.thinking
         if (
             self._check_budget_vs_max_tokens
             and thinking is not None
-            and thinking.type != "disabled"
+            and thinking.type == "enabled"
             and thinking.budget_tokens is not None
             and thinking.budget_tokens >= self.max_tokens
         ):
