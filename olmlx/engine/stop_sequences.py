@@ -78,6 +78,9 @@ class StopScanner:
         self._stops = [s for s in (stop_sequences or []) if s]
         self._text = ""
         self.stop_hit = False
+        # The stop sequence that matched (earliest position; list order breaks
+        # a same-position tie), so the Anthropic surface can report it (#711).
+        self.matched: str | None = None
         self._thinking_aware = thinking_aware
         # Thinking-phase state (only used when thinking_aware). The phase machine
         # cycles detect → in_think → detect so every block is tracked, not just
@@ -102,6 +105,7 @@ class StopScanner:
         if self._thinking_aware:
             self._advance_thinking_state(prev_len)
         stop_idx = -1
+        stop_seq_hit: str | None = None
         for stop_seq in self._stops:
             # A match ending in the new piece must start within
             # len(stop_seq)-1 of the boundary; anything earlier was
@@ -114,9 +118,11 @@ class StopScanner:
                     idx = self._text.find(stop_seq, idx + 1)
             if idx != -1 and (stop_idx == -1 or idx < stop_idx):
                 stop_idx = idx
+                stop_seq_hit = stop_seq
         if stop_idx == -1:
             return piece, False
         self.stop_hit = True
+        self.matched = stop_seq_hit
         return (self._text[prev_len:stop_idx] if prev_len < stop_idx else ""), True
 
     def _is_visible(self, idx: int) -> bool:
@@ -182,12 +188,27 @@ def truncate_at_stop(
     ``thinking_aware=True``, matches inside any ``<think>...</think>`` block are
     ignored (issue #588).
     """
+    truncated, matched = truncate_at_stop_match(text, stop_sequences, thinking_aware)
+    return truncated, matched is not None
+
+
+def truncate_at_stop_match(
+    text: str, stop_sequences: list[str] | None, thinking_aware: bool = False
+) -> tuple[str, str | None]:
+    """Like :func:`truncate_at_stop`, but returns the matched sequence.
+
+    Returns (text truncated at the earliest match, the stop sequence that
+    matched or ``None``). Same selection rule as :class:`StopScanner` (earliest
+    position, list order breaks a same-position tie) so the streaming and
+    non-streaming paths report the same sequence (#711).
+    """
     spans = _find_think_spans(text) if thinking_aware else []
 
     def _hidden(idx: int) -> bool:
         return any(start <= idx < resume for start, resume in spans)
 
     earliest = -1
+    matched: str | None = None
     for stop_seq in stop_sequences or []:
         if not stop_seq:
             continue
@@ -196,6 +217,7 @@ def truncate_at_stop(
             idx = text.find(stop_seq, idx + 1)
         if idx != -1 and (earliest == -1 or idx < earliest):
             earliest = idx
+            matched = stop_seq
     if earliest == -1:
-        return text, False
-    return text[:earliest], True
+        return text, None
+    return text[:earliest], matched

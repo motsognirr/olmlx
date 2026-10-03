@@ -45,6 +45,20 @@ def _content_block_start_types(sse_text: str) -> list[str]:
     return types
 
 
+def _message_delta_delta(sse_text: str) -> dict:
+    """``delta`` dict from the `message_delta` SSE event (empty if none)."""
+    for line in sse_text.splitlines():
+        if not line.startswith("data:"):
+            continue
+        try:
+            payload = json.loads(line[5:])
+        except json.JSONDecodeError:
+            continue
+        if payload.get("type") == "message_delta":
+            return payload.get("delta", {})
+    return {}
+
+
 def _message_delta_usage(sse_text: str) -> dict:
     """Usage dict from the `message_delta` SSE event (empty if none)."""
     for line in sse_text.splitlines():
@@ -512,6 +526,201 @@ class TestAnthropicEndpoint:
             )
         assert resp.status_code == 200
         assert resp.json()["stop_reason"] == "stop_sequence"
+
+    @pytest.mark.asyncio
+    async def test_stop_sequence_hit_sets_stop_sequence_field(self, app_client):
+        # #711: the response must name the matched sequence in `stop_sequence`.
+        stats = TimingStats(prompt_eval_count=5, eval_count=3)
+        with patch(
+            "olmlx.routers.anthropic.generate_chat", new_callable=AsyncMock
+        ) as mock_gen:
+            mock_gen.return_value = {
+                "text": "partial",
+                "done": True,
+                "done_reason": "stop",
+                "finish_reason": "stop",
+                "stop_sequence": "STOP",
+                "stats": stats,
+            }
+            resp = await app_client.post(
+                "/v1/messages",
+                json={
+                    "model": "qwen3",
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "max_tokens": 50,
+                    "stop_sequences": ["END", "STOP"],
+                },
+            )
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["stop_reason"] == "stop_sequence"
+        assert data["stop_sequence"] == "STOP"
+
+    @pytest.mark.asyncio
+    async def test_stop_sequence_hit_through_real_full_completion(
+        self, app_client, monkeypatch
+    ):
+        # #711 end-to-end on the non-streaming engine path: _full_completion's
+        # post-hoc truncate_at_stop used to pop done_reason, so the router
+        # reported "end_turn". Drive the real _full_completion (only the model
+        # forward is faked) through the real router.
+        import contextlib
+
+        from olmlx.engine import inference as _inf_mod
+
+        @contextlib.asynccontextmanager
+        async def fake_locked(*a, **k):
+            yield None
+
+        @contextlib.contextmanager
+        def fake_ref(*a, **k):
+            yield None
+
+        monkeypatch.setattr(_inf_mod, "_inference_locked", fake_locked)
+        monkeypatch.setattr(_inf_mod, "_inference_ref", fake_ref)
+
+        async def fake_inner(*a, **k):
+            return {
+                "text": "hello STOP world",
+                "done": True,
+                "stats": TimingStats(prompt_eval_count=4, eval_count=9),
+                "done_reason": "length",
+            }
+
+        monkeypatch.setattr(_inf_mod, "_full_completion_inner", fake_inner)
+
+        async def fake_generate_chat(*args, **kwargs):
+            lm = MagicMock()
+            lm.inference_queue_timeout = 30.0
+            lm.sync_mode = None
+            lm.text_tokenizer.encode.return_value = [1, 2]
+            return await _inf_mod._full_completion(
+                lm,
+                "prompt",
+                50,
+                {"stop": ["STOP"]},
+                TimingStats(prompt_eval_count=4, eval_count=9),
+            )
+
+        with patch(
+            "olmlx.routers.anthropic.generate_chat", side_effect=fake_generate_chat
+        ):
+            resp = await app_client.post(
+                "/v1/messages",
+                json={
+                    "model": "qwen3",
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "max_tokens": 50,
+                    "stop_sequences": ["STOP"],
+                },
+            )
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["content"][0]["text"].strip() == "hello"
+        assert data["stop_reason"] == "stop_sequence"
+        assert data["stop_sequence"] == "STOP"
+
+    @pytest.mark.asyncio
+    async def test_streaming_stop_sequence_hit_sets_message_delta(self, app_client):
+        # #711: streaming message_delta must carry stop_sequence too.
+        async def mock_stream(*args, **kwargs):
+            async def gen():
+                yield {"text": "partial", "done": False}
+                yield {
+                    "text": "",
+                    "done": True,
+                    "done_reason": "stop",
+                    "stop_sequence": "STOP",
+                    "stats": TimingStats(prompt_eval_count=3, eval_count=2),
+                }
+
+            return gen()
+
+        with patch("olmlx.routers.anthropic.generate_chat", side_effect=mock_stream):
+            resp = await app_client.post(
+                "/v1/messages",
+                json={
+                    "model": "qwen3",
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "max_tokens": 50,
+                    "stop_sequences": ["STOP"],
+                    "stream": True,
+                },
+            )
+        assert resp.status_code == 200
+        delta = _message_delta_delta(resp.text)
+        assert delta["stop_reason"] == "stop_sequence"
+        assert delta["stop_sequence"] == "STOP"
+
+    @pytest.mark.asyncio
+    async def test_streaming_natural_end_message_delta_stop_sequence_null(
+        self, app_client
+    ):
+        # Anthropic always sends stop_sequence in message_delta; null when no
+        # stop sequence matched.
+        async def mock_stream(*args, **kwargs):
+            async def gen():
+                yield {"text": "done", "done": False}
+                yield {"text": "", "done": True, "stats": TimingStats()}
+
+            return gen()
+
+        with patch("olmlx.routers.anthropic.generate_chat", side_effect=mock_stream):
+            resp = await app_client.post(
+                "/v1/messages",
+                json={
+                    "model": "qwen3",
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "max_tokens": 50,
+                    "stream": True,
+                },
+            )
+        delta = _message_delta_delta(resp.text)
+        assert delta["stop_reason"] == "end_turn"
+        assert "stop_sequence" in delta and delta["stop_sequence"] is None
+
+    @pytest.mark.asyncio
+    async def test_streaming_tools_buffered_stop_sequence_hit(self, app_client):
+        # #711: the buffered-tools streaming path must agree with the
+        # incremental path when a stop sequence ends a tool-less response.
+        async def mock_stream(*args, **kwargs):
+            async def gen():
+                yield {"text": "plain answer", "done": False}
+                yield {
+                    "text": "",
+                    "done": True,
+                    "done_reason": "stop",
+                    "stop_sequence": "END",
+                    "stats": TimingStats(eval_count=2),
+                }
+
+            return gen()
+
+        with patch("olmlx.routers.anthropic.generate_chat", side_effect=mock_stream):
+            resp = await app_client.post(
+                "/v1/messages",
+                json={
+                    "model": "qwen3",
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "max_tokens": 50,
+                    "stop_sequences": ["END"],
+                    "stream": True,
+                    "tools": [
+                        {
+                            "name": "search",
+                            "description": "Search",
+                            "input_schema": {
+                                "type": "object",
+                                "properties": {"q": {"type": "string"}},
+                            },
+                        }
+                    ],
+                },
+            )
+        assert resp.status_code == 200
+        delta = _message_delta_delta(resp.text)
+        assert delta["stop_reason"] == "stop_sequence"
+        assert delta["stop_sequence"] == "END"
 
     @pytest.mark.asyncio
     async def test_panel_model_dispatches_to_panel_coordinator(self, app_client):

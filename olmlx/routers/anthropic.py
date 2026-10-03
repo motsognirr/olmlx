@@ -197,6 +197,16 @@ def _anthropic_stop_reason(done_reason: str | None, has_tools: bool) -> str:
     return "end_turn"
 
 
+def _anthropic_stop_sequence(stop_reason: str, stop_sequence: str | None) -> str | None:
+    """The matched stop string for Anthropic's ``stop_sequence`` field.
+
+    Non-null only when ``stop_reason`` is ``"stop_sequence"`` — a tool call
+    that happened to end on a stop hit reports ``tool_use`` with a null
+    ``stop_sequence``, as the Anthropic API does (#711).
+    """
+    return stop_sequence if stop_reason == "stop_sequence" else None
+
+
 def _convert_messages(req: AnthropicMessagesRequest) -> list[dict]:
     """Convert Anthropic message format to internal chat format.
 
@@ -519,6 +529,7 @@ async def _stream_buffered_with_tools(
     stop_reason = _anthropic_stop_reason(done_reason, bool(tool_uses))
     yield {
         "stop_reason": stop_reason,
+        "stop_sequence": _anthropic_stop_sequence(stop_reason, out.stop_sequence),
         "output_tokens": output_tokens,
         "input_tokens": out.stats.prompt_eval_count if out.stats else 0,
     }
@@ -545,6 +556,7 @@ async def _stream_thinking_state_machine(result):
     output_tokens = 0
     input_tokens = 0
     done_reason = None
+    stop_sequence = None
     split_state: dict = {}
     current: str | None = None  # open block type: None | "thinking" | "text"
     text_block_emitted = False
@@ -642,6 +654,7 @@ async def _stream_thinking_state_machine(result):
                 # matching the non-streaming and buffered-tools paths.
                 input_tokens = stats.prompt_eval_count or 0
             done_reason = chunk.get("done_reason")
+            stop_sequence = chunk.get("stop_sequence")
             break
 
         for channel, fragment in split_thinking_parts(
@@ -678,8 +691,10 @@ async def _stream_thinking_state_machine(result):
         )
         block_idx += 1
 
+    stop_reason = _anthropic_stop_reason(done_reason, False)
     yield {
-        "stop_reason": _anthropic_stop_reason(done_reason, False),
+        "stop_reason": stop_reason,
+        "stop_sequence": _anthropic_stop_sequence(stop_reason, stop_sequence),
         "output_tokens": output_tokens,
         "input_tokens": input_tokens,
     }
@@ -899,6 +914,7 @@ async def anthropic_messages(req: AnthropicMessagesRequest, request: Request):
                         "type": "message_delta",
                         "delta": {
                             "stop_reason": meta.get("stop_reason", "end_turn"),
+                            "stop_sequence": meta.get("stop_sequence"),
                         },
                         "usage": {
                             "output_tokens": meta.get("output_tokens", 0),
@@ -992,6 +1008,9 @@ async def anthropic_messages(req: AnthropicMessagesRequest, request: Request):
 
         done_reason = result.get("done_reason")
         stop_reason = _anthropic_stop_reason(done_reason, bool(tool_uses))
+        stop_sequence = _anthropic_stop_sequence(
+            stop_reason, result.get("stop_sequence")
+        )
         usage = AnthropicUsage(
             input_tokens=stats.prompt_eval_count if stats else 0,
             output_tokens=stats.eval_count if stats else 0,
@@ -1003,5 +1022,6 @@ async def anthropic_messages(req: AnthropicMessagesRequest, request: Request):
             content=content_blocks,
             model=req.model,
             stop_reason=stop_reason,
+            stop_sequence=stop_sequence,
             usage=usage,
         )
