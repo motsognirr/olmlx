@@ -12,6 +12,11 @@ The core is :func:`split_thinking_parts`, which preserves the interleaving
 order of channels within a chunk (the Anthropic content-block emitter needs
 ordering); :func:`split_thinking_streaming` joins each channel for callers
 that keep two independent channels per chunk.
+
+Engine stream chunks can also carry thinking *structurally* as
+``{"thinking": ...}`` (gpt-oss's Harmony ``analysis`` channel, #713) — already
+classified, so it bypasses the tag grammar. Routers consume chunks through
+:func:`split_chunk_parts` / :func:`split_chunk_streaming`, which handle both.
 """
 
 import logging
@@ -239,6 +244,25 @@ def split_thinking_streaming(text: str, state: dict) -> tuple[str, str]:
     thinking = "".join(frag for channel, frag in parts if channel == "thinking")
     content = "".join(frag for channel, frag in parts if channel == "content")
     return thinking, content
+
+
+def split_chunk_parts(chunk: dict, state: dict) -> list[tuple[str, str]]:
+    """:func:`split_thinking_parts` for an engine stream chunk.
+
+    A structured ``{"thinking": ...}`` chunk is thinking verbatim — never run
+    through the tag grammar, so reasoning that mentions ``</think>`` can't
+    end the block early and leak into content.
+    """
+    if "thinking" in chunk:
+        return [("thinking", chunk["thinking"])] if chunk["thinking"] else []
+    return split_thinking_parts(chunk.get("text", ""), state)
+
+
+def split_chunk_streaming(chunk: dict, state: dict) -> tuple[str, str]:
+    """:func:`split_thinking_streaming` for an engine stream chunk."""
+    if "thinking" in chunk:
+        return chunk["thinking"] or "", ""
+    return split_thinking_streaming(chunk.get("text", ""), state)
 
 
 def flush_split_thinking(state: dict) -> tuple[str, str]:

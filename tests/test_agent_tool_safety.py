@@ -241,6 +241,24 @@ class TestToolSafetyJudge:
         assert await judge("bash", {"command": "rm -rf /"}, None) is False
 
     @pytest.mark.asyncio
+    async def test_reasoning_only_output_denies(self, store, tmp_path, monkeypatch):
+        """A gpt-oss judge that runs out of its 8-token budget inside the
+        analysis channel streams only structured thinking chunks (#713) —
+        half-finished reasoning must not decide the verdict (fail-closed)."""
+        svc = _service(store, tmp_path)
+        judge = svc._make_tool_safety_judge("m", "goal")
+
+        async def fake(manager, model, messages, **kw):
+            async def gen():
+                yield {"thinking": "User runs rm; ALLOW?", "done": False}
+                yield {"done": True}
+
+            return gen()
+
+        monkeypatch.setattr("olmlx.engine.inference.generate_chat", fake)
+        assert await judge("bash", {"command": "rm -rf /"}, None) is False
+
+    @pytest.mark.asyncio
     async def test_denies_on_unparseable(self, store, tmp_path, monkeypatch):
         svc = _service(store, tmp_path)
         judge = svc._make_tool_safety_judge("m", "goal")

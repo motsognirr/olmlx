@@ -8,6 +8,7 @@ re-imports these names so existing call sites and tests are unchanged.
 """
 
 import logging
+import re
 from typing import TYPE_CHECKING
 
 import mlx.core as mx
@@ -17,6 +18,7 @@ from olmlx.engine.grammar import (
     make_processor as _make_grammar_processor,
     unwrap_mlx_tokenizer as _unwrap_mlx_tokenizer,
 )
+from olmlx.engine.tool_parser import _GPT_OSS_TOOL_NAME_RE
 
 if TYPE_CHECKING:
     from olmlx.engine.model_manager import LoadedModel
@@ -200,6 +202,10 @@ def _make_presence_penalty_processor(presence_penalty: float):
     return processor
 
 
+# Harmony channel name: the leading word after ``<|channel|>`` (mirrors
+# ``_GPT_OSS_CHANNEL_RE`` in tool_parser.py).
+_CHANNEL_NAME_RE = re.compile(r"\s*(\w+)")
+
 # gpt-oss special tokens used by the streaming filter
 _GPT_OSS_STRUCTURAL_TOKENS = frozenset(
     {
@@ -214,12 +220,22 @@ _GPT_OSS_STRUCTURAL_TOKENS = frozenset(
 
 
 class _GptOssChannelFilter:
-    """Stateful filter for gpt-oss channel tokens.
+    """Stateful router for gpt-oss (Harmony) channel tokens.
 
-    Call ``should_yield(text)`` for each token. Returns True if the token's text
-    should be sent to the client. After the stream ends, call
-    ``get_fallback_texts()`` — if non-empty, yield those as fallback (the model
-    produced analysis but no final channel).
+    Call ``feed(text)`` for each token; it returns ``(thinking, content)`` —
+    the token's text on at most one side, or neither for structural tokens and
+    suppressed blocks. ``analysis`` streams as thinking (#713), ``final`` and
+    recipient-less ``commentary`` preamble (#621) as content, and commentary
+    addressed to ``to=functions.X`` (a tool call, recovered from the raw text)
+    is suppressed — the same classification as ``_parse_gpt_oss_channels``.
+
+    Keeping thinking structured (the engine yields ``{"thinking": ...}``
+    chunks) rather than re-encoding it as in-band ``<think>`` markup means a
+    reasoning trace that mentions ``</think>`` can't break out into content.
+
+    Unlike the non-streaming parser, analysis-only output is not promoted to
+    content: it has already been streamed as thinking by the time the stream
+    ends — the same as a truncated ``<think>`` block on other models.
 
     This is a class (not an async generator) so the caller can iterate the raw
     stream for prompt-cache token accumulation while only yielding filtered text.
@@ -231,94 +247,90 @@ class _GptOssChannelFilter:
     _IN_BLOCK = "in_block"
     _CONTENT = "content"
 
+    # What a block's message text is emitted as, decided at ``<|message|>``.
+    _THINKING = "thinking"
+    _VISIBLE = "visible"
+    _SUPPRESSED = "suppressed"
+
     def __init__(self):
         self._state = self._INIT
         self._channel = None
+        self._header = ""
+        self._emit_as = self._SUPPRESSED
         self._saw_any_channel = False
-        self._saw_final = False
-        self._analysis_texts: list[str] = []
         self._full_text_parts: list[str] = []
 
-    def should_yield(self, text: str) -> bool:
-        """Process one token's text and return whether it should be yielded."""
+    def _classify_block(self) -> str:
+        if self._channel == "analysis":
+            return self._THINKING
+        if self._channel == "final":
+            return self._VISIBLE
+        if self._channel == "commentary" and not _GPT_OSS_TOOL_NAME_RE.search(
+            self._header
+        ):
+            return self._VISIBLE
+        return self._SUPPRESSED
+
+    def feed(self, text: str) -> tuple[str, str]:
+        """Process one token's text; return ``(thinking, content)`` to emit."""
         self._full_text_parts.append(text)
 
         if text == "<|start|>":
             self._state = self._AFTER_START
             self._saw_any_channel = True
-            return False
+            return "", ""
 
         if text == "<|channel|>":
             self._state = self._EXPECT_CHANNEL
             self._saw_any_channel = True
-            return False
+            return "", ""
 
         if self._state == self._AFTER_START:
-            return False
+            return "", ""
 
         if self._state == self._EXPECT_CHANNEL:
-            self._channel = text.strip()
+            # Channel name is the leading word, like _GPT_OSS_CHANNEL_RE; the
+            # rest of the header (e.g. ``to=functions.X``) follows until
+            # ``<|message|>``.
+            name = _CHANNEL_NAME_RE.match(text)
+            self._channel = name.group(1) if name else ""
+            self._header = text[name.end() :] if name else text
             self._state = self._IN_BLOCK
-            if self._channel == "final":
-                self._saw_final = True
-            return False
+            return "", ""
 
-        if text == "<|message|>" and self._state == self._IN_BLOCK:
-            self._state = self._CONTENT
-            return False
+        if self._state == self._IN_BLOCK:
+            if text == "<|message|>":
+                self._state = self._CONTENT
+                self._emit_as = self._classify_block()
+            else:
+                self._header += text
+            return "", ""
 
         if text in ("<|end|>", "<|call|>", "<|return|>"):
             self._state = self._INIT
             self._channel = None
-            return False
+            self._emit_as = self._SUPPRESSED
+            return "", ""
 
-        if self._state == self._CONTENT and self._channel == "final":
-            return True
-
-        if (
-            self._state == self._CONTENT
-            and self._channel == "analysis"
-            and not self._saw_final
-        ):
-            self._analysis_texts.append(text)
-            return False
+        if self._state == self._CONTENT:
+            if self._emit_as == self._THINKING:
+                return text, ""
+            if self._emit_as == self._VISIBLE:
+                return "", text
+            return "", ""
 
         if (
             self._state == self._INIT
             and not self._saw_any_channel
             and text not in _GPT_OSS_STRUCTURAL_TOKENS
         ):
-            return True
+            return "", text
 
-        return False
-
-    def get_fallback_texts(self) -> list[str]:
-        """Return buffered analysis texts if no final channel was seen."""
-        if not self._saw_final and self._analysis_texts:
-            return self._analysis_texts
-        return []
+        return "", ""
 
     def get_full_text(self) -> str:
         """Return the complete raw text accumulated during streaming."""
         return "".join(self._full_text_parts)
-
-
-async def _gpt_oss_filter(token_stream):
-    """Async generator wrapper for backward compatibility with tests."""
-    filt = _GptOssChannelFilter()
-    buffered = []
-    async for token in token_stream:
-        if filt.should_yield(token.text):
-            yield token
-        else:
-            buffered.append(token)
-    for text in filt.get_fallback_texts():
-        # Find matching token from buffer
-        for tok in buffered:
-            if tok.text == text:
-                yield tok
-                buffered.remove(tok)
-                break
 
 
 # ---------------------------------------------------------------------------

@@ -379,6 +379,22 @@ class ThinkingTracker:
         visible_delta = "".join(visible_parts) or None
         return think_delta, visible_delta, thinking_ended, thinking_started
 
+    def feed_thinking(self, text: str) -> tuple[str | None, bool]:
+        """Ingest a structured thinking chunk (gpt-oss analysis, #713).
+
+        Already classified by the engine, so it bypasses the tag splitter and
+        stays out of ``accumulated`` (the turn-end parse input). Returns
+        ``(think_delta, thinking_started)``; the next visible ``feed`` reports
+        ``thinking_ended``.
+        """
+        if self._thinking_disabled or not text:
+            return None, False
+        thinking_started = not self._in_thinking
+        self._in_thinking = True
+        self._just_started = thinking_started
+        self._think_emitted += len(text)
+        return text, thinking_started
+
     def flush(self) -> tuple[str | None, str | None, bool]:
         """Flush the splitter's held buffer at stream end.
 
@@ -1082,6 +1098,13 @@ class ChatSession:
                 continue
             if chunk.get("done"):
                 break
+            if "thinking" in chunk:
+                think_delta, thinking_started = tracker.feed_thinking(chunk["thinking"])
+                if thinking_started:
+                    yield {"type": "thinking_start"}
+                if think_delta:
+                    yield {"type": "thinking_token", "text": think_delta}
+                continue
             text = chunk.get("text", "")
             if text:
                 token_count += 1

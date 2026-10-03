@@ -18,7 +18,7 @@ from olmlx.routers.streaming_common import (
 )
 from olmlx.routers.thinking_split import (
     flush_split_thinking,
-    split_thinking_streaming,
+    split_chunk_streaming,
 )
 from olmlx.schemas.chat import ChatRequest, Message, ToolCall, ToolCallFunction
 from olmlx.utils.streaming import safe_ndjson_stream
@@ -258,7 +258,6 @@ async def chat(req: ChatRequest, request: Request):
                 if stats:
                     final.update(stats.to_dict())
                 return pre_done + json.dumps(final) + "\n"
-            text = chunk.get("text", "")
             # Always run the splitter, even when ``thinking_expected`` is
             # False: Gemma 4 emits its channel-format thinking
             # (``<|channel>thought\n...<channel|>``) regardless of the
@@ -271,7 +270,7 @@ async def chat(req: ChatRequest, request: Request):
             # All emitter branches below use ``exclude_none=True`` so
             # null ``thinking`` / ``images`` / ``tool_calls`` fields are
             # suppressed from the wire payload.
-            thinking_chunk, content_chunk = split_thinking_streaming(text, think_state)
+            thinking_chunk, content_chunk = split_chunk_streaming(chunk, think_state)
             if not thinking_chunk and not content_chunk:
                 return None
             return (

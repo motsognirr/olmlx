@@ -52,7 +52,6 @@ from olmlx.engine.logits_processors import (
     _make_frequency_penalty_processor,
     _make_presence_penalty_processor,
     # Re-exported only for back-compat with tests that import them from here.
-    _gpt_oss_filter as _gpt_oss_filter,
     _GPT_OSS_STRUCTURAL_TOKENS as _GPT_OSS_STRUCTURAL_TOKENS,
     _resolve_model_vocab_size as _resolve_model_vocab_size,
 )

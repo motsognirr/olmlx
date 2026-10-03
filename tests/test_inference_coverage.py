@@ -694,36 +694,24 @@ class TestAddNativeToolHint:
 # _GptOssChannelFilter                                                         #
 # --------------------------------------------------------------------------- #
 class TestGptOssChannelFilter:
-    def test_final_channel_content_yielded(self):
+    def test_final_channel_content_is_content(self):
         filt = _GptOssChannelFilter()
         seq = ["<|channel|>", "final", "<|message|>", "answer"]
-        yielded = [t for t in seq if filt.should_yield(t)]
-        assert yielded == ["answer"]
-        assert filt.get_fallback_texts() == []
+        assert [filt.feed(t) for t in seq][-1] == ("", "answer")
 
-    def test_analysis_buffered_and_used_as_fallback_when_no_final(self):
+    def test_analysis_content_is_thinking(self):
         filt = _GptOssChannelFilter()
         seq = ["<|channel|>", "analysis", "<|message|>", "thinking..."]
-        yielded = [t for t in seq if filt.should_yield(t)]
-        assert yielded == []  # analysis is not yielded inline
-        # No final channel → analysis text is the fallback.
-        assert filt.get_fallback_texts() == ["thinking..."]
+        assert [filt.feed(t) for t in seq][-1] == ("thinking...", "")
 
-    def test_no_channel_plain_text_yielded(self):
+    def test_no_channel_plain_text_is_content(self):
         filt = _GptOssChannelFilter()
-        # Plain non-structural text in init state is passed through.
-        assert filt.should_yield("hello") is True
+        assert filt.feed("hello") == ("", "hello")
 
-    def test_structural_tokens_never_yielded(self):
+    def test_structural_tokens_never_emitted(self):
         filt = _GptOssChannelFilter()
-        assert filt.should_yield("<|start|>") is False
-        assert filt.should_yield("<|end|>") is False
-
-    def test_full_text_accumulates_all_tokens(self):
-        filt = _GptOssChannelFilter()
-        for t in ["<|channel|>", "final", "<|message|>", "hi"]:
-            filt.should_yield(t)
-        assert filt.get_full_text() == "<|channel|>final<|message|>hi"
+        assert filt.feed("<|start|>") == ("", "")
+        assert filt.feed("<|end|>") == ("", "")
 
 
 # --------------------------------------------------------------------------- #

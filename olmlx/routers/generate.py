@@ -10,7 +10,7 @@ from olmlx.engine.grammar import parse_response_format
 from olmlx.engine.inference import generate_completion
 from olmlx.engine.tool_parser import parse_model_output
 from olmlx.routers.common import format_error, resolve_think_flag
-from olmlx.routers.thinking_split import flush_split_thinking, split_thinking_streaming
+from olmlx.routers.thinking_split import flush_split_thinking, split_chunk_streaming
 from olmlx.schemas.generate import GenerateRequest
 from olmlx.utils.streaming import safe_ndjson_stream
 
@@ -92,9 +92,7 @@ async def generate(req: GenerateRequest, request: Request):
                     final.update(stats.to_dict())
                 lines.append(json.dumps(final) + "\n")
                 return lines
-            thinking_chunk, content_chunk = split_thinking_streaming(
-                chunk.get("text", ""), think_state
-            )
+            thinking_chunk, content_chunk = split_chunk_streaming(chunk, think_state)
             if not thinking_chunk and not content_chunk:
                 return None
             return json.dumps(_frame(now, content_chunk, thinking_chunk)) + "\n"
@@ -134,20 +132,23 @@ async def generate(req: GenerateRequest, request: Request):
         # These do NOT have parity, and closing the gap is out of scope here
         # (it's a pre-existing characteristic shared with /api/chat's streaming
         # splitter):
-        #   * parse_model_output also handles the gpt-oss channel format and
-        #     prefix-less Gemma 4 `thought\n...` blocks; the streaming splitter
-        #     handles neither (a bare `thought\n` open tag can't be matched
-        #     incrementally without false-positiving on ordinary prose).
+        #   * parse_model_output also handles prefix-less Gemma 4 `thought\n...`
+        #     blocks; the streaming splitter doesn't (a bare `thought\n` open
+        #     tag can't be matched incrementally without false-positiving on
+        #     ordinary prose).
         #   * parse_model_output does not apply the streaming-only
         #     INIT_ORPHAN_DETECT_LIMIT.
-        # Practical impact: a gpt-oss model with think=true + stream=true leaks
-        # its channel-format thinking into `response`. When extending the tag
-        # set, update both sites where the format is safe to match in a stream.
+        # When extending the tag set, update both sites where the format is
+        # safe to match in a stream. gpt-oss is handled in the engine on both
+        # paths: streaming yields structured `thinking` chunks, and here the
+        # engine has already parsed the channels into `result["thinking"]`
+        # (#713).
         thinking, visible_text, _ = parse_model_output(
             result.get("text", ""),
             has_tools=False,
             thinking_expected=bool(result.get("thinking_expected")),
         )
+        thinking = thinking or result.get("thinking", "")
         response = {
             "model": req.model,
             "created_at": now,
