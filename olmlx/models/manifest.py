@@ -1,6 +1,8 @@
 import dataclasses
 import json
 import hashlib
+import os
+import tempfile
 import typing
 from dataclasses import dataclass, asdict
 from pathlib import Path
@@ -17,14 +19,46 @@ class ModelManifest:
     family: str = ""
     parameter_size: str = ""
     quantization_level: str = ""
+    # Version of the metadata estimator (store._ESTIMATOR_VERSION) that wrote
+    # family/parameter_size/quantization_level. Missing on pre-#702 manifests,
+    # so it loads as 0 and the store re-derives those fields (#702).
+    estimator_version: int = 0
 
     def to_dict(self) -> dict:
         return asdict(self)
 
     def save(self, path: Path):
+        """Write atomically (temp file + ``os.replace``): manifests are also
+        rewritten on the read path (#702) and by other processes (the CLI), so
+        a reader must never observe a truncated file."""
         path.parent.mkdir(parents=True, exist_ok=True)
-        with open(path, "w") as f:
-            json.dump(self.to_dict(), f, indent=2)
+        fd, tmp = tempfile.mkstemp(
+            dir=path.parent, prefix=f".{path.name}.", suffix=".tmp"
+        )
+        try:
+            try:
+                f = os.fdopen(fd, "w")
+            except BaseException:
+                os.close(fd)
+                raise
+            with f:
+                # mkstemp creates 0600. Keep an existing file's mode; for a
+                # new file use the store dir's mode minus exec bits, which
+                # tracks the umask it was created under (a private 0700 dir
+                # gets 0600 manifests, a 0755 dir gets 0644).
+                try:
+                    mode = path.stat().st_mode & 0o777
+                except OSError:
+                    mode = path.parent.stat().st_mode & 0o666
+                os.fchmod(f.fileno(), mode)
+                json.dump(self.to_dict(), f, indent=2)
+            os.replace(tmp, path)
+        except BaseException:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
 
     @classmethod
     def load(cls, path: Path) -> "ModelManifest":

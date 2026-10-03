@@ -117,18 +117,32 @@ def _has_model_marker(model_dir: Path) -> bool:
     return any((model_dir / name).exists() for name in _MODEL_MARKER_FILES)
 
 
-def _extract_metadata(model_dir: Path) -> dict:
-    """Extract model metadata from config.json if available."""
+#: Version of the metadata derivation in :func:`_extract_metadata` /
+#: :func:`_estimate_param_count`, stamped into every written manifest. BUMP
+#: THIS whenever the family / parameter_size / quantization_level derivation
+#: changes, or existing manifest.json files keep the old values forever (#702).
+_ESTIMATOR_VERSION = 1
+
+
+def _extract_metadata(model_dir: Path, cfg: dict | None = None) -> dict:
+    """Extract model metadata from config.json if available.
+
+    *cfg* is an already-parsed ``config.json`` (skips re-reading it).
+    """
     config_path = model_dir / "config.json"
     meta = {"family": "", "parameter_size": "", "quantization_level": ""}
-    if not config_path.exists() and (model_dir / "model_index.json").exists():
+    if (
+        cfg is None
+        and not config_path.exists()
+        and (model_dir / "model_index.json").exists()
+    ):
         meta["family"] = "image"  # diffusers pipeline (#723)
         return meta
-    cfg = None
-    if config_path.exists():
+    if cfg is not None or config_path.exists():
         try:
-            with open(config_path) as f:
-                cfg = json.load(f)
+            if cfg is None:
+                with open(config_path) as f:
+                    cfg = json.load(f)
             meta["family"] = cfg.get("model_type", "")
             params = _estimate_param_count(cfg)
             if params:
@@ -150,8 +164,8 @@ def _extract_metadata(model_dir: Path) -> dict:
         except Exception:
             pass
     # Also check config.json for MLX quantization info (reuse already-loaded cfg)
-    if cfg and "quantization" in cfg:
-        q = cfg["quantization"]
+    q = cfg.get("quantization") if isinstance(cfg, dict) else None
+    if isinstance(q, dict):
         bits = q.get("bits", "")
         if bits:
             meta["quantization_level"] = f"{bits}-bit"
@@ -217,7 +231,59 @@ def _derive_manifest(local_dir: Path, name: str, hf_path: str) -> ModelManifest:
         family=meta["family"],
         parameter_size=meta["parameter_size"],
         quantization_level=meta["quantization_level"],
+        estimator_version=_ESTIMATOR_VERSION,
     )
+
+
+def _refresh_if_stale(
+    manifest: ModelManifest, model_dir: Path, manifest_path: Path
+) -> ModelManifest:
+    """Re-derive the estimator-owned fields of a manifest written by an older
+    :data:`_ESTIMATOR_VERSION` (#702).
+
+    Only ``family`` / ``parameter_size`` / ``quantization_level`` are
+    recomputed — a ``config.json`` read — so this stays cheap on the
+    ``/api/tags`` polling path; ``size`` / ``digest`` / ``modified_at`` are kept
+    (recomputing ``size`` would walk the whole directory). A directory with no
+    model marker to derive from is left as-is rather than blanked, as is one
+    whose ``config.json`` does not parse to a mapping (it may be mid-rewrite)
+    — without a
+    version stamp, so a later read retries. A field the estimator cannot
+    derive (empty result) keeps its stored value. Persisting the refresh is
+    best-effort: a failed save still returns the fresh values.
+    """
+    if manifest.estimator_version >= _ESTIMATOR_VERSION:
+        return manifest
+    if not _has_model_marker(model_dir):
+        return manifest
+    config_path = model_dir / "config.json"
+    cfg = None
+    if config_path.exists():
+        try:
+            cfg = json.loads(config_path.read_text())
+        except Exception:
+            return manifest
+        if not isinstance(cfg, dict):
+            return manifest
+    # _extract_metadata swallows its own errors today; the guard keeps a
+    # future regression there from failing /api/tags and /api/show.
+    try:
+        meta = _extract_metadata(model_dir, cfg=cfg)
+    except Exception:
+        logger.debug("Failed to re-derive manifest metadata: %s", model_dir)
+        return manifest
+    refreshed = replace(
+        manifest,
+        family=meta["family"] or manifest.family,
+        parameter_size=meta["parameter_size"] or manifest.parameter_size,
+        quantization_level=meta["quantization_level"] or manifest.quantization_level,
+        estimator_version=_ESTIMATOR_VERSION,
+    )
+    try:
+        refreshed.save(manifest_path)
+    except Exception:
+        logger.debug("Failed to save refreshed manifest: %s", manifest_path)
+    return refreshed
 
 
 class ModelStore:
@@ -552,6 +618,7 @@ class ModelStore:
                 family=meta["family"],
                 parameter_size=meta["parameter_size"],
                 quantization_level=meta["quantization_level"],
+                estimator_version=_ESTIMATOR_VERSION,
             )
             manifest.save(local_dir / "manifest.json")
 
@@ -601,10 +668,12 @@ class ModelStore:
                 manifest_path = d / "manifest.json"
                 if manifest_path.exists():
                     try:
-                        models.append(ModelManifest.load(manifest_path))
-                        continue
+                        loaded = ModelManifest.load(manifest_path)
                     except Exception:
                         logger.warning("Failed to load manifest: %s", manifest_path)
+                    else:
+                        models.append(_refresh_if_stale(loaded, d, manifest_path))
+                        continue
                 # No valid manifest — try to derive one from the model files
                 if _has_model_marker(d):
                     manifest: ModelManifest | None = None
@@ -633,7 +702,10 @@ class ModelStore:
             return None
         model_dir, has_manifest = resolved
         if has_manifest:
-            return ModelManifest.load(model_dir / "manifest.json")
+            manifest_path = model_dir / "manifest.json"
+            return _refresh_if_stale(
+                ModelManifest.load(manifest_path), model_dir, manifest_path
+            )
         # Derive manifest on demand and backfill so subsequent calls are fast.
         normalized = self.registry.normalize_name(name)
         resolved_cfg = self.registry.resolve(name)

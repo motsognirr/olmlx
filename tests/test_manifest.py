@@ -157,3 +157,123 @@ class TestModelManifest:
         path.write_text(json.dumps(data))
         m = ModelManifest.load(path)
         assert m.size == 0
+
+    def test_load_missing_estimator_version_defaults_to_zero(self, tmp_path):
+        """Pre-#702 manifests carry no ``estimator_version``; they must load
+        with version 0 so the store flags them as stale (#702)."""
+        path = tmp_path / "manifest.json"
+        data = {
+            "name": "test:latest",
+            "hf_path": "test/model",
+            "parameter_size": "77M",
+        }
+        path.write_text(json.dumps(data))
+        m = ModelManifest.load(path)
+        assert m.estimator_version == 0
+        assert m.parameter_size == "77M"
+
+    def test_save_is_atomic_on_write_failure(self, tmp_path, monkeypatch):
+        """A crash mid-write must leave the previous manifest intact rather
+        than a truncated file (list_local/show now write on read, #702)."""
+        path = tmp_path / "manifest.json"
+        ModelManifest(name="old:latest", hf_path="a/b", parameter_size="77M").save(path)
+        before = path.read_bytes()
+
+        real_dump = json.dump
+
+        def _partial_dump(obj, f, **kw):
+            f.write('{"name": "trunc')
+            raise OSError("disk full")
+
+        monkeypatch.setattr(json, "dump", _partial_dump)
+        try:
+            ModelManifest(name="new:latest", hf_path="a/b").save(path)
+        except OSError:
+            pass
+        monkeypatch.setattr(json, "dump", real_dump)
+
+        assert path.read_bytes() == before
+        assert ModelManifest.load(path).parameter_size == "77M"
+        # No stray temp files left behind.
+        assert [p.name for p in tmp_path.iterdir()] == ["manifest.json"]
+
+    def test_save_new_file_in_public_dir_is_world_readable(self, tmp_path):
+        d = tmp_path / "public"
+        d.mkdir()
+        d.chmod(0o755)
+        path = d / "manifest.json"
+        ModelManifest(name="a:latest", hf_path="a/b").save(path)
+        assert path.stat().st_mode & 0o777 == 0o644
+
+    def test_save_preserves_existing_file_mode(self, tmp_path):
+        path = tmp_path / "manifest.json"
+        path.write_text("{}")
+        path.chmod(0o640)
+        ModelManifest(name="a:latest", hf_path="a/b").save(path)
+        assert path.stat().st_mode & 0o777 == 0o640
+
+    def test_save_new_file_honours_directory_mode(self, tmp_path):
+        """A private (0700) store dir gets private (0600) manifests, as the old
+        umask-honouring open(path, "w") would have produced."""
+        d = tmp_path / "private"
+        d.mkdir(mode=0o700)
+        d.chmod(0o700)
+        path = d / "manifest.json"
+        ModelManifest(name="a:latest", hf_path="a/b").save(path)
+        assert path.stat().st_mode & 0o777 == 0o600
+
+    def test_save_closes_fd_when_chmod_fails(self, tmp_path, monkeypatch):
+        import os
+        import tempfile
+
+        import pytest
+
+        fds = []
+        real_mkstemp = tempfile.mkstemp
+
+        def _rec(*a, **kw):
+            fd, name = real_mkstemp(*a, **kw)
+            fds.append(fd)
+            return fd, name
+
+        def _eperm(*a, **kw):
+            raise PermissionError("EPERM")
+
+        monkeypatch.setattr(tempfile, "mkstemp", _rec)
+        monkeypatch.setattr(os, "fchmod", _eperm)
+        monkeypatch.setattr(os, "chmod", _eperm)
+        with pytest.raises(PermissionError):
+            ModelManifest(name="a:latest", hf_path="a/b").save(
+                tmp_path / "manifest.json"
+            )
+        assert fds
+        with pytest.raises(OSError):
+            os.fstat(fds[0])
+        assert list(tmp_path.iterdir()) == []
+
+    def test_save_closes_fd_when_fdopen_fails(self, tmp_path, monkeypatch):
+        import os
+        import tempfile
+
+        import pytest
+
+        fds = []
+        real_mkstemp = tempfile.mkstemp
+
+        def _rec(*a, **kw):
+            fd, name = real_mkstemp(*a, **kw)
+            fds.append(fd)
+            return fd, name
+
+        def _fail(*a, **kw):
+            raise OSError("fdopen failed")
+
+        monkeypatch.setattr(tempfile, "mkstemp", _rec)
+        monkeypatch.setattr(os, "fdopen", _fail)
+        with pytest.raises(OSError):
+            ModelManifest(name="a:latest", hf_path="a/b").save(
+                tmp_path / "manifest.json"
+            )
+        with pytest.raises(OSError):
+            os.fstat(fds[0])
+        assert list(tmp_path.iterdir()) == []
