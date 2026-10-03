@@ -29,7 +29,7 @@ def load_vlm(path: str, **kwargs: Any) -> tuple[Any, Any]:
     view = ensure_external_ple_view(path)
     if view is not None:
         path = str(view)
-    model, processor = mlx_vlm.load(path, **kwargs)
+    model, processor = mlx_vlm.load(path, **kwargs)  # pyright: ignore[reportPrivateImportUsage]
     # Materialize non-parameter buffers (scaled-RoPE ``_freqs``, ...) on THIS
     # (load) thread. mlx-vlm's parameter eval — like mlx-lm's — skips underscore
     # buffers, so left lazy they crash when first evaluated on the generation

@@ -125,6 +125,94 @@ def test_rebuilds_when_source_weights_replaced(tmp_path):
     assert (view / src.name).stat().st_ino == src.stat().st_ino
 
 
+def test_rebuilds_when_copied_metadata_changes(tmp_path):
+    """Sidecars are COPIED into the view (not linked); a re-pull that only
+    fixes e.g. the tokenizer must not leave the view serving the old copy."""
+    model_dir = tmp_path / "model"
+    _write_checkpoint(model_dir)
+    view = ensure_external_ple_view(model_dir)
+
+    (model_dir / "tokenizer.json").write_text('{"fixed": true}')
+
+    view = ensure_external_ple_view(model_dir)
+    assert (view / "tokenizer.json").read_text() == '{"fixed": true}'
+
+
+def test_store_manifest_rewrite_does_not_rebuild(tmp_path):
+    """olmlx's own bookkeeping (manifest.json, refreshed by the store) is not
+    model content; rewriting it must not trigger a rebuild every load."""
+    model_dir = tmp_path / "model"
+    _write_checkpoint(model_dir)
+    view = ensure_external_ple_view(model_dir)
+    marker = (view / "config.json").stat().st_mtime_ns
+
+    (model_dir / "manifest.json").write_text('{"size": 1}')
+    (model_dir / "manifest.json").write_text('{"size": 2}')
+
+    assert ensure_external_ple_view(model_dir) == view
+    assert (view / "config.json").stat().st_mtime_ns == marker
+
+
+def test_rebuilds_when_ple_only_shard_rewritten(tmp_path):
+    """PLE-only shards are not linked into the view — the manifest addresses
+    them by file name + byte offset — so a rewrite (possibly with a different
+    header length) must invalidate the view rather than serve wrong rows."""
+    model_dir = tmp_path / "model"
+    _write_checkpoint(model_dir)
+    view = ensure_external_ple_view(model_dir)
+    before = (view / "ple-store.json").read_text()
+
+    shard = model_dir / "model-00001-of-00002.safetensors"
+    w = mx.load(str(shard))
+    mx.eval(w)
+    w["language_model.model.extra_metadata_padding"] = mx.zeros((3,))
+    shard.unlink()
+    mx.save_safetensors(str(shard), w)  # new header length, new offsets
+
+    view = ensure_external_ple_view(model_dir)
+    assert (view / "ple-store.json").read_text() != before
+
+
+def test_stale_rebuild_swaps_atomically_and_cleans_up(tmp_path):
+    """Replacing a stale view moves the old one aside by rename (never an
+    rmtree of the live path before the new view exists) and leaves no
+    temp/stale directories behind."""
+    model_dir = tmp_path / "model"
+    _write_checkpoint(model_dir)
+    ensure_external_ple_view(model_dir)
+    (model_dir / "tokenizer.json").write_text('{"v": 2}')
+
+    view = ensure_external_ple_view(model_dir)
+
+    assert (view / "tokenizer.json").read_text() == '{"v": 2}'
+    leftovers = [p.name for p in model_dir.iterdir() if p.name.startswith(".")]
+    assert leftovers == []
+
+
+def test_stale_rebuild_tolerates_concurrent_removal(tmp_path, monkeypatch):
+    """Another loader may move the stale view aside first; that must not
+    raise FileNotFoundError."""
+    from olmlx.engine import qwen4_exp_ple
+
+    model_dir = tmp_path / "model"
+    _write_checkpoint(model_dir)
+    view = ensure_external_ple_view(model_dir)
+    (model_dir / "tokenizer.json").write_text('{"v": 3}')
+
+    real_build = qwen4_exp_ple._build_view
+
+    def racing_build(src, dst):
+        real_build(src, dst)
+        # Simulate a concurrent loader removing the stale view mid-rebuild.
+        import shutil
+
+        shutil.rmtree(view, ignore_errors=True)
+
+    monkeypatch.setattr(qwen4_exp_ple, "_build_view", racing_build)
+    out = ensure_external_ple_view(model_dir)
+    assert (out / "tokenizer.json").read_text() == '{"v": 3}'
+
+
 def test_non_qwen4_exp_returns_none(tmp_path):
     model_dir = tmp_path / "model"
     _write_checkpoint(model_dir, model_type="qwen3_5_moe")

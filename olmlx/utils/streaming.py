@@ -452,7 +452,7 @@ def async_mlx_stream(
         if is_vlm:
             import mlx_vlm
 
-            return mlx_vlm.stream_generate(
+            return mlx_vlm.stream_generate(  # pyright: ignore[reportPrivateImportUsage]
                 model,
                 tokenizer,
                 prompt=prompt,

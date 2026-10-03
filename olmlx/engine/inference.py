@@ -4183,7 +4183,7 @@ async def _full_completion_inner(
             # unpacking captures prompt/generation token counts (#429).
             result = None
             text_parts = []
-            for response in mlx_vlm.stream_generate(
+            for response in mlx_vlm.stream_generate(  # pyright: ignore[reportPrivateImportUsage]
                 lm.model,
                 lm.tokenizer,
                 prompt=prompt,
@@ -4247,7 +4247,7 @@ async def _full_completion_inner(
 
             result = None
             text_parts = []
-            for response in mlx_vlm.stream_generate(
+            for response in mlx_vlm.stream_generate(  # pyright: ignore[reportPrivateImportUsage]
                 lm.model,
                 lm.tokenizer,
                 prompt=prompt,

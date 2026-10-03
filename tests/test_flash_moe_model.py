@@ -1389,7 +1389,8 @@ class TestFlashMoeQwen4ExpVlm:
         mx.random.seed(0)
         cfg = _tiny_qwen4_exp_text_config()
         block = Qwen4ExpSparseMoeBlock(cfg)
-        block.update(tree_map(lambda a: a.astype(mx.float16), block.parameters()))
+        # float32: CPU GatherMM (CI runners) only supports float32.
+        block.update(tree_map(lambda a: a.astype(mx.float32), block.parameters()))
         mx.eval(block.parameters())
 
         model_dir = tmp_path / "model"
@@ -1442,7 +1443,7 @@ class TestFlashMoeQwen4ExpVlm:
         from olmlx.engine.flash.flash_moe_model import FlashMoeModelWrapper
 
         block, store, cfg = block_and_store
-        x = mx.random.normal((1, 5, cfg.hidden_size)).astype(mx.float16)
+        x = mx.random.normal((1, 5, cfg.hidden_size)).astype(mx.float32)
         expected = block(x)
         mx.eval(expected)
 
