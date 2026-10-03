@@ -709,7 +709,7 @@ class ModelStore:
 
     def read_manifest(self, local_dir: Path) -> ModelManifest | None:
         """Load ``<local_dir>/manifest.json``, applying the #702 stale-estimator
-        refresh, or ``None`` when it is missing or unreadable.
+        refresh, or ``None`` when it is missing or unreadable. Never raises.
 
         The single reader for callers outside :meth:`list_local` / :meth:`show`
         (``/api/ps``, the load-time size lookup) so none of them can bypass
@@ -724,7 +724,15 @@ class ModelStore:
         except Exception:
             logger.debug("Failed to load manifest: %s", manifest_path)
             return None
-        return _refresh_if_stale(manifest, local_dir, manifest_path)
+        # Never raise: /api/ps (polled) and the load path previously swallowed
+        # every manifest error. _refresh_if_stale guards its parsing, but a
+        # filesystem error (e.g. PermissionError from a marker stat) can still
+        # escape it — fall back to the stored values.
+        try:
+            return _refresh_if_stale(manifest, local_dir, manifest_path)
+        except Exception:
+            logger.debug("Failed to refresh manifest: %s", manifest_path)
+            return manifest
 
     def show(self, name: str) -> ModelManifest | None:
         resolved = self._resolve_model_dir(name)

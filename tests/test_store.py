@@ -994,6 +994,25 @@ class TestStaleManifestRefresh:
         assert result is not None
         self._assert_refreshed(result, local_dir)
 
+    def test_read_manifest_refresh_error_returns_loaded_manifest(
+        self, mock_store, monkeypatch
+    ):
+        """A refresh failure the refresh doesn't guard itself (e.g. a
+        PermissionError from the marker stat) must not escape: /api/ps and the
+        load-time size lookup fall back to the stored manifest rather than 500."""
+        import olmlx.models.store as store_mod
+
+        local_dir = _write_stale_model(mock_store, self.HF)
+
+        def _boom(_model_dir):
+            raise PermissionError("denied")
+
+        monkeypatch.setattr(store_mod, "_has_model_marker", _boom)
+        result = mock_store.read_manifest(local_dir)
+        assert result is not None
+        assert result.hf_path == self.HF
+        assert result.estimator_version == 0
+
     def test_read_manifest_missing_returns_none(self, mock_store, tmp_path):
         assert mock_store.read_manifest(tmp_path / "nope") is None
 
