@@ -1,6 +1,6 @@
 from typing import Any
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 from olmlx.schemas.common import ModelName
 
@@ -78,7 +78,10 @@ class AnthropicMessage(BaseModel):
 
 class AnthropicThinkingParam(BaseModel):
     type: str
-    budget_tokens: int | None = None
+    # ge=0: a negative budget is a 400 (Anthropic parity) rather than being
+    # silently dropped downstream. 0 is meaningful (close immediately), and
+    # Anthropic's 1024 minimum is deliberately not enforced.
+    budget_tokens: int | None = Field(None, ge=0)
 
     model_config = {"extra": "allow"}
 
@@ -134,6 +137,27 @@ class AnthropicMessagesRequest(BaseModel):
 
     model_config = {"extra": "allow"}
 
+    @model_validator(mode="after")
+    def validate_budget_below_max_tokens(self) -> "AnthropicMessagesRequest":
+        # Match Anthropic (#743): budget_tokens must be < max_tokens, else 400
+        # invalid_request_error. Anthropic's 1024 minimum is deliberately NOT
+        # enforced — small budgets are legitimate for local models. Gated on
+        # type == "enabled" (the only type Anthropic defines the rule for):
+        # adaptive / forward-compat types must not be 400'd, and a budget
+        # >= max_tokens can never trigger before max_tokens anyway.
+        thinking = self.thinking
+        if (
+            thinking is not None
+            and thinking.type == "enabled"
+            and thinking.budget_tokens is not None
+            and thinking.budget_tokens >= self.max_tokens
+        ):
+            raise ValueError(
+                f"thinking.budget_tokens ({thinking.budget_tokens}) must be "
+                f"less than max_tokens ({self.max_tokens})"
+            )
+        return self
+
 
 class AnthropicCountTokensRequest(AnthropicMessagesRequest):
     """Request schema for /v1/messages/count_tokens.
@@ -141,10 +165,18 @@ class AnthropicCountTokensRequest(AnthropicMessagesRequest):
     The real Anthropic count_tokens endpoint takes no max_tokens field, so —
     unlike /v1/messages — omitting it must not be an error. Re-declaring the
     field with a default makes it optional while inheriting every other field
-    and validator from AnthropicMessagesRequest.
+    and validator from AnthropicMessagesRequest, except the budget-vs-
+    max_tokens check, which is overridden to a no-op below (comparing against
+    a placeholder max_tokens would be meaningless).
     """
 
     max_tokens: int = Field(1, ge=1)
+
+    @model_validator(mode="after")
+    def validate_budget_below_max_tokens(self) -> "AnthropicCountTokensRequest":
+        # Overrides (disables) the parent's budget < max_tokens check:
+        # max_tokens here is a placeholder, never client-supplied.
+        return self
 
 
 class AnthropicUsage(BaseModel):
