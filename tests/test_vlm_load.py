@@ -1,7 +1,7 @@
 """Conformance test for the mlx-vlm load chokepoint.
 
 All ``mlx_vlm.load`` calls must go through ``olmlx.engine.vlm_load.load_vlm``
-so load-time workarounds (engine/gemma4_sanitize_fix.py) are applied
+so load-time hooks (engine/qwen4_exp_ple.py's external PLE view) are applied
 structurally — a call site that bypasses the chokepoint silently loses them.
 """
 

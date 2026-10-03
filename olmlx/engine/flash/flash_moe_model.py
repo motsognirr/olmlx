@@ -127,6 +127,39 @@ class _FlashMoEQwen3Next(_FlashMoEBase):
         return y + shared_y
 
 
+class _FlashMoEQwen35Vlm(_FlashMoEBase):
+    """Replacement MoE layer for mlx-vlm's Qwen3.5-family sparse MoE blocks.
+
+    Covers ``Qwen3_5MoeSparseMoeBlock`` and its subclasses (Qwen4-Exp /
+    Qwen3.8-Flash-Next). Unlike mlx-lm's Qwen3-Next block these carry no
+    ``norm_topk_prob`` — top-k scores are always renormalized — and compute
+    the shared-expert scale through ``_shared_expert_scale``, which Qwen4-Exp
+    overrides with a row-invariant quantized projection. The class's own
+    ``_shared_expert_scale`` is reused (it only reads ``self.shared_expert_gate``)
+    so subclass overrides carry over without olmlx mirroring them.
+    """
+
+    def __init__(self, original_moe, flash_moe: FlashMoE):
+        super().__init__(original_moe, flash_moe)
+        self.gate = original_moe.gate
+        self.top_k = original_moe.top_k
+        self.shared_expert = original_moe.shared_expert
+        self.shared_expert_gate = original_moe.shared_expert_gate
+        self._shared_expert_scale_fn = type(original_moe)._shared_expert_scale
+
+    def _route(self, x):
+        gates = mx.softmax(self.gate(x), axis=-1, precise=True)  # pyright: ignore[reportCallIssue]
+        k = self.top_k
+        inds = mx.argpartition(gates, kth=-k, axis=-1)[..., -k:]
+        scores = mx.take_along_axis(gates, inds, axis=-1)
+        scores = scores / scores.sum(axis=-1, keepdims=True)
+        return inds, scores
+
+    def _combine(self, x, y):
+        shared_y = self.shared_expert(x)
+        return y + self._shared_expert_scale_fn(self, x) * shared_y
+
+
 class _FlashMoEQwen3(_FlashMoEBase):
     """Replacement MoE layer for plain Qwen3-MoE style models.
 
@@ -222,6 +255,12 @@ class FlashMoeModelWrapper(nn.Module):
     ):
         super().__init__()
         self._model = model
+        # Module owning the decoder ``layers``. mlx-lm models and most mlx-vlm
+        # VLMs expose ``layers`` at the top level; mlx-vlm's qwen3_5/qwen4_exp
+        # VLMs only on ``language_model``. The full VLM is still the wrapped
+        # model — ``mlx_vlm.stream_generate`` dereferences
+        # ``model.language_model`` and vision inputs need the whole tree.
+        self._moe_root = _moe_root(model)
         self._weight_store = weight_store
         # Always None for MoE (expert prefetch was removed), but surfaced so
         # the generic close/metrics paths' ``getattr(model, "prefetcher", None)``
@@ -229,7 +268,7 @@ class FlashMoeModelWrapper(nn.Module):
         # FlashModelWrapper (dense), which still uses a real prefetcher.
         self.prefetcher = None
         _replace_moe_layers(
-            model,
+            self._moe_root,
             weight_store,
             moe_layer_indices,
             hidden_size,
@@ -255,11 +294,23 @@ class FlashMoeModelWrapper(nn.Module):
 
     @property
     def layers(self):
-        return self._model.layers
+        return self._moe_root.layers
 
     @property
     def args(self):
         return self._model.args
+
+
+def _moe_root(model: nn.Module) -> nn.Module:
+    """Return the module whose ``layers`` hold the decoder (see wrapper)."""
+    try:
+        model.layers  # noqa: B018 — property access may raise
+        return model
+    except AttributeError:
+        language_model = getattr(model, "language_model", None)
+        if language_model is None:
+            raise
+        return language_model
 
 
 def wrap_flash_moe(
@@ -446,7 +497,16 @@ def _replace_moe_layers(
             gate_is_linear = isinstance(gate, (nn.Linear,)) or (
                 hasattr(nn, "QuantizedLinear") and isinstance(gate, nn.QuantizedLinear)
             )
-            if hasattr(moe_module, "shared_expert_gate") and gate_is_linear:
+            if (
+                gate_is_linear
+                and hasattr(moe_module, "shared_expert_gate")
+                and hasattr(type(moe_module), "_shared_expert_scale")
+            ):
+                # mlx-vlm Qwen3.5-family block (Qwen4-Exp): always-renormalized
+                # top-k, shared scale via the class's _shared_expert_scale.
+                # Before Qwen3-Next, which expects mlx-lm's norm_topk_prob.
+                replacement = _FlashMoEQwen35Vlm(moe_module, flash_moe)
+            elif hasattr(moe_module, "shared_expert_gate") and gate_is_linear:
                 # Qwen3-Next style: linear gate + shared_expert + shared_expert_gate
                 replacement = _FlashMoEQwen3Next(moe_module, flash_moe)
             elif gate_is_linear and hasattr(moe_module, "e_score_correction_bias"):

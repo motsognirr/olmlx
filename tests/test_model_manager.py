@@ -884,6 +884,43 @@ class TestDetectModelKind:
         ):
             manager._detect_model_kind("test/future_hybrid_vlm")
 
+    @pytest.mark.parametrize("mlx_lm_has_module", [False, True])
+    def test_qwen4_exp_hybrid_vlm_routes_to_mlx_vlm(
+        self, tmp_path, registry, mock_store, mlx_lm_has_module
+    ):
+        """Qwen4-Exp (Qwen3.8-Flash-Next) is a hybrid linear-attention VLM that
+        mlx-vlm serves natively (and only mlx-vlm carries its mmap PLE
+        storage), so the #284 reroute must not fire — with or without an
+        mlx-lm module of the same name."""
+        config_path = self._make_config(
+            tmp_path,
+            {
+                "model_type": "qwen4_exp",
+                "vision_config": {"hidden_size": 1024},
+                "text_config": {
+                    "model_type": "qwen4_exp_text",
+                    "layer_types": ["linear_attention", "full_attention"],
+                },
+            },
+        )
+        manager = self._make_manager(registry, mock_store)
+
+        import importlib.util
+
+        real_find_spec = importlib.util.find_spec
+
+        def find_spec(name, *args, **kwargs):
+            if name.startswith("mlx_lm.models."):
+                return object() if mlx_lm_has_module else None
+            return real_find_spec(name, *args, **kwargs)
+
+        with (
+            patch("huggingface_hub.hf_hub_download", return_value=config_path),
+            patch("importlib.util.find_spec", side_effect=find_spec),
+        ):
+            kind = manager._detect_model_kind("test/qwen4_exp")
+        assert kind == "vlm"
+
     def test_hybrid_linear_attention_vlm_uses_text_config_model_type(
         self, tmp_path, registry, mock_store
     ):
@@ -2240,8 +2277,16 @@ class TestFlashMoeVlmFallback:
         assert is_vlm is True
         mock_mlx_vlm.load.assert_called_once()
 
-    def test_flash_moe_uses_language_model_from_vlm(self, registry, mock_store):
-        """VLM fallback should extract language_model for the MoE wrapper."""
+    def test_flash_moe_wraps_full_vlm_model(self, registry, mock_store):
+        """VLM fallback must hand the FULL VLM model to the MoE wrapper.
+
+        The result is served with ``is_vlm=True`` through
+        ``mlx_vlm.stream_generate``, which dereferences
+        ``model.language_model``; wrapping only the inner language model
+        broke every request ("'LanguageModel' object has no attribute
+        'language_model'"). The wrapper itself finds the decoder layers on
+        ``language_model`` when the top-level object has none.
+        """
         manager = self._make_manager(registry, mock_store)
         self._pre_download(mock_store, "test/moe-vlm2")
         flash_moe_dir = self._make_flash_moe_dir(mock_store, "test/moe-vlm2")
@@ -2275,14 +2320,19 @@ class TestFlashMoeVlmFallback:
                     with patch(
                         "olmlx.engine.flash.moe_weight_store.FlashMoeWeightStore"
                     ):
-                        manager._load_flash_moe_model(
+                        _, tokenizer, is_vlm, _ = manager._load_flash_moe_model(
                             "test/moe-vlm2",
                             str(mock_store.local_path("test/moe-vlm2")),
                             flash_moe_dir,
                             flash_moe_config=fm_config,
                         )
 
-        assert captured_model["model"] is mock_language_model
+        assert captured_model["model"] is mock_vlm_model
+        # Served via mlx_vlm.stream_generate, which needs the mlx-vlm
+        # processor (its ``detokenizer``), not the bare HF tokenizer — same
+        # contract as the non-flash VLM loader.
+        assert is_vlm is True
+        assert tokenizer is mock_processor
 
     def test_flash_moe_still_works_with_mlx_lm(self, registry, mock_store):
         """When mlx-lm succeeds, it should NOT fall back to mlx-vlm."""

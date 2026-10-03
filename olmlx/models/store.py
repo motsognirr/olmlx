@@ -193,10 +193,18 @@ def _is_valid_mlx_dir(path: Path) -> bool:
 
 
 def _dir_size(path: Path) -> int:
+    # Count each inode once: hard-linked views (e.g. the qwen4_exp
+    # external-PLE view) share the checkpoint's bytes on disk.
     total = 0
+    seen: set[tuple[int, int]] = set()
     for f in path.rglob("*"):
         if f.is_file():
-            total += f.stat().st_size
+            st = f.stat()
+            key = (st.st_dev, st.st_ino)
+            if key in seen:
+                continue
+            seen.add(key)
+            total += st.st_size
     return total
 
 
