@@ -1,4 +1,4 @@
-from typing import Any, ClassVar
+from typing import Any
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 
@@ -134,10 +134,6 @@ class AnthropicMessagesRequest(BaseModel):
 
     model_config = {"extra": "allow"}
 
-    # count_tokens takes no max_tokens (its schema defaults a placeholder), so
-    # the budget-vs-max_tokens rule below applies only to /v1/messages.
-    _check_budget_vs_max_tokens: ClassVar[bool] = True
-
     @model_validator(mode="after")
     def validate_budget_below_max_tokens(self) -> "AnthropicMessagesRequest":
         # Match Anthropic (#743): budget_tokens must be < max_tokens, else 400
@@ -148,8 +144,7 @@ class AnthropicMessagesRequest(BaseModel):
         # >= max_tokens can never trigger before max_tokens anyway.
         thinking = self.thinking
         if (
-            self._check_budget_vs_max_tokens
-            and thinking is not None
+            thinking is not None
             and thinking.type == "enabled"
             and thinking.budget_tokens is not None
             and thinking.budget_tokens >= self.max_tokens
@@ -172,7 +167,11 @@ class AnthropicCountTokensRequest(AnthropicMessagesRequest):
 
     max_tokens: int = Field(1, ge=1)
 
-    _check_budget_vs_max_tokens: ClassVar[bool] = False
+    @model_validator(mode="after")
+    def validate_budget_below_max_tokens(self) -> "AnthropicCountTokensRequest":
+        # Overrides (disables) the parent's budget < max_tokens check:
+        # max_tokens here is a placeholder, never client-supplied.
+        return self
 
 
 class AnthropicUsage(BaseModel):

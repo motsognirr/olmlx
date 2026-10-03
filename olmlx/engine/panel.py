@@ -488,24 +488,24 @@ async def panel_generate_chat(
             manager,
             panel,
             messages,
-            options,
-            tools,
-            keep_alive,
-            max_tokens,
-            enable_thinking,
-            thinking_budget,
+            options=options,
+            tools=tools,
+            keep_alive=keep_alive,
+            max_tokens=max_tokens,
+            enable_thinking=enable_thinking,
+            thinking_budget=thinking_budget,
         )
 
     (member_names, answers), merged = await _run_panel(
         manager,
         panel,
         messages,
-        tools,
-        options,
-        keep_alive,
-        max_tokens,
-        enable_thinking,
-        thinking_budget,
+        tools=tools,
+        options=options,
+        keep_alive=keep_alive,
+        max_tokens=max_tokens,
+        enable_thinking=enable_thinking,
+        thinking_budget=thinking_budget,
     )
     if merged:
         raw = serialize_tool_calls_qwen(merged)
@@ -547,12 +547,12 @@ async def _panel_stream(
         manager,
         panel,
         messages,
-        tools,
-        options,
-        keep_alive,
-        max_tokens,
-        enable_thinking,
-        thinking_budget,
+        tools=tools,
+        options=options,
+        keep_alive=keep_alive,
+        max_tokens=max_tokens,
+        enable_thinking=enable_thinking,
+        thinking_budget=thinking_budget,
     )
     if merged:
         raw = serialize_tool_calls_qwen(merged)
