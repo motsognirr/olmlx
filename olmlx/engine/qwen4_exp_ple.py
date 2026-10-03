@@ -23,6 +23,7 @@ picks it up without per-call-site wiring.
 
 from __future__ import annotations
 
+import errno
 import json
 import logging
 import shutil
@@ -46,7 +47,18 @@ def _needs_view(model_dir: Path) -> bool:
         return False
     if (config.get("text_config") or {}).get("ple_storage"):
         return False  # checkpoint is already an external-PLE view
-    return any(_PLE_MARKER in key for key in index.get("weight_map", {}))
+    if any(_PLE_MARKER in key for key in index.get("weight_map", {})):
+        return True
+    # A qwen4_exp checkpoint without recognizable PLE shards: either a variant
+    # without PLE, or an upstream key rename that stopped the marker matching —
+    # in which case the ~30 GiB tables would be wired as parameters again.
+    logger.warning(
+        "qwen4_exp checkpoint %s has no PLE shards matching %r; loading "
+        "without the external PLE view",
+        model_dir,
+        _PLE_MARKER,
+    )
+    return False
 
 
 _FINGERPRINT = ".olmlx_source_fingerprint.json"
@@ -126,8 +138,11 @@ def ensure_external_ple_view(model_path: str | Path) -> Path | None:
                 pass  # a concurrent loader already moved it aside
         try:
             tmp.rename(view)
-        except OSError:
-            # Lost a race with a concurrent builder; use theirs if it is sound.
+        except OSError as exc:
+            # ENOTEMPTY/EEXIST: a concurrent builder renamed theirs in first —
+            # use it if sound. Anything else is a real failure.
+            if exc.errno not in (errno.ENOTEMPTY, errno.EEXIST):
+                raise
             if not _view_is_current(model_dir, view):
                 raise
     finally:

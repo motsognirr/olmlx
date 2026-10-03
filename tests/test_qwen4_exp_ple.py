@@ -281,3 +281,41 @@ def test_store_dir_size_counts_hard_links_once(tmp_path, linked):
     else:
         (sub / "a.bin").write_bytes(b"x" * 1000)
         assert _dir_size(tmp_path) == 2000
+
+
+def test_rename_failure_other_than_race_is_raised(tmp_path, monkeypatch):
+    """Only ENOTEMPTY/EEXIST mean "a concurrent builder won"; any other
+    rename failure is a real error and must surface."""
+    import errno
+    from pathlib import Path as _Path
+
+    model_dir = tmp_path / "model"
+    _write_checkpoint(model_dir)
+    real_rename = _Path.rename
+
+    def failing_rename(self, target):
+        if _Path(target).name == VIEW_DIRNAME:
+            raise OSError(errno.EPERM, "nope")
+        return real_rename(self, target)
+
+    monkeypatch.setattr(_Path, "rename", failing_rename)
+    with pytest.raises(OSError, match="nope"):
+        ensure_external_ple_view(model_dir)
+
+
+def test_warns_when_qwen4_exp_has_no_ple_shards(tmp_path, caplog):
+    """If an upstream rename makes the PLE marker stop matching, the ~30 GiB
+    tables would silently be wired again — make that visible."""
+    model_dir = tmp_path / "model"
+    _write_checkpoint(model_dir)
+    index_path = model_dir / "model.safetensors.index.json"
+    index = json.loads(index_path.read_text())
+    index["weight_map"] = {
+        k.replace(".ngram_embedding.shards.", ".ngram_table.parts."): v
+        for k, v in index["weight_map"].items()
+    }
+    index_path.write_text(json.dumps(index))
+
+    with caplog.at_level("WARNING", logger="olmlx.engine.qwen4_exp_ple"):
+        assert ensure_external_ple_view(model_dir) is None
+    assert "no PLE shards" in caplog.text
