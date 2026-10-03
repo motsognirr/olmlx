@@ -9,11 +9,13 @@ from tests.integration.conftest import set_stream_responses
 
 
 class TestZeroTokenGeneration:
-    """Verify well-formed responses when generation produces zero tokens."""
+    """Verify zero-token generation limits are rejected up front on every surface."""
 
-    async def test_generate_zero_max_tokens(self, integration_ctx):
-        """POST /api/generate with num_predict: 0 returns well-formed response."""
-        set_stream_responses([""])
+    async def test_generate_zero_max_tokens_rejected(self, integration_ctx):
+        """POST /api/generate with num_predict: 0 is rejected (#709).
+
+        mlx-lm's decode loop never runs with max_tokens=0 and crashes with an
+        UnboundLocalError, so 0 is a 400 like OpenAI's max_tokens (ge=1)."""
         resp = await integration_ctx.client.post(
             "/api/generate",
             json={
@@ -23,18 +25,11 @@ class TestZeroTokenGeneration:
                 "options": {"num_predict": 0},
             },
         )
-        assert resp.status_code == 200
-        data = resp.json()
-        assert data["done"] is True
-        assert "response" in data
-        # No division-by-zero — TPS fields should be present or absent, not NaN
-        for key in ("prompt_eval_duration", "eval_duration"):
-            if key in data and data[key] is not None:
-                assert isinstance(data[key], (int, float))
+        assert resp.status_code == 400
+        assert "num_predict" in resp.json()["error"]
 
-    async def test_chat_zero_max_tokens(self, integration_ctx):
-        """POST /api/chat with num_predict: 0 returns well-formed response."""
-        set_stream_responses([""])
+    async def test_chat_zero_max_tokens_rejected(self, integration_ctx):
+        """POST /api/chat with num_predict: 0 is rejected (#709)."""
         resp = await integration_ctx.client.post(
             "/api/chat",
             json={
@@ -44,11 +39,8 @@ class TestZeroTokenGeneration:
                 "options": {"num_predict": 0},
             },
         )
-        assert resp.status_code == 200
-        data = resp.json()
-        assert data["done"] is True
-        assert "message" in data
-        assert data["message"]["role"] == "assistant"
+        assert resp.status_code == 400
+        assert "num_predict" in resp.json()["error"]
 
     async def test_openai_zero_max_tokens_rejected(self, integration_ctx):
         """POST /v1/chat/completions with max_tokens: 0 is rejected (ge=1)."""

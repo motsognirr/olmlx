@@ -118,6 +118,12 @@ class TestCommonSchemas:
         with pytest.raises(ValidationError, match="num_predict"):
             ModelOptions(num_predict=-3)
 
+    def test_model_options_num_predict_rejects_zero(self):
+        """#709: 0 reached mlx-lm's decode loop with max_tokens=0 and crashed
+        with an UnboundLocalError (500 / misleading streaming 200)."""
+        with pytest.raises(ValidationError, match="num_predict"):
+            ModelOptions(num_predict=0)
+
     def test_model_options_num_ctx_rejects_zero(self):
         with pytest.raises(ValidationError, match="num_ctx"):
             ModelOptions(num_ctx=0)

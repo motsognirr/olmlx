@@ -1283,6 +1283,78 @@ class TestRegistryModelConfig:
                 }
             )
 
+    @pytest.mark.parametrize("value", [0, -3])
+    def test_option_num_predict_out_of_range_rejected(self, value):
+        """#709: models.json ``num_predict`` defaults are merged in after
+        request validation, so the request-side range (>= 1, -1, -2) must be
+        enforced at config-parse time."""
+        with pytest.raises(ValueError, match="num_predict"):
+            ModelConfig.from_entry(
+                {
+                    "hf_path": "org/model",
+                    "options": {"num_predict": value},
+                }
+            )
+
+    def test_option_num_predict_above_token_limit_accepted(self, monkeypatch):
+        """``max_tokens_limit`` caps client-supplied lengths only; an
+        operator-set per-model default above it must not drop the entry."""
+        monkeypatch.setattr("olmlx.config.settings.max_tokens_limit", 1000)
+        cfg = ModelConfig.from_entry(
+            {"hf_path": "org/model", "options": {"num_predict": 1001}}
+        )
+        assert cfg.options["num_predict"] == 1001
+
+    def test_request_num_predict_above_token_limit_still_rejected(self, monkeypatch):
+        from pydantic import ValidationError
+
+        from olmlx.schemas.common import ModelOptions
+
+        monkeypatch.setattr("olmlx.config.settings.max_tokens_limit", 1000)
+        with pytest.raises(ValidationError, match="exceeds configured limit"):
+            ModelOptions(num_predict=1001)
+
+    @pytest.mark.parametrize(
+        "options",
+        [
+            {"top_p": 2.0},
+            {"top_k": -1},
+            {"temperature": -1.0},
+            {"repeat_last_n": -5},
+            {"min_p": 1.5},
+        ],
+    )
+    def test_option_out_of_range_rejected(self, options):
+        """Per-model options are merged after request validation, so they get
+        the same ModelOptions range checks as request options."""
+        (key,) = options
+        with pytest.raises(ValueError, match=key):
+            ModelConfig.from_entry({"hf_path": "org/model", "options": options})
+
+    def test_valid_option_keys_are_declared_model_options_fields(self):
+        """``ModelOptions`` allows extras, which it never range-checks — every
+        per-model option key must be a declared field or its bounds are
+        silently skipped by ``_validate_options``."""
+        from olmlx.engine.registry import VALID_OPTION_KEYS
+        from olmlx.schemas.common import ModelOptions
+
+        assert VALID_OPTION_KEYS <= set(ModelOptions.model_fields)
+
+    @pytest.mark.parametrize("value", [-2, -1, 1, 128])
+    def test_option_num_predict_valid_values_accepted(self, value):
+        cfg = ModelConfig.from_entry(
+            {"hf_path": "org/model", "options": {"num_predict": value}}
+        )
+        assert cfg.options["num_predict"] == value
+
+    def test_option_num_predict_zero_rejected_on_direct_construction(self):
+        """#709: direct construction (e.g. ``add_mapping(model_config=...)``)
+        bypasses ``from_entry``, so ``__post_init__`` validates options too —
+        otherwise 0 reaches the engine and the persisted entry is dropped
+        on the next ``load()``."""
+        with pytest.raises(ValueError, match="num_predict"):
+            ModelConfig(hf_path="org/model", options={"num_predict": 0})
+
     def test_invalid_hf_path_in_dict_rejected(self):
         """Invalid hf_path in dict entry is rejected at parse time."""
         with pytest.raises(ValueError, match="owner/repo"):

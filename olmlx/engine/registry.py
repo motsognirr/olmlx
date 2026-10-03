@@ -13,7 +13,10 @@ from typing import Any, Literal, NamedTuple, get_args
 
 import logging
 
+from pydantic import ValidationError
+
 from olmlx.config import FlashMoeConfig, SyncMode, settings
+from olmlx.schemas.common import SKIP_TOKEN_LIMIT, ModelOptions
 from olmlx.utils.loop_affinity import assert_loop_thread
 
 SpeculativeStrategy = Literal[
@@ -224,6 +227,20 @@ def _validate_options(options: dict) -> None:
             raise ValueError(
                 f"Option '{key}' must be {expected}, got {type(value).__name__}"
             )
+    # Per-model defaults are merged in after request validation, so apply
+    # ModelOptions' range checks to the (narrower, whitelisted) keys above —
+    # otherwise e.g. ``num_predict: 0`` would bypass them and crash generation
+    # (#709). ``max_tokens_limit`` is exempt: it caps client-supplied lengths,
+    # not operator config, which may deliberately set a larger default.
+    try:
+        ModelOptions.model_validate(options, context={SKIP_TOKEN_LIMIT: True})
+    except ValidationError as e:
+        details = "; ".join(
+            f"{'.'.join(str(p) for p in err['loc'])}: "
+            f"{err['msg'].removeprefix('Value error, ')}"
+            for err in e.errors()
+        )
+        raise ValueError(f"Invalid option value(s): {details}") from None
 
 
 def _validate_timeout(name: str, value: Any) -> float:
@@ -485,8 +502,10 @@ class ModelConfig:
 
     def __post_init__(self) -> None:
         # ``from_entry`` already validates JSON inputs, but direct
-        # construction (tests, programmatic callers) bypasses it. Keep
-        # this in lockstep with ``Settings.speculative_tokens``'s
+        # construction (tests, programmatic callers) bypasses it.
+        if self.options:
+            _validate_options(self.options)
+        # Keep this in lockstep with ``Settings.speculative_tokens``'s
         # ``Field(gt=0)`` and the empty-string check in ``from_entry``.
         if self.speculative_tokens is not None and (
             isinstance(self.speculative_tokens, bool)
@@ -977,9 +996,8 @@ class ModelConfig:
             experimental = dict(entry.get("experimental", {}))
             if experimental:
                 _validate_experimental_overrides(experimental)
+            # Validated by ``__post_init__`` (shared with direct construction).
             options = dict(entry.get("options", {}))
-            if options:
-                _validate_options(options)
             keep_alive_raw = entry.get("keep_alive")
             if keep_alive_raw is not None:
                 keep_alive = str(keep_alive_raw)
