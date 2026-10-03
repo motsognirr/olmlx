@@ -6,7 +6,11 @@ from unittest.mock import AsyncMock, patch
 import pytest
 
 from olmlx.engine.inference import INIT_ORPHAN_DETECT_LIMIT
-from olmlx.routers.openai import JSON_MODE_SYSTEM_MSG, _normalize_multimodal_messages
+from olmlx.routers.openai import (
+    JSON_MODE_SYSTEM_MSG,
+    _merge_leading_system_messages,
+    _normalize_multimodal_messages,
+)
 from olmlx.schemas.openai import OpenAIChatRequest
 from olmlx.routers.thinking_split import (
     flush_thinking_buffer,
@@ -958,6 +962,174 @@ class TestEmptyInputRejected:
         assert resp.status_code == 400
         body = resp.text.lower()
         assert "content" in body
+
+    @pytest.mark.asyncio
+    async def test_chat_rejects_unknown_role(self, app_client):
+        # #710: unknown roles must 400, not silently drop the turn.
+        resp = await app_client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "qwen3",
+                "messages": [{"role": "bogus_role", "content": "hi"}],
+            },
+        )
+        assert resp.status_code == 400
+        assert "role" in resp.json()["error"]["message"]
+
+    @pytest.mark.asyncio
+    async def test_chat_maps_developer_role_to_system(self, app_client):
+        # Newer OpenAI clients send "developer" instead of "system"; it must
+        # reach the engine as a system message, not 400 or vanish.
+        stats = TimingStats(prompt_eval_count=10, eval_count=5)
+        with patch(
+            "olmlx.routers.openai.generate_chat", new_callable=AsyncMock
+        ) as mock_gen:
+            mock_gen.return_value = {"text": "ok", "done": True, "stats": stats}
+            resp = await app_client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "qwen3",
+                    "messages": [
+                        {"role": "developer", "content": "be terse"},
+                        {"role": "user", "content": "hi"},
+                    ],
+                },
+            )
+        assert resp.status_code == 200, resp.text
+        messages = mock_gen.call_args.args[2]
+        assert messages[0] == {"role": "system", "content": "be terse"}
+
+    @pytest.mark.asyncio
+    async def test_chat_folds_system_and_developer_into_one_leading_system(
+        self, app_client
+    ):
+        # system + developer both map to "system"; two leading system turns
+        # make strict templates (Qwen3.5/3.6) raise "System message must be at
+        # the beginning." They must reach the engine as one system message.
+        stats = TimingStats(prompt_eval_count=10, eval_count=5)
+        with patch(
+            "olmlx.routers.openai.generate_chat", new_callable=AsyncMock
+        ) as mock_gen:
+            mock_gen.return_value = {"text": "ok", "done": True, "stats": stats}
+            resp = await app_client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "qwen3",
+                    "messages": [
+                        {"role": "system", "content": "you are helpful"},
+                        {"role": "developer", "content": "be terse"},
+                        {"role": "user", "content": "hi"},
+                    ],
+                },
+            )
+        assert resp.status_code == 200, resp.text
+        messages = mock_gen.call_args.args[2]
+        assert messages == [
+            {"role": "system", "content": "you are helpful\n\nbe terse"},
+            {"role": "user", "content": "hi"},
+        ]
+
+
+class TestMergeLeadingSystemMessages:
+    def test_merges_leading_run(self):
+        msgs = [
+            {"role": "system", "content": "a"},
+            {"role": "system", "content": "b"},
+            {"role": "user", "content": "q"},
+        ]
+        assert _merge_leading_system_messages(msgs) == [
+            {"role": "system", "content": "a\n\nb"},
+            {"role": "user", "content": "q"},
+        ]
+
+    def test_skips_empty_content(self):
+        msgs = [
+            {"role": "system", "content": ""},
+            {"role": "system"},
+            {"role": "system", "content": "b"},
+            {"role": "user", "content": "q"},
+        ]
+        assert _merge_leading_system_messages(msgs)[0] == {
+            "role": "system",
+            "content": "b",
+        }
+
+    def test_leaves_mid_conversation_system_alone(self):
+        # Only the leading run is folded; a later system turn keeps its
+        # position (templates like Qwen3/Llama render it in place).
+        msgs = [
+            {"role": "system", "content": "a"},
+            {"role": "user", "content": "q"},
+            {"role": "system", "content": "b"},
+        ]
+        assert _merge_leading_system_messages(msgs) == msgs
+
+    def test_all_empty_keeps_first_message_as_is(self):
+        # No content anywhere in the run: don't fabricate a content field.
+        msgs = [
+            {"role": "system"},
+            {"role": "system"},
+            {"role": "user", "content": "q"},
+        ]
+        assert _merge_leading_system_messages(msgs) == [
+            {"role": "system"},
+            {"role": "user", "content": "q"},
+        ]
+
+    def test_keeps_name_shared_by_all_folded_turns(self):
+        msgs = [
+            {"role": "system", "name": "policy", "content": "a"},
+            {"role": "system", "name": "policy", "content": "b"},
+        ]
+        assert _merge_leading_system_messages(msgs) == [
+            {"role": "system", "name": "policy", "content": "a\n\nb"}
+        ]
+
+    def test_drops_name_when_folded_turns_disagree(self):
+        # Keeping the first turn's name would re-attribute the second turn's
+        # instructions to it.
+        msgs = [
+            {"role": "system", "name": "policy", "content": "a"},
+            {"role": "system", "name": "style", "content": "b"},
+        ]
+        assert _merge_leading_system_messages(msgs) == [
+            {"role": "system", "content": "a\n\nb"}
+        ]
+        msgs = [
+            {"role": "system", "name": "policy", "content": "a"},
+            {"role": "system", "content": "b"},
+        ]
+        assert _merge_leading_system_messages(msgs) == [
+            {"role": "system", "content": "a\n\nb"}
+        ]
+
+    def test_attachments_do_not_block_fold(self):
+        # A system turn carrying images must still fold, or strict templates
+        # raise on the second system turn. Attachments are concatenated.
+        msgs = [
+            {"role": "system", "content": "a", "images": ["i1"]},
+            {"role": "system", "content": "b", "images": ["i2"], "audio": ["a1"]},
+            {"role": "user", "content": "q"},
+        ]
+        assert _merge_leading_system_messages(msgs) == [
+            {
+                "role": "system",
+                "content": "a\n\nb",
+                "images": ["i1", "i2"],
+                "audio": ["a1"],
+            },
+            {"role": "user", "content": "q"},
+        ]
+
+    def test_does_not_mutate_input(self):
+        first = {"role": "system", "content": "a", "images": ["i1"]}
+        msgs = [first, {"role": "system", "content": "b", "images": ["i2"]}]
+        _merge_leading_system_messages(msgs)
+        assert first == {"role": "system", "content": "a", "images": ["i1"]}
+
+    def test_single_system_unchanged(self):
+        msgs = [{"role": "system", "content": "a"}, {"role": "user", "content": "q"}]
+        assert _merge_leading_system_messages(msgs) == msgs
 
 
 class TestXCacheIDHeader:

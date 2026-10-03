@@ -43,9 +43,24 @@ _MAX_CONTENT_LENGTH = 1_000_000
 _MAX_CONTENT_BLOCKS = 1_000
 
 
+# Roles the Anthropic router renders (#710, mirrors chat.py #696): anything else
+# renders to nothing in the chat template and silently drops the turn. No
+# "tool" — tool results are tool_result blocks inside a user message. "system"
+# is deliberately kept although not in the Anthropic wire spec: the router folds
+# inline system messages into the leading system block (Claude Code sends them).
+_VALID_ROLES = frozenset({"system", "user", "assistant"})
+
+
 class AnthropicMessage(BaseModel):
     role: str
     content: str | list[AnthropicContentBlock]
+
+    @field_validator("role")
+    @classmethod
+    def validate_role(cls, v: str) -> str:
+        if v not in _VALID_ROLES:
+            raise ValueError(f"role must be one of {sorted(_VALID_ROLES)}, got {v!r}")
+        return v
 
     @field_validator("content")
     @classmethod

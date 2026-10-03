@@ -382,6 +382,40 @@ def _normalize_multimodal_messages(messages: list[dict]) -> list[dict]:
     return messages
 
 
+def _merge_leading_system_messages(messages: list[dict]) -> list[dict]:
+    """Fold the leading run of system messages into a single system message.
+
+    ``developer`` is normalized to ``system`` by the schema (#710), so a client
+    sending ``system`` + ``developer`` produces two leading system turns.
+    Strict chat templates (Qwen3.5/3.6) raise "System message must be at the
+    beginning." on the second one. Only the leading run is folded; a
+    mid-conversation system turn keeps its position. Runs after
+    ``_normalize_multimodal_messages``, so content is a string or absent.
+    The first turn's other fields are kept (``name`` only when all folded
+    turns share it), and any ``images``/``audio`` across the run are
+    concatenated.
+    """
+    run = 0
+    while run < len(messages) and messages[run].get("role") == "system":
+        run += 1
+    if run < 2:
+        return messages
+    leading = messages[:run]
+    merged = dict(leading[0])
+    parts = [m["content"] for m in leading if m.get("content")]
+    if parts:
+        merged["content"] = "\n\n".join(parts)
+    # Keep ``name`` only if every folded turn agrees; otherwise the first
+    # turn's name would claim the later turns' instructions.
+    if len({m.get("name") for m in leading}) > 1:
+        merged.pop("name", None)
+    for key in ("images", "audio"):
+        items = [x for m in leading for x in (m.get(key) or [])]
+        if items:
+            merged[key] = items
+    return [merged, *messages[run:]]
+
+
 @router.post(
     "/v1/chat/completions",
     response_model=OpenAIChatResponse,
@@ -423,6 +457,7 @@ async def openai_chat(req: OpenAIChatRequest, request: Request):
         messages = _normalize_multimodal_messages(messages)
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc))
+    messages = _merge_leading_system_messages(messages)
     grammar_spec = None
     if req.response_format and req.response_format.type in (
         "json_object",

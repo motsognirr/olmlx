@@ -755,6 +755,24 @@ class TestAnthropicEndpoint:
         mock_gen.assert_not_called()
 
     @pytest.mark.asyncio
+    async def test_unknown_role_returns_400(self, app_client):
+        """#710: an unrecognized role must 400 in the Anthropic error envelope
+        instead of being silently dropped from the prompt."""
+        resp = await app_client.post(
+            "/v1/messages",
+            json={
+                "model": "qwen3",
+                "max_tokens": 50,
+                "messages": [{"role": "bogus_role", "content": "hi"}],
+            },
+        )
+        assert resp.status_code == 400
+        data = resp.json()
+        assert data["type"] == "error"
+        assert data["error"]["type"] == "invalid_request_error"
+        assert "role" in data["error"]["message"]
+
+    @pytest.mark.asyncio
     async def test_missing_max_tokens_returns_400(self, app_client):
         """max_tokens is required per the Anthropic spec; omitting it must yield
         a 400 in the Anthropic error envelope, not a silent default 200."""
