@@ -165,6 +165,10 @@ class TestGuards:
         must be a hard error, never a silent copy-through."""
         src, model = _save(make_tiny_qwen3_moe, "qwen3_moe", tmp_path)
         w = mx.load(str(src / "model.safetensors"))
+        # mx.load is lazy: materialize before overwriting the file it reads
+        # from (mlx >= 0.32.2 otherwise fails "[read] Unable to read from
+        # file", here or — via a still-pending read — in a later test).
+        mx.eval(w)
         w["model.layers.0.mlp.mystery_bias"] = mx.zeros((8,))
         mx.save_safetensors(str(src / "model.safetensors"), w)
         with pytest.raises(ReapApplyError, match="mystery_bias"):
