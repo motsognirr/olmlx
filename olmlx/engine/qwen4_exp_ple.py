@@ -106,11 +106,15 @@ def _view_is_current(model_dir: Path, view: Path) -> bool:
     """True when the view was built from exactly the current source files."""
     try:
         recorded = json.loads((view / _FINGERPRINT).read_text())
-        for name in ("config.json", "ple-store.json", "model.safetensors.index.json"):
+        # The manifest name is mlx-vlm's choice; read it from the view's own
+        # config rather than hard-coding it.
+        view_config = json.loads((view / "config.json").read_text())
+        manifest = view_config["text_config"]["ple_storage"]["manifest"]
+        for name in (manifest, "model.safetensors.index.json"):
             if not (view / name).is_file():
                 return False
         return recorded == _source_fingerprint(model_dir)
-    except (OSError, ValueError):
+    except (OSError, ValueError, KeyError, TypeError):
         return False
 
 

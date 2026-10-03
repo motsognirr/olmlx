@@ -386,3 +386,21 @@ def test_store_dir_size_ignores_zero_inodes(tmp_path, monkeypatch):
 
     monkeypatch.setattr(type(tmp_path), "stat", fake_stat)
     assert store._dir_size(tmp_path) == 300
+
+
+def test_currency_uses_manifest_name_from_view_config(tmp_path):
+    """The PLE manifest file name comes from the view's config (mlx-vlm's
+    choice), not a hard-coded constant."""
+    from olmlx.engine import qwen4_exp_ple
+
+    model_dir = tmp_path / "model"
+    _write_checkpoint(model_dir)
+    view = ensure_external_ple_view(model_dir)
+    cfg = json.loads((view / "config.json").read_text())
+    (view / "ple-store.json").rename(view / "renamed-store.json")
+    cfg["text_config"]["ple_storage"]["manifest"] = "renamed-store.json"
+    (view / "config.json").write_text(json.dumps(cfg))
+
+    assert qwen4_exp_ple._view_is_current(model_dir, view) is True
+    (view / "renamed-store.json").unlink()
+    assert qwen4_exp_ple._view_is_current(model_dir, view) is False
