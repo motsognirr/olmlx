@@ -519,6 +519,23 @@ class TestBudgetMustBeBelowMaxTokens:
                 thinking={"type": "enabled", "budget_tokens": budget},
             )
 
+    def test_schema_rejects_negative_budget(self):
+        """A negative budget is nonsense (the processor would silently drop
+        it); reject it as a 400 instead. Zero stays valid."""
+        from pydantic import ValidationError
+
+        with pytest.raises(ValidationError, match="budget_tokens"):
+            self._req(
+                max_tokens=100,
+                thinking={"type": "enabled", "budget_tokens": -1},
+            )
+
+    def test_schema_accepts_zero_budget(self):
+        req = self._req(
+            max_tokens=100, thinking={"type": "enabled", "budget_tokens": 0}
+        )
+        assert req.thinking.budget_tokens == 0
+
     def test_schema_accepts_budget_below_max_tokens(self):
         req = self._req(
             max_tokens=100, thinking={"type": "enabled", "budget_tokens": 99}

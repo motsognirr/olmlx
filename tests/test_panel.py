@@ -693,10 +693,24 @@ class TestContinuationRouting:
             {"role": "tool", "content": "result", "tool_call_id": "1"},
         ]
         (members_a, _), _ = await panel_mod._run_panel(
-            None, _make_panel(), base, None, None, None, 128, None
+            None,
+            _make_panel(),
+            base,
+            tools=None,
+            options=None,
+            keep_alive=None,
+            max_tokens=128,
+            enable_thinking=None,
         )
         (members_b, _), _ = await panel_mod._run_panel(
-            None, _make_panel(), continuation, None, None, None, 128, None
+            None,
+            _make_panel(),
+            continuation,
+            tools=None,
+            options=None,
+            keep_alive=None,
+            max_tokens=128,
+            enable_thinking=None,
         )
         assert members_a == members_b == ["qa", "qb"]
 

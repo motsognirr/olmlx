@@ -78,7 +78,10 @@ class AnthropicMessage(BaseModel):
 
 class AnthropicThinkingParam(BaseModel):
     type: str
-    budget_tokens: int | None = None
+    # ge=0: a negative budget is a 400 (Anthropic parity) rather than being
+    # silently dropped downstream. 0 is meaningful (close immediately), and
+    # Anthropic's 1024 minimum is deliberately not enforced.
+    budget_tokens: int | None = Field(None, ge=0)
 
     model_config = {"extra": "allow"}
 
@@ -162,7 +165,9 @@ class AnthropicCountTokensRequest(AnthropicMessagesRequest):
     The real Anthropic count_tokens endpoint takes no max_tokens field, so —
     unlike /v1/messages — omitting it must not be an error. Re-declaring the
     field with a default makes it optional while inheriting every other field
-    and validator from AnthropicMessagesRequest.
+    and validator from AnthropicMessagesRequest, except the budget-vs-
+    max_tokens check, which is overridden to a no-op below (comparing against
+    a placeholder max_tokens would be meaningless).
     """
 
     max_tokens: int = Field(1, ge=1)
