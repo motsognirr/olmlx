@@ -707,6 +707,25 @@ class ModelStore:
                         models.append(manifest)
         return models
 
+    def read_manifest(self, local_dir: Path) -> ModelManifest | None:
+        """Load ``<local_dir>/manifest.json``, applying the #702 stale-estimator
+        refresh, or ``None`` when it is missing or unreadable.
+
+        The single reader for callers outside :meth:`list_local` / :meth:`show`
+        (``/api/ps``, the load-time size lookup) so none of them can bypass
+        :func:`_refresh_if_stale` (#741). Does disk I/O (and possibly a
+        manifest rewrite): call it via ``asyncio.to_thread`` on async paths.
+        """
+        manifest_path = local_dir / "manifest.json"
+        try:
+            manifest = ModelManifest.load(manifest_path)
+        except FileNotFoundError:
+            return None
+        except Exception:
+            logger.debug("Failed to load manifest: %s", manifest_path)
+            return None
+        return _refresh_if_stale(manifest, local_dir, manifest_path)
+
     def show(self, name: str) -> ModelManifest | None:
         resolved = self._resolve_model_dir(name)
         if resolved is None:

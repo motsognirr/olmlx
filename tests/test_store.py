@@ -986,6 +986,21 @@ class TestStaleManifestRefresh:
         results = mock_store.list_local()
         assert results[0].parameter_size == "494M"
 
+    def test_read_manifest_rederives_stale_manifest(self, mock_store):
+        """#741: the shared reader used by /api/ps and the load-time size
+        lookup applies the same refresh as list_local/show."""
+        local_dir = _write_stale_model(mock_store, self.HF)
+        result = mock_store.read_manifest(local_dir)
+        assert result is not None
+        self._assert_refreshed(result, local_dir)
+
+    def test_read_manifest_missing_returns_none(self, mock_store, tmp_path):
+        assert mock_store.read_manifest(tmp_path / "nope") is None
+
+    def test_read_manifest_corrupt_returns_none(self, mock_store, tmp_path):
+        (tmp_path / "manifest.json").write_text("{not json")
+        assert mock_store.read_manifest(tmp_path) is None
+
     def test_derive_manifest_stamps_estimator_version(self, tmp_path):
         from olmlx.models.store import _ESTIMATOR_VERSION, _derive_manifest
 

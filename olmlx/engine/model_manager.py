@@ -1171,16 +1171,11 @@ class ModelManager(SpeculativeLoaderMixin):
                     if self.store is not None:
                         _local_dir = self.store.local_path(hf_path)
                         if _local_dir.exists():
-                            _manifest_path = _local_dir / "manifest.json"
-                            if _manifest_path.exists():
-                                try:
-                                    import json
-
-                                    _model_size = json.loads(
-                                        _manifest_path.read_text()
-                                    ).get("size", 0)
-                                except Exception:
-                                    pass
+                            _manifest = await asyncio.to_thread(
+                                self.store.read_manifest, _local_dir
+                            )
+                            if _manifest is not None:
+                                _model_size = _manifest.size
                             if _model_size == 0:
                                 _model_size = await asyncio.to_thread(
                                     _dir_size, _local_dir

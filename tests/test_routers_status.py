@@ -84,6 +84,55 @@ class TestStatusRouter:
         assert model["digest"] == "sha256:abc123"
 
     @pytest.mark.asyncio
+    async def test_ps_rederives_stale_manifest_parameter_size(self, app_client):
+        """#741: /api/ps must apply the #702 stale-manifest refresh rather than
+        trusting a manifest written by an older estimator."""
+        from olmlx.models.store import _ESTIMATOR_VERSION
+
+        lm = app_client._transport.app.state.model_manager._loaded["qwen3:latest"]
+        store = app_client._transport.app.state.model_store
+        local_dir = store.local_path(lm.hf_path)
+        local_dir.mkdir(parents=True, exist_ok=True)
+        (local_dir / "config.json").write_text(
+            json.dumps(
+                {
+                    "model_type": "qwen2",
+                    "hidden_size": 896,
+                    "num_hidden_layers": 24,
+                    "intermediate_size": 4864,
+                    "num_attention_heads": 14,
+                    "num_key_value_heads": 2,
+                    "vocab_size": 151936,
+                    "tie_word_embeddings": True,
+                    "quantization": {"group_size": 64, "bits": 4},
+                }
+            )
+        )
+        # Pre-#702 manifest: no estimator_version, wrong parameter_size.
+        stale = {
+            "name": lm.name,
+            "hf_path": lm.hf_path,
+            "size": 4096,
+            "digest": "sha256:abc123",
+            "format": "mlx",
+            "family": "qwen2",
+            "parameter_size": "77M",
+            "quantization_level": "4-bit",
+        }
+        (local_dir / "manifest.json").write_text(json.dumps(stale))
+
+        resp = await app_client.get("/api/ps")
+        assert resp.status_code == 200
+        model = resp.json()["models"][0]
+        assert model["details"]["parameter_size"] == "494M"
+        assert model["details"]["family"] == "qwen2"
+        assert model["digest"] == "sha256:abc123"
+        on_disk = json.loads((local_dir / "manifest.json").read_text())
+        assert on_disk["parameter_size"] == "494M"
+        assert on_disk["estimator_version"] == _ESTIMATOR_VERSION
+        assert on_disk["size"] == 4096
+
+    @pytest.mark.asyncio
     async def test_ps_populates_size_and_vram(self, app_client, tmp_path):
         """ps populates size and size_vram from the manifest when lm.size_bytes is 0."""
         lm = app_client._transport.app.state.model_manager._loaded["qwen3:latest"]
