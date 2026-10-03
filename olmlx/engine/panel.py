@@ -248,6 +248,7 @@ async def _run_panel(
     keep_alive: int | str | None,
     max_tokens: int,
     enable_thinking: bool | None,
+    thinking_budget: int | None = None,
 ) -> tuple[tuple[list[str], list[str]], list[dict]]:
     """Route, run each panelist once, and reconcile this turn.
 
@@ -276,6 +277,9 @@ async def _run_panel(
             keep_alive=keep_alive,
             max_tokens=max_tokens,
             enable_thinking=enable_thinking,
+            # Each panelist is an independent generate_chat, so it honors the
+            # Anthropic thinking budget the same way a single model would.
+            thinking_budget=thinking_budget,
         )
         parse_text = result.get("raw_text") or result.get("text") or ""
         _thinking, visible, tool_uses = parse_model_output(
@@ -428,6 +432,7 @@ async def _judge_answer(
     max_tokens: int,
     enable_thinking: bool | None,
     stream: bool,
+    thinking_budget: int | None = None,
 ):
     """Run the judge (no tools) to synthesize the final answer.
 
@@ -446,6 +451,8 @@ async def _judge_answer(
         keep_alive=keep_alive,
         max_tokens=max_tokens,
         enable_thinking=enable_thinking,
+        # The judge's prose is the user-visible answer, so it gets the budget.
+        thinking_budget=thinking_budget,
         # The judge summarizes; keep channel-format reasoners (gpt-oss) terse so
         # they emit a clean final answer instead of spending the token budget in
         # the analysis channel. No-op for non-reasoning judges.
@@ -469,16 +476,13 @@ async def panel_generate_chat(
 ) -> AsyncGenerator[dict, None] | dict:
     """Drop-in, ``generate_chat``-compatible entry point for a panel model.
 
-    ``cache_id``, ``grammar_spec`` and ``thinking_budget`` are accepted for
-    signature parity but not applied to the panel as a whole (the judge/panelists manage
-    their own caching).
+    ``cache_id`` and ``grammar_spec`` are accepted for signature parity but
+    not applied to the panel as a whole (the judge/panelists manage their own
+    caching). ``thinking_budget`` (#743) is forwarded to each panelist and to
+    the judge's synthesis call; the classifier and the judge's stop-condition
+    decision run with thinking disabled and get no budget.
     """
     panel = _resolve_panel(manager, model_name)
-    if thinking_budget is not None:
-        # info, not warning: Anthropic clients send a budget every request.
-        logger.info(
-            "Thinking budget %d not enforced for panel %s", thinking_budget, model_name
-        )
     if stream:
         return _panel_stream(
             manager,
@@ -489,6 +493,7 @@ async def panel_generate_chat(
             keep_alive,
             max_tokens,
             enable_thinking,
+            thinking_budget,
         )
 
     (member_names, answers), merged = await _run_panel(
@@ -500,6 +505,7 @@ async def panel_generate_chat(
         keep_alive,
         max_tokens,
         enable_thinking,
+        thinking_budget,
     )
     if merged:
         raw = serialize_tool_calls_qwen(merged)
@@ -515,6 +521,7 @@ async def panel_generate_chat(
         max_tokens,
         enable_thinking,
         stream=False,
+        thinking_budget=thinking_budget,
     )
 
 
@@ -527,6 +534,7 @@ async def _panel_stream(
     keep_alive: int | str | None,
     max_tokens: int,
     enable_thinking: bool | None,
+    thinking_budget: int | None = None,
 ) -> AsyncGenerator[dict, None]:
     """Streaming coordinator.
 
@@ -544,6 +552,7 @@ async def _panel_stream(
         keep_alive,
         max_tokens,
         enable_thinking,
+        thinking_budget,
     )
     if merged:
         raw = serialize_tool_calls_qwen(merged)
@@ -568,6 +577,7 @@ async def _panel_stream(
         max_tokens,
         enable_thinking,
         stream=True,
+        thinking_budget=thinking_budget,
     )
     # ``_judge_answer`` calls ``generate_chat`` with a runtime ``stream`` bool,
     # so the overload can't narrow the return to the async-generator branch.

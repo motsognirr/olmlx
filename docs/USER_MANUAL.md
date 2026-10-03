@@ -1263,6 +1263,29 @@ Or disable:
 }
 ```
 
+**`budget_tokens`** caps the think block: once the model has generated
+roughly `budget_tokens` tokens with a think block still open, olmlx forces the
+think-close sequence so the model moves on to its answer. As in Anthropic's
+API, `budget_tokens` must be less than `max_tokens`; a request with
+`budget_tokens >= max_tokens` is rejected with a 400 `invalid_request_error`
+before any model is loaded. Unlike Anthropic, olmlx has no 1024-token minimum,
+because small budgets are reasonable for local models.
+
+The budget is **not enforced** in the following cases. The request still
+succeeds, the budget is ignored, and the server logs it at info level:
+
+| Case | Why |
+|------|-----|
+| Speculative models (classic, PLD, DFlash, EAGLE, MTP) | Speculative decoders don't apply logits processors yet. Support is planned once decoders gain sampler/processor support (#730). |
+| Distributed inference | The processor is a Python callable and can't be sent to the worker ranks. |
+| Grammar-constrained requests (JSON mode / JSON Schema) | A forced close token would break the grammar state. |
+| No evidence a think block is open | The budget applies only when the prompt ends in the think opener or the model emits it, so a direct answer is never cut off by a forced `</think>`. A model that reasons without either isn't capped. |
+| Tokenizers without think markers (e.g. gpt-oss, which uses the Harmony analysis channel) | There is no close sequence to force. |
+
+Panel models pass the budget to each panelist and to the judge's final answer.
+The routing classifier and the judge's gather/answer decision run with thinking
+disabled.
+
 #### Tool Use
 
 Define tools in Anthropic format — olmlx converts them to the model's native format internally:

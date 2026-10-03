@@ -2692,7 +2692,7 @@ class TestXCacheIDHeader:
 class TestThinkingParamSchema:
     def test_thinking_enabled(self):
         req = AnthropicMessagesRequest(
-            max_tokens=100,
+            max_tokens=16000,
             model="test",
             messages=[AnthropicMessage(role="user", content="hi")],
             thinking=AnthropicThinkingParam(type="enabled", budget_tokens=10000),
@@ -2723,7 +2723,7 @@ class TestThinkingParamSchema:
     def test_thinking_from_dict(self):
         """Schema parses thinking from raw dict (as JSON would arrive)."""
         req = AnthropicMessagesRequest(
-            max_tokens=100,
+            max_tokens=16000,
             model="test",
             messages=[AnthropicMessage(role="user", content="hi")],
             thinking={"type": "enabled", "budget_tokens": 5000},
@@ -2754,7 +2754,7 @@ class TestThinkingParamSchema:
     def test_thinking_extra_fields_accepted(self):
         """Unknown fields in thinking param are accepted for forward compatibility."""
         req = AnthropicMessagesRequest(
-            max_tokens=100,
+            max_tokens=16000,
             model="test",
             messages=[AnthropicMessage(role="user", content="hi")],
             thinking={"type": "enabled", "budget_tokens": 5000, "new_field": "value"},
@@ -2777,7 +2777,7 @@ class TestThinkingParamRouter:
                 json={
                     "model": "qwen3",
                     "messages": [{"role": "user", "content": "hi"}],
-                    "max_tokens": 100,
+                    "max_tokens": 16000,
                     "thinking": {"type": "enabled", "budget_tokens": 10000},
                 },
             )
@@ -2893,7 +2893,7 @@ class TestThinkingParamRouter:
                 json={
                     "model": "qwen3",
                     "messages": [{"role": "user", "content": "search for test"}],
-                    "max_tokens": 100,
+                    "max_tokens": 16000,
                     "thinking": {"type": "enabled", "budget_tokens": 10000},
                     "tools": [
                         {
@@ -2930,7 +2930,7 @@ class TestThinkingParamRouter:
                 json={
                     "model": "qwen3",
                     "messages": [{"role": "user", "content": "hi"}],
-                    "max_tokens": 100,
+                    "max_tokens": 16000,
                     "stream": True,
                     "thinking": {"type": "enabled", "budget_tokens": 8000},
                 },
@@ -2952,7 +2952,7 @@ class TestThinkingParamRouter:
                 json={
                     "model": "qwen3",
                     "messages": [{"role": "user", "content": "hi"}],
-                    "max_tokens": 100,
+                    "max_tokens": 16000,
                     "thinking": {"type": "enabled", "budget_tokens": 5000},
                 },
             )

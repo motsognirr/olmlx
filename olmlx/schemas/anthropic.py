@@ -1,6 +1,6 @@
-from typing import Any
+from typing import Any, ClassVar
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 from olmlx.schemas.common import ModelName
 
@@ -134,6 +134,29 @@ class AnthropicMessagesRequest(BaseModel):
 
     model_config = {"extra": "allow"}
 
+    # count_tokens takes no max_tokens (its schema defaults a placeholder), so
+    # the budget-vs-max_tokens rule below applies only to /v1/messages.
+    _check_budget_vs_max_tokens: ClassVar[bool] = True
+
+    @model_validator(mode="after")
+    def validate_budget_below_max_tokens(self) -> "AnthropicMessagesRequest":
+        # Match Anthropic (#743): budget_tokens must be < max_tokens, else 400
+        # invalid_request_error. Anthropic's 1024 minimum is deliberately NOT
+        # enforced — small budgets are legitimate for local models.
+        thinking = self.thinking
+        if (
+            self._check_budget_vs_max_tokens
+            and thinking is not None
+            and thinking.type != "disabled"
+            and thinking.budget_tokens is not None
+            and thinking.budget_tokens >= self.max_tokens
+        ):
+            raise ValueError(
+                f"thinking.budget_tokens ({thinking.budget_tokens}) must be "
+                f"less than max_tokens ({self.max_tokens})"
+            )
+        return self
+
 
 class AnthropicCountTokensRequest(AnthropicMessagesRequest):
     """Request schema for /v1/messages/count_tokens.
@@ -145,6 +168,8 @@ class AnthropicCountTokensRequest(AnthropicMessagesRequest):
     """
 
     max_tokens: int = Field(1, ge=1)
+
+    _check_budget_vs_max_tokens: ClassVar[bool] = False
 
 
 class AnthropicUsage(BaseModel):
