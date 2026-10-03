@@ -1448,6 +1448,11 @@ class ModelManager(SpeculativeLoaderMixin):
             )
         return True
 
+    # Hybrid linear-attention VLM families that mlx-vlm serves natively, exempt
+    # from the #284 reroute to mlx-lm. qwen4_exp (Qwen3.8-Flash-Next): mlx-lm
+    # has no module for it, and only mlx-vlm carries its mmap PLE storage.
+    _MLX_VLM_NATIVE_HYBRIDS = frozenset({"qwen4_exp"})
+
     # Config keys that indicate a vision-language model
     _VLM_CONFIG_KEYS = frozenset(
         {
@@ -1555,7 +1560,10 @@ class ModelManager(SpeculativeLoaderMixin):
             # Update this matcher (or replace with a model_type allowlist)
             # as new hybrid families appear.
             text_cfg = config.get("text_config")
-            if isinstance(text_cfg, dict):
+            if (
+                isinstance(text_cfg, dict)
+                and model_type not in self._MLX_VLM_NATIVE_HYBRIDS
+            ):
                 layer_types = text_cfg.get("layer_types")
                 if isinstance(layer_types, list) and "linear_attention" in layer_types:
                     # Resolve the mlx-lm module name in the try/except so the
@@ -2600,9 +2608,23 @@ class ModelManager(SpeculativeLoaderMixin):
                 mlx_lm, load_path, lazy=True
             )
         except _FALLBACK_EXCEPTIONS:
-            model, tokenizer, _ = self._vlm_fallback_load(load_path, hf_path, lazy=True)
+            # Served with is_vlm=True via mlx_vlm.stream_generate, so mirror
+            # the non-flash VLM loader: wrap the FULL VLM (stream_generate
+            # reads ``model.language_model``; the wrapper finds the decoder
+            # layers itself, and its non-expert eval also covers the vision
+            # tower) and keep the mlx-vlm processor as the "tokenizer"
+            # (stream_generate needs its ``detokenizer``).
+            from olmlx.engine.vlm_load import load_vlm
+
+            logger.info("mlx-lm failed for %s, falling back to mlx-vlm", hf_path)
+            model, processor = load_vlm(load_path, lazy=True)
+            tok = processor.tokenizer if hasattr(processor, "tokenizer") else processor
+            self._load_chat_template(tok, load_path, hf_path)
+            caps = detect_caps(tok)
+            tokenizer = processor
             is_vlm = True
-        caps = detect_caps(tokenizer)
+        else:
+            caps = detect_caps(tokenizer)
 
         # The store is not returned: unload recovers it from the wrapper's
         # `_weight_store` attribute.

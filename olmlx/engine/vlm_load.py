@@ -18,14 +18,18 @@ def load_vlm(path: str, **kwargs: Any) -> tuple[Any, Any]:
     """
     import mlx_vlm
 
-    from olmlx.engine.gemma4_sanitize_fix import ensure_gemma4_sanitize_patch
-
     # Function-local import: model_manager imports this module (lazily), so a
     # top-level import back would form a cycle. Matches flash.prepare's pattern.
     from olmlx.engine.model_manager import _materialize_module_buffers
 
-    ensure_gemma4_sanitize_patch()
-    model, processor = mlx_vlm.load(path, **kwargs)
+    from olmlx.engine.qwen4_exp_ple import ensure_external_ple_view
+
+    # Qwen4-Exp: serve the ~30 GiB n-gram (PLE) tables by mmap row lookup
+    # instead of wiring them as parameters (see engine/qwen4_exp_ple.py).
+    view = ensure_external_ple_view(path)
+    if view is not None:
+        path = str(view)
+    model, processor = mlx_vlm.load(path, **kwargs)  # pyright: ignore[reportPrivateImportUsage]
     # Materialize non-parameter buffers (scaled-RoPE ``_freqs``, ...) on THIS
     # (load) thread. mlx-vlm's parameter eval — like mlx-lm's — skips underscore
     # buffers, so left lazy they crash when first evaluated on the generation

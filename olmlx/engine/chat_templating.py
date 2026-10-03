@@ -735,7 +735,7 @@ def _apply_chat_template_vlm(
     if enable_thinking is not None:
         extra_kwargs["enable_thinking"] = enable_thinking
     # Pass the full message list so the model gets proper conversation context
-    result = mlx_vlm.apply_chat_template(
+    result = mlx_vlm.apply_chat_template(  # pyright: ignore[reportPrivateImportUsage]
         processor,
         config,
         messages,

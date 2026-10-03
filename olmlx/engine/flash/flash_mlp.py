@@ -12,7 +12,7 @@ from collections import deque
 import mlx.core as mx
 import mlx.nn as nn
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 from olmlx.engine.flash.predictor import SparsityPredictor
 from olmlx.engine.flash.weight_store import FlashWeightStore
@@ -91,7 +91,7 @@ class WindowManager:
             self._cached_window[layer_idx] = set()
         if active_list is None:
             mx.eval(active_indices)
-            active_list = active_indices.tolist()
+            active_list = cast(list[int], active_indices.tolist())
         self._history[layer_idx].append(set(active_list))
         self._dirty[layer_idx] = True
 

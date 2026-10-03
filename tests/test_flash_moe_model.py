@@ -1,5 +1,7 @@
 """Tests for olmlx.engine.flash.flash_moe_model — Flash-MoE model wrapper."""
 
+import json
+
 import mlx.core as mx
 import mlx.nn as nn
 import pytest
@@ -1324,3 +1326,194 @@ class TestWrapFlashMoe:
                 MagicMock(), flash_dir, io_threads=4, cache_budget_experts=4
             )
         spy_store.close.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# mlx-vlm Qwen3.5-family MoE blocks (Qwen4-Exp / Qwen3.8-Flash-Next).
+# These carry no ``norm_topk_prob`` (top-k scores are always renormalized)
+# and compute the shared-expert scale through an overridable
+# ``_shared_expert_scale`` (Qwen4-Exp uses a row-invariant quantized
+# projection). Tested against the REAL upstream block for numerical parity.
+# ---------------------------------------------------------------------------
+
+
+def _tiny_qwen4_exp_text_config():
+    from mlx_vlm.models.qwen4_exp.config import TextConfig
+
+    return TextConfig(
+        model_type="qwen4_exp_text",
+        hidden_size=64,
+        num_hidden_layers=1,
+        num_attention_heads=4,
+        linear_num_value_heads=4,
+        linear_num_key_heads=2,
+        linear_key_head_dim=16,
+        linear_value_head_dim=16,
+        linear_conv_kernel_dim=4,
+        num_experts=8,
+        num_experts_per_tok=3,
+        shared_expert_intermediate_size=32,
+        moe_intermediate_size=32,
+        rms_norm_eps=1e-6,
+        vocab_size=128,
+        num_key_value_heads=2,
+        max_position_embeddings=1024,
+    )
+
+
+class _Qwen4ExpMoeLayer(nn.Module):
+    def __init__(self, block):
+        super().__init__()
+        self.mlp = block
+
+
+class _Qwen4ExpMoeModel(nn.Module):
+    def __init__(self, block):
+        super().__init__()
+        self.layers = [_Qwen4ExpMoeLayer(block)]
+
+
+class TestFlashMoeQwen4ExpVlm:
+    @pytest.fixture()
+    def block_and_store(self, tmp_path):
+        from mlx.utils import tree_map
+        from safetensors.numpy import save_file
+
+        import numpy as np
+
+        from mlx_vlm.models.qwen4_exp.language import Qwen4ExpSparseMoeBlock
+
+        from olmlx.engine.flash.moe_bundler import bundle_moe_experts
+        from olmlx.engine.flash.moe_weight_store import FlashMoeWeightStore
+
+        mx.random.seed(0)
+        cfg = _tiny_qwen4_exp_text_config()
+        block = Qwen4ExpSparseMoeBlock(cfg)
+        # float32: CPU GatherMM (CI runners) only supports float32.
+        block.update(tree_map(lambda a: a.astype(mx.float32), block.parameters()))
+        mx.eval(block.parameters())
+
+        model_dir = tmp_path / "model"
+        model_dir.mkdir()
+        tensors = {
+            f"model.layers.0.mlp.switch_mlp.{proj}.weight": np.array(
+                getattr(block.switch_mlp, proj).weight
+            )
+            for proj in ("gate_proj", "up_proj", "down_proj")
+        }
+        save_file(tensors, str(model_dir / "model.safetensors"))
+        (model_dir / "config.json").write_text(
+            json.dumps(
+                {
+                    "hidden_size": cfg.hidden_size,
+                    "moe_intermediate_size": cfg.moe_intermediate_size,
+                    "num_hidden_layers": 1,
+                    "num_experts": cfg.num_experts,
+                    "num_experts_per_tok": cfg.num_experts_per_tok,
+                }
+            )
+        )
+        bundle_moe_experts(model_dir, tmp_path / "flash_moe")
+        store = FlashMoeWeightStore(
+            tmp_path / "flash_moe", num_io_threads=2, cache_budget_experts=8
+        )
+        yield block, store, cfg
+        store.close()
+
+    def test_dispatches_to_vlm_qwen35_class(self, block_and_store):
+        from olmlx.engine.flash.flash_moe_model import (
+            FlashMoeModelWrapper,
+            _FlashMoEQwen35Vlm,
+        )
+
+        block, store, cfg = block_and_store
+        model = _Qwen4ExpMoeModel(block)
+        FlashMoeModelWrapper(
+            model,
+            store,
+            [0],
+            cfg.hidden_size,
+            cfg.moe_intermediate_size,
+            cfg.num_experts,
+            cfg.num_experts_per_tok,
+        )
+        assert isinstance(model.layers[0].mlp, _FlashMoEQwen35Vlm)
+
+    def test_matches_upstream_block_output(self, block_and_store):
+        from olmlx.engine.flash.flash_moe_model import FlashMoeModelWrapper
+
+        block, store, cfg = block_and_store
+        x = mx.random.normal((1, 5, cfg.hidden_size)).astype(mx.float32)
+        expected = block(x)
+        mx.eval(expected)
+
+        model = _Qwen4ExpMoeModel(block)
+        FlashMoeModelWrapper(
+            model,
+            store,
+            [0],
+            cfg.hidden_size,
+            cfg.moe_intermediate_size,
+            cfg.num_experts,
+            cfg.num_experts_per_tok,
+        )
+        actual = model.layers[0].mlp(x)
+        mx.eval(actual)
+        assert actual.shape == expected.shape
+        assert mx.allclose(
+            actual.astype(mx.float32), expected.astype(mx.float32), atol=2e-2
+        ).item()
+
+    def test_wraps_full_vlm_model_without_top_level_layers(self, block_and_store):
+        """mlx-vlm's qwen3_5/qwen4_exp top-level Model exposes no ``layers``;
+        the wrapper replaces MoE layers on ``language_model`` but keeps the
+        full VLM as the wrapped model (``mlx_vlm.stream_generate`` reads
+        ``model.language_model``), and ``layers`` resolves to the decoder."""
+        from olmlx.engine.flash.flash_moe_model import (
+            FlashMoeModelWrapper,
+            _FlashMoEQwen35Vlm,
+        )
+
+        block, store, cfg = block_and_store
+        language_model = _Qwen4ExpMoeModel(block)
+
+        class _Vlm(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.language_model = language_model
+                self.vision_tower = nn.Linear(4, 4)
+
+        vlm = _Vlm()
+        wrapped = FlashMoeModelWrapper(
+            vlm,
+            store,
+            [0],
+            cfg.hidden_size,
+            cfg.moe_intermediate_size,
+            cfg.num_experts,
+            cfg.num_experts_per_tok,
+        )
+        assert wrapped._model is vlm
+        assert wrapped.language_model is language_model
+        assert isinstance(language_model.layers[0].mlp, _FlashMoEQwen35Vlm)
+        assert wrapped.layers is language_model.layers
+
+
+def test_qwen3_next_branch_without_norm_topk_prob_raises_clearly():
+    """A Qwen3.5-family mlx-vlm block that no longer matches the
+    _FlashMoEQwen35Vlm dispatch (e.g. upstream renamed _shared_expert_scale)
+    must fail with an actionable error, not a bare AttributeError."""
+    from unittest.mock import MagicMock
+
+    from olmlx.engine.flash.flash_moe_model import _FlashMoEQwen3Next
+
+    class _Block(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.gate = nn.Linear(4, 2, bias=False)
+            self.top_k = 1
+            self.shared_expert = nn.Linear(4, 4)
+            self.shared_expert_gate = nn.Linear(4, 1, bias=False)
+
+    with pytest.raises(NotImplementedError, match="norm_topk_prob"):
+        _FlashMoEQwen3Next(_Block(), MagicMock())
