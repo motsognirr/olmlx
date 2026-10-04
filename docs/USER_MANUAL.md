@@ -1271,7 +1271,8 @@ non-negative and less than `max_tokens`; a request that breaks any of these
 rules is rejected with a 400 `invalid_request_error` before any model is
 loaded. Budgets sent with any other
 `type` (`"disabled"`, `"adaptive"`, or an unknown type) are not checked, and a
-negative one is ignored. Unlike Anthropic, olmlx has no 1024-token minimum,
+negative one is ignored. In particular, `"adaptive"` (which Claude Code sends)
+needs no budget; without one the think block is bounded only by `max_tokens`. Unlike Anthropic, olmlx has no 1024-token minimum,
 because small budgets are reasonable for local models.
 
 The budget is **not enforced** in the following cases. The request still

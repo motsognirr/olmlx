@@ -295,11 +295,11 @@ async def _run_panel(
         manager,
         panel,
         messages,
-        members,
-        answers,
-        per_panelist_tools,
-        options,
-        keep_alive,
+        members=members,
+        answers=answers,
+        per_panelist_tools=per_panelist_tools,
+        options=options,
+        keep_alive=keep_alive,
     )
     return (members, answers), merged
 
@@ -377,6 +377,7 @@ async def _resolve_tool_turn(
     manager: "ModelManager",
     panel: "PanelConfig",
     messages: list[dict],
+    *,
     members: list[str],
     answers: list[str],
     per_panelist_tools: list[list[dict]],
