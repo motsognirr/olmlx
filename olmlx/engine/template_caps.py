@@ -45,6 +45,20 @@ def _find_template_variables(tpl: str) -> set[str] | None:
         return None
 
 
+def _is_template_raise(exc: BaseException) -> bool:
+    """True for the exception transformers' ``raise_exception`` throws.
+
+    That is exactly ``jinja2.exceptions.TemplateError`` — its subclasses
+    (syntax errors, undefined variables) are template bugs, not a deliberate
+    rejection of the conversation.
+    """
+    try:
+        import jinja2
+    except ImportError:  # pragma: no cover - jinja2 ships with transformers
+        return False
+    return type(exc) is jinja2.exceptions.TemplateError
+
+
 _PROBE_LEADING_SYSTEM = [
     {"role": "system", "content": "s"},
     {"role": "user", "content": "u"},
@@ -66,8 +80,9 @@ def _probe_rejects_positional_system(tokenizer: Any, tpl: str) -> bool:
     A static scan can't tell "raise on a non-first system turn" from other
     ``raise_exception`` guards, so render the template: the conversation with
     a leading system turn must render and the same conversation with an extra
-    late system turn must raise. A template that rejects both (no system role
-    at all) or neither is not flagged — folding wouldn't change the outcome.
+    late system turn must ``raise_exception``. A template that rejects both
+    (no system role at all) or neither is not flagged — folding wouldn't
+    change the outcome.
     """
     if "raise_exception" not in tpl:
         return False
@@ -82,8 +97,11 @@ def _probe_rejects_positional_system(tokenizer: Any, tpl: str) -> bool:
     try:
         apply(_PROBE_LATE_SYSTEM, **kwargs)
     except Exception as exc:
-        logger.debug("Template rejects a non-leading system turn: %s", exc)
-        return True
+        # Only the template's deliberate ``raise_exception`` counts; a template
+        # bug on the late render must not reorder the client's messages.
+        if _is_template_raise(exc):
+            logger.debug("Template rejects a non-leading system turn: %s", exc)
+            return True
     return False
 
 

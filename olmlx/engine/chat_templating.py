@@ -14,7 +14,7 @@ import json
 import logging
 from typing import TYPE_CHECKING, Any
 
-from olmlx.engine.template_caps import TemplateCaps
+from olmlx.engine.template_caps import TemplateCaps, _is_template_raise
 
 if TYPE_CHECKING:
     from olmlx.engine.prompt_cache.checkpoint import SegmentedPrompt
@@ -31,20 +31,6 @@ class ChatTemplateRejectedError(ValueError, RuntimeError):
     ``RuntimeError`` so existing ``except RuntimeError`` fallbacks around
     template application keep catching it.
     """
-
-
-def _is_template_raise(exc: BaseException) -> bool:
-    """True for the exception transformers' ``raise_exception`` throws.
-
-    That is exactly ``jinja2.exceptions.TemplateError`` — its subclasses
-    (syntax errors, undefined variables) are template bugs, not a rejection
-    of the request, and stay a 500.
-    """
-    try:
-        import jinja2
-    except ImportError:  # pragma: no cover - jinja2 ships with transformers
-        return False
-    return type(exc) is jinja2.exceptions.TemplateError
 
 
 def _fold_system_messages_to_front(messages: list[dict]) -> list[dict]:

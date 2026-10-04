@@ -239,3 +239,20 @@ class TestReviewFollowups:
             {"role": "system", "content": "b", "name": "x"},
         ]
         assert _fold_system_messages_to_front(messages)[0]["name"] == "x"
+
+
+class TestProbeOnlyCountsDeliberateRejection:
+    def test_late_render_failing_for_other_reasons_is_not_flagged(self):
+        # The late render fails with a template *bug* (undefined attribute
+        # access), not a raise_exception — must not trigger the fold.
+        tpl = """
+{%- for message in messages %}
+    {%- if message.role == "system" and not loop.first %}
+        {{- message.missing.attr }}
+    {%- endif %}
+    {{- message.content }}
+{%- endfor %}
+{%- if false %}{{ raise_exception('unused') }}{% endif %}
+"""
+        caps = detect_caps(_JinjaTokenizer(tpl))
+        assert caps.rejects_positional_system is False
