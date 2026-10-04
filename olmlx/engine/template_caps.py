@@ -91,6 +91,13 @@ def detect_caps(tokenizer: Any) -> TemplateCaps:
     """Inspect the tokenizer's chat_template to determine supported features."""
     tpl = getattr(tokenizer, "chat_template", None)
     if tpl is None:
+        # VLM processors may keep the template (and its renderer) on the
+        # wrapped tokenizer — same lookup as ``_get_chat_template_text``.
+        inner = getattr(tokenizer, "tokenizer", None)
+        inner_tpl = getattr(inner, "chat_template", None)
+        if isinstance(inner_tpl, (str, list)):
+            tokenizer, tpl = inner, inner_tpl
+    if tpl is None:
         return TemplateCaps()
 
     # Handle list-of-dicts format (named templates)

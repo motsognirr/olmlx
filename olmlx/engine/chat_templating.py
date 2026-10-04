@@ -74,8 +74,11 @@ def _fold_system_messages_to_front(messages: list[dict]) -> list[dict]:
     # Same metadata rules as the OpenAI router's leading-run merge: keep
     # ``name`` only if every folded turn agrees, and carry every turn's
     # ``images``/``audio`` over so no client input is silently dropped.
-    if len({m.get("name") for m in systems}) > 1:
+    names = {m.get("name") for m in systems}
+    if len(names) > 1:
         lead.pop("name", None)
+    elif None not in names:
+        lead["name"] = names.pop()
     for key in ("images", "audio"):
         items = [x for m in systems for x in (m.get(key) or [])]
         if items:

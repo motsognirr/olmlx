@@ -220,3 +220,22 @@ class TestFoldKeepsMetadata:
             {"role": "system", "content": "b", "name": "y"},
         ]
         assert "name" not in _fold_system_messages_to_front(differ)[0]
+
+
+class TestReviewFollowups:
+    def test_probe_uses_inner_tokenizer_of_processor(self):
+        class Processor:
+            # Processor without its own apply_chat_template; the template and
+            # the renderer live on the wrapped tokenizer (VLM layout).
+            def __init__(self):
+                self.tokenizer = _JinjaTokenizer(STRICT_TEMPLATE)
+
+        caps = detect_caps(Processor())
+        assert caps.rejects_positional_system is True
+
+    def test_agreed_name_copied_onto_new_lead(self):
+        messages = [
+            {"role": "user", "content": "u"},
+            {"role": "system", "content": "b", "name": "x"},
+        ]
+        assert _fold_system_messages_to_front(messages)[0]["name"] == "x"
