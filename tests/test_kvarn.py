@@ -577,6 +577,10 @@ class TestMakeKvarnCache:
 
 
 class TestKvarnBudgetEstimate:
+    """The estimate gates live generation: KVarN (like TurboQuant) holds the
+    packed state plus a full-precision dequant side buffer until the cache is
+    stored, and layers the codec can't take stay plain fp16 KVCache."""
+
     def _model(self):
         args = MagicMock(spec=[])
         args.num_hidden_layers = 4
@@ -594,8 +598,8 @@ class TestKvarnBudgetEstimate:
         model = self._model()
         fp16 = estimate_kv_cache_bytes(model, 10000)
         kvarn = estimate_kv_cache_bytes(model, 10000, kv_cache_quant="kvarn:k4v2")
-        # fp16 K+V: 2*256 bytes. kvarn: K 64+8, V 32+8 → 112 bytes.
-        assert fp16 / kvarn == pytest.approx(512 / 112, rel=0.01)
+        # fp16 K+V: 2*256 bytes. kvarn: K 64+8+256, V 32+8+256 → 624 bytes.
+        assert fp16 / kvarn == pytest.approx(512 / 624, rel=0.01)
 
     def test_symmetric_2(self):
         from olmlx.engine.kv_budget import estimate_kv_cache_bytes
@@ -603,4 +607,84 @@ class TestKvarnBudgetEstimate:
         model = self._model()
         fp16 = estimate_kv_cache_bytes(model, 10000)
         kvarn = estimate_kv_cache_bytes(model, 10000, kv_cache_quant="kvarn:2")
-        assert fp16 / kvarn == pytest.approx(512 / 80, rel=0.01)
+        assert fp16 / kvarn == pytest.approx(512 / 592, rel=0.01)
+
+    @staticmethod
+    def _layered_model(head_dims):
+        from types import SimpleNamespace
+
+        args = SimpleNamespace(
+            num_hidden_layers=len(head_dims),
+            num_attention_heads=8,
+            num_key_value_heads=2,
+            head_dim=128,
+            hidden_size=1024,
+        )
+        layers = [
+            SimpleNamespace(self_attn=SimpleNamespace(n_kv_heads=2, head_dim=hd))
+            for hd in head_dims
+        ]
+        return SimpleNamespace(args=args, model=SimpleNamespace(layers=layers))
+
+    @pytest.mark.parametrize(
+        "spec,quant_ratio,bad_head_dim",
+        [
+            ("kvarn:k4v2", 624 / 512, 72),  # 72: no power-of-two tile ≥ 16
+            ("turboquant:2", 292 / 256, 66),  # 66: not divisible by 4
+        ],
+    )
+    def test_incompatible_layer_charged_at_fp16(self, spec, quant_ratio, bad_head_dim):
+        from olmlx.engine.kv_budget import MEMORY_SAFETY_FACTOR, estimate_kv_cache_bytes
+
+        model = self._layered_model([128, bad_head_dim])
+        n = 1000
+        got = estimate_kv_cache_bytes(model, n, kv_cache_quant=spec)
+        quantized = 2 * 2 * 128 * n * 2 * quant_ratio
+        plain = 2 * 2 * bad_head_dim * n * 2
+        assert got == pytest.approx(
+            (quantized + plain) * MEMORY_SAFETY_FACTOR, rel=1e-6
+        )
+
+
+class TestPackedBufferMaterialization:
+    """The packed buffers never feed the returned K/V (those come from the
+    side buffer), so without help they grow a lazy slice_update chain every
+    decode token. Each pending write pins a buffer: a 36-layer model hit
+    ``metal::malloc Resource limit (499000)`` at ~3.4k generated tokens
+    (TurboQuant on main too). The cache must fold the chain into the token
+    graph at each ``step`` boundary."""
+
+    @pytest.mark.parametrize("make", ["kvarn", "turboquant"])
+    def test_packed_buffers_materialized_at_step_boundary(self, make):
+        from olmlx.engine.turboquant import TurboQuantRotation
+        from olmlx.engine.turboquant_cache import TurboQuantKVCache
+
+        if make == "kvarn":
+            c = _make_cache(head_dim=64)
+        else:
+            c = TurboQuantKVCache(
+                bits=4,
+                rotation_key=TurboQuantRotation(head_dim=64, seed=0),
+                rotation_value=TurboQuantRotation(head_dim=64, seed=1),
+            )
+        step = c.step
+
+        def decode_to_boundary():
+            x = mx.random.normal((1, 1, 10, 64))
+            mx.eval(c.update_and_fetch(x, x))
+            for _ in range(step - 10):  # last write lands exactly on `step`
+                t = mx.random.normal((1, 1, 1, 64))
+                # Mirrors mlx-lm: only the returned K/V reach the eval.
+                mx.eval(c.update_and_fetch(t, t))
+            assert c.offset == step
+
+        assert "error" not in _run_in_thread(decode_to_boundary)
+
+        # No ensure_state_materialized: the boundary step must already have
+        # materialized the packed chain. Reading it from another thread
+        # raises "There is no Stream" on Metal if it is still lazy.
+        def read_packed():
+            mx.eval(c._key_indices, c._key_norms, c._value_indices, c._value_norms)
+
+        res = _run_in_thread(read_packed)
+        assert "error" not in res, res.get("error")

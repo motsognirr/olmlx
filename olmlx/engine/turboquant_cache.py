@@ -256,10 +256,30 @@ class TurboQuantKVCache(_BaseCache):
         self._key_dequant[..., prev : self.offset, :] = k_new
         self._value_dequant[..., prev : self.offset, :] = v_new
 
-        return (
-            self._key_dequant[..., : self.offset, :],
-            self._value_dequant[..., : self.offset, :],
-        )
+        keys_out = self._key_dequant[..., : self.offset, :]
+        values_out = self._value_dequant[..., : self.offset, :]
+        if self.offset // self.step != prev // self.step:
+            # The packed writes above never enter the returned K/V's graph
+            # (those are side-buffer views), so mlx-lm's per-token eval leaves
+            # them a growing lazy slice_update chain — one pinned buffer per
+            # packed buffer per layer per token. Unbounded, that exhausts
+            # Metal's buffer limit (``metal::malloc Resource limit (499000)``
+            # at ~3.4k decode tokens on a 36-layer model). Once per ``step``
+            # tokens, make the returned keys depend on the packed buffers so
+            # the token's own eval materializes the chain on the generating
+            # thread: no extra sync, no per-token cost, safe under compile.
+            # (End-of-generation ``ensure_state_materialized`` still covers
+            # the < step tail.)
+            (keys_out,) = mx.depends(
+                [keys_out],
+                [
+                    self._key_indices,
+                    self._key_norms,
+                    self._value_indices,
+                    self._value_norms,
+                ],
+            )
+        return keys_out, values_out
 
     @property
     def state(self):

@@ -2092,6 +2092,7 @@ On each attention step, the cache is dequantized: unpack indices, look up centro
 ### Constraints
 
 - **Incompatible with disk cache offload** — cannot save/restore quantized cache state to disk
+- **The compression is for the stored cache, not live generation.** While a request is generating, the cache also keeps a full-precision dequantized copy of the history, so that only the new token needs dequantizing each step. Live KV memory is therefore slightly *above* fp16. The copy is dropped once the cache is stored between turns, and that stored cache is what the ratios above describe. The pre-flight KV memory check charges the live footprint, so an over-long prompt gets a clean error instead of a Metal OOM.
 - Head dimension must be divisible by the packing factor (2 for 4-bit, 4 for 2-bit)
 - Works with hybrid models (e.g., Nemotron-H SSM+attention) — only attention layers are quantized
 - Works transparently with prompt caching (KV cache reuse)
@@ -2129,7 +2130,7 @@ Store: packed indices + float32 (mean, scale) per tile
 
 The cache reuses TurboQuant's dequant side buffer (`KVarNKVCache` subclasses `TurboQuantKVCache`), so decode speed is on par with TurboQuant. Prompt caching, speculative trim, hybrid layouts, and all the constraints above apply unchanged. A layer whose head dim has no power-of-two tile ≥ 16 stays unquantized.
 
-Compression at `head_dim=128`: `kvarn:4` ~3.6x, `kvarn:k4v2` ~4.6x, `kvarn:2` ~6.4x. The per-tile stats cost 8 bytes per 128 coordinates.
+Compression at `head_dim=128`: `kvarn:4` ~3.6x, `kvarn:k4v2` ~4.6x, `kvarn:2` ~6.4x. The per-tile stats cost 8 bytes per 128 coordinates. Like TurboQuant, these ratios apply to the stored cache; live generation also holds the full-precision side buffer (see Constraints above).
 
 Teacher-forced fidelity against an fp16 cache, on a greedy chain-of-thought trace (mean next-token KL; lower is better):
 
