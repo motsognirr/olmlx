@@ -330,6 +330,7 @@ async def _judge_wants_gather(
     manager: "ModelManager",
     panel: "PanelConfig",
     messages: list[dict],
+    *,
     members: list[str],
     answers: list[str],
     per_panelist_tools: list[list[dict]],
@@ -402,11 +403,11 @@ async def _resolve_tool_turn(
             manager,
             panel,
             messages,
-            members,
-            answers,
-            per_panelist_tools,
-            options,
-            keep_alive,
+            members=members,
+            answers=answers,
+            per_panelist_tools=per_panelist_tools,
+            options=options,
+            keep_alive=keep_alive,
         ):
             return merge_tool_calls(per_panelist_tools)
         return []

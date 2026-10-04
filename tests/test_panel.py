@@ -899,6 +899,52 @@ class TestRouterDispatchBehavioral:
             f"generate_chat was called unexpectedly: {generate_called}"
         )
 
+    @pytest.mark.asyncio
+    async def test_anthropic_panel_dispatch_forwards_thinking_budget(self, monkeypatch):
+        """/v1/messages on a panel model hands thinking.budget_tokens (and
+        enable_thinking) to panel_generate_chat, so panels honor the budget
+        end to end (#743)."""
+        from httpx import ASGITransport, AsyncClient
+        from unittest.mock import MagicMock
+
+        from olmlx.app import create_app
+        from olmlx.utils.timing import TimingStats
+
+        reg = _registry_with_panel(monkeypatch)
+        received: list[dict] = []
+
+        async def fake_panel_generate_chat(
+            manager, model_name, messages, options=None, **kwargs
+        ):
+            received.append(kwargs)
+            return {"text": "panel answer", "done": True, "stats": TimingStats()}
+
+        monkeypatch.setattr(
+            "olmlx.routers.anthropic.panel_generate_chat", fake_panel_generate_chat
+        )
+
+        app = create_app()
+        app.state.registry = reg
+        app.state.model_manager = MagicMock()
+        app.state.model_store = MagicMock()
+
+        transport = ASGITransport(app=app, raise_app_exceptions=True)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            resp = await client.post(
+                "/v1/messages",
+                json={
+                    "model": "list-panel",
+                    "messages": [{"role": "user", "content": "hello"}],
+                    "max_tokens": 1024,
+                    "thinking": {"type": "enabled", "budget_tokens": 256},
+                },
+            )
+
+        assert resp.status_code == 200, resp.text
+        assert len(received) == 1
+        assert received[0].get("thinking_budget") == 256
+        assert received[0].get("enable_thinking") is True
+
 
 def _registry_with_panel(monkeypatch):
     import json as _json
