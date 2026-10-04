@@ -603,6 +603,47 @@ class TestBudgetMustBeBelowMaxTokens:
         )
         assert req.thinking.budget_tokens == 5000
 
+    def test_schema_rejects_enabled_without_budget(self):
+        """Anthropic requires budget_tokens when type is "enabled"; without
+        it the think block would run uncapped, so it is a 400."""
+        from pydantic import ValidationError
+
+        with pytest.raises(ValidationError, match="budget_tokens"):
+            self._req(max_tokens=100, thinking={"type": "enabled"})
+
+    def test_count_tokens_enabled_without_budget_not_checked(self):
+        """count_tokens opts out of thinking-budget validation entirely."""
+        from olmlx.schemas.anthropic import AnthropicCountTokensRequest
+
+        req = AnthropicCountTokensRequest(
+            model="qwen3",
+            messages=[{"role": "user", "content": "hi"}],
+            thinking={"type": "enabled"},
+        )
+        assert req.thinking.budget_tokens is None
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("stream", [False, True])
+    async def test_router_400_enabled_without_budget(self, app_client, stream):
+        with patch(
+            "olmlx.routers.anthropic.generate_chat", new_callable=AsyncMock
+        ) as mock_gen:
+            resp = await app_client.post(
+                "/v1/messages",
+                json={
+                    "model": "qwen3",
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "max_tokens": 1024,
+                    "stream": stream,
+                    "thinking": {"type": "enabled"},
+                },
+            )
+        assert resp.status_code == 400
+        data = resp.json()
+        assert data["error"]["type"] == "invalid_request_error"
+        assert "budget_tokens" in data["error"]["message"]
+        mock_gen.assert_not_called()
+
     @pytest.mark.asyncio
     @pytest.mark.parametrize("stream", [False, True])
     async def test_router_returns_400_before_generation(self, app_client, stream):

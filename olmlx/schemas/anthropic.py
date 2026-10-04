@@ -144,16 +144,17 @@ class AnthropicMessagesRequest(BaseModel):
         # type == "enabled" (the only type Anthropic defines the rule for):
         # adaptive / forward-compat types must not be 400'd, and a budget
         # >= max_tokens can never trigger before max_tokens anyway.
-        # A negative budget is likewise a 400 (rather than being silently
-        # dropped downstream) under the same gate; 0 is meaningful (close
-        # immediately).
+        # Under the same gate, a missing budget is a 400 (Anthropic requires
+        # it; without one the think block runs uncapped) and so is a negative
+        # one (rather than being silently dropped downstream); 0 is
+        # meaningful (close immediately).
         thinking = self.thinking
-        if (
-            thinking is None
-            or thinking.type != "enabled"
-            or thinking.budget_tokens is None
-        ):
+        if thinking is None or thinking.type != "enabled":
             return self
+        if thinking.budget_tokens is None:
+            raise ValueError(
+                'thinking.budget_tokens is required when thinking.type is "enabled"'
+            )
         if thinking.budget_tokens < 0:
             raise ValueError(
                 f"thinking.budget_tokens ({thinking.budget_tokens}) must be "
