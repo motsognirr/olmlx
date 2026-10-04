@@ -90,8 +90,10 @@ def _probe_rejects_positional_system(tokenizer: Any, tpl: str) -> bool:
     if not callable(apply):
         return False
     kwargs = {"tokenize": False, "add_generation_prompt": True}
+    # Fresh copies per render: some renderers (mlx-vlm processors) rewrite
+    # messages in place, which would corrupt the shared probe constants.
     try:
-        apply(_PROBE_LEADING_SYSTEM, **kwargs)
+        apply([dict(m) for m in _PROBE_LEADING_SYSTEM], **kwargs)
     except Exception as exc:
         # Visible by default so "probe couldn't render" is distinguishable from
         # "positional system is fine"; either way the fold stays off and a
@@ -103,7 +105,7 @@ def _probe_rejects_positional_system(tokenizer: Any, tpl: str) -> bool:
         )
         return False
     try:
-        apply(_PROBE_LATE_SYSTEM, **kwargs)
+        apply([dict(m) for m in _PROBE_LATE_SYSTEM], **kwargs)
     except Exception as exc:
         # Only the template's deliberate ``raise_exception`` counts; a template
         # bug on the late render must not reorder the client's messages.

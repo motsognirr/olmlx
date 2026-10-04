@@ -279,3 +279,25 @@ class TestFoldConsistency:
             _fold_system_messages_to_front(messages), add_generation_prompt=True
         )
         assert n == len(expected)
+
+
+class TestProbeConstantsNotMutated:
+    def test_mutating_renderer_cannot_corrupt_probe(self):
+        from olmlx.engine import template_caps as tc
+
+        before = (
+            [dict(m) for m in tc._PROBE_LEADING_SYSTEM],
+            [dict(m) for m in tc._PROBE_LATE_SYSTEM],
+        )
+
+        class Mutating(_JinjaTokenizer):
+            def apply_chat_template(self, messages, tokenize=False, **kwargs):
+                out = super().apply_chat_template(messages, **kwargs)
+                for m in messages:
+                    m["content"] = [{"type": "text", "text": m["content"]}]
+                messages.append({"role": "user", "content": "junk"})
+                return out
+
+        detect_caps(Mutating(STRICT_TEMPLATE))
+        assert tc._PROBE_LEADING_SYSTEM == before[0]
+        assert tc._PROBE_LATE_SYSTEM == before[1]
