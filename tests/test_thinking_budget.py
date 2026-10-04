@@ -530,6 +530,29 @@ class TestBudgetMustBeBelowMaxTokens:
                 thinking={"type": "enabled", "budget_tokens": -1},
             )
 
+    @pytest.mark.parametrize("thinking_type", ["disabled", "adaptive", "future-mode"])
+    def test_negative_budget_not_checked_for_non_enabled_types(self, thinking_type):
+        """The non-negative rule is gated like the budget < max_tokens rule:
+        only ``type: enabled`` is validated, so an inert budget on another
+        type is not a 400."""
+        req = self._req(
+            max_tokens=100,
+            thinking={"type": thinking_type, "budget_tokens": -1},
+        )
+        assert req.thinking.budget_tokens == -1
+
+    def test_count_tokens_negative_budget_not_checked(self):
+        """count_tokens opts out of budget validation entirely, negatives
+        included."""
+        from olmlx.schemas.anthropic import AnthropicCountTokensRequest
+
+        req = AnthropicCountTokensRequest(
+            model="qwen3",
+            messages=[{"role": "user", "content": "hi"}],
+            thinking={"type": "enabled", "budget_tokens": -1},
+        )
+        assert req.thinking.budget_tokens == -1
+
     def test_schema_accepts_zero_budget(self):
         req = self._req(
             max_tokens=100, thinking={"type": "enabled", "budget_tokens": 0}
