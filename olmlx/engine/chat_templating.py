@@ -71,7 +71,10 @@ def _fold_system_messages_to_front(messages: list[dict]) -> list[dict]:
     if not any(m.get("role") == "system" for m in messages[1:]):
         return messages
     systems = [m for m in messages if m.get("role") == "system"]
-    if any(not isinstance(m.get("content") or "", str) for m in systems):
+    if any(
+        m.get("content") is not None and not isinstance(m["content"], str)
+        for m in systems
+    ):
         return messages
     rest = [m for m in messages if m.get("role") != "system"]
     return [_merge_system_turns(systems), *rest]

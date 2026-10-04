@@ -301,3 +301,13 @@ class TestProbeConstantsNotMutated:
         detect_caps(Mutating(STRICT_TEMPLATE))
         assert tc._PROBE_LEADING_SYSTEM == before[0]
         assert tc._PROBE_LATE_SYSTEM == before[1]
+
+
+class TestFoldNonStringGuard:
+    @pytest.mark.parametrize("content", [[], {}])
+    def test_falsy_non_string_content_is_not_folded(self, content):
+        messages = [
+            {"role": "user", "content": "u"},
+            {"role": "system", "content": content},
+        ]
+        assert _fold_system_messages_to_front(messages) is messages
