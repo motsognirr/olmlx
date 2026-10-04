@@ -33,44 +33,48 @@ class ChatTemplateRejectedError(ValueError, RuntimeError):
     """
 
 
+def _merge_system_turns(turns: list[dict]) -> dict:
+    """Merge system turns into one message — the shared metadata rules.
+
+    Used by both the OpenAI router's leading-run merge and the engine's
+    late-system fold, so the two agree on what a merged turn means. Starts
+    from the first turn's fields; non-empty contents are joined with blank
+    lines; ``name`` is kept only if every turn agrees (otherwise the first
+    turn's name would claim the later turns' instructions); ``images`` and
+    ``audio`` from every turn are concatenated so no client input is dropped.
+    Content must already be a string or absent.
+    """
+    merged = dict(turns[0])
+    parts = [m["content"] for m in turns if m.get("content")]
+    if parts:
+        merged["content"] = "\n\n".join(parts)
+    if len({m.get("name") for m in turns}) > 1:
+        merged.pop("name", None)
+    for key in ("images", "audio"):
+        items = [x for m in turns for x in (m.get(key) or [])]
+        if items:
+            merged[key] = items
+    return merged
+
+
 def _fold_system_messages_to_front(messages: list[dict]) -> list[dict]:
     """Fold every non-leading system turn into the leading system message.
 
     For templates that reject a system turn anywhere but first (Qwen3.5/3.6,
-    detected by ``TemplateCaps.rejects_positional_system``). Later system
-    content is appended to the leading system message in order; if the
-    conversation doesn't start with one, a leading system message is created.
-    ``images``/``audio`` from every system turn are carried over. Returns the
-    input unchanged when there's nothing to fold, and never mutates it. Non-string system content is left alone (the template's own
-    rejection then surfaces as a 400).
+    detected by ``TemplateCaps.rejects_positional_system``). All system turns
+    are merged in order by ``_merge_system_turns`` into a single leading
+    message (which becomes the leading message even when the conversation
+    didn't start with one). Returns the input unchanged when there's nothing
+    to fold, and never mutates it. Non-string system content is left alone
+    (the template's own rejection then surfaces as a 400).
     """
-    late = [i for i, m in enumerate(messages) if m.get("role") == "system" and i > 0]
-    if not late:
+    if not any(m.get("role") == "system" for m in messages[1:]):
         return messages
     systems = [m for m in messages if m.get("role") == "system"]
     if any(not isinstance(m.get("content") or "", str) for m in systems):
         return messages
-    lead = (
-        dict(messages[0])
-        if messages[0].get("role") == "system"
-        else {"role": "system", "content": ""}
-    )
-    parts = [m["content"] for m in systems if m.get("content")]
-    lead["content"] = "\n\n".join(parts)
-    # Same metadata rules as the OpenAI router's leading-run merge: keep
-    # ``name`` only if every folded turn agrees, and carry every turn's
-    # ``images``/``audio`` over so no client input is silently dropped.
-    names = {m.get("name") for m in systems}
-    if len(names) > 1:
-        lead.pop("name", None)
-    elif None not in names:
-        lead["name"] = names.pop()
-    for key in ("images", "audio"):
-        items = [x for m in systems for x in (m.get(key) or [])]
-        if items:
-            lead[key] = items
     rest = [m for m in messages if m.get("role") != "system"]
-    return [lead, *rest]
+    return [_merge_system_turns(systems), *rest]
 
 
 def _inject_tools_into_system(messages: list[dict], tools: list[dict]) -> list[dict]:

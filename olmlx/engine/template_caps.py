@@ -93,10 +93,14 @@ def _probe_rejects_positional_system(tokenizer: Any, tpl: str) -> bool:
     try:
         apply(_PROBE_LEADING_SYSTEM, **kwargs)
     except Exception as exc:
-        # Distinguish "probe couldn't render" from "positional system is fine"
-        # in the logs; either way the fold stays off and a real rejection
-        # still surfaces as a 400.
-        logger.debug("Positional-system probe could not render template: %s", exc)
+        # Visible by default so "probe couldn't render" is distinguishable from
+        # "positional system is fine"; either way the fold stays off and a
+        # real rejection still surfaces as a 400.
+        logger.info(
+            "Positional-system probe could not render template (late system "
+            "turns will not be folded): %s",
+            exc,
+        )
         return False
     try:
         apply(_PROBE_LATE_SYSTEM, **kwargs)
