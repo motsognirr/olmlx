@@ -214,6 +214,7 @@ def _fake_generate_chat_factory(responses: dict):
         enable_thinking=None,
         reasoning_effort=None,
         grammar_spec=None,
+        thinking_budget=None,
     ):
         text = responses[model_name]
         return {"text": text, "done": True, "stats": None}
@@ -454,31 +455,84 @@ class TestPanelGenerateChatNonStream:
         assert captured.get("reasoning_effort") == "low"
 
     @pytest.mark.asyncio
-    async def test_thinking_budget_ignored_is_logged(self, monkeypatch, caplog):
-        """Panels don't enforce the Anthropic thinking budget (#716); that
-        must be observable in the log rather than silently dropped."""
-        import logging
+    @pytest.mark.parametrize("stream", [False, True])
+    async def test_thinking_budget_forwarded_to_judge_and_panelists(
+        self, monkeypatch, stream
+    ):
+        """#743: the judge's prose is the user-visible answer and each
+        panelist is an independent generate_chat, so both must receive the
+        Anthropic thinking budget. The classifier (thinking disabled) must
+        not."""
+        calls: list[tuple[str, dict]] = []
+        responses = {
+            "c": '{"route": "default"}',
+            "da": "A",
+            "db": "B",
+            "j": "final",
+        }
 
-        async def _ok(manager, model_name, messages, **kwargs):
-            assert "thinking_budget" not in kwargs
-            return {"text": "final", "done": True, "stats": None}
+        async def _capture(manager, model_name, messages, **kwargs):
+            calls.append((model_name, kwargs))
+            text = responses[model_name]
+            if kwargs.get("stream"):
 
-        monkeypatch.setattr(panel_mod, "generate_chat", _ok)
+                async def _gen():
+                    yield {"text": text}
+                    yield {"done": True, "done_reason": "stop"}
+
+                return _gen()
+            return {"text": text, "done": True, "stats": None}
+
+        monkeypatch.setattr(panel_mod, "generate_chat", _capture)
         monkeypatch.setattr(panel_mod, "_resolve_panel", lambda m, n: _make_panel())
-        with caplog.at_level(logging.INFO, logger="olmlx.engine.panel"):
-            await panel_mod.panel_generate_chat(
-                manager=None,
-                model_name="p:latest",
-                messages=[{"role": "user", "content": "hi"}],
-                tools=None,
-                stream=False,
-                thinking_budget=1024,
-            )
-        assert any(
-            "thinking budget" in r.getMessage().lower()
-            and "not enforced" in r.getMessage()
-            for r in caplog.records
+        result = await panel_mod.panel_generate_chat(
+            manager=None,
+            model_name="p:latest",
+            messages=[{"role": "user", "content": "hi"}],
+            tools=None,
+            stream=stream,
+            thinking_budget=1024,
         )
+        if stream:
+            await _drain(result)
+        by_model = {name: kw for name, kw in calls}
+        assert set(by_model) == {"c", "da", "db", "j"}
+        assert by_model["j"].get("thinking_budget") == 1024
+        assert by_model["da"].get("thinking_budget") == 1024
+        assert by_model["db"].get("thinking_budget") == 1024
+        assert by_model["c"].get("thinking_budget") is None
+
+    @pytest.mark.asyncio
+    async def test_judge_decision_call_gets_no_thinking_budget(self, monkeypatch):
+        """The stop_condition="judge" decision call is a 16-token grammar-
+        constrained JSON verdict with thinking disabled — no budget."""
+        calls: list[tuple[str, dict]] = []
+        tool_call = (
+            '<tool_call>\n{"name": "search", "arguments": {"q": "x"}}\n</tool_call>'
+        )
+        responses = {"c": '{"route": "default"}', "da": tool_call, "db": "B", "dc": "C"}
+
+        async def _capture(manager, model_name, messages, **kwargs):
+            calls.append((model_name, kwargs))
+            if model_name == "j":
+                return {"text": '{"action": "gather"}', "done": True, "stats": None}
+            return {"text": responses[model_name], "done": True, "stats": None}
+
+        monkeypatch.setattr(panel_mod, "generate_chat", _capture)
+        monkeypatch.setattr(
+            panel_mod, "_resolve_panel", lambda m, n: _panel_with_stop("judge")
+        )
+        await panel_mod.panel_generate_chat(
+            manager=None,
+            model_name="p:latest",
+            messages=[{"role": "user", "content": "hi"}],
+            tools=[{"type": "function", "function": {"name": "search"}}],
+            stream=False,
+            thinking_budget=1024,
+        )
+        decision = [kw for name, kw in calls if name == "j"]
+        assert decision, "judge decision call expected"
+        assert all(kw.get("thinking_budget") is None for kw in decision)
 
     @pytest.mark.asyncio
     async def test_final_turn_returns_judge_answer(self, monkeypatch):
@@ -520,6 +574,7 @@ def _fake_generate_chat_streaming_factory(responses: dict, stream_models: set):
         enable_thinking=None,
         reasoning_effort=None,
         grammar_spec=None,
+        thinking_budget=None,
     ):
         text = responses[model_name]
         if stream and model_name in stream_models:
@@ -638,10 +693,24 @@ class TestContinuationRouting:
             {"role": "tool", "content": "result", "tool_call_id": "1"},
         ]
         (members_a, _), _ = await panel_mod._run_panel(
-            None, _make_panel(), base, None, None, None, 128, None
+            None,
+            _make_panel(),
+            base,
+            tools=None,
+            options=None,
+            keep_alive=None,
+            max_tokens=128,
+            enable_thinking=None,
         )
         (members_b, _), _ = await panel_mod._run_panel(
-            None, _make_panel(), continuation, None, None, None, 128, None
+            None,
+            _make_panel(),
+            continuation,
+            tools=None,
+            options=None,
+            keep_alive=None,
+            max_tokens=128,
+            enable_thinking=None,
         )
         assert members_a == members_b == ["qa", "qb"]
 
@@ -667,6 +736,7 @@ class TestFailurePropagation:
             enable_thinking=None,
             reasoning_effort=None,
             grammar_spec=None,
+            thinking_budget=None,
         ):
             if model_name == raise_on:
                 raise RuntimeError(f"boom in {model_name}")
@@ -828,6 +898,52 @@ class TestRouterDispatchBehavioral:
         assert generate_called == [], (
             f"generate_chat was called unexpectedly: {generate_called}"
         )
+
+    @pytest.mark.asyncio
+    async def test_anthropic_panel_dispatch_forwards_thinking_budget(self, monkeypatch):
+        """/v1/messages on a panel model hands thinking.budget_tokens (and
+        enable_thinking) to panel_generate_chat, so panels honor the budget
+        end to end (#743)."""
+        from httpx import ASGITransport, AsyncClient
+        from unittest.mock import MagicMock
+
+        from olmlx.app import create_app
+        from olmlx.utils.timing import TimingStats
+
+        reg = _registry_with_panel(monkeypatch)
+        received: list[dict] = []
+
+        async def fake_panel_generate_chat(
+            manager, model_name, messages, options=None, **kwargs
+        ):
+            received.append(kwargs)
+            return {"text": "panel answer", "done": True, "stats": TimingStats()}
+
+        monkeypatch.setattr(
+            "olmlx.routers.anthropic.panel_generate_chat", fake_panel_generate_chat
+        )
+
+        app = create_app()
+        app.state.registry = reg
+        app.state.model_manager = MagicMock()
+        app.state.model_store = MagicMock()
+
+        transport = ASGITransport(app=app, raise_app_exceptions=True)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            resp = await client.post(
+                "/v1/messages",
+                json={
+                    "model": "list-panel",
+                    "messages": [{"role": "user", "content": "hello"}],
+                    "max_tokens": 1024,
+                    "thinking": {"type": "enabled", "budget_tokens": 256},
+                },
+            )
+
+        assert resp.status_code == 200, resp.text
+        assert len(received) == 1
+        assert received[0].get("thinking_budget") == 256
+        assert received[0].get("enable_thinking") is True
 
 
 def _registry_with_panel(monkeypatch):
