@@ -194,3 +194,29 @@ class TestTemplateRejectionIs400:
         with pytest.raises(RuntimeError) as ei:
             _apply_chat_template(Boom(), [{"role": "user", "content": "x"}])
         assert not isinstance(ei.value, ValueError)
+
+
+class TestFoldKeepsMetadata:
+    def test_late_system_images_and_audio_carried_over(self):
+        messages = [
+            {"role": "system", "content": "a", "images": ["i1"]},
+            {"role": "user", "content": "u1"},
+            {"role": "system", "content": "b", "images": ["i2"], "audio": ["a1"]},
+        ]
+        lead = _fold_system_messages_to_front(messages)[0]
+        assert lead["images"] == ["i1", "i2"]
+        assert lead["audio"] == ["a1"]
+
+    def test_name_kept_only_when_all_agree(self):
+        same = [
+            {"role": "system", "content": "a", "name": "x"},
+            {"role": "user", "content": "u"},
+            {"role": "system", "content": "b", "name": "x"},
+        ]
+        assert _fold_system_messages_to_front(same)[0]["name"] == "x"
+        differ = [
+            {"role": "system", "content": "a", "name": "x"},
+            {"role": "user", "content": "u"},
+            {"role": "system", "content": "b", "name": "y"},
+        ]
+        assert "name" not in _fold_system_messages_to_front(differ)[0]

@@ -54,8 +54,8 @@ def _fold_system_messages_to_front(messages: list[dict]) -> list[dict]:
     detected by ``TemplateCaps.rejects_positional_system``). Later system
     content is appended to the leading system message in order; if the
     conversation doesn't start with one, a leading system message is created.
-    Returns the input unchanged when there's nothing to fold, and never
-    mutates it. Non-string system content is left alone (the template's own
+    ``images``/``audio`` from every system turn are carried over. Returns the
+    input unchanged when there's nothing to fold, and never mutates it. Non-string system content is left alone (the template's own
     rejection then surfaces as a 400).
     """
     late = [i for i, m in enumerate(messages) if m.get("role") == "system" and i > 0]
@@ -71,6 +71,15 @@ def _fold_system_messages_to_front(messages: list[dict]) -> list[dict]:
     )
     parts = [m["content"] for m in systems if m.get("content")]
     lead["content"] = "\n\n".join(parts)
+    # Same metadata rules as the OpenAI router's leading-run merge: keep
+    # ``name`` only if every folded turn agrees, and carry every turn's
+    # ``images``/``audio`` over so no client input is silently dropped.
+    if len({m.get("name") for m in systems}) > 1:
+        lead.pop("name", None)
+    for key in ("images", "audio"):
+        items = [x for m in systems for x in (m.get(key) or [])]
+        if items:
+            lead[key] = items
     rest = [m for m in messages if m.get("role") != "system"]
     return [lead, *rest]
 
