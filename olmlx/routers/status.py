@@ -1,4 +1,4 @@
-import json
+import asyncio
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -50,24 +50,23 @@ async def ps(request: Request):
             expires = datetime.fromtimestamp(lm.expires_at, tz=timezone.utc).isoformat()
 
         # Read metadata from the manifest (backfilled at load time) to avoid
-        # expensive _dir_size / _extract_metadata calls on the event loop.
+        # an expensive _dir_size walk.
         size = lm.size_bytes
         meta = {"family": "", "parameter_size": "", "quantization_level": ""}
         digest = ""
         if store is not None:
-            local_dir = store.local_path(lm.hf_path)
-            manifest_path = local_dir / "manifest.json"
-            if manifest_path.exists():
-                try:
-                    m = json.loads(manifest_path.read_text())
-                    if size == 0:
-                        size = m.get("size", 0)
-                    digest = m.get("digest", "")
-                    meta["family"] = m.get("family", "")
-                    meta["parameter_size"] = m.get("parameter_size", "")
-                    meta["quantization_level"] = m.get("quantization_level", "")
-                except Exception:
-                    pass
+            # read_manifest applies the #702 stale-estimator refresh (#741),
+            # which may re-read config.json and rewrite the manifest.
+            m = await asyncio.to_thread(
+                store.read_manifest, store.local_path(lm.hf_path)
+            )
+            if m is not None:
+                if size == 0:
+                    size = m.size
+                digest = m.digest
+                meta["family"] = m.family
+                meta["parameter_size"] = m.parameter_size
+                meta["quantization_level"] = m.quantization_level
 
         # Override with HQQ weight quantization if applied at load time.
         if lm.weight_quant:
