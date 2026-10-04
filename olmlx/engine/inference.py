@@ -110,6 +110,7 @@ from olmlx.engine.generation_options import (  # noqa: F401
 from olmlx.engine.kv_budget import (  # noqa: F401
     MEMORY_SAFETY_FACTOR,
     _parse_kv_cache_quant,
+    _parse_kv_cache_quant_kv,
     build_context_input_tokens,
     estimate_kv_cache_bytes,
     tokenize_for_cache,
@@ -1181,6 +1182,16 @@ def _make_turboquant_prompt_cache(model: Any, bits: int, is_vlm: bool = False) -
     return make_turboquant_cache(cache_model, bits=bits)
 
 
+def _make_kvarn_prompt_cache(
+    model: Any, key_bits: int, value_bits: int, is_vlm: bool = False
+) -> list:
+    """Create a KVarN-compressed prompt cache for the model (#748)."""
+    from olmlx.engine.kvarn_cache import make_kvarn_cache
+
+    cache_model = _get_model_for_cache(model, is_vlm)
+    return make_kvarn_cache(cache_model, key_bits=key_bits, value_bits=value_bits)
+
+
 def _make_spectral_prompt_cache(
     model: Any, bits: int, calibration_dir: Any, is_vlm: bool = False
 ) -> list:
@@ -1246,7 +1257,11 @@ def _make_prompt_cache_for_lm(lm: LoadedModel) -> list:
     (plain mlx-lm, TurboQuant, or SpectralQuant).  Single source of truth
     for cache creation."""
     if lm.kv_cache_quant is not None:
-        method, bits = _parse_kv_cache_quant(lm.kv_cache_quant)
+        method, bits, value_bits = _parse_kv_cache_quant_kv(lm.kv_cache_quant)
+        if method == "kvarn":
+            return _make_kvarn_prompt_cache(
+                lm.model, bits, value_bits, is_vlm=lm.is_vlm
+            )
         if method == "spectral":
             return _make_spectral_prompt_cache(
                 lm.model, bits, lm.spectral_calibration_dir, is_vlm=lm.is_vlm
@@ -1794,6 +1809,7 @@ def _cache_list_contains_lazy_state(cache: list[Any]) -> bool:
     LAZY_STATE_CLASSES = {
         "ArraysCache",
         "TurboQuantKVCache",
+        "KVarNKVCache",
         "SpectralQuantKVCache",
         "ShardKVCache",
     }

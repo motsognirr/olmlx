@@ -224,6 +224,16 @@ SCENARIOS: list[Scenario] = [
         env_overrides={"OLMLX_KV_CACHE_QUANT": "turboquant:2"},
     ),
     Scenario(
+        name="kvarn-k4v2",
+        description="KVarN variance-normalized KV quant, 4-bit keys / 2-bit values",
+        env_overrides={"OLMLX_KV_CACHE_QUANT": "kvarn:k4v2"},
+    ),
+    Scenario(
+        name="kvarn-2",
+        description="KVarN variance-normalized 2-bit KV cache quantization",
+        env_overrides={"OLMLX_KV_CACHE_QUANT": "kvarn:2"},
+    ),
+    Scenario(
         name="spectral-4",
         description="SpectralQuant 4-bit KV cache quantization",
         env_overrides={"OLMLX_KV_CACHE_QUANT": "spectral:4"},

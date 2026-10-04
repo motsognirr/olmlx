@@ -69,6 +69,19 @@ def _parse_kv_cache_quant(spec: str) -> tuple[str, int]:
     return method, int(bits_str)
 
 
+def _parse_kv_cache_quant_kv(spec: str) -> tuple[str, int, int]:
+    """Like ``_parse_kv_cache_quant`` but returns ``(method, key_bits,
+    value_bits)``, accepting KVarN's asymmetric ``kvarn:k4v2`` form (#748).
+    Symmetric methods report the same width for K and V."""
+    method, bits_str = spec.split(":")
+    if method == "kvarn":
+        from olmlx.config import parse_kvarn_bits
+
+        key_bits, value_bits = parse_kvarn_bits(bits_str)
+        return method, key_bits, value_bits
+    return method, int(bits_str), int(bits_str)
+
+
 def estimate_kv_cache_bytes(
     model: Any, num_tokens: int, *, kv_cache_quant: str | None = None
 ) -> int:
@@ -160,9 +173,21 @@ def estimate_kv_cache_bytes(
     bytes_per_element = 2  # float16/bfloat16
 
     if kv_cache_quant is not None:
-        method, quant_bits = _parse_kv_cache_quant(kv_cache_quant)
+        method, quant_bits, value_bits = _parse_kv_cache_quant_kv(kv_cache_quant)
         fp16_per_entry = head_dim * bytes_per_element
-        if method == "turboquant":
+        if method == "kvarn":
+            # KVarN (#748): per-K/V packed indices + a float32 (mean, scale)
+            # pair per tile. Averaged over K and V since the estimate applies
+            # one ratio to the K+V total.
+            from olmlx.engine.kvarn import choose_tile
+
+            tile = choose_tile(head_dim)
+            if tile is not None:
+                stats_bytes = 8 * (head_dim // tile)
+                k_entry = head_dim // (8 // quant_bits) + stats_bytes
+                v_entry = head_dim // (8 // value_bits) + stats_bytes
+                _tq_ratio = (k_entry + v_entry) / (2 * fp16_per_entry)
+        elif method == "turboquant":
             # TurboQuant: packed indices + float32 norm
             tq_per_entry = head_dim // (8 // quant_bits) + 4  # 4 bytes for f32 norm
             _tq_ratio = tq_per_entry / fp16_per_entry
