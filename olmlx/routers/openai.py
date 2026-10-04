@@ -389,8 +389,10 @@ def _merge_leading_system_messages(messages: list[dict]) -> list[dict]:
     ``developer`` is normalized to ``system`` by the schema (#710), so a client
     sending ``system`` + ``developer`` produces two leading system turns.
     Strict chat templates (Qwen3.5/3.6) raise "System message must be at the
-    beginning." on the second one. Only the leading run is folded; a
-    mid-conversation system turn keeps its position. Runs after
+    beginning." on the second one. Only the leading run is folded here; a
+    mid-conversation system turn keeps its position, and ``generate_chat``
+    folds it to the front only for templates that reject it
+    (``TemplateCaps.rejects_positional_system``, #740). Runs after
     ``_normalize_multimodal_messages``, so content is a string or absent.
     The first turn's other fields are kept (``name`` only when all folded
     turns share it), and any ``images``/``audio`` across the run are

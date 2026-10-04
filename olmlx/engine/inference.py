@@ -79,6 +79,7 @@ from olmlx.engine.chat_templating import (
     _apply_chat_template_vlm,
     _convert_tool_messages_to_responses,
     _convert_tool_messages_to_user_text,
+    _fold_system_messages_to_front,
     _get_chat_template_text,
     _inject_tools_into_system,
     _normalize_tool_calls_in_messages,
@@ -4614,6 +4615,13 @@ async def generate_chat(
         # the model's own chat template so the helper can suppress patterns the
         # template uses natively (e.g. Mistral's `[TOOL_CALLS]`).
         caps = lm.template_caps or TemplateCaps()
+        # Templates that raise on a non-leading system turn (Qwen3.5/3.6) get
+        # every system/developer turn folded into the leading one; templates
+        # that render a positional system turn keep it in place (#740). Runs
+        # before the native-tool hint so the hint lands on the merged message.
+        # Identity check: a MagicMock caps must not trigger the fold.
+        if caps.rejects_positional_system is True:
+            messages = _fold_system_messages_to_front(messages)
         if tools and caps.supports_tools:
             template_text = _get_chat_template_text(lm.tokenizer)
             messages = _add_native_tool_hint(messages, template_text)

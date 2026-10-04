@@ -22,6 +22,59 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+class ChatTemplateRejectedError(ValueError, RuntimeError):
+    """The chat template ``raise_exception``-ed on the request's messages.
+
+    Templates raise to reject a conversation shape they can't render (a late
+    system turn, an unknown role, images in a system message), so this is a
+    client error: a ``ValueError`` → 400 (#740). It is also a
+    ``RuntimeError`` so existing ``except RuntimeError`` fallbacks around
+    template application keep catching it.
+    """
+
+
+def _is_template_raise(exc: BaseException) -> bool:
+    """True for the exception transformers' ``raise_exception`` throws.
+
+    That is exactly ``jinja2.exceptions.TemplateError`` — its subclasses
+    (syntax errors, undefined variables) are template bugs, not a rejection
+    of the request, and stay a 500.
+    """
+    try:
+        import jinja2
+    except ImportError:  # pragma: no cover - jinja2 ships with transformers
+        return False
+    return type(exc) is jinja2.exceptions.TemplateError
+
+
+def _fold_system_messages_to_front(messages: list[dict]) -> list[dict]:
+    """Fold every non-leading system turn into the leading system message.
+
+    For templates that reject a system turn anywhere but first (Qwen3.5/3.6,
+    detected by ``TemplateCaps.rejects_positional_system``). Later system
+    content is appended to the leading system message in order; if the
+    conversation doesn't start with one, a leading system message is created.
+    Returns the input unchanged when there's nothing to fold, and never
+    mutates it. Non-string system content is left alone (the template's own
+    rejection then surfaces as a 400).
+    """
+    late = [i for i, m in enumerate(messages) if m.get("role") == "system" and i > 0]
+    if not late:
+        return messages
+    systems = [m for m in messages if m.get("role") == "system"]
+    if any(not isinstance(m.get("content") or "", str) for m in systems):
+        return messages
+    lead = (
+        dict(messages[0])
+        if messages[0].get("role") == "system"
+        else {"role": "system", "content": ""}
+    )
+    parts = [m["content"] for m in systems if m.get("content")]
+    lead["content"] = "\n\n".join(parts)
+    rest = [m for m in messages if m.get("role") != "system"]
+    return [lead, *rest]
+
+
 def _inject_tools_into_system(messages: list[dict], tools: list[dict]) -> list[dict]:
     """Inject tool descriptions into the system message when the template doesn't support tools natively."""
     tool_desc_parts = []
@@ -226,9 +279,17 @@ def _apply_chat_template(
             try:
                 return tokenizer.apply_chat_template(messages, **kwargs)
             except Exception as exc2:
+                if _is_template_raise(exc2):
+                    raise ChatTemplateRejectedError(
+                        f"Chat template rejected the messages: {exc2}"
+                    ) from exc2
                 raise RuntimeError(
                     f"Chat template failed even without tools: {exc2}"
                 ) from exc2
+        if _is_template_raise(exc):
+            raise ChatTemplateRejectedError(
+                f"Chat template rejected the messages: {exc}"
+            ) from exc
         raise RuntimeError(f"Chat template failed: {exc}") from exc
 
 
@@ -669,6 +730,38 @@ def _apply_chat_template_vlm(
     audio: list[str] | None = None,
 ) -> str:
     """Apply chat template for vision-language models (mlx-vlm).
+
+    A template ``raise_exception`` surfaces as ``ChatTemplateRejectedError``
+    (400), matching the text path (#740).
+    """
+    try:
+        return _render_vlm_prompt(
+            processor,
+            model,
+            messages,
+            images,
+            tools=tools,
+            enable_thinking=enable_thinking,
+            audio=audio,
+        )
+    except Exception as exc:
+        if _is_template_raise(exc):
+            raise ChatTemplateRejectedError(
+                f"Chat template rejected the messages: {exc}"
+            ) from exc
+        raise
+
+
+def _render_vlm_prompt(
+    processor: Any,
+    model: Any,
+    messages: list[dict],
+    images: list[str] | None = None,
+    tools: list[dict] | None = None,
+    enable_thinking: bool | None = None,
+    audio: list[str] | None = None,
+) -> str:
+    """Render the VLM prompt; see ``_apply_chat_template_vlm``.
 
     When tools are provided, bypasses mlx_vlm.apply_chat_template and calls
     the processor's tokenizer directly.  mlx_vlm's message processing wraps

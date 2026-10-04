@@ -22,6 +22,11 @@ class TemplateCaps:
     # Minimal templates (e.g. Devstral/Mistral) only allow user/system/assistant
     # and raise on anything else; for those we fold tool turns into user text.
     handles_tool_role: bool = False
+    # Whether the template raises on a system turn that isn't the first message
+    # (Qwen3.5/3.6: "System message must be at the beginning."). For those,
+    # late system/developer turns are folded into the leading one (#740);
+    # templates that render a positional system turn keep it in place.
+    rejects_positional_system: bool = False
 
 
 def _find_template_variables(tpl: str) -> set[str] | None:
@@ -38,6 +43,48 @@ def _find_template_variables(tpl: str) -> set[str] | None:
         return jinja2.meta.find_undeclared_variables(ast)
     except Exception:
         return None
+
+
+_PROBE_LEADING_SYSTEM = [
+    {"role": "system", "content": "s"},
+    {"role": "user", "content": "u"},
+    {"role": "assistant", "content": "a"},
+    {"role": "user", "content": "u"},
+]
+_PROBE_LATE_SYSTEM = [
+    {"role": "system", "content": "s"},
+    {"role": "user", "content": "u"},
+    {"role": "assistant", "content": "a"},
+    {"role": "system", "content": "s"},
+    {"role": "user", "content": "u"},
+]
+
+
+def _probe_rejects_positional_system(tokenizer: Any, tpl: str) -> bool:
+    """Render a late-system probe and report whether only it is rejected.
+
+    A static scan can't tell "raise on a non-first system turn" from other
+    ``raise_exception`` guards, so render the template: the conversation with
+    a leading system turn must render and the same conversation with an extra
+    late system turn must raise. A template that rejects both (no system role
+    at all) or neither is not flagged — folding wouldn't change the outcome.
+    """
+    if "raise_exception" not in tpl:
+        return False
+    apply = getattr(tokenizer, "apply_chat_template", None)
+    if not callable(apply):
+        return False
+    kwargs = {"tokenize": False, "add_generation_prompt": True}
+    try:
+        apply(_PROBE_LEADING_SYSTEM, **kwargs)
+    except Exception:
+        return False
+    try:
+        apply(_PROBE_LATE_SYSTEM, **kwargs)
+    except Exception as exc:
+        logger.debug("Template rejects a non-leading system turn: %s", exc)
+        return True
+    return False
 
 
 def detect_caps(tokenizer: Any) -> TemplateCaps:
@@ -100,4 +147,5 @@ def detect_caps(tokenizer: Any) -> TemplateCaps:
         has_channel_format=has_channel_format,
         uses_tool_responses=uses_tool_responses,
         handles_tool_role=handles_tool_role,
+        rejects_positional_system=_probe_rejects_positional_system(tokenizer, tpl),
     )
