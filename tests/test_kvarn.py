@@ -138,9 +138,8 @@ class TestKVarNRotation:
         from olmlx.engine.kvarn import KVarNRotation
 
         rot = KVarNRotation(head_dim=128, seed=0)
-        m = np.array(rot.matrix)
+        m = rot.dense_matrix()
         np.testing.assert_allclose(m @ m.T, np.eye(128), atol=1e-5)
-        np.testing.assert_allclose(np.array(rot.matrix_T), m.T, atol=0)
 
     def test_block_diagonal_tiles(self):
         """head_dim=256 → two independent 128-wide Hadamard tiles."""
@@ -148,7 +147,7 @@ class TestKVarNRotation:
 
         rot = KVarNRotation(head_dim=256, seed=0)
         assert rot.tile == 128
-        m = np.array(rot.matrix)
+        m = rot.dense_matrix()
         assert np.all(m[:128, 128:] == 0)
         assert np.all(m[128:, :128] == 0)
         # Hadamard entries all have magnitude 1/sqrt(tile)
@@ -158,9 +157,9 @@ class TestKVarNRotation:
     def test_seed_deterministic_and_distinct(self):
         from olmlx.engine.kvarn import KVarNRotation
 
-        a = np.array(KVarNRotation(head_dim=64, seed=3).matrix)
-        b = np.array(KVarNRotation(head_dim=64, seed=3).matrix)
-        c = np.array(KVarNRotation(head_dim=64, seed=4).matrix)
+        a = KVarNRotation(head_dim=64, seed=3).dense_matrix()
+        b = KVarNRotation(head_dim=64, seed=3).dense_matrix()
+        c = KVarNRotation(head_dim=64, seed=4).dense_matrix()
         np.testing.assert_array_equal(a, b)
         assert not np.array_equal(a, c)
 
@@ -181,7 +180,7 @@ class TestKVarNRotation:
         def use():
             x = mx.random.normal((1, 2, 4, 64))
             packed, stats = kvarn_quantize(x, rot, bits=4)
-            mx.eval(packed, stats, rot.matrix, rot.matrix_T)
+            mx.eval(packed, stats, rot.signs, rot.hadamard)
             return True
 
         res = _run_in_thread(use)
@@ -300,6 +299,53 @@ class TestQuantizeDequantize:
         out = kvarn_dequantize(p, s, rot, bits=4)
         rel = float(mx.sqrt(mx.sum((out - x) ** 2)) / mx.sqrt(mx.sum(x**2)))
         assert rel < 0.15
+
+    @pytest.mark.parametrize("head_dim", [128, 256, 96])
+    def test_tiled_rotation_matches_dense(self, head_dim):
+        """The tile-wise kernels implement exactly x @ R.T / y @ R."""
+        from olmlx.engine.kvarn import KVarNRotation, kvarn_dequantize, kvarn_quantize
+
+        mx.random.seed(5)
+        rot = KVarNRotation(head_dim=head_dim, seed=7)
+        r = rot.dense_matrix()
+        x = mx.random.normal((1, 2, 3, head_dim))
+        p, s = kvarn_quantize(x, rot, bits=4)
+        out = np.array(kvarn_dequantize(p, s, rot, bits=4))
+        # The dequantized vector rotated forward must be the per-tile
+        # reconstruction mu + scale * centered(codebook) — check via norms of
+        # the rotated residual instead of re-deriving: R orthogonal ⇒ equal.
+        xr = np.array(x) @ r.T
+        outr = out @ r.T
+        np.testing.assert_allclose(
+            np.linalg.norm(outr - xr, axis=-1),
+            np.linalg.norm(out - np.array(x), axis=-1),
+            rtol=1e-4,
+        )
+        # Per-tile means of the reconstruction match the stored means.
+        n_tiles = head_dim // rot.tile
+        means = outr.reshape(1, 2, 3, n_tiles, rot.tile).mean(-1)
+        np.testing.assert_allclose(means, np.array(s)[..., :n_tiles], atol=1e-4)
+
+    @pytest.mark.parametrize("bits", [2, 4])
+    def test_encode_recon_matches_dequantize(self, bits):
+        from olmlx.engine.kvarn import (
+            KVarNRotation,
+            kvarn_dequantize,
+            kvarn_encode,
+            kvarn_quantize,
+        )
+
+        rot = KVarNRotation(head_dim=256, seed=0)
+        x = mx.random.normal((1, 2, 5, 256)).astype(mx.float16)
+        p, s, recon = kvarn_encode(x, rot, bits, mx.float16)
+        p2, s2 = kvarn_quantize(x, rot, bits)
+        np.testing.assert_array_equal(np.array(p), np.array(p2))
+        assert recon.dtype == mx.float16
+        np.testing.assert_allclose(
+            np.array(recon.astype(mx.float32)),
+            np.array(kvarn_dequantize(p, s, rot, bits, dtype=mx.float32)),
+            atol=2e-2,
+        )
 
     def test_zero_vector_roundtrips_to_zero(self):
         from olmlx.engine.kvarn import KVarNRotation, kvarn_dequantize, kvarn_quantize
@@ -467,12 +513,12 @@ class TestMakeKvarnCache:
         assert cache[0]._key_bits == 4 and cache[0]._value_bits == 2
         # Distinct per-layer, per-K/V rotations
         assert not np.array_equal(
-            np.array(cache[0].rotation_key.matrix),
-            np.array(cache[0].rotation_value.matrix),
+            cache[0].rotation_key.dense_matrix(),
+            cache[0].rotation_value.dense_matrix(),
         )
         assert not np.array_equal(
-            np.array(cache[0].rotation_key.matrix),
-            np.array(cache[1].rotation_key.matrix),
+            cache[0].rotation_key.dense_matrix(),
+            cache[1].rotation_key.dense_matrix(),
         )
 
     def test_hybrid_preserves_non_kv_layers(self):

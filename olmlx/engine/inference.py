@@ -109,7 +109,6 @@ from olmlx.engine.generation_options import (  # noqa: F401
 )
 from olmlx.engine.kv_budget import (  # noqa: F401
     MEMORY_SAFETY_FACTOR,
-    _parse_kv_cache_quant,
     _parse_kv_cache_quant_kv,
     build_context_input_tokens,
     estimate_kv_cache_bytes,
@@ -1809,11 +1808,17 @@ def _cache_list_contains_lazy_state(cache: list[Any]) -> bool:
     LAZY_STATE_CLASSES = {
         "ArraysCache",
         "TurboQuantKVCache",
-        "KVarNKVCache",
         "SpectralQuantKVCache",
         "ShardKVCache",
     }
-    return any(type(layer).__name__ in LAZY_STATE_CLASSES for layer in cache)
+    # Walk the MRO so subclasses (``KVarNKVCache`` extends
+    # ``TurboQuantKVCache``, #748) inherit the flag. Listing a new subclass
+    # by hand is easy to forget, and CI on CPU can't see the crash.
+    return any(
+        cls.__name__ in LAZY_STATE_CLASSES
+        for layer in cache
+        for cls in type(layer).__mro__
+    )
 
 
 def _is_pure_rotating_cache(cache: list[Any]) -> bool:

@@ -60,7 +60,7 @@ def parse_kvarn_bits(spec: str) -> tuple[int, int]:
     """Parse the part after ``kvarn:`` into ``(key_bits, value_bits)``.
 
     Accepts ``k<K>v<V>`` (asymmetric) or a bare ``<B>`` (symmetric), with each
-    width in ``KVARN_SUPPORTED_BITS``.
+    width 2 or 4 (the only widths ``turboquant.pack_indices`` packs).
     """
     m = _KVARN_SPEC_RE.fullmatch(spec)
     if m is None:

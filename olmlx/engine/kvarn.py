@@ -33,10 +33,8 @@ import mlx.core as mx
 import numpy as np
 
 from olmlx.config import parse_kvarn_bits  # noqa: F401 — re-export
+from olmlx.engine.shardquant import make_v_rotation
 from olmlx.engine.turboquant import get_codebook, pack_indices, unpack_indices
-
-#: Bit widths supported for each of K and V (the packers handle 2 and 4).
-KVARN_SUPPORTED_BITS: tuple[int, ...] = (2, 4)
 
 #: Largest tile; also the preferred one when head_dim allows it.
 _MAX_TILE = 128
@@ -56,22 +54,17 @@ def choose_tile(head_dim: int) -> int | None:
     return None
 
 
-def _hadamard(n: int) -> np.ndarray:
-    """Orthonormal Sylvester Hadamard matrix of size ``n`` (a power of two)."""
-    h = np.ones((1, 1), dtype=np.float32)
-    while h.shape[0] < n:
-        h = np.block([[h, h], [h, -h]])
-    return h / np.sqrt(np.float32(n))
-
-
 class KVarNRotation:
     """Per-layer block-diagonal randomized Hadamard rotation.
 
-    ``matrix = blockdiag(H_tile, ...) @ diag(signs)`` — orthogonal, so the
-    inverse is the transpose. Exposes the same ``matrix`` / ``matrix_T``
-    attribute names as ``TurboQuantRotation``; ``TurboQuantKVCache`` shares
-    objects stored under ``rotation_key`` / ``rotation_value`` by reference
-    in ``__deepcopy__``.
+    Mathematically ``R = blockdiag(H_tile, ...) @ diag(signs)`` (orthogonal),
+    applied as ``y = x @ R.T``. It is never materialized densely: the kernels
+    flip signs, reshape to ``(..., n_tiles, tile)`` and multiply by the single
+    ``tile x tile`` Hadamard, so a ``head_dim`` > ``tile`` layer (Gemma 4's
+    512-wide global layers) doesn't pay for the zero blocks. The Sylvester
+    Hadamard is symmetric, so the same matrix serves both directions.
+    ``TurboQuantKVCache.__deepcopy__`` shares objects stored under
+    ``rotation_key`` / ``rotation_value`` by reference.
     """
 
     def __init__(self, head_dim: int, seed: int):
@@ -84,18 +77,23 @@ class KVarNRotation:
         self.head_dim = head_dim
         self.tile = tile
         rng = np.random.RandomState(seed)
-        signs = rng.choice(np.array([-1.0, 1.0], dtype=np.float32), size=head_dim)
-        h = _hadamard(tile)
-        block = np.zeros((head_dim, head_dim), dtype=np.float32)
-        for start in range(0, head_dim, tile):
-            block[start : start + tile, start : start + tile] = h
-        self.matrix: mx.array = mx.array(block * signs[None, :])
-        self.matrix_T: mx.array = self.matrix.T
+        self.signs: mx.array = mx.array(
+            rng.choice(np.array([-1.0, 1.0], dtype=np.float32), size=head_dim)
+        )
+        self.hadamard: mx.array = make_v_rotation(tile)
         # Materialize eagerly: the prompt cache (and this rotation) is built on
         # the event-loop thread, prefill/decode run on a generation worker.
-        # Under mlx thread-local streams (#499) the lazy ``.T`` would stay bound
-        # to the constructing thread — same fix as TurboQuantRotation.
-        mx.eval(self.matrix, self.matrix_T)
+        # Under mlx thread-local streams (#499) a lazy op would stay bound to
+        # the constructing thread — same fix as TurboQuantRotation.
+        mx.eval(self.signs, self.hadamard)
+
+    def dense_matrix(self) -> np.ndarray:
+        """The full ``head_dim x head_dim`` ``R`` (for tests/inspection only)."""
+        h = np.array(self.hadamard)
+        block = np.zeros((self.head_dim, self.head_dim), dtype=np.float32)
+        for start in range(0, self.head_dim, self.tile):
+            block[start : start + self.tile, start : start + self.tile] = h
+        return block * np.array(self.signs)[None, :]
 
 
 def _unit_codebook(bits: int) -> mx.array:
@@ -105,21 +103,38 @@ def _unit_codebook(bits: int) -> mx.array:
 
 @lru_cache(maxsize=128)
 def _compiled_quantize_core(
-    n_levels: int, tile: int, x_shape: tuple, x_dtype: mx.Dtype
+    bits: int,
+    tile: int,
+    x_shape: tuple,
+    x_dtype: mx.Dtype,
+    out_dtype: mx.Dtype | None,
 ):
     """Compiled (rotate + normalize + quantize + scale) kernel, cached per
     full input shape for the same reason as turboquant's (mlx's shapeless
-    compile bakes non-last dims into the trace)."""
+    compile bakes non-last dims into the trace). ``x_dtype`` keys the cache
+    only. With ``out_dtype`` set it also returns the reconstruction (what
+    ``kvarn_dequantize`` would produce), saving the cache a second
+    unpack/gather pass per decode step.
+
+    Bit-packing happens *inside* the kernel so the packed indices are a
+    sibling output of the same primitive as the reconstruction. In the cache
+    the packed indices feed only the never-per-token-evaluated
+    ``_key_indices`` slice_update chain; packed outside the kernel they would
+    stay a lazy subgraph per token per layer, pinning the kernel's output
+    buffers until end-of-generation — exhausting Metal's buffer limit
+    (``metal::malloc Resource limit``) within a few thousand decode tokens.
+    """
+    n_levels = 1 << bits
     head_dim = x_shape[-1]
     n_tiles = head_dim // tile
     lead = tuple(x_shape[:-1])
+    tiled = lead + (n_tiles, tile)
 
     @mx.compile
     def _fn(
-        x: mx.array, rotation_T: mx.array, codebook: mx.array
-    ) -> tuple[mx.array, mx.array]:
-        y = x.astype(mx.float32) @ rotation_T
-        yt = y.reshape(lead + (n_tiles, tile))
+        x: mx.array, signs: mx.array, hadamard: mx.array, codebook: mx.array
+    ) -> tuple[mx.array, ...]:
+        yt = (x.astype(mx.float32) * signs).reshape(tiled) @ hadamard
         mu = mx.mean(yt, axis=-1, keepdims=True)
         c = yt - mu
         c_norm = mx.sqrt(mx.sum(c * c, axis=-1, keepdims=True))
@@ -144,7 +159,11 @@ def _compiled_quantize_core(
         scale = mx.where(zc_norm > eps, c_norm / mx.maximum(zc_norm, eps), 0.0)
 
         stats = mx.concatenate([mu[..., 0], scale[..., 0]], axis=-1)
-        return best_idx.reshape(lead + (head_dim,)), stats
+        packed = pack_indices(best_idx.reshape(lead + (head_dim,)), bits)
+        if out_dtype is None:
+            return (packed, stats)
+        recon = ((mu + scale * zc) @ hadamard).reshape(lead + (head_dim,)) * signs
+        return (packed, stats, recon.astype(out_dtype))
 
     return _fn
 
@@ -158,10 +177,18 @@ def kvarn_quantize(
     ``(..., head_dim // (8 // bits))`` and float32 per-tile stats of shape
     ``(..., 2 * n_tiles)`` laid out as ``[means..., scales...]``.
     """
-    codebook = _unit_codebook(bits)
-    fn = _compiled_quantize_core(1 << bits, rotation.tile, tuple(x.shape), x.dtype)
-    idx, stats = fn(x, rotation.matrix_T, codebook)
-    return pack_indices(idx, bits), stats
+    fn = _compiled_quantize_core(bits, rotation.tile, tuple(x.shape), x.dtype, None)
+    out = fn(x, rotation.signs, rotation.hadamard, _unit_codebook(bits))
+    return out[0], out[1]
+
+
+def kvarn_encode(
+    x: mx.array, rotation: KVarNRotation, bits: int, dtype: mx.Dtype
+) -> tuple[mx.array, mx.array, mx.array]:
+    """``kvarn_quantize`` plus the reconstruction in ``dtype``, in one pass."""
+    fn = _compiled_quantize_core(bits, rotation.tile, tuple(x.shape), x.dtype, dtype)
+    out = fn(x, rotation.signs, rotation.hadamard, _unit_codebook(bits))
+    return out[0], out[1], out[2]
 
 
 @lru_cache(maxsize=128)
@@ -174,14 +201,18 @@ def _compiled_dequant_core(n_levels: int, tile: int, indices_shape: tuple):
 
     @mx.compile
     def _fn(
-        indices: mx.array, stats: mx.array, rotation: mx.array, codebook: mx.array
+        indices: mx.array,
+        stats: mx.array,
+        signs: mx.array,
+        hadamard: mx.array,
+        codebook: mx.array,
     ) -> mx.array:
         zh = codebook[indices.astype(mx.uint32)].reshape(lead + (n_tiles, tile))
         zc = zh - mx.mean(zh, axis=-1, keepdims=True)
         mu = stats[..., :n_tiles][..., None]
         scale = stats[..., n_tiles:][..., None]
-        y = (mu + scale * zc).reshape(lead + (head_dim,))
-        return y @ rotation
+        yt = mu + scale * zc
+        return (yt @ hadamard).reshape(lead + (head_dim,)) * signs
 
     return _fn
 
@@ -194,8 +225,7 @@ def kvarn_dequantize(
     dtype: mx.Dtype | None = None,
 ) -> mx.array:
     """Reconstruct ``(..., head_dim)`` vectors from ``kvarn_quantize`` output."""
-    codebook = _unit_codebook(bits)
     indices = unpack_indices(packed, bits, rotation.head_dim)
     fn = _compiled_dequant_core(1 << bits, rotation.tile, tuple(indices.shape))
-    out = fn(indices, stats, rotation.matrix, codebook)
+    out = fn(indices, stats, rotation.signs, rotation.hadamard, _unit_codebook(bits))
     return out.astype(dtype) if dtype is not None else out

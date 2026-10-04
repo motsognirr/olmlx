@@ -64,7 +64,6 @@ class TurboQuantKVCache(_BaseCache):
         # update ``__deepcopy__`` so snapshots stay correct (either teach it
         # to invoke the new logic with reconstructed args, or move the side
         # effect to a separate factory).
-        self._bits = bits
         # Per-K/V widths drive every quantize/dequantize call and buffer
         # shape; TurboQuant is symmetric, ``KVarNKVCache`` (#748) is not.
         self._key_bits = bits
@@ -88,8 +87,17 @@ class TurboQuantKVCache(_BaseCache):
     # fix (deepcopy, dequant shed, packed-buffer materialization). The
     # second return value is the per-token side data stored in the
     # ``_key_norms`` / ``_value_norms`` buffers — its last dim may be > 1.
+    # ``_encode`` is the per-step entry point (quantize + reconstruct the new
+    # slice); a codec that already has the reconstruction in hand while
+    # quantizing overrides it to skip the second unpack/gather pass.
     def _quantize(self, x: mx.array, rotation: Any, bits: int):
         return turboquant_quantize(x, rotation, bits)
+
+    def _encode(
+        self, x: mx.array, rotation: Any, bits: int, dtype: mx.Dtype
+    ) -> tuple[mx.array, mx.array, mx.array]:
+        packed, side = self._quantize(x, rotation, bits)
+        return packed, side, self._dequantize(packed, side, rotation, bits, dtype)
 
     def _dequantize(
         self,
@@ -145,9 +153,14 @@ class TurboQuantKVCache(_BaseCache):
                 dtype=self._dequant_dtype,
             )
 
-        # Quantize incoming tokens (returns bit-packed indices)
-        k_idx, k_nrm = self._quantize(keys, self.rotation_key, self._key_bits)
-        v_idx, v_nrm = self._quantize(values, self.rotation_value, self._value_bits)
+        # Quantize incoming tokens (bit-packed indices + side data) and
+        # reconstruct only this new slice for the side buffer.
+        k_idx, k_nrm, k_new = self._encode(
+            keys, self.rotation_key, self._key_bits, input_dtype
+        )
+        v_idx, v_nrm, v_new = self._encode(
+            values, self.rotation_value, self._value_bits, input_dtype
+        )
 
         # Allocate or expand buffers in lockstep (indices, norms, dequant side buffer)
         if self._key_indices is None or (prev + num_steps) > self._key_indices.shape[2]:
@@ -155,11 +168,15 @@ class TurboQuantKVCache(_BaseCache):
             # K and V shapes are derived separately: packed width is
             # head_dim // (8 // bits) and the side data's last dim is
             # codec-defined, either of which may differ between K and V.
+            # (The rotations themselves are still sized from the key head
+            # dim by the factory, so a layer whose V head dim differs from
+            # its K head dim is not supported.)
             k_idx_shape = (B, n_heads, new_steps, k_idx.shape[-1])
             k_nrm_shape = (B, n_heads, new_steps, k_nrm.shape[-1])
             v_idx_shape = (B, n_heads, new_steps, v_idx.shape[-1])
             v_nrm_shape = (B, n_heads, new_steps, v_nrm.shape[-1])
-            deq_shape = (B, n_heads, new_steps, head_dim)
+            k_deq_shape = (B, n_heads, new_steps, head_dim)
+            v_deq_shape = (B, n_heads, new_steps, values.shape[-1])
 
             if self._key_indices is not None:
                 assert (
@@ -199,14 +216,14 @@ class TurboQuantKVCache(_BaseCache):
                 self._key_dequant = mx.concatenate(
                     [
                         self._key_dequant,
-                        mx.zeros(deq_shape, dtype=self._dequant_dtype),
+                        mx.zeros(k_deq_shape, dtype=self._dequant_dtype),
                     ],
                     axis=2,
                 )
                 self._value_dequant = mx.concatenate(
                     [
                         self._value_dequant,
-                        mx.zeros(deq_shape, dtype=self._dequant_dtype),
+                        mx.zeros(v_deq_shape, dtype=self._dequant_dtype),
                     ],
                     axis=2,
                 )
@@ -215,8 +232,8 @@ class TurboQuantKVCache(_BaseCache):
                 self._key_norms = mx.zeros(k_nrm_shape, dtype=mx.float32)
                 self._value_indices = mx.zeros(v_idx_shape, dtype=mx.uint8)
                 self._value_norms = mx.zeros(v_nrm_shape, dtype=mx.float32)
-                self._key_dequant = mx.zeros(deq_shape, dtype=self._dequant_dtype)
-                self._value_dequant = mx.zeros(deq_shape, dtype=self._dequant_dtype)
+                self._key_dequant = mx.zeros(k_deq_shape, dtype=self._dequant_dtype)
+                self._value_dequant = mx.zeros(v_deq_shape, dtype=self._dequant_dtype)
 
         # Store quantized data
         assert (
@@ -233,24 +250,9 @@ class TurboQuantKVCache(_BaseCache):
         self._value_indices[..., prev : self.offset, :] = v_idx
         self._value_norms[..., prev : self.offset, :] = v_nrm
 
-        # Dequantize only the newly appended slice and splice into the side buffer.
-        # We reuse the local ``k_idx/v_idx/k_nrm/v_nrm`` (just written into the
-        # persisted buffers on the lines above) instead of re-slicing them back out —
-        # the slice would add a gather op per step per layer for identical data.
-        k_new = self._dequantize(
-            k_idx,
-            k_nrm,
-            self.rotation_key,
-            self._key_bits,
-            dtype=input_dtype,
-        )
-        v_new = self._dequantize(
-            v_idx,
-            v_nrm,
-            self.rotation_value,
-            self._value_bits,
-            dtype=input_dtype,
-        )
+        # Splice the new slice's reconstruction (from ``_encode``, built from
+        # the local ``k_idx/k_nrm`` rather than re-slicing the persisted
+        # buffers) into the side buffer.
         self._key_dequant[..., prev : self.offset, :] = k_new
         self._value_dequant[..., prev : self.offset, :] = v_new
 

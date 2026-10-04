@@ -62,17 +62,11 @@ memory usage to exceed the raw 2-bytes-per-element calculation by 20-30%.
 logger = logging.getLogger(__name__)
 
 
-def _parse_kv_cache_quant(spec: str) -> tuple[str, int]:
-    """Split an `OLMLX_KV_CACHE_QUANT` value like `"spectral:4"`
-    into `(method, bits)`.  Format is validated at config load time."""
-    method, bits_str = spec.split(":")
-    return method, int(bits_str)
-
-
 def _parse_kv_cache_quant_kv(spec: str) -> tuple[str, int, int]:
-    """Like ``_parse_kv_cache_quant`` but returns ``(method, key_bits,
-    value_bits)``, accepting KVarN's asymmetric ``kvarn:k4v2`` form (#748).
-    Symmetric methods report the same width for K and V."""
+    """Split an ``OLMLX_KV_CACHE_QUANT`` value like ``"spectral:4"`` or
+    ``"kvarn:k4v2"`` (#748) into ``(method, key_bits, value_bits)``.
+    Symmetric methods report the same width for K and V. Format is validated
+    at config load time."""
     method, bits_str = spec.split(":")
     if method == "kvarn":
         from olmlx.config import parse_kvarn_bits

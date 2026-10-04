@@ -24,6 +24,7 @@ from olmlx.engine.kvarn import (
     KVarNRotation,
     choose_tile,
     kvarn_dequantize,
+    kvarn_encode,
     kvarn_quantize,
 )
 from olmlx.engine.turboquant_cache import (
@@ -51,11 +52,19 @@ class KVarNKVCache(TurboQuantKVCache):
         super().__init__(
             bits=key_bits, rotation_key=rotation_key, rotation_value=rotation_value
         )
+        # Override the base's symmetric widths.
         self._key_bits = key_bits
         self._value_bits = value_bits
 
     def _quantize(self, x: mx.array, rotation: Any, bits: int):
         return kvarn_quantize(x, rotation, bits)
+
+    def _encode(
+        self, x: mx.array, rotation: Any, bits: int, dtype: mx.Dtype
+    ) -> tuple[mx.array, mx.array, mx.array]:
+        # The quantize kernel already builds the reconstruction to pick the
+        # norm-preserving scale; emit it instead of re-deriving it.
+        return kvarn_encode(x, rotation, bits, dtype)
 
     def _dequantize(
         self,

@@ -1308,10 +1308,10 @@ class TestInferenceIntegration:
         model.args.head_dim = 64
 
         cache_4 = _make_turboquant_prompt_cache(model, bits=4)
-        assert cache_4[0]._bits == 4
+        assert cache_4[0]._key_bits == cache_4[0]._value_bits == 4
 
         cache_2 = _make_turboquant_prompt_cache(model, bits=2)
-        assert cache_2[0]._bits == 2
+        assert cache_2[0]._key_bits == cache_2[0]._value_bits == 2
 
 
 class TestBitsValidation:
