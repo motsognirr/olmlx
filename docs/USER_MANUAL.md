@@ -1266,10 +1266,11 @@ Or disable:
 **`budget_tokens`** caps the think block: once the model has generated
 roughly `budget_tokens` tokens with a think block still open, olmlx forces the
 think-close sequence so the model moves on to its answer. As in Anthropic's
-API, `budget_tokens` must be less than `max_tokens` when `type` is
-`"enabled"`; such a request with `budget_tokens >= max_tokens` is rejected with
-a 400 `invalid_request_error` before any model is loaded, as is a negative
-`budget_tokens`. Unlike Anthropic, olmlx has no 1024-token minimum,
+API, when `type` is `"enabled"` the budget must be non-negative and less than
+`max_tokens`; a request that breaks either rule is rejected with a 400
+`invalid_request_error` before any model is loaded. Budgets sent with any other
+`type` (`"disabled"`, `"adaptive"`, or an unknown type) are not checked, and a
+negative one is ignored. Unlike Anthropic, olmlx has no 1024-token minimum,
 because small budgets are reasonable for local models.
 
 The budget is **not enforced** in the following cases. The request still
