@@ -1307,7 +1307,11 @@ def count_chat_tokens(
     No GPU inference needed — CPU-only tokenization.  Uses
     add_generation_prompt=True so the count includes the assistant-turn
     opener tokens, matching what the model actually receives at inference.
+    Applies the same late-system fold as ``generate_chat`` (#740) so the count
+    matches the prompt generation renders.
     """
+    if caps is not None and caps.rejects_positional_system is True:
+        messages = _fold_system_messages_to_front(messages)
     result = _apply_chat_template(
         tokenizer, messages, tools, caps, tokenize=True, enable_thinking=enable_thinking
     )
@@ -4582,6 +4586,16 @@ async def generate_chat(
         if reasoning_effort is None and lm.reasoning_effort is not None:
             reasoning_effort = lm.reasoning_effort
 
+        # Templates that raise on a non-leading system turn (Qwen3.5/3.6) get
+        # every system/developer turn folded into the leading one; templates
+        # that render a positional system turn keep it in place (#740). Runs
+        # before media extraction (so the image/audio lists follow the folded
+        # order the prompt renders) and before the native-tool hint (so the
+        # hint lands on the merged message). Identity check: a MagicMock caps
+        # must not trigger the fold.
+        if (lm.template_caps or TemplateCaps()).rejects_positional_system is True:
+            messages = _fold_system_messages_to_front(messages)
+
         images = _extract_images(messages)
         audio = _extract_audio(messages)
 
@@ -4615,13 +4629,6 @@ async def generate_chat(
         # the model's own chat template so the helper can suppress patterns the
         # template uses natively (e.g. Mistral's `[TOOL_CALLS]`).
         caps = lm.template_caps or TemplateCaps()
-        # Templates that raise on a non-leading system turn (Qwen3.5/3.6) get
-        # every system/developer turn folded into the leading one; templates
-        # that render a positional system turn keep it in place (#740). Runs
-        # before the native-tool hint so the hint lands on the merged message.
-        # Identity check: a MagicMock caps must not trigger the fold.
-        if caps.rejects_positional_system is True:
-            messages = _fold_system_messages_to_front(messages)
         if tools and caps.supports_tools:
             template_text = _get_chat_template_text(lm.tokenizer)
             messages = _add_native_tool_hint(messages, template_text)

@@ -92,7 +92,11 @@ def _probe_rejects_positional_system(tokenizer: Any, tpl: str) -> bool:
     kwargs = {"tokenize": False, "add_generation_prompt": True}
     try:
         apply(_PROBE_LEADING_SYSTEM, **kwargs)
-    except Exception:
+    except Exception as exc:
+        # Distinguish "probe couldn't render" from "positional system is fine"
+        # in the logs; either way the fold stays off and a real rejection
+        # still surfaces as a 400.
+        logger.debug("Positional-system probe could not render template: %s", exc)
         return False
     try:
         apply(_PROBE_LATE_SYSTEM, **kwargs)

@@ -256,3 +256,26 @@ class TestProbeOnlyCountsDeliberateRejection:
 """
         caps = detect_caps(_JinjaTokenizer(tpl))
         assert caps.rejects_positional_system is False
+
+
+class TestFoldConsistency:
+    def test_count_chat_tokens_folds_for_strict_template(self):
+        from olmlx.engine.inference import count_chat_tokens
+
+        class Tok(_JinjaTokenizer):
+            def apply_chat_template(self, messages, tokenize=False, **kwargs):
+                text = super().apply_chat_template(messages, **kwargs)
+                return list(range(len(text))) if tokenize else text
+
+        tok = Tok(STRICT_TEMPLATE)
+        caps = detect_caps(tok)
+        messages = [
+            {"role": "user", "content": "u1"},
+            {"role": "system", "content": "be terse"},
+            {"role": "user", "content": "u2"},
+        ]
+        n = count_chat_tokens(tok, messages, caps=caps)
+        expected = tok.apply_chat_template(
+            _fold_system_messages_to_front(messages), add_generation_prompt=True
+        )
+        assert n == len(expected)

@@ -6501,3 +6501,38 @@ class TestGenerateChatPositionalSystem:
     async def test_positional_template_keeps_late_system(self, mock_manager):
         msgs = await self._captured_messages(mock_manager, TemplateCaps())
         assert [m["role"] for m in msgs] == ["user", "system", "user"]
+
+
+class TestGenerateChatFoldMediaOrder:
+    @pytest.mark.asyncio
+    async def test_media_extracted_in_folded_order(self, mock_manager):
+        """Images on a late system turn move to the front with the fold, so
+        the extracted image list must follow the folded message order (#740)."""
+        lm = mock_manager._loaded["qwen3:latest"]
+        lm.is_vlm = True
+        lm.template_caps = TemplateCaps(rejects_positional_system=True)
+
+        class _Stop(Exception):
+            pass
+
+        captured = {}
+
+        def fake_vlm(processor, model, messages, images=None, **kwargs):
+            captured["images"] = images
+            raise _Stop
+
+        with patch(
+            "olmlx.engine.inference._apply_chat_template_vlm", side_effect=fake_vlm
+        ):
+            with pytest.raises(_Stop):
+                await generate_chat(
+                    mock_manager,
+                    "qwen3",
+                    [
+                        {"role": "user", "content": "u1", "images": ["user.png"]},
+                        {"role": "system", "content": "s", "images": ["sys.png"]},
+                        {"role": "user", "content": "u2"},
+                    ],
+                    stream=False,
+                )
+        assert captured["images"] == ["sys.png", "user.png"]
