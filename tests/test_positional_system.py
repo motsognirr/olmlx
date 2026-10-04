@@ -311,3 +311,35 @@ class TestFoldNonStringGuard:
             {"role": "system", "content": content},
         ]
         assert _fold_system_messages_to_front(messages) is messages
+
+
+class TestRealTransformersTokenizer:
+    """Through the production ``PreTrainedTokenizerBase.apply_chat_template``
+    (not a direct jinja render), so a wrapper that re-raised the template's
+    ``raise_exception`` as a different type would be caught here."""
+
+    @staticmethod
+    def _tok(template):
+        from tokenizers import Tokenizer
+        from tokenizers.models import WordLevel
+        from transformers import PreTrainedTokenizerFast
+
+        tok = PreTrainedTokenizerFast(
+            tokenizer_object=Tokenizer(WordLevel({"[UNK]": 0}, unk_token="[UNK]"))
+        )
+        tok.chat_template = template
+        return tok
+
+    def test_detects_strict_template(self):
+        assert detect_caps(self._tok(STRICT_TEMPLATE)).rejects_positional_system
+
+    def test_rejection_maps_to_chat_template_rejected_error(self):
+        tok = self._tok(STRICT_TEMPLATE)
+        with pytest.raises(ChatTemplateRejectedError, match="at the beginning"):
+            _apply_chat_template(
+                tok,
+                [
+                    {"role": "user", "content": "u1"},
+                    {"role": "system", "content": "s"},
+                ],
+            )
