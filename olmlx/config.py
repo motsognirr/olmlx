@@ -1,6 +1,7 @@
 import logging
 import math
 import os
+import re
 from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
@@ -52,6 +53,27 @@ def validate_weight_quant_format(v: str | None) -> str | None:
     return v
 
 
+_KVARN_SPEC_RE = re.compile(r"k([24])v([24])|([24])")
+
+
+def parse_kvarn_bits(spec: str) -> tuple[int, int]:
+    """Parse the part after ``kvarn:`` into ``(key_bits, value_bits)``.
+
+    Accepts ``k<K>v<V>`` (asymmetric) or a bare ``<B>`` (symmetric), with each
+    width 2 or 4 (the only widths ``turboquant.pack_indices`` packs).
+    """
+    m = _KVARN_SPEC_RE.fullmatch(spec)
+    if m is None:
+        raise ValueError(
+            f"Invalid KVarN bits {spec!r}; expected k<K>v<V> or <B> with "
+            f"widths in {{2,4}} (e.g. k4v2, 4)"
+        )
+    if m.group(3) is not None:
+        b = int(m.group(3))
+        return b, b
+    return int(m.group(1)), int(m.group(2))
+
+
 def validate_kv_cache_quant_format(v: str | None) -> str | None:
     """Validate that *v* is a valid ``kv_cache_quant`` value.
 
@@ -68,6 +90,13 @@ def validate_kv_cache_quant_format(v: str | None) -> str | None:
         "shard": {"2", "4", "8"},
     }
     parts = v.split(":", 1)
+    if len(parts) == 2 and parts[0] == "kvarn":
+        # KVarN (#748) takes per-K/V widths: kvarn:k4v2, or kvarn:4.
+        try:
+            parse_kvarn_bits(parts[1])
+        except ValueError as e:
+            raise ValueError(f"Invalid kv_cache_quant={v!r}. {e}") from None
+        return v
     if (
         len(parts) != 2
         or parts[0] not in _VALID_BITS_BY_METHOD
@@ -76,7 +105,8 @@ def validate_kv_cache_quant_format(v: str | None) -> str | None:
         raise ValueError(
             f"Invalid kv_cache_quant={v!r}. "
             f"Expected '<method>:<bits>' where method:bits is one of "
-            f"turboquant:{{2,4}}, spectral:{{2,4}}, shard:{{2,4,8}}."
+            f"turboquant:{{2,4}}, spectral:{{2,4}}, shard:{{2,4,8}}, "
+            f"or kvarn:k{{2,4}}v{{2,4}} / kvarn:{{2,4}}."
         )
     return v
 

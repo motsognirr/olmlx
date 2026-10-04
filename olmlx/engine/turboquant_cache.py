@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import copy
 import logging
+from collections.abc import Callable
 from typing import Any
 
 import mlx.core as mx
@@ -63,7 +64,10 @@ class TurboQuantKVCache(_BaseCache):
         # update ``__deepcopy__`` so snapshots stay correct (either teach it
         # to invoke the new logic with reconstructed args, or move the side
         # effect to a separate factory).
-        self._bits = bits
+        # Per-K/V widths drive every quantize/dequantize call and buffer
+        # shape; TurboQuant is symmetric, ``KVarNKVCache`` (#748) is not.
+        self._key_bits = bits
+        self._value_bits = bits
         self.rotation_key = rotation_key
         self.rotation_value = rotation_value
         self._key_indices: mx.array | None = None
@@ -77,6 +81,33 @@ class TurboQuantKVCache(_BaseCache):
         self._value_dequant: mx.array | None = None
         self._dequant_dtype: mx.Dtype | None = None
         self.offset = 0
+
+    # Quantizer hooks. Subclasses (``KVarNKVCache``) swap the codec while
+    # inheriting the buffer management and every cross-thread Metal-stream
+    # fix (deepcopy, dequant shed, packed-buffer materialization). The
+    # second return value is the per-token side data stored in the
+    # ``_key_norms`` / ``_value_norms`` buffers — its last dim may be > 1.
+    # ``_encode`` is the per-step entry point (quantize + reconstruct the new
+    # slice); a codec that already has the reconstruction in hand while
+    # quantizing overrides it to skip the second unpack/gather pass.
+    def _quantize(self, x: mx.array, rotation: Any, bits: int):
+        return turboquant_quantize(x, rotation, bits)
+
+    def _encode(
+        self, x: mx.array, rotation: Any, bits: int, dtype: mx.Dtype
+    ) -> tuple[mx.array, mx.array, mx.array]:
+        packed, side = self._quantize(x, rotation, bits)
+        return packed, side, self._dequantize(packed, side, rotation, bits, dtype)
+
+    def _dequantize(
+        self,
+        packed: mx.array,
+        side: mx.array,
+        rotation: Any,
+        bits: int,
+        dtype: mx.Dtype | None = None,
+    ) -> mx.array:
+        return turboquant_dequantize(packed, side, rotation, bits, dtype=dtype)
 
     def update_and_fetch(
         self, keys: mx.array, values: mx.array
@@ -107,33 +138,45 @@ class TurboQuantKVCache(_BaseCache):
         # must happen first. ``_dequant_dtype`` was preserved by
         # ``release_dequant_buffers``, so the rebuilt dtype matches the lock.
         if self._key_indices is not None and self._key_dequant is None:
-            self._key_dequant = turboquant_dequantize(
+            self._key_dequant = self._dequantize(
                 self._key_indices,
                 self._key_norms,
                 self.rotation_key,
-                self._bits,
+                self._key_bits,
                 dtype=self._dequant_dtype,
             )
-            self._value_dequant = turboquant_dequantize(
+            self._value_dequant = self._dequantize(
                 self._value_indices,
                 self._value_norms,
                 self.rotation_value,
-                self._bits,
+                self._value_bits,
                 dtype=self._dequant_dtype,
             )
 
-        # Quantize incoming tokens (returns bit-packed indices)
-        k_idx, k_nrm = turboquant_quantize(keys, self.rotation_key, self._bits)
-        v_idx, v_nrm = turboquant_quantize(values, self.rotation_value, self._bits)
-
-        packed_dim = k_idx.shape[-1]  # head_dim // (8 // bits)
+        # Quantize incoming tokens (bit-packed indices + side data) and
+        # reconstruct only this new slice for the side buffer.
+        k_idx, k_nrm, k_new = self._encode(
+            keys, self.rotation_key, self._key_bits, input_dtype
+        )
+        v_idx, v_nrm, v_new = self._encode(
+            values, self.rotation_value, self._value_bits, input_dtype
+        )
 
         # Allocate or expand buffers in lockstep (indices, norms, dequant side buffer)
         if self._key_indices is None or (prev + num_steps) > self._key_indices.shape[2]:
             new_steps = (num_steps + self.step - 1) // self.step * self.step
-            idx_shape = (B, n_heads, new_steps, packed_dim)
-            nrm_shape = (B, n_heads, new_steps, 1)
-            deq_shape = (B, n_heads, new_steps, head_dim)
+            # K and V shapes are derived separately: packed width is
+            # head_dim // (8 // bits) and the side data's last dim is
+            # codec-defined, either of which may differ between K and V.
+            # (The rotations themselves are still sized from the key head
+            # dim by the factory, so a layer whose V head dim differs from
+            # its K head dim is not supported.)
+            k_idx_shape = (B, n_heads, new_steps, k_idx.shape[-1])
+            k_nrm_shape = (B, n_heads, new_steps, k_nrm.shape[-1])
+            v_idx_shape = (B, n_heads, new_steps, v_idx.shape[-1])
+            v_nrm_shape = (B, n_heads, new_steps, v_nrm.shape[-1])
+            k_deq_shape = (B, n_heads, new_steps, head_dim)
+            v_deq_shape = (B, n_heads, new_steps, values.shape[-1])
 
             if self._key_indices is not None:
                 assert (
@@ -155,38 +198,42 @@ class TurboQuantKVCache(_BaseCache):
                     self._key_dequant = self._key_dequant[..., :prev, :]
                     self._value_dequant = self._value_dequant[..., :prev, :]
                 self._key_indices = mx.concatenate(
-                    [self._key_indices, mx.zeros(idx_shape, dtype=mx.uint8)], axis=2
+                    [self._key_indices, mx.zeros(k_idx_shape, dtype=mx.uint8)],
+                    axis=2,
                 )
                 self._key_norms = mx.concatenate(
-                    [self._key_norms, mx.zeros(nrm_shape, dtype=mx.float32)], axis=2
+                    [self._key_norms, mx.zeros(k_nrm_shape, dtype=mx.float32)],
+                    axis=2,
                 )
                 self._value_indices = mx.concatenate(
-                    [self._value_indices, mx.zeros(idx_shape, dtype=mx.uint8)], axis=2
+                    [self._value_indices, mx.zeros(v_idx_shape, dtype=mx.uint8)],
+                    axis=2,
                 )
                 self._value_norms = mx.concatenate(
-                    [self._value_norms, mx.zeros(nrm_shape, dtype=mx.float32)], axis=2
+                    [self._value_norms, mx.zeros(v_nrm_shape, dtype=mx.float32)],
+                    axis=2,
                 )
                 self._key_dequant = mx.concatenate(
                     [
                         self._key_dequant,
-                        mx.zeros(deq_shape, dtype=self._dequant_dtype),
+                        mx.zeros(k_deq_shape, dtype=self._dequant_dtype),
                     ],
                     axis=2,
                 )
                 self._value_dequant = mx.concatenate(
                     [
                         self._value_dequant,
-                        mx.zeros(deq_shape, dtype=self._dequant_dtype),
+                        mx.zeros(v_deq_shape, dtype=self._dequant_dtype),
                     ],
                     axis=2,
                 )
             else:
-                self._key_indices = mx.zeros(idx_shape, dtype=mx.uint8)
-                self._key_norms = mx.zeros(nrm_shape, dtype=mx.float32)
-                self._value_indices = mx.zeros(idx_shape, dtype=mx.uint8)
-                self._value_norms = mx.zeros(nrm_shape, dtype=mx.float32)
-                self._key_dequant = mx.zeros(deq_shape, dtype=self._dequant_dtype)
-                self._value_dequant = mx.zeros(deq_shape, dtype=self._dequant_dtype)
+                self._key_indices = mx.zeros(k_idx_shape, dtype=mx.uint8)
+                self._key_norms = mx.zeros(k_nrm_shape, dtype=mx.float32)
+                self._value_indices = mx.zeros(v_idx_shape, dtype=mx.uint8)
+                self._value_norms = mx.zeros(v_nrm_shape, dtype=mx.float32)
+                self._key_dequant = mx.zeros(k_deq_shape, dtype=self._dequant_dtype)
+                self._value_dequant = mx.zeros(v_deq_shape, dtype=self._dequant_dtype)
 
         # Store quantized data
         assert (
@@ -203,31 +250,36 @@ class TurboQuantKVCache(_BaseCache):
         self._value_indices[..., prev : self.offset, :] = v_idx
         self._value_norms[..., prev : self.offset, :] = v_nrm
 
-        # Dequantize only the newly appended slice and splice into the side buffer.
-        # We reuse the local ``k_idx/v_idx/k_nrm/v_nrm`` (just written into the
-        # persisted buffers on the lines above) instead of re-slicing them back out —
-        # the slice would add a gather op per step per layer for identical data.
-        k_new = turboquant_dequantize(
-            k_idx,
-            k_nrm,
-            self.rotation_key,
-            self._bits,
-            dtype=input_dtype,
-        )
-        v_new = turboquant_dequantize(
-            v_idx,
-            v_nrm,
-            self.rotation_value,
-            self._bits,
-            dtype=input_dtype,
-        )
+        # Splice the new slice's reconstruction (from ``_encode``, built from
+        # the local ``k_idx/k_nrm`` rather than re-slicing the persisted
+        # buffers) into the side buffer.
         self._key_dequant[..., prev : self.offset, :] = k_new
         self._value_dequant[..., prev : self.offset, :] = v_new
 
-        return (
-            self._key_dequant[..., : self.offset, :],
-            self._value_dequant[..., : self.offset, :],
-        )
+        keys_out = self._key_dequant[..., : self.offset, :]
+        values_out = self._value_dequant[..., : self.offset, :]
+        if self.offset // self.step != prev // self.step:
+            # The packed writes above never enter the returned K/V's graph
+            # (those are side-buffer views), so mlx-lm's per-token eval leaves
+            # them a growing lazy slice_update chain — one pinned buffer per
+            # packed buffer per layer per token. Unbounded, that exhausts
+            # Metal's buffer limit (``metal::malloc Resource limit (499000)``
+            # at ~3.4k decode tokens on a 36-layer model). Once per ``step``
+            # tokens, make the returned keys depend on the packed buffers so
+            # the token's own eval materializes the chain on the generating
+            # thread: no extra sync, no per-token cost, safe under compile.
+            # (End-of-generation ``ensure_state_materialized`` still covers
+            # the < step tail.)
+            (keys_out,) = mx.depends(
+                [keys_out],
+                [
+                    self._key_indices,
+                    self._key_norms,
+                    self._value_indices,
+                    self._value_norms,
+                ],
+            )
+        return keys_out, values_out
 
     @property
     def state(self):
@@ -520,22 +572,26 @@ def _detect_head_dim(model: Any, layers_hint: Any = None) -> int:
         ) from e
 
 
-def make_turboquant_cache(model: Any, bits: int) -> list:
-    """Create a cache list with TurboQuantKVCache for attention layers.
+def build_kv_quant_caches(
+    model: Any,
+    make_layer: Callable[[int, int], Any | None],
+    *,
+    head_dim: int | None = None,
+) -> tuple[list, int]:
+    """Build a per-layer cache list, quantizing only plain-KVCache layers.
 
-    For hybrid models (e.g. Nemotron-H with SSM + attention layers), only
-    attention-layer caches (KVCache) are replaced with TurboQuantKVCache.
-    Non-attention caches (e.g. ArraysCache for SSM/Mamba layers) are preserved.
+    Shared by the TurboQuant and KVarN (#748) factories. ``make_layer(i,
+    layer_head_dim)`` returns the quantized cache for attention layer ``i``,
+    or ``None`` when that layer's head dim is incompatible (it then keeps the
+    default cache). For hybrid models (e.g. Nemotron-H, Qwen3.5 GDN) the
+    layout comes from ``model.make_cache()`` and non-KVCache layers
+    (``ArraysCache``, ``RotatingKVCache``) are preserved unchanged.
+
+    Returns ``(caches, n_quantized)``.
     """
     num_layers = len(model.layers)
-    head_dim = _detect_head_dim(model)
-
-    packing_factor = 8 // bits
-    if head_dim % packing_factor != 0:
-        raise ValueError(
-            f"TurboQuant {bits}-bit requires head_dim divisible by {packing_factor}, "
-            f"got head_dim={head_dim}"
-        )
+    if head_dim is None:
+        head_dim = _detect_head_dim(model)
 
     # Get default cache layout from model if available (hybrid models
     # return different cache types per layer, e.g. ArraysCache for SSM)
@@ -547,7 +603,7 @@ def make_turboquant_cache(model: Any, bits: int) -> list:
         default_caches = [None] * num_layers
 
     caches = []
-    tq_count = 0
+    n_quantized = 0
     for i, default in enumerate(default_caches):
         if default is None or isinstance(default, KVCache):
             # Detect per-layer head dim from K projection weight shape.
@@ -571,19 +627,42 @@ def make_turboquant_cache(model: Any, bits: int) -> list:
             except (AttributeError, IndexError):
                 pass
 
-            if layer_head_dim % (8 // bits) != 0:
-                # Not compatible with TurboQuant packing — keep default cache
+            layer_cache = make_layer(i, layer_head_dim)
+            if layer_cache is None:
+                # Not compatible with this quantizer — keep default cache
                 caches.append(default if default is not None else KVCache())
                 continue
-
-            rot_k = TurboQuantRotation(head_dim=layer_head_dim, seed=i * 2)
-            rot_v = TurboQuantRotation(head_dim=layer_head_dim, seed=i * 2 + 1)
-            caches.append(
-                TurboQuantKVCache(bits=bits, rotation_key=rot_k, rotation_value=rot_v)
-            )
-            tq_count += 1
+            caches.append(layer_cache)
+            n_quantized += 1
         else:
             caches.append(default)
+    return caches, n_quantized
+
+
+def make_turboquant_cache(model: Any, bits: int) -> list:
+    """Create a cache list with TurboQuantKVCache for attention layers.
+
+    For hybrid models (e.g. Nemotron-H with SSM + attention layers), only
+    attention-layer caches (KVCache) are replaced with TurboQuantKVCache.
+    Non-attention caches (e.g. ArraysCache for SSM/Mamba layers) are preserved.
+    """
+    head_dim = _detect_head_dim(model)
+
+    packing_factor = 8 // bits
+    if head_dim % packing_factor != 0:
+        raise ValueError(
+            f"TurboQuant {bits}-bit requires head_dim divisible by {packing_factor}, "
+            f"got head_dim={head_dim}"
+        )
+
+    def _make_layer(i: int, layer_head_dim: int) -> TurboQuantKVCache | None:
+        if layer_head_dim % packing_factor != 0:
+            return None
+        rot_k = TurboQuantRotation(head_dim=layer_head_dim, seed=i * 2)
+        rot_v = TurboQuantRotation(head_dim=layer_head_dim, seed=i * 2 + 1)
+        return TurboQuantKVCache(bits=bits, rotation_key=rot_k, rotation_value=rot_v)
+
+    caches, tq_count = build_kv_quant_caches(model, _make_layer, head_dim=head_dim)
 
     logger.info(
         "Created TurboQuant KV cache: %d/%d cache entries quantized, %d-bit, head_dim=%d",

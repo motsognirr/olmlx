@@ -36,7 +36,7 @@ from olmlx.engine.inference import (
     _make_presence_penalty_processor,
     _merge_default_options,
     _message_boundary_token_ids,
-    _parse_kv_cache_quant,
+    _parse_kv_cache_quant_kv,
     _resolve_model_vocab_size,
     count_chat_tokens,
     estimate_kv_cache_bytes,
@@ -129,11 +129,13 @@ class TestEstimateKvCacheBytes:
         model = SimpleNamespace(args=_uniform_args(head_dim=128))
         assert estimate_kv_cache_bytes(model, 10) == int(4 * 2 * 2 * 128 * 10 * 2 * 1.3)
 
-    def test_turboquant_ratio_reduces_estimate(self):
+    def test_turboquant_counts_dequant_side_buffer(self):
+        # Live TurboQuant generation holds packed state + a full-precision
+        # side buffer, so it costs slightly more than plain fp16 KV.
         model = SimpleNamespace(args=_uniform_args())
         plain = estimate_kv_cache_bytes(model, 10)
         tq = estimate_kv_cache_bytes(model, 10, kv_cache_quant="turboquant:4")
-        assert tq < plain
+        assert tq > plain
 
     def test_spectral_ratio_reduces_estimate(self):
         model = SimpleNamespace(args=_uniform_args())
@@ -328,14 +330,17 @@ class TestApplySamplingDefaults:
 
 
 # --------------------------------------------------------------------------- #
-# _parse_kv_cache_quant                                                        #
+# _parse_kv_cache_quant_kv                                                     #
 # --------------------------------------------------------------------------- #
 class TestParseKvCacheQuant:
     def test_turboquant_spec(self):
-        assert _parse_kv_cache_quant("turboquant:4") == ("turboquant", 4)
+        assert _parse_kv_cache_quant_kv("turboquant:4") == ("turboquant", 4, 4)
 
     def test_spectral_spec(self):
-        assert _parse_kv_cache_quant("spectral:2") == ("spectral", 2)
+        assert _parse_kv_cache_quant_kv("spectral:2") == ("spectral", 2, 2)
+
+    def test_kvarn_asymmetric_spec(self):
+        assert _parse_kv_cache_quant_kv("kvarn:k4v2") == ("kvarn", 4, 2)
 
 
 # --------------------------------------------------------------------------- #

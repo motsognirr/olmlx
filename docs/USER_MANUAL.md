@@ -17,6 +17,7 @@ A comprehensive guide to olmlx — an Ollama-compatible API server powered by Ap
 - [Distributed Inference (Experimental)](#distributed-inference-experimental)
 - [macOS Service Management](#macos-service-management)
 - [TurboQuant KV Cache Quantization (Experimental)](#turboquant-kv-cache-quantization-experimental)
+  - [KVarN: Variance-Normalized KV Quantization](#kvarn-variance-normalized-kv-quantization)
 - [Flash-MoE Expert Offloading](#flash-moe-expert-offloading)
 - [Benchmarking](#benchmarking)
 - [Troubleshooting](#troubleshooting)
@@ -1446,7 +1447,7 @@ All settings are configured via `OLMLX_`-prefixed environment variables. You can
 
 | Variable | Type | Default | Description |
 |---|---|---|---|
-| `OLMLX_KV_CACHE_QUANT` | string/None | `None` | KV cache quantization method. Format: `<method>:<bits>` where method is `turboquant` or `spectral`, bits is `2` or `4` |
+| `OLMLX_KV_CACHE_QUANT` | string/None | `None` | KV cache quantization method. Format: `<method>:<bits>`: `turboquant:{2,4}`, `spectral:{2,4}`, `shard:{2,4,8}`, or `kvarn:k{2,4}v{2,4}` / `kvarn:{2,4}` (see [KVarN](#kvarn-variance-normalized-kv-quantization)) |
 
 ### Flash-MoE Settings
 
@@ -2091,10 +2092,54 @@ On each attention step, the cache is dequantized: unpack indices, look up centro
 ### Constraints
 
 - **Incompatible with disk cache offload** — cannot save/restore quantized cache state to disk
+- **The compression is for the stored cache, not live generation.** While a request is generating, the cache also keeps a full-precision dequantized copy of the history, so that only the new token needs dequantizing each step. Live KV memory is therefore slightly *above* fp16. The copy is dropped once the cache is stored between turns, and that stored cache is what the ratios above describe. The pre-flight KV memory check charges the live footprint, so an over-long prompt gets a clean error instead of a Metal OOM.
 - Head dimension must be divisible by the packing factor (2 for 4-bit, 4 for 2-bit)
 - Works with hybrid models (e.g., Nemotron-H SSM+attention) — only attention layers are quantized
 - Works transparently with prompt caching (KV cache reuse)
 - Best gains on long sequences; rotation overhead dominates on short sequences
+
+### KVarN: Variance-Normalized KV Quantization
+
+KVarN (issue #748; modeled on Huawei CSL's KVarN vLLM backend, Apache 2.0) targets the failure mode that matters for long reasoning: quantization error **accumulating across decode steps**, driven mostly by tokens whose **magnitudes** get crushed. MSE-optimal codebooks are biased toward shrinkage. TurboQuant's 2-bit reconstruction of a vector is noticeably shorter than the original, and that bias compounds every step.
+
+```bash
+# Headline config: 4-bit keys, 2-bit values
+OLMLX_KV_CACHE_QUANT=kvarn:k4v2
+
+# Symmetric widths
+OLMLX_KV_CACHE_QUANT=kvarn:4
+OLMLX_KV_CACHE_QUANT=kvarn:2
+```
+
+Per token, per tile (the largest power of two ≤ 128 dividing `head_dim`):
+
+```
+Randomized Hadamard rotation (block-diagonal, seeded sign flips)
+       │
+       ▼
+Subtract tile mean, divide by tile std  (variance normalization)
+       │
+       ▼
+Nearest N(0,1) Lloyd-Max centroid per coordinate, bit-packed
+       │
+       ▼
+Store: packed indices + float32 (mean, scale) per tile
+```
+
+`scale` is chosen so that the reconstructed tile has exactly the original centered norm, which means every token's L2 norm survives quantization. Keys and values take independent widths, since keys feed the softmax and are the more sensitive of the two.
+
+The cache reuses TurboQuant's dequant side buffer (`KVarNKVCache` subclasses `TurboQuantKVCache`), so decode speed is on par with TurboQuant. Prompt caching, speculative trim, hybrid layouts, and all the constraints above apply unchanged. A layer whose head dim has no power-of-two tile ≥ 16 stays unquantized.
+
+Compression at `head_dim=128`: `kvarn:4` ~3.6x, `kvarn:k4v2` ~4.6x, `kvarn:2` ~6.4x. The per-tile stats cost 8 bytes per 128 coordinates. Like TurboQuant, these ratios apply to the stored cache; live generation also holds the full-precision side buffer (see Constraints above).
+
+Teacher-forced fidelity against an fp16 cache, on a greedy chain-of-thought trace (mean next-token KL; lower is better):
+
+| Model | turboquant:4 | kvarn:4 | kvarn:k4v2 | turboquant:2 | kvarn:2 |
+|---|---|---|---|---|---|
+| Qwen3-4B-4bit (800 tok) | 0.052 | **0.041** | 0.078 | 3.12 | **1.12** |
+| Qwen3.5-4B-4bit hybrid (500 tok) | 0.0033 | **0.0025** | 0.0097 | 0.037 | **0.025** |
+
+Bench scenarios: `kvarn-k4v2`, `kvarn-2` (`olmlx bench run --scenarios ...`).
 
 ---
 

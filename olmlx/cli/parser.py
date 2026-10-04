@@ -95,7 +95,7 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help=(
             "KV cache quantization method and bits "
-            "(e.g. turboquant:4, spectral:2, shard:4)"
+            "(e.g. turboquant:4, spectral:2, shard:4, kvarn:k4v2)"
         ),
     )
     serve_p.add_argument(

@@ -4658,12 +4658,15 @@ class TestEstimateKvCacheBytes:
         expected_raw = 4 * 2 * 8 * 128 * 500 * 2
         assert result == int(expected_raw * _inf_mod.MEMORY_SAFETY_FACTOR)
 
-    def test_turboquant_4bit_reduces_estimate(self):
-        """TurboQuant 4-bit KV cache should reduce the memory estimate.
+    def test_turboquant_4bit_counts_side_buffer(self):
+        """The estimate gates *live generation*, during which a TurboQuant
+        cache holds its packed state AND the full-precision dequant side
+        buffer (``_key_dequant``/``_value_dequant``, shed only once the cache
+        is stored). Charging only the packed size admitted prompts ~5x larger
+        than fit and OOM'd Metal mid-prefill (#748 review).
 
-        Normal: head_dim * 2 bytes per head per K or V entry
-        TurboQuant 4-bit: head_dim/2 bytes (packed indices) + 4 bytes (norm)
-        For head_dim=128: 256 bytes → 68 bytes ≈ 3.76x reduction.
+        Per head per K or V entry at head_dim=128: fp16 256 bytes;
+        TurboQuant 4-bit 64 packed + 4 norm + 256 side buffer = 324 bytes.
         """
         model = self._make_model(
             num_hidden_layers=80,
@@ -4676,13 +4679,11 @@ class TestEstimateKvCacheBytes:
         tq4_result = estimate_kv_cache_bytes(
             model, 37000, kv_cache_quant="turboquant:4"
         )
-        # TurboQuant 4-bit should be significantly smaller
-        assert tq4_result < fp16_result
-        # Per-element: fp16 = 256 bytes, tq4 = 68 bytes → ratio ≈ 3.76x
-        assert fp16_result / tq4_result == pytest.approx(256 / 68, rel=0.01)
+        assert tq4_result > fp16_result
+        assert fp16_result / tq4_result == pytest.approx(256 / 324, rel=0.01)
 
-    def test_turboquant_2bit_reduces_estimate(self):
-        """TurboQuant 2-bit should compress even more than 4-bit."""
+    def test_turboquant_2bit_counts_side_buffer(self):
+        """2-bit: 32 packed + 4 norm + 256 side buffer = 292 bytes."""
         model = self._make_model(
             num_hidden_layers=80,
             num_attention_heads=64,
@@ -4694,9 +4695,7 @@ class TestEstimateKvCacheBytes:
         tq2_result = estimate_kv_cache_bytes(
             model, 37000, kv_cache_quant="turboquant:2"
         )
-        # Per-element: fp16 = 256 bytes, tq2 = 36 bytes → ratio ≈ 7.1x
-        assert tq2_result < fp16_result
-        assert fp16_result / tq2_result == pytest.approx(256 / 36, rel=0.01)
+        assert fp16_result / tq2_result == pytest.approx(256 / 292, rel=0.01)
 
     def test_shard_reduces_estimate(self):
         """ShardQuant KV cache must reduce the estimate too — before #634 it

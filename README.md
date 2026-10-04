@@ -435,7 +435,7 @@ All settings can be overridden with `OLMLX_`-prefixed environment variables or a
 | `OLMLX_SPECULATIVE_DRAFT_MODEL` | `None` | HuggingFace path of the draft model (also `--speculative-draft-model`) |
 | `OLMLX_SPECULATIVE_TOKENS` | `4` | Candidate tokens generated per verification step (also `--speculative-tokens`) |
 | `OLMLX_SPECULATIVE_CACHE_SLOTS` | `2` | Cross-request KV snapshots kept per model so each agent turn prefills only the new suffix (`classic`/`pld` only). `0` disables (fresh prefill every turn). Each slot is a full target (+draft) KV snapshot — keep small. |
-| `OLMLX_KV_CACHE_QUANT` | `None` | KV cache quantization: `turboquant:4` (~3.9x), `turboquant:2` (~7.5x), `spectral:4` (~5.9x), `spectral:2`, or `shard:{2,4,8}` (asymmetric K/V + sink/window) (also `--kv-cache-quant`) |
+| `OLMLX_KV_CACHE_QUANT` | `None` | KV cache quantization: `turboquant:4` (~3.9x), `turboquant:2` (~7.5x), `spectral:4` (~5.9x), `spectral:2`, `shard:{2,4,8}` (asymmetric K/V + sink/window), or `kvarn:k4v2` / `kvarn:{2,4}` (variance-normalized, per-K/V bits) (also `--kv-cache-quant`) |
 
 ### Flash inference settings
 
@@ -695,7 +695,17 @@ olmlx shard prepare <model>
 OLMLX_KV_CACHE_QUANT=shard:4
 ```
 
-Note: TurboQuant, SpectralQuant, and Shard are incompatible with disk cache offload.
+**KVarN** (issue #748, modeled on Huawei CSL's KVarN) applies a randomized Hadamard rotation, normalizes each tile to zero mean / unit variance before Lloyd-Max quantization, and stores a per-tile scale chosen so each token's magnitude survives quantization exactly. Keys and values take independent widths. No calibration:
+
+```bash
+# 4-bit keys, 2-bit values (~4.6x at head_dim 128): near 4-bit quality
+OLMLX_KV_CACHE_QUANT=kvarn:k4v2
+
+# Symmetric: kvarn:4 (~3.6x) or kvarn:2 (~6.4x)
+OLMLX_KV_CACHE_QUANT=kvarn:2
+```
+
+Note: TurboQuant, SpectralQuant, Shard, and KVarN are incompatible with disk cache offload.
 
 ## Distributed Inference (Experimental)
 

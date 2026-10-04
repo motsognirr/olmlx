@@ -62,11 +62,18 @@ memory usage to exceed the raw 2-bytes-per-element calculation by 20-30%.
 logger = logging.getLogger(__name__)
 
 
-def _parse_kv_cache_quant(spec: str) -> tuple[str, int]:
-    """Split an `OLMLX_KV_CACHE_QUANT` value like `"spectral:4"`
-    into `(method, bits)`.  Format is validated at config load time."""
+def _parse_kv_cache_quant_kv(spec: str) -> tuple[str, int, int]:
+    """Split an ``OLMLX_KV_CACHE_QUANT`` value like ``"spectral:4"`` or
+    ``"kvarn:k4v2"`` (#748) into ``(method, key_bits, value_bits)``.
+    Symmetric methods report the same width for K and V. Format is validated
+    at config load time."""
     method, bits_str = spec.split(":")
-    return method, int(bits_str)
+    if method == "kvarn":
+        from olmlx.config import parse_kvarn_bits
+
+        key_bits, value_bits = parse_kvarn_bits(bits_str)
+        return method, key_bits, value_bits
+    return method, int(bits_str), int(bits_str)
 
 
 def estimate_kv_cache_bytes(
@@ -76,9 +83,12 @@ def estimate_kv_cache_bytes(
 
     Formula: sum_over_attn_layers(2 * kv_heads_i * head_dim) * num_tokens * bytes_per_element * MEMORY_SAFETY_FACTOR
 
-    When *kv_cache_quant* is set (e.g. ``"turboquant:4"``), the per-head
-    storage is reduced from ``head_dim * 2`` bytes (fp16) to the compressed
-    size: ``head_dim / (8 / bits)`` packed-index bytes + 4 norm bytes.
+    When *kv_cache_quant* is set (e.g. ``"turboquant:4"``), each layer's
+    per-head bytes are scaled by its *live-generation* footprint relative to
+    fp16 (``_quant_ratio``): packed indices + side data, plus — for the
+    TurboQuant family (``turboquant``/``kvarn``) — the full-precision dequant
+    side buffer they keep resident while generating. Layers whose head dim
+    the codec can't take stay fp16.
 
     For NAS models (e.g. nemotron-nas) that have per-layer variable attention
     (some layers are no-op with self_attn=None, and KV head counts vary per
@@ -89,12 +99,8 @@ def estimate_kv_cache_bytes(
     if num_tokens <= 0:
         return 0
 
-    # TurboQuant compression ratio.  Normal fp16 stores head_dim * 2 bytes
-    # per K or V entry.  TurboQuant stores head_dim/(8/bits) packed-index
-    # bytes + 4 float32 norm bytes.  We compute a multiplier <1 to scale
-    # the fp16 estimate.  MLA models use a different cache layout so
-    # TurboQuant does not apply there (ratio stays 1.0).
-    _tq_ratio = 1.0  # applied to raw estimate before safety factor
+    # MLA models use a different cache layout; KV quantization does not
+    # apply there (see the early return below).
 
     # mlx-lm text models: model.args
     # mlx-vlm vision-language models: model.language_model.args or .config
@@ -159,27 +165,53 @@ def estimate_kv_cache_bytes(
     )
     bytes_per_element = 2  # float16/bfloat16
 
-    if kv_cache_quant is not None:
-        method, quant_bits = _parse_kv_cache_quant(kv_cache_quant)
-        fp16_per_entry = head_dim * bytes_per_element
-        if method == "turboquant":
-            # TurboQuant: packed indices + float32 norm
-            tq_per_entry = head_dim // (8 // quant_bits) + 4  # 4 bytes for f32 norm
-            _tq_ratio = tq_per_entry / fp16_per_entry
-        elif method == "spectral":
+    def _quant_ratio(layer_head_dim: int) -> float:
+        """Live-generation bytes for one K+V entry at ``layer_head_dim``,
+        relative to fp16. Computed per layer because the cache factories
+        decide per layer: a head dim the codec can't take keeps a plain fp16
+        ``KVCache`` (ratio 1.0)."""
+        if kv_cache_quant is None:
+            return 1.0
+        method, key_bits, value_bits = _parse_kv_cache_quant_kv(kv_cache_quant)
+        fp16_per_entry = layer_head_dim * bytes_per_element
+        if method in ("turboquant", "kvarn"):
+            # TurboQuant-family caches (KVarNKVCache subclasses
+            # TurboQuantKVCache) hold the packed state AND a full-precision
+            # dequant side buffer for the whole history while generating —
+            # shed only when the cache is stored. This estimate gates live
+            # generation, so it must charge both: the packed size alone
+            # admitted prompts ~5x too large, OOMing Metal mid-prefill instead
+            # of a clean MemoryError/400 (#748 review). Live TurboQuant is
+            # therefore slightly *above* fp16; its compression applies to the
+            # stored (between-turn) cache.
+            if method == "kvarn":
+                from olmlx.engine.kvarn import choose_tile
+
+                tile = choose_tile(layer_head_dim)
+                if tile is None:
+                    return 1.0
+                side = 8 * (layer_head_dim // tile)  # f32 (mean, scale)/tile
+            else:
+                if layer_head_dim % (8 // key_bits) != 0:
+                    return 1.0
+                side = 4  # f32 norm
+            k_entry = layer_head_dim // (8 // key_bits) + side + fp16_per_entry
+            v_entry = layer_head_dim // (8 // value_bits) + side + fp16_per_entry
+            return (k_entry + v_entry) / (2 * fp16_per_entry)
+        if method == "spectral":
             # SpectralQuant: two packed regimes (semantic + tail) + float32 norm
-            # Conservative estimate using avg_bits (actual varies per head)
-            sq_per_entry = head_dim // (8 // quant_bits) + 4
-            _tq_ratio = sq_per_entry / fp16_per_entry
-        elif method == "shard":
+            # Conservative estimate using avg_bits (actual varies per head).
+            # Dequantizes on read — no resident side buffer.
+            return (layer_head_dim // (8 // key_bits) + 4) / fp16_per_entry
+        if method == "shard":
             # ShardQuant: PCA-basis-projected packed indices + float32 norm.
             # Rank truncation makes the real footprint smaller than this, so
             # the turboquant-style estimate is a safe upper bound — but still
             # far below fp16. Without it, shard-quant models were estimated at
             # full fp16 KV size, 503-ing long prompts that would actually fit
             # (#634).
-            shard_per_entry = head_dim // (8 // quant_bits) + 4
-            _tq_ratio = shard_per_entry / fp16_per_entry
+            return (layer_head_dim // (8 // key_bits) + 4) / fp16_per_entry
+        return 1.0
 
     # Try layer introspection for NAS/variable-attention/hybrid models.
     # ``args_owner`` was set above to the component whose args we resolved
@@ -255,19 +287,20 @@ def estimate_kv_cache_bytes(
                 * layer_head_dim
                 * effective_tokens
                 * bytes_per_element
+                * _quant_ratio(layer_head_dim)
             )
         # Only trust introspection when every encountered layer reported its
         # KV heads.  found_attn_layer == False likely means the attention
         # module uses a different attribute name (e.g. "attention" instead of
         # "self_attn"); fall through to the args-based estimate in that case.
         if introspection_complete and found_attn_layer:
-            return int(raw_total * _tq_ratio * MEMORY_SAFETY_FACTOR)
+            return int(raw_total * MEMORY_SAFETY_FACTOR)
 
     # Fallback: uniform estimate from args
     num_layers = args.num_hidden_layers
     num_kv_heads = getattr(args, "num_key_value_heads", num_heads)
     raw = num_layers * 2 * num_kv_heads * head_dim * num_tokens * bytes_per_element
-    return int(raw * _tq_ratio * MEMORY_SAFETY_FACTOR)
+    return int(raw * _quant_ratio(head_dim) * MEMORY_SAFETY_FACTOR)
 
 
 def tokenize_for_cache(tokenizer: Any, prompt_text: str) -> list[int]:
