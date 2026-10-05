@@ -66,7 +66,8 @@ def _fold_system_messages_to_front(messages: list[dict]) -> list[dict]:
     message (which becomes the leading message even when the conversation
     didn't start with one). Returns the input unchanged when there's nothing
     to fold, and never mutates it. Non-string system content is left alone
-    (the template's own rejection then surfaces as a 400).
+    (the template's own rejection then surfaces as a 400); content-less
+    system turns fold to an empty-string lead.
     """
     if not any(m.get("role") == "system" for m in messages[1:]):
         return messages
@@ -77,7 +78,12 @@ def _fold_system_messages_to_front(messages: list[dict]) -> list[dict]:
     ):
         return messages
     rest = [m for m in messages if m.get("role") != "system"]
-    return [_merge_system_turns(systems), *rest]
+    lead = _merge_system_turns(systems)
+    # All system turns content-less (None or absent): give the lead a string,
+    # or the strict template's ``+ message.content`` fails as a 500.
+    if not isinstance(lead.get("content"), str):
+        lead["content"] = ""
+    return [lead, *rest]
 
 
 def _inject_tools_into_system(messages: list[dict], tools: list[dict]) -> list[dict]:

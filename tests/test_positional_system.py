@@ -343,3 +343,20 @@ class TestRealTransformersTokenizer:
                     {"role": "system", "content": "s"},
                 ],
             )
+
+
+class TestFoldContentlessSystem:
+    @pytest.mark.parametrize("late", [{"content": None}, {}])
+    def test_contentless_system_turns_fold_to_empty_string(self, late):
+        # ``model_dump(exclude_none=True)`` drops a null system content, so a
+        # content-less late turn is realistic. The merged lead must carry a
+        # string, or the strict template's ``+ message.content`` fails with a
+        # non-rejection error → 500 instead of rendering.
+        messages = [
+            {"role": "user", "content": "u1"},
+            {"role": "system", **late},
+            {"role": "user", "content": "u2"},
+        ]
+        folded = _fold_system_messages_to_front(messages)
+        assert folded[0] == {"role": "system", "content": ""}
+        _JinjaTokenizer(STRICT_TEMPLATE).apply_chat_template(folded)
