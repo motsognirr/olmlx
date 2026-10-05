@@ -2943,3 +2943,28 @@ class TestErrorEnvelopes:
         assert "detail" not in data
         assert data["error"]["message"] == "bad image"
         assert data["error"]["type"] == "invalid_request_error"
+
+
+class TestChatTemplateRejection:
+    """A template ``raise_exception`` is a client error → 400, not 500 (#740)."""
+
+    @pytest.mark.asyncio
+    async def test_template_rejection_is_400(self, app_client):
+        from olmlx.engine.chat_templating import ChatTemplateRejectedError
+
+        with patch(
+            "olmlx.routers.openai.generate_chat",
+            new_callable=AsyncMock,
+            side_effect=ChatTemplateRejectedError(
+                "Chat template rejected the messages: Unexpected message role."
+            ),
+        ):
+            resp = await app_client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "qwen3",
+                    "messages": [{"role": "user", "content": "hi"}],
+                },
+            )
+        assert resp.status_code == 400
+        assert "Unexpected message role" in resp.json()["error"]["message"]

@@ -14,12 +14,76 @@ import json
 import logging
 from typing import TYPE_CHECKING, Any
 
-from olmlx.engine.template_caps import TemplateCaps
+from olmlx.engine.template_caps import TemplateCaps, _is_template_raise
 
 if TYPE_CHECKING:
     from olmlx.engine.prompt_cache.checkpoint import SegmentedPrompt
 
 logger = logging.getLogger(__name__)
+
+
+class ChatTemplateRejectedError(ValueError, RuntimeError):
+    """The chat template ``raise_exception``-ed on the request's messages.
+
+    Templates raise to reject a conversation shape they can't render (a late
+    system turn, an unknown role, images in a system message), so this is a
+    client error: a ``ValueError`` → 400 (#740). It is also a
+    ``RuntimeError`` so existing ``except RuntimeError`` fallbacks around
+    template application keep catching it.
+    """
+
+
+def _merge_system_turns(turns: list[dict]) -> dict:
+    """Merge system turns into one message — the shared metadata rules.
+
+    Used by both the OpenAI router's leading-run merge and the engine's
+    late-system fold, so the two agree on what a merged turn means. Starts
+    from the first turn's fields; non-empty contents are joined with blank
+    lines; ``name`` is kept only if every turn agrees (otherwise the first
+    turn's name would claim the later turns' instructions); ``images`` and
+    ``audio`` from every turn are concatenated so no client input is dropped.
+    Content must already be a string or absent.
+    """
+    merged = dict(turns[0])
+    parts = [m["content"] for m in turns if m.get("content")]
+    if parts:
+        merged["content"] = "\n\n".join(parts)
+    if len({m.get("name") for m in turns}) > 1:
+        merged.pop("name", None)
+    for key in ("images", "audio"):
+        items = [x for m in turns for x in (m.get(key) or [])]
+        if items:
+            merged[key] = items
+    return merged
+
+
+def _fold_system_messages_to_front(messages: list[dict]) -> list[dict]:
+    """Fold every non-leading system turn into the leading system message.
+
+    For templates that reject a system turn anywhere but first (Qwen3.5/3.6,
+    detected by ``TemplateCaps.rejects_positional_system``). All system turns
+    are merged in order by ``_merge_system_turns`` into a single leading
+    message (which becomes the leading message even when the conversation
+    didn't start with one). Returns the input unchanged when there's nothing
+    to fold, and never mutates it. Non-string system content is left alone
+    (the template's own rejection then surfaces as a 400); content-less
+    system turns fold to an empty-string lead.
+    """
+    if not any(m.get("role") == "system" for m in messages[1:]):
+        return messages
+    systems = [m for m in messages if m.get("role") == "system"]
+    if any(
+        m.get("content") is not None and not isinstance(m["content"], str)
+        for m in systems
+    ):
+        return messages
+    rest = [m for m in messages if m.get("role") != "system"]
+    lead = _merge_system_turns(systems)
+    # All system turns content-less (None or absent): give the lead a string,
+    # or the strict template's ``+ message.content`` fails as a 500.
+    if not isinstance(lead.get("content"), str):
+        lead["content"] = ""
+    return [lead, *rest]
 
 
 def _inject_tools_into_system(messages: list[dict], tools: list[dict]) -> list[dict]:
@@ -226,9 +290,17 @@ def _apply_chat_template(
             try:
                 return tokenizer.apply_chat_template(messages, **kwargs)
             except Exception as exc2:
+                if _is_template_raise(exc2):
+                    raise ChatTemplateRejectedError(
+                        f"Chat template rejected the messages: {exc2}"
+                    ) from exc2
                 raise RuntimeError(
                     f"Chat template failed even without tools: {exc2}"
                 ) from exc2
+        if _is_template_raise(exc):
+            raise ChatTemplateRejectedError(
+                f"Chat template rejected the messages: {exc}"
+            ) from exc
         raise RuntimeError(f"Chat template failed: {exc}") from exc
 
 
@@ -669,6 +741,38 @@ def _apply_chat_template_vlm(
     audio: list[str] | None = None,
 ) -> str:
     """Apply chat template for vision-language models (mlx-vlm).
+
+    A template ``raise_exception`` surfaces as ``ChatTemplateRejectedError``
+    (400), matching the text path (#740).
+    """
+    try:
+        return _render_vlm_prompt(
+            processor,
+            model,
+            messages,
+            images,
+            tools=tools,
+            enable_thinking=enable_thinking,
+            audio=audio,
+        )
+    except Exception as exc:
+        if _is_template_raise(exc):
+            raise ChatTemplateRejectedError(
+                f"Chat template rejected the messages: {exc}"
+            ) from exc
+        raise
+
+
+def _render_vlm_prompt(
+    processor: Any,
+    model: Any,
+    messages: list[dict],
+    images: list[str] | None = None,
+    tools: list[dict] | None = None,
+    enable_thinking: bool | None = None,
+    audio: list[str] | None = None,
+) -> str:
+    """Render the VLM prompt; see ``_apply_chat_template_vlm``.
 
     When tools are provided, bypasses mlx_vlm.apply_chat_template and calls
     the processor's tokenizer directly.  mlx_vlm's message processing wraps

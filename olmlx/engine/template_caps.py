@@ -22,6 +22,11 @@ class TemplateCaps:
     # Minimal templates (e.g. Devstral/Mistral) only allow user/system/assistant
     # and raise on anything else; for those we fold tool turns into user text.
     handles_tool_role: bool = False
+    # Whether the template raises on a system turn that isn't the first message
+    # (Qwen3.5/3.6: "System message must be at the beginning."). For those,
+    # late system/developer turns are folded into the leading one (#740);
+    # templates that render a positional system turn keep it in place.
+    rejects_positional_system: bool = False
 
 
 def _find_template_variables(tpl: str) -> set[str] | None:
@@ -40,9 +45,86 @@ def _find_template_variables(tpl: str) -> set[str] | None:
         return None
 
 
+def _is_template_raise(exc: BaseException) -> bool:
+    """True for the exception transformers' ``raise_exception`` throws.
+
+    That is exactly ``jinja2.exceptions.TemplateError`` — its subclasses
+    (syntax errors, undefined variables) are template bugs, not a deliberate
+    rejection of the conversation.
+    """
+    try:
+        import jinja2
+    except ImportError:  # pragma: no cover - jinja2 ships with transformers
+        return False
+    return type(exc) is jinja2.exceptions.TemplateError
+
+
+_PROBE_LEADING_SYSTEM = [
+    {"role": "system", "content": "s"},
+    {"role": "user", "content": "u"},
+    {"role": "assistant", "content": "a"},
+    {"role": "user", "content": "u"},
+]
+_PROBE_LATE_SYSTEM = [
+    {"role": "system", "content": "s"},
+    {"role": "user", "content": "u"},
+    {"role": "assistant", "content": "a"},
+    {"role": "system", "content": "s"},
+    {"role": "user", "content": "u"},
+]
+
+
+def _probe_rejects_positional_system(tokenizer: Any, tpl: str) -> bool:
+    """Render a late-system probe and report whether only it is rejected.
+
+    A static scan can't tell "raise on a non-first system turn" from other
+    ``raise_exception`` guards, so render the template: the conversation with
+    a leading system turn must render and the same conversation with an extra
+    late system turn must ``raise_exception``. A template that rejects both
+    (no system role at all) or neither is not flagged — folding wouldn't
+    change the outcome.
+    """
+    if "raise_exception" not in tpl:
+        return False
+    apply = getattr(tokenizer, "apply_chat_template", None)
+    if not callable(apply):
+        return False
+    kwargs = {"tokenize": False, "add_generation_prompt": True}
+    # Fresh copies per render: some renderers (mlx-vlm processors) rewrite
+    # messages in place, which would corrupt the shared probe constants.
+    try:
+        apply([dict(m) for m in _PROBE_LEADING_SYSTEM], **kwargs)
+    except Exception as exc:
+        # Visible by default so "probe couldn't render" is distinguishable from
+        # "positional system is fine"; either way the fold stays off and a
+        # real rejection still surfaces as a 400.
+        logger.info(
+            "Positional-system probe could not render template (late system "
+            "turns will not be folded): %s",
+            exc,
+        )
+        return False
+    try:
+        apply([dict(m) for m in _PROBE_LATE_SYSTEM], **kwargs)
+    except Exception as exc:
+        # Only the template's deliberate ``raise_exception`` counts; a template
+        # bug on the late render must not reorder the client's messages.
+        if _is_template_raise(exc):
+            logger.debug("Template rejects a non-leading system turn: %s", exc)
+            return True
+    return False
+
+
 def detect_caps(tokenizer: Any) -> TemplateCaps:
     """Inspect the tokenizer's chat_template to determine supported features."""
     tpl = getattr(tokenizer, "chat_template", None)
+    if tpl is None:
+        # VLM processors may keep the template (and its renderer) on the
+        # wrapped tokenizer — same lookup as ``_get_chat_template_text``.
+        inner = getattr(tokenizer, "tokenizer", None)
+        inner_tpl = getattr(inner, "chat_template", None)
+        if isinstance(inner_tpl, (str, list)):
+            tokenizer, tpl = inner, inner_tpl
     if tpl is None:
         return TemplateCaps()
 
@@ -100,4 +182,5 @@ def detect_caps(tokenizer: Any) -> TemplateCaps:
         has_channel_format=has_channel_format,
         uses_tool_responses=uses_tool_responses,
         handles_tool_role=handles_tool_role,
+        rejects_positional_system=_probe_rejects_positional_system(tokenizer, tpl),
     )
