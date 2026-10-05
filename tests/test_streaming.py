@@ -192,6 +192,45 @@ class TestAsyncMlxStream:
         )
 
     @pytest.mark.asyncio
+    async def test_vlm_lazy_cache_state_materialized_after_generation(self):
+        """The VLM stream must finalize a lazy-state (KVarN/TurboQuant) cache on
+        the generating worker too — mlx-vlm stores it in the PromptCacheState
+        and the next turn's worker would otherwise crash on its packed buffers.
+        """
+        mock_mlx_vlm = MagicMock()
+        mock_mlx_vlm.stream_generate = MagicMock(
+            return_value=iter([MagicMock(text="hi", finish_reason="stop")])
+        )
+        calls: list[str] = []
+
+        class _Lazy:
+            def __init__(self, name):
+                self.name = name
+
+            def ensure_state_materialized(self):
+                calls.append(self.name)
+
+        # mlx-vlm generates into the state's cache instead of ``prompt_cache``
+        # on a prefix hit, so both must be finalized.
+        state = MagicMock()
+        state.cache = [_Lazy("reused")]
+
+        with patch.dict("sys.modules", {"mlx_vlm": mock_mlx_vlm}):
+            stream = async_mlx_stream(
+                MagicMock(),
+                MagicMock(),
+                "prompt",
+                max_tokens=10,
+                is_vlm=True,
+                prompt_cache=[_Lazy("fresh")],
+                prompt_cache_state=state,
+            )
+            async for _ in stream:
+                pass
+
+        assert sorted(calls) == ["fresh", "reused"]
+
+    @pytest.mark.asyncio
     async def test_error_propagation(self):
         mock_mlx_lm = MagicMock()
         mock_mlx_lm.stream_generate = MagicMock(

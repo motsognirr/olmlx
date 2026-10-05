@@ -535,6 +535,31 @@ class TestMakeKvarnCache:
         assert cache[0] is arrays
         assert isinstance(cache[1], KVarNKVCache)
 
+    def test_mlx_vlm_plain_kvcache_is_quantized(self):
+        """VLMs (Gemma 4 via mlx-vlm) build their layout from mlx-vlm's own
+        cache classes, which don't subclass mlx-lm's — a plain mlx-vlm
+        ``KVCache`` must still be quantized, or ``kv_cache_quant`` is a no-op
+        on every VLM. Its windowed and model-specific subclasses (Qwen3.8's
+        ``QSAKVCache`` carries sparse-indexer state) must be left alone."""
+        from mlx_vlm.models.cache import KVCache as VlmKVCache
+        from mlx_vlm.models.cache import RotatingKVCache as VlmRotating
+
+        from olmlx.engine.kvarn_cache import KVarNKVCache, make_kvarn_cache
+
+        class _ModelSpecificKVCache(VlmKVCache):
+            pass
+
+        rotating = VlmRotating(max_size=8)
+        special = _ModelSpecificKVCache()
+        model = MagicMock()
+        model.layers = [MagicMock() for _ in range(3)]
+        model.args.head_dim = 128
+        model.make_cache.return_value = [rotating, VlmKVCache(), special]
+        cache = make_kvarn_cache(model, key_bits=4, value_bits=2)
+        assert cache[0] is rotating
+        assert isinstance(cache[1], KVarNKVCache)
+        assert cache[2] is special
+
     def test_unsupported_head_dim_falls_back(self):
         from mlx_lm.models.cache import KVCache
 

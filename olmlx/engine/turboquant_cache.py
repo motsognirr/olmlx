@@ -572,6 +572,24 @@ def _detect_head_dim(model: Any, layers_hint: Any = None) -> int:
         ) from e
 
 
+def _is_plain_kv_cache(cache: Any) -> bool:
+    """True for a full-attention layer cache the quantizers may replace.
+
+    mlx-lm's ``KVCache`` (and subclasses, as before), or exactly mlx-vlm's
+    plain ``KVCache``: VLM layouts come from mlx-vlm's own cache classes, which
+    don't subclass mlx-lm's, so an ``isinstance`` check alone left every VLM
+    unquantized. mlx-vlm subclasses are excluded — they carry model-specific
+    state the attention reads (Qwen3.8's ``QSAKVCache`` sparse-indexer keys).
+    """
+    if isinstance(cache, KVCache):
+        return True
+    try:
+        from mlx_vlm.models.cache import KVCache as VlmKVCache
+    except ImportError:
+        return False
+    return type(cache) is VlmKVCache
+
+
 def build_kv_quant_caches(
     model: Any,
     make_layer: Callable[[int, int], Any | None],
@@ -605,7 +623,7 @@ def build_kv_quant_caches(
     caches = []
     n_quantized = 0
     for i, default in enumerate(default_caches):
-        if default is None or isinstance(default, KVCache):
+        if default is None or _is_plain_kv_cache(default):
             # Detect per-layer head dim from K projection weight shape.
             # Models like gemma4 have different head dims for full vs sliding
             # attention layers (global_head_dim=512 vs head_dim=256).

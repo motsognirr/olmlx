@@ -409,6 +409,39 @@ def _cache_needs_materialize(cache: Any) -> bool:
     )
 
 
+def vlm_generation_caches(gen_kwargs: dict[str, Any]) -> list[Any]:
+    """The caches an ``mlx_vlm.stream_generate`` call may generate into.
+
+    mlx-vlm uses the passed ``prompt_cache`` on a miss, but on a prefix hit it
+    swaps in (and trims) the cache held by ``prompt_cache_state`` instead, so
+    both must be finalized after generation.
+    """
+    state = gen_kwargs.get("prompt_cache_state")
+    return [gen_kwargs.get("prompt_cache"), getattr(state, "cache", None)]
+
+
+def _finalize_lazy_caches(gen: Any, caches: list[Any]) -> Any:
+    """Wrap ``gen`` so lazy-state ``caches`` are materialized when it ends.
+
+    The wrapper's ``finally`` runs on the generating worker on both exhaustion
+    and ``gen.close()`` (cancel), and ``mx.eval`` blocks until done, so the
+    buffers are materialized leaves before the worker returns. Returns ``gen``
+    unwrapped (no per-token frame overhead) when no cache needs it.
+    """
+    caches = [c for c in caches if _cache_needs_materialize(c)]
+    if not caches:
+        return gen
+
+    def _finalizing():
+        try:
+            yield from gen
+        finally:
+            for cache in caches:
+                materialize_lazy_cache_state(cache)
+
+    return _finalizing()
+
+
 def async_mlx_stream(
     model: Any,
     tokenizer: Any,
@@ -452,7 +485,7 @@ def async_mlx_stream(
         if is_vlm:
             import mlx_vlm
 
-            return mlx_vlm.stream_generate(  # pyright: ignore[reportPrivateImportUsage]
+            gen = mlx_vlm.stream_generate(  # pyright: ignore[reportPrivateImportUsage]
                 model,
                 tokenizer,
                 prompt=prompt,
@@ -461,6 +494,10 @@ def async_mlx_stream(
                 max_tokens=max_tokens,
                 **kwargs,
             )
+            # A ``kv_cache_quant`` VLM generates into a lazy-state cache too:
+            # the fresh ``prompt_cache``, or on a prefix hit the cache mlx-vlm
+            # reuses from ``prompt_cache_state`` (see ``vlm_generation_caches``).
+            return _finalize_lazy_caches(gen, vlm_generation_caches(kwargs))
         else:
             import mlx_lm
 
@@ -480,27 +517,14 @@ def async_mlx_stream(
                 )
 
             gen = mlx_lm.stream_generate(model, tokenizer, **gen_kwargs)
-            prompt_cache = gen_kwargs.get("prompt_cache")
-            if not _cache_needs_materialize(prompt_cache):
-                return gen
-
             # Flat-path lazy-state caches (TurboQuant) leave their packed
             # buffers as a lazy graph bound to THIS worker thread's Metal
             # stream — ``update_and_fetch`` returns from a dequant side buffer,
             # so the packed writes never enter mlx-lm's per-token ``mx.eval``.
-            # Materialize them here, on the generating worker, before the cache
-            # is stored and reused by a different worker thread (which would
-            # otherwise crash: "no Stream(gpu, N) in current thread"). The
-            # wrapper's ``finally`` runs on this thread on both exhaustion and
-            # ``gen.close()`` (cancel), and ``mx.eval`` blocks until done, so
-            # the buffers are materialized leaves before the worker returns.
-            def _finalizing():
-                try:
-                    yield from gen
-                finally:
-                    materialize_lazy_cache_state(prompt_cache)
-
-            return _finalizing()
+            # Materialize them on the generating worker before the cache is
+            # stored and reused by a different worker thread (which would
+            # otherwise crash: "no Stream(gpu, N) in current thread").
+            return _finalize_lazy_caches(gen, [gen_kwargs.get("prompt_cache")])
 
     stream = CancellableStream(gen_factory, is_vlm=is_vlm, trace_context=trace_context)
     stream.start()

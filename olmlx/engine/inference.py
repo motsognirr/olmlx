@@ -96,7 +96,11 @@ from olmlx.engine.template_caps import TemplateCaps
 from olmlx.utils import metrics as _metrics
 from olmlx.utils import tracing as _tracing
 from olmlx.utils.audio_input import cleanup_temp_audio, materialize_audio
-from olmlx.utils.streaming import async_mlx_stream, materialize_lazy_cache_state
+from olmlx.utils.streaming import (
+    async_mlx_stream,
+    materialize_lazy_cache_state,
+    vlm_generation_caches,
+)
 from olmlx.utils.timing import Timer, TimingStats
 
 # Extracted helper modules (#split-large-modules). Re-exported so
@@ -1276,6 +1280,23 @@ def _make_prompt_cache_for_lm(lm: LoadedModel) -> list:
         sink, window = _parse_kv_eviction(lm.kv_eviction)
         return _make_eviction_prompt_cache(cache_model, sink, window)
     return make_prompt_cache(cache_model)
+
+
+def _attach_vlm_kv_quant_cache(lm: LoadedModel, gen_kwargs: dict) -> None:
+    """Hand mlx-vlm the ``kv_cache_quant`` cache for this VLM generation.
+
+    ``mlx_vlm.stream_generate`` builds a plain fp16 cache unless one is passed
+    as ``prompt_cache``, so without this the setting is silently ignored on
+    every VLM. On a prefix hit mlx-vlm swaps in the ``PromptCacheState``'s
+    cache (a quant cache from the previous turn) instead. Built on the event
+    loop like the text path's: the rotations are eager-eval'd at construction,
+    and the generating worker materializes the packed buffers at the end
+    (``vlm_generation_caches``). Called after the KV preflight so its
+    memory-pressure ``prompt_cache`` pop (text-store re-insert) never sees it.
+    Identity/type checks so a MagicMock ``lm`` can't route here.
+    """
+    if lm.is_vlm is True and isinstance(lm.kv_cache_quant, str):
+        gen_kwargs["prompt_cache"] = _make_prompt_cache_for_lm(lm)
 
 
 def _extract_images(messages: list[dict]) -> list[str] | None:
@@ -3451,6 +3472,7 @@ async def _stream_completion(
             _recheck_window_if_eviction_cache_lost(
                 lm, gen_kwargs, prompt, full_prompt_tokens, use_prompt_cache
             )
+        _attach_vlm_kv_quant_cache(lm, gen_kwargs)
 
         # Yield cache stats after the pre-flight check so routers can
         # use them.  This starts the HTTP response — no 503 after this.
@@ -4052,6 +4074,7 @@ async def _full_completion(
                         lm, gen_kwargs, prompt, full_prompt_tokens, use_prompt_cache
                     )
 
+                _attach_vlm_kv_quant_cache(lm, gen_kwargs)
                 result_dict = await _full_completion_inner(
                     lm,
                     prompt,
@@ -4379,10 +4402,17 @@ async def _full_completion_inner(
         # from a dequant side buffer, so the packed writes never enter the
         # per-token eval). Materialize them here, on the generating worker,
         # before the cache is stored and reused from another worker thread —
-        # symmetric with the streaming path's gen_factory finalizer. Skipped by
+        # symmetric with the streaming path's gen_factory finalizer. A VLM may
+        # have generated into its PromptCacheState's cache instead (prefix
+        # hit), so both are covered (``vlm_generation_caches``). Skipped by
         # the speculative branch, which returns above and does not build these
         # caches. No-op for plain/Spectral/Shard caches.
-        materialize_lazy_cache_state(gen_kwargs.get("prompt_cache"))
+        for cache in (
+            vlm_generation_caches(gen_kwargs)
+            if lm.is_vlm
+            else [gen_kwargs.get("prompt_cache")]
+        ):
+            materialize_lazy_cache_state(cache)
 
         # Sync the generation_stream specifically — mlx_lm/mlx_vlm run GPU
         # work on this module-level stream, not the default stream.  Without
