@@ -9,7 +9,7 @@ re-imports these names so existing call sites and tests are unchanged.
 
 import logging
 import re
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 import mlx.core as mx
 
@@ -140,7 +140,8 @@ def _token_ids(tokens) -> list[int]:
     identity, so they never deduplicate in a dict/set (#757).
     """
     if isinstance(tokens, mx.array):
-        return tokens.reshape(-1).tolist()
+        # A 1-D int array's ``tolist()`` is ``list[int]`` (typed as a union).
+        return cast(list[int], tokens.reshape(-1).tolist())
     return [int(t) for t in tokens]
 
 
