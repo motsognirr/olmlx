@@ -152,11 +152,13 @@ def _make_generated_penalty_processor(penalty: float, presence: bool):
 
     def processor(tokens, logits: mx.array) -> mx.array:
         nonlocal counts
-        if len(tokens) == 0 or penalty == 0:
+        if penalty == 0:
             return logits
-        vocab_size = logits.shape[-1]
         if counts is None:
-            counts = mx.zeros((vocab_size,), dtype=mx.float32)
+            # The first call — empty history or prompt only — counts nothing.
+            counts = mx.zeros((logits.shape[-1],), dtype=mx.float32)
+            return logits
+        if len(tokens) == 0:
             return logits
         n_counts = counts.shape[0]  # bound by the array scattered into
         newest = mx.array(tokens[-1:]).reshape(-1).astype(mx.int32)

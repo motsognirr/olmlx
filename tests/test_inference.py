@@ -581,6 +581,15 @@ class TestPenaltyProcessors:
         out = processor(mx.array([3, 1]), mx.full((4,), 10.0))
         assert mx.allclose(out, mx.array([10.0, 9.0, 10.0, 10.0])).item()
 
+    def test_empty_first_history_still_counts_next_token(self):
+        """A caller whose first call carries an empty history must not make
+        the next call (re)initialize instead of counting its token."""
+        processor = _make_frequency_penalty_processor(1.0)
+        processor(mx.array([], dtype=mx.int32), mx.full((1, 4), 10.0))
+        processor(mx.array([0]), mx.full((1, 4), 10.0))
+        out = processor(mx.array([0, 1]), mx.full((1, 4), 10.0))
+        assert mx.allclose(out, mx.array([[9.0, 9.0, 10.0, 10.0]])).item()
+
     def test_zero_penalty_returns_unchanged(self):
         for make in (
             _make_frequency_penalty_processor,

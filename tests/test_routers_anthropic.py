@@ -768,6 +768,7 @@ class TestAnthropicEndpoint:
         assert seen[0] == "message_start", seen
         assert seen[-1] == "message_stop", seen
 
+    @pytest.mark.asyncio
     async def test_streaming_tools_buffered_stop_sequence_hit(self, app_client):
         # #711: the buffered-tools streaming path must agree with the
         # incremental path when a stop sequence ends a tool-less response.
