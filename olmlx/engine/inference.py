@@ -1179,22 +1179,33 @@ def _get_model_for_cache(model: Any, is_vlm: bool) -> Any:
     return model
 
 
-def _make_turboquant_prompt_cache(model: Any, bits: int, is_vlm: bool = False) -> list:
+def _make_turboquant_prompt_cache(
+    model: Any, bits: int, is_vlm: bool = False, rotation_memo: dict | None = None
+) -> list:
     """Create a TurboQuant-compressed prompt cache for the model."""
     from olmlx.engine.turboquant_cache import make_turboquant_cache
 
     cache_model = _get_model_for_cache(model, is_vlm)
-    return make_turboquant_cache(cache_model, bits=bits)
+    return make_turboquant_cache(cache_model, bits=bits, rotation_memo=rotation_memo)
 
 
 def _make_kvarn_prompt_cache(
-    model: Any, key_bits: int, value_bits: int, is_vlm: bool = False
+    model: Any,
+    key_bits: int,
+    value_bits: int,
+    is_vlm: bool = False,
+    rotation_memo: dict | None = None,
 ) -> list:
     """Create a KVarN-compressed prompt cache for the model (#748)."""
     from olmlx.engine.kvarn_cache import make_kvarn_cache
 
     cache_model = _get_model_for_cache(model, is_vlm)
-    return make_kvarn_cache(cache_model, key_bits=key_bits, value_bits=value_bits)
+    return make_kvarn_cache(
+        cache_model,
+        key_bits=key_bits,
+        value_bits=value_bits,
+        rotation_memo=rotation_memo,
+    )
 
 
 def _make_spectral_prompt_cache(
@@ -1263,9 +1274,13 @@ def _make_prompt_cache_for_lm(lm: LoadedModel) -> list:
     for cache creation."""
     if lm.kv_cache_quant is not None:
         method, bits, value_bits = _parse_kv_cache_quant_kv(lm.kv_cache_quant)
+        # getattr: duck-typed ``lm`` stand-ins may lack the field; isinstance:
+        # a MagicMock ``lm`` must not hand a mock in as the memo.
+        memo = getattr(lm, "kv_quant_rotations", None)
+        memo = memo if isinstance(memo, dict) else None
         if method == "kvarn":
             return _make_kvarn_prompt_cache(
-                lm.model, bits, value_bits, is_vlm=lm.is_vlm
+                lm.model, bits, value_bits, is_vlm=lm.is_vlm, rotation_memo=memo
             )
         if method == "spectral":
             return _make_spectral_prompt_cache(
@@ -1275,12 +1290,27 @@ def _make_prompt_cache_for_lm(lm: LoadedModel) -> list:
             return _make_shard_prompt_cache(
                 lm.model, bits, lm.shard_calibration_dir, is_vlm=lm.is_vlm
             )
-        return _make_turboquant_prompt_cache(lm.model, bits, is_vlm=lm.is_vlm)
+        return _make_turboquant_prompt_cache(
+            lm.model, bits, is_vlm=lm.is_vlm, rotation_memo=memo
+        )
     cache_model = _get_model_for_cache(lm.model, lm.is_vlm)
     if lm.kv_eviction is not None:
         sink, window = _parse_kv_eviction(lm.kv_eviction)
         return _make_eviction_prompt_cache(cache_model, sink, window)
     return make_prompt_cache(cache_model)
+
+
+def _will_speculate(lm: LoadedModel, *, has_media: bool, grammar_active: bool) -> bool:
+    """Whether this request takes the speculative decoding path.
+
+    Single source for the dispatch in ``_stream_completion`` /
+    ``_generate_sync`` and for ``_attach_kv_quant_cache`` (speculative
+    decoders never read ``prompt_cache``), so they can't drift. Media requests
+    go to mlx-vlm; grammar isn't plumbed through the decoders (#361).
+    ``has_media`` is the caller's media test — streaming routes any media away
+    from speculation, non-streaming only a VLM's.
+    """
+    return bool(lm.is_speculative) and not has_media and not grammar_active
 
 
 def _attach_kv_quant_cache(
@@ -3494,9 +3524,11 @@ async def _stream_completion(
         _attach_kv_quant_cache(
             lm,
             gen_kwargs,
-            will_speculate=bool(lm.is_speculative)
-            and not (images or audio_paths)
-            and not grammar_active,
+            will_speculate=_will_speculate(
+                lm,
+                has_media=bool(images or audio_paths),
+                grammar_active=grammar_active,
+            ),
         )
 
         # Yield cache stats after the pre-flight check so routers can
@@ -3542,7 +3574,9 @@ async def _stream_completion(
             )
             use_speculative = False
         else:
-            use_speculative = lm.is_speculative and not (images or audio_paths)
+            use_speculative = _will_speculate(
+                lm, has_media=bool(images or audio_paths), grammar_active=False
+            )
 
         # prompt is a str or a token-id list; only the latter gives a count here.
         _prefill_prompt_tokens = len(prompt) if isinstance(prompt, list) else None
@@ -4104,9 +4138,11 @@ async def _full_completion(
                 _attach_kv_quant_cache(
                     lm,
                     gen_kwargs,
-                    will_speculate=lm.is_speculative is True
-                    and not grammar_active
-                    and not (lm.is_vlm and (images or audio)),
+                    will_speculate=_will_speculate(
+                        lm,
+                        has_media=bool(lm.is_vlm and (images or audio)),
+                        grammar_active=grammar_active,
+                    ),
                 )
                 result_dict = await _full_completion_inner(
                     lm,
@@ -4266,7 +4302,11 @@ async def _full_completion_inner(
             )
             use_speculative = False
         else:
-            use_speculative = lm.is_speculative
+            use_speculative = _will_speculate(
+                lm,
+                has_media=bool(lm.is_vlm and (images or audio_paths)),
+                grammar_active=False,
+            )
 
         try:
             if lm.is_vlm and (images or audio_paths):

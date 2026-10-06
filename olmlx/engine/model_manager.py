@@ -239,20 +239,6 @@ class ModelManager(SpeculativeLoaderMixin):
             except Exception as exc:
                 logger.exception("Error dropping grammar cache for %s", lm.name)
                 errors.append(exc)
-        # The quant-cache rotation memos are process-global; don't let them
-        # outlive the model (up to ~2 MB per rotation pair at D=512). Other
-        # loaded models just rebuild theirs once on their next request.
-        if isinstance(lm.kv_cache_quant, str):
-            try:
-                from olmlx.engine.kvarn_cache import _shared_kvarn_rotation
-                from olmlx.engine.turboquant_cache import shared_turboquant_rotation
-
-                shared_turboquant_rotation.cache_clear()
-                _shared_kvarn_rotation.cache_clear()
-            except Exception as exc:
-                logger.exception("Error clearing quant rotation memos for %s", lm.name)
-                errors.append(exc)
-
         if getattr(lm.model, "prefetcher", None) is not None:
             try:
                 lm.model.prefetcher.close()

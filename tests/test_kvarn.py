@@ -718,51 +718,49 @@ class TestPackedBufferMaterialization:
 class TestRotationReuse:
     """The quant cache is rebuilt per request on paths with no stored cache
     (every VLM request, text with the prompt cache off), on the event loop —
-    so the deterministic, immutable per-layer rotations are built once and
-    shared (the cache's ``__deepcopy__`` already shares them by reference)."""
+    so the deterministic, immutable per-layer rotations are built once per
+    loaded model and shared (``__deepcopy__`` already shares them by
+    reference). The memo lives on the ``LoadedModel``, so it dies with it and
+    never crosses models."""
 
-    def test_turboquant_rotations_shared_across_caches(self):
+    def test_turboquant_rotations_shared_via_memo(self):
         from olmlx.engine.turboquant_cache import make_turboquant_cache
 
-        a = make_turboquant_cache(_mock_model(2), bits=4)
-        b = make_turboquant_cache(_mock_model(2), bits=4)
+        memo: dict = {}
+        a = make_turboquant_cache(_mock_model(2), bits=4, rotation_memo=memo)
+        b = make_turboquant_cache(_mock_model(2), bits=4, rotation_memo=memo)
         assert a[1].rotation_key is b[1].rotation_key
         assert a[1].rotation_value is b[1].rotation_value
         assert a[0].rotation_key is not a[1].rotation_key
 
-    def test_kvarn_rotations_shared_across_caches(self):
+    def test_kvarn_rotations_shared_via_memo(self):
         from olmlx.engine.kvarn_cache import make_kvarn_cache
 
-        a = make_kvarn_cache(_mock_model(2), key_bits=4, value_bits=2)
-        b = make_kvarn_cache(_mock_model(2), key_bits=4, value_bits=2)
+        memo: dict = {}
+        a = make_kvarn_cache(_mock_model(2), 4, 2, rotation_memo=memo)
+        b = make_kvarn_cache(_mock_model(2), 4, 2, rotation_memo=memo)
         assert a[1].rotation_key is b[1].rotation_key
         assert a[0].rotation_key is not a[0].rotation_value
 
-    def test_rotation_memos_cleared_on_model_close(self):
-        """The memo is process-global; it must not outlive the model that
-        populated it (each rotation pair is up to ~2 MB at D=512)."""
-        from olmlx.engine.kvarn_cache import _shared_kvarn_rotation, make_kvarn_cache
-        from olmlx.engine.model_manager import ModelManager
-        from olmlx.engine.turboquant_cache import (
-            make_turboquant_cache,
-            shared_turboquant_rotation,
-        )
+    def test_prompt_cache_for_lm_memo_is_per_model(self):
+        from olmlx.engine.inference import _make_prompt_cache_for_lm
+        from olmlx.engine.loaded_model import LoadedModel
 
-        make_turboquant_cache(_mock_model(2), bits=4)
-        make_kvarn_cache(_mock_model(2), key_bits=4, value_bits=2)
-        lm = MagicMock(
-            kv_cache_quant="turboquant:4",
-            is_whisper=False,
-            is_tts=False,
-            is_image=False,
-            adapter_base=None,
-            weight_store=None,
-            speculative_decoder=None,
-        )
-        lm.model.prefetcher = None
-        ModelManager._close_loaded_model(lm)
-        assert shared_turboquant_rotation.cache_info().currsize == 0
-        assert _shared_kvarn_rotation.cache_info().currsize == 0
+        def _lm():
+            return LoadedModel(
+                name="m",
+                hf_path="m",
+                model=_mock_model(2),
+                tokenizer=MagicMock(),
+                kv_cache_quant="kvarn:k4v2",
+            )
+
+        lm1, lm2 = _lm(), _lm()
+        a = _make_prompt_cache_for_lm(lm1)
+        b = _make_prompt_cache_for_lm(lm1)
+        c = _make_prompt_cache_for_lm(lm2)
+        assert a[0].rotation_key is b[0].rotation_key
+        assert a[0].rotation_key is not c[0].rotation_key
 
 
 class TestVlmKvCacheClassImport:

@@ -203,6 +203,10 @@ class LoadedModel:
     uses_checkpoint_persistence: bool = False
     spectral_calibration_dir: Any = None  # Path | None, typed as Any to avoid import
     shard_calibration_dir: Any = None  # Path | None, typed as Any to avoid import
+    # Per-model memo of TurboQuant/KVarN rotations (``memoized_rotation``):
+    # rebuilt quant caches share them instead of redoing the QR per request.
+    # Lives exactly as long as this model, so nothing leaks past an unload.
+    kv_quant_rotations: dict = field(default_factory=dict)
     default_options: dict = field(default_factory=dict)
     inference_queue_timeout: float | None = None
     inference_timeout: float | None = None
