@@ -94,7 +94,8 @@ def materialize_restored_cache(cache: list[Any]) -> None:
                 _collect(item)
 
     _collect(flatten_cache_state(cache))
-    mx.eval(leaves)
+    if leaves:
+        mx.eval(leaves)
 
 
 def snapshot_cache_for_persistence(
