@@ -42,7 +42,7 @@ jobs:
       # on, so a resolution regression blocks merges rather than just skipping
       # the review.
       - name: Run Aider Code Review (gpt-5.6-luna)
-        uses: motsognirr/aider-code-review@a5dcc5d393dcdf3c14880a70710e4c403c2b0528 # v1.3.0
+        uses: motsognirr/aider-code-review@9f5baff07b14477a959babae220a4238dfb4a69a # v1.3.1
         with:
           openai_api_key: ${{ secrets.OPENAI_API_KEY }}
           github_token: ${{ secrets.GITHUB_TOKEN }}
@@ -64,7 +64,7 @@ jobs:
       # routed to V4.1-Flash since 2026-09-14 and V4.1-Flash beats V4-Pro on
       # coding benchmarks (DeepSWE v1.1: 74.2 vs 62.7). Revisit when V4.1-Pro ships.
       - name: Run Aider Code Review (deepseek-flash)
-        uses: motsognirr/aider-code-review@a5dcc5d393dcdf3c14880a70710e4c403c2b0528 # v1.3.0
+        uses: motsognirr/aider-code-review@9f5baff07b14477a959babae220a4238dfb4a69a # v1.3.1
         with:
           deepseek_api_key: ${{ secrets.DEEPSEEK_API_KEY }}
           github_token: ${{ secrets.GITHUB_TOKEN }}
