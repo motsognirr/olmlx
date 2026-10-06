@@ -69,13 +69,21 @@ def tokenizer_eos_ids(tokenizer: Any) -> frozenset[int]:
     The non-speculative path stops on any id in mlx-lm's
     ``TokenizerWrapper.eos_token_ids``; a bare ``eos_token_id`` misses the
     extra end-of-turn ids of Gemma 3 / Llama 3.x, so speculative decoding ran
-    past the turn to ``max_tokens`` (#757). Non-int entries are dropped so a
+    past the turn to ``max_tokens`` (#757). mlx-vlm loads leave the raw HF
+    tokenizer (what speculative VLM targets pass) without ``eos_token_ids``
+    but attach the config's list as ``stopping_criteria`` (Gemma 3:
+    ``[1, 106]``), so that is folded in too. Non-int entries are dropped so a
     MagicMock tokenizer yields an empty set rather than junk.
     """
     ids: set[int] = set()
-    multi = getattr(tokenizer, "eos_token_ids", None)
-    if isinstance(multi, (set, frozenset, list, tuple)):
-        ids.update(t for t in multi if isinstance(t, int))
+    criteria = getattr(tokenizer, "stopping_criteria", None)
+    for multi in (
+        getattr(tokenizer, "eos_token_ids", None),
+        getattr(criteria, "eos_token_ids", None),
+        getattr(criteria, "additional_eos_token_ids", None),
+    ):
+        if isinstance(multi, (set, frozenset, list, tuple)):
+            ids.update(t for t in multi if isinstance(t, int))
     single = getattr(tokenizer, "eos_token_id", None)
     if isinstance(single, int):
         ids.add(single)

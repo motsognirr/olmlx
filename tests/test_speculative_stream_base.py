@@ -243,6 +243,23 @@ class TestMultipleEosIds:
         assert tokenizer_eos_ids(_Tok()) == frozenset({7})
         assert tokenizer_eos_ids(None) == frozenset()
 
+    def test_tokenizer_eos_ids_from_vlm_stopping_criteria(self):
+        """mlx-vlm loads attach the config's ``eos_token_id`` list (Gemma 3:
+        ``[1, 106]``) to the raw HF tokenizer as ``stopping_criteria`` — the
+        HF tokenizer itself has no ``eos_token_ids``. Speculative VLM targets
+        pass that raw tokenizer, so the criteria must be folded in."""
+        from olmlx.engine.speculative_stream import tokenizer_eos_ids
+
+        class _Criteria:
+            eos_token_ids = [1, 106]
+            additional_eos_token_ids = [107]
+
+        class _HFTok:
+            eos_token_id = 1
+            stopping_criteria = _Criteria()
+
+        assert tokenizer_eos_ids(_HFTok()) == frozenset({1, 106, 107})
+
     async def test_async_stream_uses_all_eos_ids(self):
         from olmlx.engine.speculative_stream import async_speculative_stream
 
