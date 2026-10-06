@@ -9,7 +9,7 @@ re-imports these names so existing call sites and tests are unchanged.
 
 import logging
 import re
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING
 
 import mlx.core as mx
 
@@ -132,54 +132,39 @@ def _install_grammar_processor(
     return True
 
 
-def _token_ids(tokens) -> list[int]:
-    """History as Python ints.
+def _make_generated_penalty_processor(penalty: float, presence: bool):
+    """Shared OpenAI frequency/presence penalty over the *generated* tokens.
 
-    mlx-lm's ``generate_step`` passes the history as an ``mx.array``: ``not``
-    on it raises once it holds 2+ tokens, and its 0-d elements hash by object
-    identity, so they never deduplicate in a dict/set (#757).
+    Relies on the processor contract shared by mlx-lm ``generate_step``,
+    mlx-vlm and the batched ``GenerationBatch``: one call per sampled token,
+    the history's newest entry being the token sampled last. The first call's
+    history is prompt only — its last token on the exclusive mlx-lm path, all
+    of it on the batched / mlx-vlm paths — so it is never counted; seeding
+    from it would ban common prompt tokens on a long prompt (#757).
+
+    Counts live in a device-resident ``[vocab]`` vector updated by one
+    scatter-add per step: no host sync (mlx-lm calls processors right after
+    ``async_eval`` of the previous token, so a ``.tolist()`` here would stall
+    the pipeline every token) and constant per-step work. The history may be
+    an ``mx.array`` or a list.
     """
-    if isinstance(tokens, mx.array):
-        # A 1-D int array's ``tolist()`` is ``list[int]`` (typed as a union).
-        return cast(list[int], tokens.reshape(-1).tolist())
-    return [int(t) for t in tokens]
-
-
-def _make_incremental_penalty_processor(penalty: float, presence: bool):
-    """Shared OpenAI frequency/presence penalty processor.
-
-    Keeps an incremental count dict (O(1) per step) to avoid O(n²) rebuilds
-    for long generations: seeded from the initial history on first call, then
-    bumped by the newest token per step. The logits are fresh every call, so
-    the penalty for *every* counted token is re-applied each step — a
-    presence penalty is ``penalty`` per seen token, a frequency penalty is
-    ``penalty * count``.
-    """
-    counts: dict[int, int] = {}
-    _initialised = False
+    counts: mx.array | None = None
 
     def processor(tokens, logits: mx.array) -> mx.array:
-        nonlocal _initialised
+        nonlocal counts
         if len(tokens) == 0 or penalty == 0:
             return logits
         vocab_size = logits.shape[-1]
-        if not _initialised:
-            new_ids = _token_ids(tokens)
-            _initialised = True
-        else:
-            new_ids = _token_ids(tokens[-1:])
-        for tid in new_ids:
-            if 0 <= tid < vocab_size:
-                counts[tid] = counts.get(tid, 0) + 1
-        if not counts:
+        if counts is None:
+            counts = mx.zeros((vocab_size,), dtype=mx.float32)
             return logits
-        ids = mx.array(list(counts.keys()))
-        if presence:
-            amounts = mx.array(penalty, dtype=logits.dtype)
-        else:
-            amounts = (penalty * mx.array(list(counts.values()))).astype(logits.dtype)
-        logits[..., ids] = logits[..., ids] - amounts
-        return logits
+        newest = mx.array(tokens[-1:]).reshape(-1).astype(mx.int32)
+        in_range = (newest >= 0) & (newest < vocab_size)
+        counts = counts.at[mx.clip(newest, 0, vocab_size - 1)].add(
+            in_range.astype(mx.float32)
+        )
+        amounts = (counts > 0).astype(mx.float32) if presence else counts
+        return logits - (penalty * amounts).astype(logits.dtype)
 
     return processor
 
@@ -191,7 +176,7 @@ def _make_frequency_penalty_processor(frequency_penalty: float):
     in the text so far, decreasing the model's likelihood to repeat the
     same line verbatim.
     """
-    return _make_incremental_penalty_processor(frequency_penalty, presence=False)
+    return _make_generated_penalty_processor(frequency_penalty, presence=False)
 
 
 def _make_presence_penalty_processor(presence_penalty: float):
@@ -201,7 +186,7 @@ def _make_presence_penalty_processor(presence_penalty: float):
     in the text so far, increasing the model's likelihood to talk about
     new topics.
     """
-    return _make_incremental_penalty_processor(presence_penalty, presence=True)
+    return _make_generated_penalty_processor(presence_penalty, presence=True)
 
 
 # Harmony channel name: the leading word after ``<|channel|>`` (mirrors

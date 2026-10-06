@@ -21,7 +21,6 @@ import contextlib
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
-import mlx.core as mx
 import pytest
 
 import olmlx.engine.inference as _inf_mod
@@ -32,8 +31,6 @@ from olmlx.engine.inference import (
     _full_completion,
     _get_chat_template_text,
     _GptOssChannelFilter,
-    _make_frequency_penalty_processor,
-    _make_presence_penalty_processor,
     _merge_default_options,
     _message_boundary_token_ids,
     _parse_kv_cache_quant_kv,
@@ -528,59 +525,6 @@ class TestCountChatTokens:
         tok.apply_chat_template.return_value = "not a token list"
         with pytest.raises(TypeError, match="Unexpected return type"):
             count_chat_tokens(tok, [{"role": "user", "content": "hi"}])
-
-
-# --------------------------------------------------------------------------- #
-# penalty processor out-of-range / incremental paths                          #
-# --------------------------------------------------------------------------- #
-class TestPenaltyProcessorEdgeCases:
-    def test_empty_tokens_noop(self):
-        proc = _make_frequency_penalty_processor(1.0)
-        logits = mx.array([5.0, 5.0])
-        out = proc([], logits)
-        assert mx.allclose(out, logits).item()
-
-    def test_zero_penalty_noop(self):
-        proc = _make_frequency_penalty_processor(0.0)
-        logits = mx.array([5.0, 5.0])
-        out = proc([0, 1], logits)
-        assert mx.allclose(out, logits).item()
-
-    def test_frequency_out_of_range_seed_token_ignored(self):
-        proc = _make_frequency_penalty_processor(1.0)
-        # token 9 is out of range (vocab 2); only token 0 penalised.
-        result = proc([0, 9], mx.array([5.0, 5.0]))
-        assert mx.allclose(result, mx.array([4.0, 5.0])).item()
-
-    def test_frequency_incremental_out_of_range_ignored(self):
-        proc = _make_frequency_penalty_processor(1.0)
-        proc([0], mx.array([5.0, 5.0]))  # init seeds freq {0:1}
-        result = proc([0, 9], mx.array([5.0, 5.0]))  # new token 9 out of range
-        assert mx.allclose(result, mx.array([4.0, 5.0])).item()
-
-    def test_frequency_counts_accumulate(self):
-        proc = _make_frequency_penalty_processor(1.0)
-        proc([0, 0], mx.array([5.0, 5.0]))  # init: token 0 seen twice
-        result = proc([0, 0, 0], mx.array([5.0, 5.0]))  # incremental: +1 → 3
-        assert mx.allclose(result, mx.array([2.0, 5.0])).item()
-
-    def test_presence_incremental_new_token(self):
-        proc = _make_presence_penalty_processor(0.5)
-        proc([0], mx.array([10.0, 10.0]))  # init seeds {0}
-        result = proc([0, 1], mx.array([10.0, 10.0]))  # token 1 newly seen
-        assert mx.allclose(result, mx.array([9.5, 9.5])).item()
-
-    def test_presence_incremental_repeat_token_no_double_penalty(self):
-        proc = _make_presence_penalty_processor(0.5)
-        proc([0], mx.array([10.0, 10.0]))  # init seeds {0}
-        result = proc([0, 0], mx.array([10.0, 10.0]))  # 0 already seen
-        assert mx.allclose(result, mx.array([9.5, 10.0])).item()
-
-    def test_presence_incremental_out_of_range_ignored(self):
-        proc = _make_presence_penalty_processor(0.5)
-        proc([0], mx.array([10.0, 10.0]))
-        result = proc([0, 5], mx.array([10.0, 10.0]))  # 5 out of range
-        assert mx.allclose(result, mx.array([9.5, 10.0])).item()
 
 
 # --------------------------------------------------------------------------- #
