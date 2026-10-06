@@ -287,7 +287,18 @@ class VlmPromptCacheStore:
             from mlx_vlm.generate import PromptCacheState
 
             cache, metadata = load_prompt_cache(str(file_path), return_metadata=True)
-            materialize_restored_cache(cache)
+            try:
+                materialize_restored_cache(cache)
+            except Exception:
+                # Distinct from an unreadable file: e.g. MemoryError or a
+                # transient Metal error (mirrors the text store, #757).
+                logger.warning(
+                    "VLM disk spill: failed to materialize '%s' restored from "
+                    "disk; keeping the file",
+                    cache_id,
+                    exc_info=True,
+                )
+                return None
             token_ids = json.loads(metadata.get("token_ids", "[]"))
             state = PromptCacheState()
             state.update(token_ids, cache)

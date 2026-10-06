@@ -158,9 +158,10 @@ def _make_generated_penalty_processor(penalty: float, presence: bool):
         if counts is None:
             counts = mx.zeros((vocab_size,), dtype=mx.float32)
             return logits
+        n_counts = counts.shape[0]  # bound by the array scattered into
         newest = mx.array(tokens[-1:]).reshape(-1).astype(mx.int32)
-        in_range = (newest >= 0) & (newest < vocab_size)
-        counts = counts.at[mx.clip(newest, 0, vocab_size - 1)].add(
+        in_range = (newest >= 0) & (newest < n_counts)
+        counts = counts.at[mx.clip(newest, 0, n_counts - 1)].add(
             in_range.astype(mx.float32)
         )
         amounts = (counts > 0).astype(mx.float32) if presence else counts
