@@ -195,6 +195,12 @@ def hqq_quantize_linear(
     w = layer.weight
     bias = layer.bias if "bias" in layer else None
     packed, scales, q_biases = hqq_quantize_weight(w, cfg)
+    # Materialize now, per layer, on the load thread: ``HQQLinear`` keeps
+    # these under underscore keys that a later ``mx.eval(parameters())``
+    # skips (lazy → load-thread-bound → ``no Stream`` on the first forward),
+    # and one model-wide eval would hold every fp16 original plus every
+    # layer's solver graph at once (#757).
+    mx.eval(packed, scales, q_biases)
     return HQQLinear(
         weight=packed,
         scales=scales,
@@ -263,6 +269,11 @@ def quantize_model(
         )
         return
 
-    for name, linear in replacements:
+    # Pop as we go so each fp16 original is released once its layer is
+    # quantized and swapped out, bounding peak load memory to ~one layer.
+    replacements.reverse()
+    while replacements:
+        name, linear = replacements.pop()
         hqq_layer = hqq_quantize_linear(linear, cfg)
+        del linear
         _replace_module(model, name, hqq_layer)

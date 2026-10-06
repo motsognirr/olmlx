@@ -3129,13 +3129,10 @@ class ModelManager(SpeculativeLoaderMixin):
             cfg.group_size,
             hf_path,
         )
+        # quantize_model evals each HQQLinear's (underscore-keyed, so
+        # parameters()-invisible) buffers as it builds them (#757).
         quantize_model(target, cfg)
         mx.eval(target.parameters())
-        # ``HQQLinear`` stores its packed weight/scales/biases under underscore
-        # keys, which ``parameters()`` skips — without this the quantized
-        # weights stay lazy and load-thread-bound (first forward raises
-        # ``no Stream``) and the fp16 originals stay alive until then (#757).
-        _materialize_module_buffers(target)
 
     def _load_model_and_shard(
         self,

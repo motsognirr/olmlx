@@ -834,20 +834,47 @@ class TestHqqWeightMaterialization:
     def _forward_on_worker(model):
         return _run_in_thread(lambda: mx.eval(model(mx.ones((1, 128)))))
 
-    def test_parameters_eval_alone_crashes_cross_thread(self):
-        # Negative control: the pre-fix load-time eval leaves HQQ lazy.
-        from olmlx.engine.hqq.quantize import HQQConfig, quantize_model
+    def test_lazy_hqq_linear_crashes_cross_thread(self):
+        # Negative control: an HQQLinear built from lazy buffers is invisible
+        # to ``parameters()``, so a parameters() eval leaves it load-bound.
+        import mlx.nn as nn
 
-        def _quantize(m):
-            quantize_model(m, HQQConfig(bits=4, group_size=64))
+        from olmlx.engine.hqq.quantize import HQQLinear
+
+        class _M(nn.Module):
+            def __init__(self):
+                super().__init__()
+                w = mx.ones((128, 128)) * 0.5
+                q, s, b = mx.quantize(w, group_size=64, bits=4)
+                self.l = HQQLinear(q, s, b, None, group_size=64, bits=4)
+
+            def __call__(self, x):
+                return self.l(x)
+
+        def _load():
+            m = _M()
             mx.eval(m.parameters())
+            return m
 
-        res = self._forward_on_worker(_hqq_quantize_on_thread(_quantize))
+        res = _run_in_thread(_load)
+        assert res.get("error") is None, res.get("error")
+        res = self._forward_on_worker(res["value"])
         assert res.get("error") is not None, (
             "expected lazy HQQ buffers to be load-thread-bound — if this "
             "passes, the HQQ materialization may be unnecessary"
         )
         assert "Stream" in str(res["error"])
+
+    def test_quantize_model_materializes(self):
+        from olmlx.engine.hqq.quantize import HQQConfig, quantize_model
+
+        model = _hqq_quantize_on_thread(
+            lambda m: quantize_model(m, HQQConfig(bits=4, group_size=64))
+        )
+        res = self._forward_on_worker(model)
+        assert res.get("error") is None, (
+            f"quantize_model left HQQ buffers lazy: {res.get('error')!r}"
+        )
 
     def test_maybe_quantize_model_materializes(self):
         from olmlx.engine.model_manager import ModelManager

@@ -613,7 +613,7 @@ async def _stream_response(
                         "response.output_item.added",
                         {
                             "output_index": message_index,
-                            "item": {**message_item("in_progress"), "content": []},
+                            "item": _in_progress_skeleton(message_item("in_progress")),
                         },
                     )
                 )
