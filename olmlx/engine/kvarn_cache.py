@@ -15,6 +15,7 @@ The ``_key_norms`` / ``_value_norms`` buffers hold KVarN's per-tile
 
 from __future__ import annotations
 
+import functools
 import logging
 from typing import Any
 
@@ -77,6 +78,12 @@ class KVarNKVCache(TurboQuantKVCache):
         return kvarn_dequantize(packed, side, rotation, bits, dtype=dtype)
 
 
+@functools.lru_cache(maxsize=512)
+def _shared_kvarn_rotation(head_dim: int, seed: int) -> KVarNRotation:
+    """Build-once ``KVarNRotation`` (see ``shared_turboquant_rotation``)."""
+    return KVarNRotation(head_dim=head_dim, seed=seed)
+
+
 def make_kvarn_cache(model: Any, key_bits: int, value_bits: int) -> list:
     """Create a cache list with ``KVarNKVCache`` for attention layers.
 
@@ -91,8 +98,8 @@ def make_kvarn_cache(model: Any, key_bits: int, value_bits: int) -> list:
         return KVarNKVCache(
             key_bits=key_bits,
             value_bits=value_bits,
-            rotation_key=KVarNRotation(head_dim=layer_head_dim, seed=i * 2),
-            rotation_value=KVarNRotation(head_dim=layer_head_dim, seed=i * 2 + 1),
+            rotation_key=_shared_kvarn_rotation(layer_head_dim, i * 2),
+            rotation_value=_shared_kvarn_rotation(layer_head_dim, i * 2 + 1),
         )
 
     caches, n_quantized = build_kv_quant_caches(model, _make_layer, head_dim=head_dim)

@@ -713,3 +713,27 @@ class TestPackedBufferMaterialization:
 
         res = _run_in_thread(read_packed)
         assert "error" not in res, res.get("error")
+
+
+class TestRotationReuse:
+    """The quant cache is rebuilt per request on paths with no stored cache
+    (every VLM request, text with the prompt cache off), on the event loop —
+    so the deterministic, immutable per-layer rotations are built once and
+    shared (the cache's ``__deepcopy__`` already shares them by reference)."""
+
+    def test_turboquant_rotations_shared_across_caches(self):
+        from olmlx.engine.turboquant_cache import make_turboquant_cache
+
+        a = make_turboquant_cache(_mock_model(2), bits=4)
+        b = make_turboquant_cache(_mock_model(2), bits=4)
+        assert a[1].rotation_key is b[1].rotation_key
+        assert a[1].rotation_value is b[1].rotation_value
+        assert a[0].rotation_key is not a[1].rotation_key
+
+    def test_kvarn_rotations_shared_across_caches(self):
+        from olmlx.engine.kvarn_cache import make_kvarn_cache
+
+        a = make_kvarn_cache(_mock_model(2), key_bits=4, value_bits=2)
+        b = make_kvarn_cache(_mock_model(2), key_bits=4, value_bits=2)
+        assert a[1].rotation_key is b[1].rotation_key
+        assert a[0].rotation_key is not a[0].rotation_value

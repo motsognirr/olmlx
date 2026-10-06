@@ -663,6 +663,19 @@ def build_kv_quant_caches(
     return caches, n_quantized
 
 
+@functools.lru_cache(maxsize=512)
+def shared_turboquant_rotation(head_dim: int, seed: int) -> TurboQuantRotation:
+    """Build-once ``TurboQuantRotation`` for ``(head_dim, seed)``.
+
+    Rotations are deterministic in ``(head_dim, seed)``, eager-evaluated (no
+    stream binding, safe from any thread) and never mutated — ``__deepcopy__``
+    already shares them by reference (#634). Paths with no stored cache build a
+    fresh cache per request on the event loop (every VLM request, text with
+    the prompt cache off); rebuilding the QR there cost ~50-90 ms per request.
+    """
+    return TurboQuantRotation(head_dim=head_dim, seed=seed)
+
+
 def make_turboquant_cache(model: Any, bits: int) -> list:
     """Create a cache list with TurboQuantKVCache for attention layers.
 
@@ -682,8 +695,8 @@ def make_turboquant_cache(model: Any, bits: int) -> list:
     def _make_layer(i: int, layer_head_dim: int) -> TurboQuantKVCache | None:
         if layer_head_dim % packing_factor != 0:
             return None
-        rot_k = TurboQuantRotation(head_dim=layer_head_dim, seed=i * 2)
-        rot_v = TurboQuantRotation(head_dim=layer_head_dim, seed=i * 2 + 1)
+        rot_k = shared_turboquant_rotation(layer_head_dim, i * 2)
+        rot_v = shared_turboquant_rotation(layer_head_dim, i * 2 + 1)
         return TurboQuantKVCache(bits=bits, rotation_key=rot_k, rotation_value=rot_v)
 
     caches, tq_count = build_kv_quant_caches(model, _make_layer, head_dim=head_dim)
