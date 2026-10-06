@@ -85,6 +85,7 @@ def tokenizer_eos_ids(tokenizer: Any) -> frozenset[int]:
     for multi in (
         single,  # some tokenizers/configs carry a list here
         getattr(tokenizer, "eos_token_ids", None),
+        criteria,  # mlx-vlm attaches a StoppingCriteria; tolerate a bare list
         getattr(criteria, "eos_token_ids", None),
         getattr(criteria, "additional_eos_token_ids", None),
     ):
