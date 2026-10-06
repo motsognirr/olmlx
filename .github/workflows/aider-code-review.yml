@@ -34,14 +34,15 @@ jobs:
       # Provider-prefixed like the deepseek job below. The toolchain this
       # action pins (aider 0.86.2 / litellm 1.81.10) predates GPT-5.6 metadata,
       # so a bare name would resolve only via litellm's name-based provider
-      # guessing — which can shift under a moving tag (hence the exact
-      # `@v1.3.0` pin below, not `@v1`) or a litellm bump.
+      # guessing — which can shift under a moving tag or a litellm bump. Hence
+      # the commit-SHA pin below rather than a tag: tags (even `v1.3.0`) can be
+      # re-pointed, and this action runs with the API keys and a PR-write token.
       # `openai/` pins the routing instead. That matters because gpt-review is
       # one of the check runs factory-babysit.yml's MERGE READINESS gate waits
       # on, so a resolution regression blocks merges rather than just skipping
       # the review.
       - name: Run Aider Code Review (gpt-5.6-luna)
-        uses: motsognirr/aider-code-review@v1.3.0
+        uses: motsognirr/aider-code-review@a5dcc5d393dcdf3c14880a70710e4c403c2b0528 # v1.3.0
         with:
           openai_api_key: ${{ secrets.OPENAI_API_KEY }}
           github_token: ${{ secrets.GITHUB_TOKEN }}
@@ -63,7 +64,7 @@ jobs:
       # routed to V4.1-Flash since 2026-09-14 and V4.1-Flash beats V4-Pro on
       # coding benchmarks (DeepSWE v1.1: 74.2 vs 62.7). Revisit when V4.1-Pro ships.
       - name: Run Aider Code Review (deepseek-flash)
-        uses: motsognirr/aider-code-review@v1.3.0
+        uses: motsognirr/aider-code-review@a5dcc5d393dcdf3c14880a70710e4c403c2b0528 # v1.3.0
         with:
           deepseek_api_key: ${{ secrets.DEEPSEEK_API_KEY }}
           github_token: ${{ secrets.GITHUB_TOKEN }}
