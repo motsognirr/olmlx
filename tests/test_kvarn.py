@@ -535,6 +535,31 @@ class TestMakeKvarnCache:
         assert cache[0] is arrays
         assert isinstance(cache[1], KVarNKVCache)
 
+    def test_mlx_vlm_plain_kvcache_is_quantized(self):
+        """VLMs (Gemma 4 via mlx-vlm) build their layout from mlx-vlm's own
+        cache classes, which don't subclass mlx-lm's — a plain mlx-vlm
+        ``KVCache`` must still be quantized, or ``kv_cache_quant`` is a no-op
+        on every VLM. Its windowed and model-specific subclasses (Qwen3.8's
+        ``QSAKVCache`` carries sparse-indexer state) must be left alone."""
+        from mlx_vlm.models.cache import KVCache as VlmKVCache
+        from mlx_vlm.models.cache import RotatingKVCache as VlmRotating
+
+        from olmlx.engine.kvarn_cache import KVarNKVCache, make_kvarn_cache
+
+        class _ModelSpecificKVCache(VlmKVCache):
+            pass
+
+        rotating = VlmRotating(max_size=8)
+        special = _ModelSpecificKVCache()
+        model = MagicMock()
+        model.layers = [MagicMock() for _ in range(3)]
+        model.args.head_dim = 128
+        model.make_cache.return_value = [rotating, VlmKVCache(), special]
+        cache = make_kvarn_cache(model, key_bits=4, value_bits=2)
+        assert cache[0] is rotating
+        assert isinstance(cache[1], KVarNKVCache)
+        assert cache[2] is special
+
     def test_unsupported_head_dim_falls_back(self):
         from mlx_lm.models.cache import KVCache
 
@@ -688,3 +713,71 @@ class TestPackedBufferMaterialization:
 
         res = _run_in_thread(read_packed)
         assert "error" not in res, res.get("error")
+
+
+class TestRotationReuse:
+    """The quant cache is rebuilt per request on paths with no stored cache
+    (every VLM request, text with the prompt cache off), on the event loop —
+    so the deterministic, immutable per-layer rotations are built once per
+    loaded model and shared (``__deepcopy__`` already shares them by
+    reference). The memo lives on the ``LoadedModel``, so it dies with it and
+    never crosses models."""
+
+    def test_turboquant_rotations_shared_via_memo(self):
+        from olmlx.engine.turboquant_cache import make_turboquant_cache
+
+        memo: dict = {}
+        a = make_turboquant_cache(_mock_model(2), bits=4, rotation_memo=memo)
+        b = make_turboquant_cache(_mock_model(2), bits=4, rotation_memo=memo)
+        assert a[1].rotation_key is b[1].rotation_key
+        assert a[1].rotation_value is b[1].rotation_value
+        assert a[0].rotation_key is not a[1].rotation_key
+
+    def test_kvarn_rotations_shared_via_memo(self):
+        from olmlx.engine.kvarn_cache import make_kvarn_cache
+
+        memo: dict = {}
+        a = make_kvarn_cache(_mock_model(2), 4, 2, rotation_memo=memo)
+        b = make_kvarn_cache(_mock_model(2), 4, 2, rotation_memo=memo)
+        assert a[1].rotation_key is b[1].rotation_key
+        assert a[0].rotation_key is not a[0].rotation_value
+
+    def test_prompt_cache_for_lm_memo_is_per_model(self):
+        from olmlx.engine.inference import _make_prompt_cache_for_lm
+        from olmlx.engine.loaded_model import LoadedModel
+
+        def _lm():
+            return LoadedModel(
+                name="m",
+                hf_path="m",
+                model=_mock_model(2),
+                tokenizer=MagicMock(),
+                kv_cache_quant="kvarn:k4v2",
+            )
+
+        lm1, lm2 = _lm(), _lm()
+        a = _make_prompt_cache_for_lm(lm1)
+        b = _make_prompt_cache_for_lm(lm1)
+        c = _make_prompt_cache_for_lm(lm2)
+        assert a[0].rotation_key is b[0].rotation_key
+        assert a[0].rotation_key is not c[0].rotation_key
+
+
+class TestVlmKvCacheClassImport:
+    def test_missing_mlx_vlm_cache_module_warns_once(self, caplog, monkeypatch):
+        """A silent fallback here would re-create the exact no-op this guards
+        against (kv_cache_quant ignored on every VLM) with no log line."""
+        import sys
+
+        from olmlx.engine.turboquant_cache import _is_plain_kv_cache, _vlm_kv_cache_cls
+
+        _vlm_kv_cache_cls.cache_clear()
+        monkeypatch.setitem(sys.modules, "mlx_vlm.models.cache", None)
+        try:
+            with caplog.at_level("WARNING"):
+                assert _is_plain_kv_cache(object()) is False
+                assert _is_plain_kv_cache(object()) is False
+            hits = [r for r in caplog.records if "mlx-vlm" in r.getMessage()]
+            assert len(hits) == 1
+        finally:
+            _vlm_kv_cache_cls.cache_clear()

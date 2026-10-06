@@ -316,7 +316,7 @@ olmlx flash info <model>
 | `--samples` | `256` | Number of calibration samples for activation analysis |
 | `--threshold` | `0.01` | Activation threshold — neurons below this value are considered inactive |
 | `--epochs` | `5` | Predictor training epochs |
-| `--calibration-dataset` | `None` (uses `c4`) | Calibration dataset: `c4` (default) or `synthetic` |
+| `--calibration-dataset` | `None` (uses `c4`) | Calibration dataset: `c4` (default) or `synthetic`. Prefer `c4`: `synthetic` is a few short templates and under-calibrates large head dims (e.g. Gemma 4's 512-dim layers) |
 | `--sensitive-layers` | `0` | Number of last layers to use higher predictor rank (0 = disabled) |
 | `--sensitive-rank-multiplier` | `4` | Rank multiplier for sensitive layers |
 
@@ -2097,6 +2097,7 @@ On each attention step, the cache is dequantized: unpack indices, look up centro
 - Works with hybrid models (e.g., Nemotron-H SSM+attention) — only attention layers are quantized
 - Works transparently with prompt caching (KV cache reuse)
 - Best gains on long sequences; rotation overhead dominates on short sequences
+- Applies to vision models (e.g. Gemma 4) and to text models with the prompt cache disabled. Only plain full-attention layers are quantized: Gemma 4's sliding-window layers keep their own cache, and Qwen3.8-Flash-Next's sparse-attention cache is left unquantized. Speculative and distributed requests run unquantized.
 
 ### KVarN: Variance-Normalized KV Quantization
 

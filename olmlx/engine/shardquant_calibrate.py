@@ -207,17 +207,22 @@ def calibrate_model_shard(
     if progress_callback:
         progress_callback("Analyzing", 0.5)
 
-    if head_dim % group_size != 0:
-        raise ValueError(
-            f"head_dim={head_dim} not divisible by VQ group size {group_size} "
-            f"(bits={bits}); shard quantization unsupported for this model."
-        )
-
     calibration: ShardCalibration = {}
+    incompatible: list[tuple[int, int]] = []
     for layer_idx in range(num_layers):
+        # Heads and head_dim come from this layer's collected tensors, not the
+        # model-wide config: per-layer layouts differ (Gemma 4 full-attention
+        # layers: head_dim 512, 2-4 KV heads vs config 256, 8-16).
         head_chunks = kv_collectors[layer_idx]
-        if not any(head_chunks[h]["key"] for h in range(n_kv_heads)):
+        layer_heads = sorted(head_chunks)
+        if not any(head_chunks[h]["key"] for h in layer_heads):
             logger.debug("No KV data for layer %d, skipping", layer_idx)
+            continue
+        layer_head_dim = next(
+            c[0].shape[-1] for h in layer_heads if (c := head_chunks[h]["key"])
+        )
+        if layer_head_dim % group_size != 0:
+            incompatible.append((layer_idx, layer_head_dim))
             continue
 
         attn = _find_attention_module(model, inner, layer_idx)
@@ -239,7 +244,7 @@ def calibrate_model_shard(
         means = []
         ranks = []
         coeff_per_head = []
-        for h in range(n_kv_heads):
+        for h in layer_heads:
             chunks = head_chunks[h]["key"]
             if not chunks:
                 break
@@ -257,7 +262,7 @@ def calibrate_model_shard(
             means.append(mean_h)
             ranks.append(_rank_from_eigenvalues(eigenvalues, k_energy))
             coeff_per_head.append(centered @ basis.T)
-        if len(bases) < n_kv_heads:
+        if len(bases) < len(layer_heads):
             logger.debug("Layer %d: incomplete per-head K data, skipping", layer_idx)
             continue
         k_rank = max(ranks)
@@ -267,14 +272,14 @@ def calibrate_model_shard(
 
         # --- V: pooled rotation + PQ ------------------------------------
         v_chunks = []
-        for h in range(n_kv_heads):
+        for h in layer_heads:
             v_chunks.extend(head_chunks[h]["value"])
         v_data = mx.concatenate(v_chunks, axis=0).astype(mx.float32)
         v_norms = mx.maximum(
             mx.sqrt(mx.sum(v_data * v_data, axis=-1, keepdims=True)),
             mx.array(1e-8),
         )
-        v_rotation = make_v_rotation(head_dim, seed=layer_idx)
+        v_rotation = make_v_rotation(layer_head_dim, seed=layer_idx)
         v_rotated = (v_data / v_norms) @ v_rotation.T
         v_codebooks = fit_vq_codebooks(
             np.array(v_rotated), group_size=group_size, seed=layer_idx
@@ -300,6 +305,22 @@ def calibrate_model_shard(
     del kv_collectors
     gc.collect()
     mx.clear_cache()
+
+    if incompatible:
+        detail = ", ".join(f"layer {i}: head_dim={d}" for i, d in incompatible)
+        if not calibration:
+            raise ValueError(
+                f"No layer's head_dim is divisible by VQ group size {group_size} "
+                f"(bits={bits}; {detail}); shard quantization unsupported for "
+                "this model."
+            )
+        logger.warning(
+            "Shard calibration: %d layer(s) left unquantized, head_dim not "
+            "divisible by VQ group size %d (%s)",
+            len(incompatible),
+            group_size,
+            detail,
+        )
 
     if progress_callback:
         progress_callback("Saving calibration", 0.9)

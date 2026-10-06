@@ -14,7 +14,8 @@ serialized under the inference lock, so no internal locking is needed;
 
 Disk spill (#491): when an entry is evicted from the in-memory LRU and disk
 spill is enabled (``OLMLX_VLM_PROMPT_CACHE_DISK=1``), its KV state is written
-to a per-model ``.safetensors`` file so a later request for the same
+to a per-model ``.safetensors`` file (except quantized ``kv_cache_quant``
+caches, which can't be restored and are dropped) so a later request for the same
 ``cache_id`` can restore it instead of re-prefilling. Mirrors the text-path
 design (``prompt_cache/store.py``): ``mlx_lm``'s ``save_prompt_cache`` /
 ``load_prompt_cache`` serialize the per-layer KV (``PromptCacheState`` carries
@@ -87,6 +88,7 @@ class VlmPromptCacheStore:
         self._disk_path = disk_path
         self._model_name = model_name
         self._disk_max_bytes = disk_max_bytes
+        self._warned_unspillable = False
         self._disk_enabled = (
             disk_path is not None
             and save_prompt_cache is not None
@@ -217,6 +219,21 @@ class VlmPromptCacheStore:
         cache = getattr(state, "cache", None)
         if not cache:
             return  # never-filled state (inserted empty, evicted before use)
+        from olmlx.engine.cache_capabilities import _is_serializable_cache
+
+        if not _is_serializable_cache(cache):
+            # kv_cache_quant caches reject state restoration: a written file
+            # could never be loaded back, yet would count against the byte
+            # cap and push restorable files out. Drop it like disk-off does.
+            if not self._warned_unspillable:
+                self._warned_unspillable = True
+                logger.info(
+                    "VLM disk spill: %s uses a quantized KV cache (kv_cache_quant), "
+                    "which can't be restored from disk; evicted entries are "
+                    "dropped instead of spilled",
+                    self._model_name,
+                )
+            return
         try:
             states = flatten_cache_state(cache)
             if states:

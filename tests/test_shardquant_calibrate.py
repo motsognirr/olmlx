@@ -312,3 +312,75 @@ class TestCalibrateModelShard:
             + 1e-9
         )
         assert cos.mean() > 0.7  # random data has no low-rank structure; loose bound
+
+
+class TestPerLayerDims:
+    """Gemma 4 shape: the only plain-KVCache layers are full-attention layers
+    whose head dim (512) and KV-head count (2-4) differ from the model-wide
+    config (256, 8-16); sliding layers use RotatingKVCache. Served through
+    mlx-vlm, the caches are mlx-vlm's own classes. Calibration must take each
+    layer's dims from its cache tensors, not the config."""
+
+    def test_calibrates_full_attention_layer_with_its_own_dims(self, tmp_path):
+        from mlx_vlm.models.cache import KVCache as VlmKVCache
+        from mlx_vlm.models.cache import RotatingKVCache as VlmRotating
+
+        cfg_head_dim, cfg_heads = 8, 1  # what the config/wrapper reports
+        dims = {0: (2, 8), 1: (3, 16)}  # layer -> (heads, head_dim)
+        backbone = _FakeBackbone(2, cfg_heads, cfg_head_dim)
+        backbone.layers = [_FakeLayer(8), _FakeLayer(16)]
+
+        class _Model:
+            layers = backbone.layers
+            _backbone = backbone
+
+            def __call__(self, input_ids, cache=None):
+                seq = input_ids.shape[1]
+                rng = np.random.RandomState(seq)
+                for i, entry in enumerate(cache):
+                    h, d = dims[i]
+                    kv = rng.randn(2, 1, h, seq, d).astype(np.float32)
+                    entry.update_and_fetch(mx.array(kv[0]), mx.array(kv[1]))
+
+        texts = ["one two three four five six seven eight nine ten"] * 4
+        patches = [
+            patch(
+                "olmlx.engine.flash.prepare.load_model_with_strict_fallback",
+                return_value=(_Model(), MagicMock()),
+            ),
+            patch("olmlx.engine.flash.prepare._get_backbone", return_value=backbone),
+            patch(
+                "olmlx.engine.flash.prepare._get_c4_calibration_data",
+                return_value=texts,
+            ),
+            patch(
+                "olmlx.engine.flash.prepare._encode_tokens",
+                side_effect=lambda tok, text: list(range(len(text.split()))),
+            ),
+            patch(
+                "olmlx.engine.turboquant_cache._detect_head_dim",
+                return_value=cfg_head_dim,
+            ),
+            patch(
+                "mlx_lm.models.cache.make_prompt_cache",
+                side_effect=lambda owner: [VlmRotating(max_size=4), VlmKVCache()],
+            ),
+        ]
+        for p in patches:
+            p.start()
+        try:
+            out = shc.calibrate_model_shard(
+                "fake/model", output_dir=tmp_path / "shard", num_samples=4, bits=4
+            )
+        finally:
+            for p in patches:
+                p.stop()
+
+        calibration, _ = shc.load_shard_calibration(out)
+        assert set(calibration) == {1}  # sliding layer skipped
+        e = calibration[1]
+        assert e["k_basis"].shape == (3, 16, 16)
+        assert e["k_mean"].shape == (3, 16)
+        assert e["k_codebook"].shape == (3, 16)
+        assert e["v_rotation"].shape == (16, 16)
+        assert e["rope_dims"] == 16

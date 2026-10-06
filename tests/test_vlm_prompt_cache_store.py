@@ -159,6 +159,68 @@ async def test_async_get_miss_returns_none(tmp_path):
     assert await store.async_get("never-stored") is None
 
 
+async def test_quantized_state_not_spilled(tmp_path):
+    """TurboQuant/KVarN caches reject state restoration, so a spilled file
+    could never be loaded back — and would push restorable files out under
+    the byte cap. The spill skips them (the text store's
+    ``_is_serializable_cache`` guard)."""
+    from mlx_vlm.generate import PromptCacheState
+
+    from olmlx.engine.kvarn import KVarNRotation
+    from olmlx.engine.kvarn_cache import KVarNKVCache
+
+    layer = KVarNKVCache(
+        key_bits=4,
+        value_bits=2,
+        rotation_key=KVarNRotation(head_dim=16, seed=0),
+        rotation_value=KVarNRotation(head_dim=16, seed=1),
+    )
+    layer.update_and_fetch(
+        mx.ones((1, 2, 3, 16), dtype=mx.float16),
+        mx.ones((1, 2, 3, 16), dtype=mx.float16),
+    )
+    quant_state = PromptCacheState()
+    quant_state.update([1, 2, 3], [layer])
+
+    store = _disk_store(tmp_path)
+    await store.async_insert("a", quant_state)
+    await store.async_insert("b", _filled_state([4, 5, 6]))  # evicts "a"
+    # Spill files are named ``<id>-<digest>.safetensors``; nothing may be written.
+    assert list(tmp_path.rglob("*.safetensors")) == []
+
+
+async def test_quantized_spill_skip_logged_once_at_info(tmp_path, caplog):
+    """Dropping an evicted entry instead of spilling it is a behavior change an
+    operator who enabled disk spill should see — once per store, not per
+    eviction, and not only at DEBUG."""
+    from mlx_vlm.generate import PromptCacheState
+
+    from olmlx.engine.kvarn import KVarNRotation
+    from olmlx.engine.kvarn_cache import KVarNKVCache
+
+    def _quant_state():
+        layer = KVarNKVCache(
+            key_bits=4,
+            value_bits=2,
+            rotation_key=KVarNRotation(head_dim=16, seed=0),
+            rotation_value=KVarNRotation(head_dim=16, seed=1),
+        )
+        layer.update_and_fetch(
+            mx.ones((1, 2, 3, 16), dtype=mx.float16),
+            mx.ones((1, 2, 3, 16), dtype=mx.float16),
+        )
+        state = PromptCacheState()
+        state.update([1, 2, 3], [layer])
+        return state
+
+    store = _disk_store(tmp_path)
+    with caplog.at_level("INFO"):
+        for cid in ("a", "b", "c"):  # "a" then "b" evicted and skipped
+            await store.async_insert(cid, _quant_state())
+    hits = [r for r in caplog.records if "disk spill" in r.getMessage()]
+    assert len(hits) == 1 and hits[0].levelname == "INFO"
+
+
 async def test_empty_state_not_spilled(tmp_path):
     """A never-filled state (cache is None) evicted before use writes nothing."""
     from mlx_vlm.generate import PromptCacheState
@@ -166,8 +228,8 @@ async def test_empty_state_not_spilled(tmp_path):
     store = _disk_store(tmp_path)
     await store.async_insert("a", PromptCacheState())  # cache=None
     await store.async_insert("b", _filled_state([4, 5, 6]))  # evicts empty "a"
-    a_file = tmp_path / "test-vlm_latest" / "a.safetensors"
-    assert not a_file.exists()
+    # Spill files are named ``<id>-<digest>.safetensors``; nothing may be written.
+    assert list(tmp_path.rglob("*.safetensors")) == []
 
 
 async def test_async_get_skips_reinsert_after_bulk_clear(tmp_path):

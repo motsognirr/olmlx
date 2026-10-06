@@ -31,6 +31,7 @@ from olmlx.engine.turboquant_cache import (
     TurboQuantKVCache,
     _detect_head_dim,
     build_kv_quant_caches,
+    memoized_rotation,
 )
 
 logger = logging.getLogger(__name__)
@@ -77,7 +78,9 @@ class KVarNKVCache(TurboQuantKVCache):
         return kvarn_dequantize(packed, side, rotation, bits, dtype=dtype)
 
 
-def make_kvarn_cache(model: Any, key_bits: int, value_bits: int) -> list:
+def make_kvarn_cache(
+    model: Any, key_bits: int, value_bits: int, rotation_memo: dict | None = None
+) -> list:
     """Create a cache list with ``KVarNKVCache`` for attention layers.
 
     Hybrid layouts keep their non-KVCache layers; an attention layer whose
@@ -85,14 +88,21 @@ def make_kvarn_cache(model: Any, key_bits: int, value_bits: int) -> list:
     """
     head_dim = _detect_head_dim(model)
 
+    def _rotation(layer_head_dim: int, seed: int) -> KVarNRotation:
+        return memoized_rotation(
+            rotation_memo,
+            ("kvarn", layer_head_dim, seed),
+            lambda: KVarNRotation(head_dim=layer_head_dim, seed=seed),
+        )
+
     def _make_layer(i: int, layer_head_dim: int) -> KVarNKVCache | None:
         if choose_tile(layer_head_dim) is None:
             return None
         return KVarNKVCache(
             key_bits=key_bits,
             value_bits=value_bits,
-            rotation_key=KVarNRotation(head_dim=layer_head_dim, seed=i * 2),
-            rotation_value=KVarNRotation(head_dim=layer_head_dim, seed=i * 2 + 1),
+            rotation_key=_rotation(layer_head_dim, i * 2),
+            rotation_value=_rotation(layer_head_dim, i * 2 + 1),
         )
 
     caches, n_quantized = build_kv_quant_caches(model, _make_layer, head_dim=head_dim)

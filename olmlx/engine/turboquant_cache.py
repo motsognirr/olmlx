@@ -7,6 +7,7 @@ dequantizes on fetch, providing transparent memory compression.
 from __future__ import annotations
 
 import copy
+import functools
 import logging
 from collections.abc import Callable
 from typing import Any
@@ -572,6 +573,36 @@ def _detect_head_dim(model: Any, layers_hint: Any = None) -> int:
         ) from e
 
 
+def _is_plain_kv_cache(cache: Any) -> bool:
+    """True for a full-attention layer cache the quantizers may replace.
+
+    mlx-lm's ``KVCache`` (and subclasses, as before), or exactly mlx-vlm's
+    plain ``KVCache``: VLM layouts come from mlx-vlm's own cache classes, which
+    don't subclass mlx-lm's, so an ``isinstance`` check alone left every VLM
+    unquantized. mlx-vlm subclasses are excluded — they carry model-specific
+    state the attention reads (Qwen3.8's ``QSAKVCache`` sparse-indexer keys).
+    """
+    return isinstance(cache, KVCache) or type(cache) is _vlm_kv_cache_cls()
+
+
+@functools.cache
+def _vlm_kv_cache_cls() -> type | None:
+    # Resolved once, lazily: importing mlx_vlm at module import would pull its
+    # whole package into every text-only process.
+    try:
+        from mlx_vlm.models.cache import KVCache as VlmKVCache
+    except ImportError:
+        # Memoized, so this logs once. Silent would reproduce the bug this
+        # guards against: kv_cache_quant quietly ignored on every VLM.
+        logger.warning(
+            "mlx-vlm cache classes not importable; kv_cache_quant will not "
+            "apply to VLM models",
+            exc_info=True,
+        )
+        return None
+    return VlmKVCache
+
+
 def build_kv_quant_caches(
     model: Any,
     make_layer: Callable[[int, int], Any | None],
@@ -605,7 +636,7 @@ def build_kv_quant_caches(
     caches = []
     n_quantized = 0
     for i, default in enumerate(default_caches):
-        if default is None or isinstance(default, KVCache):
+        if default is None or _is_plain_kv_cache(default):
             # Detect per-layer head dim from K projection weight shape.
             # Models like gemma4 have different head dims for full vs sliding
             # attention layers (global_head_dim=512 vs head_dim=256).
@@ -639,7 +670,29 @@ def build_kv_quant_caches(
     return caches, n_quantized
 
 
-def make_turboquant_cache(model: Any, bits: int) -> list:
+def memoized_rotation(memo: dict | None, key: tuple, build: Callable[[], Any]) -> Any:
+    """Return ``memo[key]``, building it with ``build()`` on a miss.
+
+    Quant rotations are deterministic in ``(head_dim, seed)``, eager-evaluated
+    (no stream binding, safe from any thread) and never mutated —
+    ``__deepcopy__`` already shares them by reference (#634). Paths with no
+    stored cache build a fresh cache per request on the event loop (every VLM
+    request, text with the prompt cache off), and rebuilding the QR there cost
+    ~50-90 ms per request. The memo is owned by the ``LoadedModel``
+    (``kv_quant_rotations``), so it lives exactly as long as the model.
+    ``None`` builds without memoizing.
+    """
+    if memo is None:
+        return build()
+    rot = memo.get(key)
+    if rot is None:
+        rot = memo[key] = build()
+    return rot
+
+
+def make_turboquant_cache(
+    model: Any, bits: int, rotation_memo: dict | None = None
+) -> list:
     """Create a cache list with TurboQuantKVCache for attention layers.
 
     For hybrid models (e.g. Nemotron-H with SSM + attention layers), only
@@ -658,8 +711,16 @@ def make_turboquant_cache(model: Any, bits: int) -> list:
     def _make_layer(i: int, layer_head_dim: int) -> TurboQuantKVCache | None:
         if layer_head_dim % packing_factor != 0:
             return None
-        rot_k = TurboQuantRotation(head_dim=layer_head_dim, seed=i * 2)
-        rot_v = TurboQuantRotation(head_dim=layer_head_dim, seed=i * 2 + 1)
+        rot_k, rot_v = (
+            memoized_rotation(
+                rotation_memo,
+                ("turboquant", layer_head_dim, seed),
+                lambda seed=seed: TurboQuantRotation(
+                    head_dim=layer_head_dim, seed=seed
+                ),
+            )
+            for seed in (i * 2, i * 2 + 1)
+        )
         return TurboQuantKVCache(bits=bits, rotation_key=rot_k, rotation_value=rot_v)
 
     caches, tq_count = build_kv_quant_caches(model, _make_layer, head_dim=head_dim)
