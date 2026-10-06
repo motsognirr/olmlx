@@ -438,6 +438,7 @@ def make_shard_cache(
     the default cache with a warning.
     """
     from olmlx.engine.shardquant_calibrate import load_shard_calibration
+    from olmlx.engine.turboquant_cache import _is_plain_kv_cache
 
     if calibration_dir is None:
         # Reachable when ModelManager has no store (_find_shard_dir returns
@@ -487,7 +488,8 @@ def make_shard_cache(
     caches = []
     quantized = 0
     for i, default in enumerate(default_caches):
-        if default is not None and not isinstance(default, KVCache):
+        # mlx-vlm layouts use their own cache classes (no mlx-lm subclass).
+        if default is not None and not _is_plain_kv_cache(default):
             caches.append(default)
             continue
         entry = calibration.get(i)

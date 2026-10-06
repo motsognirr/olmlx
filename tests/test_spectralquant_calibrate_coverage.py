@@ -673,21 +673,21 @@ def test_calibrate_model_skips_non_attention_cache_entries(tmp_path):
 
     class _NoOpModel(_FakeModel):
         def __call__(self, input_ids, cache=None):
-            # Populate with a WRONG head_dim so _is_attention_cache rejects it.
+            # Only an SSM-style state: _is_attention_cache rejects it by type.
+            # (A head_dim differing from the config is NOT a rejection — layer
+            # dims come from the cache, e.g. Gemma 4's 512-dim global layers.)
             self.calls += 1
-            seq = input_ids.shape[1]
             for entry in cache:
-                entry.update_and_fetch(
-                    mx.ones((1, n_kv_heads, seq, head_dim + 4)),
-                    mx.ones((1, n_kv_heads, seq, head_dim + 4)),
-                )
+                entry[0] = mx.ones((1, 3, head_dim))
 
     model = _NoOpModel(backbone, head_dim)
     tokenizer = MagicMock()
     texts = ["one two three four"] * 2
 
     def cache_factory(_owner):
-        return [KVCache() for _ in range(num_layers)]
+        from mlx_lm.models.cache import ArraysCache
+
+        return [ArraysCache(size=1) for _ in range(num_layers)]
 
     patches = _patch_helpers(model, tokenizer, head_dim, texts, cache_factory)
     for p in patches:
@@ -701,9 +701,9 @@ def test_calibrate_model_skips_non_attention_cache_entries(tmp_path):
 
 
 def test_calibrate_model_skips_empty_layer_but_calibrates_others(tmp_path):
-    # Two layers: layer 0 gets valid KV (right head_dim), layer 1 gets a
-    # rejected cache (wrong head_dim) -> layer 1 has no chunks and is skipped
-    # in the per-layer calibration loop, but the run still succeeds.
+    # Two layers: layer 0 gets valid KV, layer 1 is a non-attention (SSM)
+    # cache -> layer 1 has no chunks and is skipped in the per-layer
+    # calibration loop, but the run still succeeds.
     head_dim = 8
     num_layers = 2
     n_kv_heads = 1
@@ -718,18 +718,17 @@ def test_calibrate_model_skips_empty_layer_but_calibrates_others(tmp_path):
                 mx.ones((1, n_kv_heads, seq, head_dim)),
                 mx.ones((1, n_kv_heads, seq, head_dim)),
             )
-            # Layer 1: wrong head_dim (rejected by _is_attention_cache).
-            cache[1].update_and_fetch(
-                mx.ones((1, n_kv_heads, seq, head_dim + 2)),
-                mx.ones((1, n_kv_heads, seq, head_dim + 2)),
-            )
+            # Layer 1: SSM-style state (rejected by _is_attention_cache).
+            cache[1][0] = mx.ones((1, 3, head_dim))
 
     model = _MixedModel(backbone, head_dim)
     tokenizer = MagicMock()
     texts = ["one two three four"] * 2
 
     def cache_factory(_owner):
-        return [KVCache() for _ in range(num_layers)]
+        from mlx_lm.models.cache import ArraysCache
+
+        return [KVCache(), ArraysCache(size=1)]
 
     patches = _patch_helpers(model, tokenizer, head_dim, texts, cache_factory)
     for p in patches:
@@ -1031,3 +1030,83 @@ def test_load_calibration_model_closes_store_when_resolution_fails(tmp_path):
         with pytest.raises(RuntimeError, match="boom"):
             sc._load_calibration_model(str(tmp_path))
     spy_store.close.assert_called_once()
+
+
+def test_calibrate_model_uses_per_layer_dims_from_cache(tmp_path):
+    """Gemma 4 shape (see the shard twin in test_shardquant_calibrate.py): a
+    sliding layer to skip, and a full-attention mlx-vlm KVCache whose head dim
+    and KV-head count differ from the config's. Each layer is calibrated with
+    the dims its cache actually holds."""
+    from mlx_vlm.models.cache import KVCache as VlmKVCache
+    from mlx_vlm.models.cache import RotatingKVCache as VlmRotating
+
+    from olmlx.engine.spectralquant_calibrate import calibrate_model, load_calibration
+
+    backbone = _FakeBackbone(2, 1, 8)  # config: 1 KV head, head_dim 8
+    dims = {0: (2, 8), 1: (3, 16)}
+
+    class _Model:
+        _backbone = backbone
+
+        def __call__(self, input_ids, cache=None):
+            seq = input_ids.shape[1]
+            rng = np.random.RandomState(seq)
+            for i, entry in enumerate(cache):
+                h, d = dims[i]
+                kv = rng.randn(2, 1, h, seq, d).astype(np.float32)
+                entry.update_and_fetch(mx.array(kv[0]), mx.array(kv[1]))
+
+    texts = ["one two three four five six seven eight nine ten"] * 4
+    patches = _patch_helpers(
+        _Model(),
+        MagicMock(),
+        8,
+        texts,
+        lambda owner: [VlmRotating(max_size=4), VlmKVCache()],
+    )
+    for p in patches:
+        p.start()
+    try:
+        out = calibrate_model("fake/model", output_dir=tmp_path / "sq", num_samples=4)
+    finally:
+        for p in patches:
+            p.stop()
+
+    calibration = load_calibration(out)
+    assert {k[0] for k in calibration} == {1}
+    assert calibration[(1, 0, "key")]["eigenvectors"].shape == (16, 16)
+
+
+def test_make_spectral_cache_quantizes_mlx_vlm_kvcache(tmp_path, monkeypatch):
+    """``spectral:`` must not be a silent no-op on VLMs: a plain mlx-vlm
+    ``KVCache`` layer gets a SpectralQuantKVCache; its sliding cache stays."""
+    from mlx_vlm.models.cache import KVCache as VlmKVCache
+    from mlx_vlm.models.cache import RotatingKVCache as VlmRotating
+
+    from olmlx.engine.spectralquant_cache import (
+        SpectralQuantKVCache,
+        make_spectral_cache,
+    )
+
+    d = 16
+    cal = {
+        "eigenvectors": mx.array(np.eye(d, dtype=np.float32)),
+        "codebook_sem": mx.linspace(-1, 1, 16),
+        "codebook_tail": mx.linspace(-1, 1, 4),
+        "d_eff": 4,
+        "bits_high": 4,
+        "bits_low": 2,
+    }
+    monkeypatch.setattr(
+        "olmlx.engine.spectralquant_calibrate.load_calibration",
+        lambda _d: {(1, 0, "key"): cal, (1, 0, "value"): cal},
+    )
+    sliding = VlmRotating(max_size=8)
+    model = MagicMock()
+    model.layers = [MagicMock(), MagicMock()]
+    model.args.head_dim = d
+    model.make_cache.return_value = [sliding, VlmKVCache()]
+
+    caches = make_spectral_cache(model, tmp_path)
+    assert caches[0] is sliding
+    assert isinstance(caches[1], SpectralQuantKVCache)

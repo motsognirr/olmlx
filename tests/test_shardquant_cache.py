@@ -379,3 +379,33 @@ class TestMakeShardCache:
         assert isinstance(caches[0], ShardKVCache)
         assert isinstance(caches[1], KVCache)
         assert not isinstance(caches[1], ShardKVCache)
+
+
+class TestVlmCacheLayout:
+    """VLM layouts come from mlx-vlm's cache classes, which don't subclass
+    mlx-lm's: the factory must still quantize a plain mlx-vlm ``KVCache``
+    (and keep its sliding/model-specific caches), or ``shard:`` is a silent
+    no-op on every VLM."""
+
+    def test_make_shard_cache_quantizes_mlx_vlm_kvcache(self, tmp_path, monkeypatch):
+        from mlx_vlm.models.cache import KVCache as VlmKVCache
+        from mlx_vlm.models.cache import RotatingKVCache as VlmRotating
+
+        from olmlx.engine.shardquant_cache import ShardKVCache, make_shard_cache
+
+        entry = TestMakeShardCache._calib_entry(TestMakeShardCache())
+        monkeypatch.setattr(
+            "olmlx.engine.shardquant_calibrate.load_shard_calibration",
+            lambda d: ({0: entry, 1: entry}, {"bits": 4}),
+        )
+        sliding = VlmRotating(max_size=8)
+
+        class Model:
+            layers = [object(), object()]
+
+            def make_cache(self):
+                return [sliding, VlmKVCache()]
+
+        caches = make_shard_cache(Model(), tmp_path, bits=4)
+        assert caches[0] is sliding
+        assert isinstance(caches[1], ShardKVCache)

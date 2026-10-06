@@ -15,7 +15,7 @@ from typing import Any
 
 import mlx.core as mx
 import numpy as np
-from mlx_lm.models.cache import KVCache
+from olmlx.engine.turboquant_cache import _is_plain_kv_cache
 
 from olmlx.engine.spectralquant import allocate_bits, fit_codebook
 
@@ -98,7 +98,7 @@ def _build_empty_collection_error(first_exc: Exception | None) -> RuntimeError:
     )
 
 
-def _is_attention_cache(cache_entry: Any, expected_head_dim: int) -> bool:
+def _is_attention_cache(cache_entry: Any, expected_head_dim: int | None = None) -> bool:
     # Combined filter: must be a standard KVCache (not an SSM cache type such
     # as ArraysCache) AND expose a plausible 4D attention state. The isinstance
     # guard is load-bearing — shape alone cannot reject Mamba2 states where
@@ -108,8 +108,14 @@ def _is_attention_cache(cache_entry: Any, expected_head_dim: int) -> bool:
     # - empty caches not yet populated (len(state) < 2)
     # - caches seeded with < 2 tokens (seq < 2; already excluded by the
     #   `len(tokens) < 2` guard in `calibrate_model`, but kept as defense)
-    # - head_dim mismatch (e.g. model weights loaded with a mismatched config)
-    if not isinstance(cache_entry, KVCache):
+    # - head_dim mismatch (e.g. model weights loaded with a mismatched config),
+    #   only when ``expected_head_dim`` is given. Calibration passes None: a
+    #   layer's dims come from its own cache tensors, since they can differ
+    #   from the model-wide config (Gemma 4 full-attention layers: head_dim
+    #   512 and 2-4 KV heads vs config 256 and 8-16).
+    # ``_is_plain_kv_cache`` also accepts mlx-vlm's plain KVCache (a VLM-only
+    # checkpoint calibrates through ``load_vlm``), but not its subclasses.
+    if not _is_plain_kv_cache(cache_entry):
         return False
     state: Any = cache_entry.state
     if not state or len(state) < 2:
@@ -118,7 +124,9 @@ def _is_attention_cache(cache_entry: Any, expected_head_dim: int) -> bool:
     if not (hasattr(keys, "ndim") and keys.ndim == 4):
         return False
     shape = keys.shape
-    return shape[2] >= 2 and shape[3] == expected_head_dim
+    return shape[2] >= 2 and (
+        expected_head_dim is None or shape[3] == expected_head_dim
+    )
 
 
 def _resolve_cache_owner(inner: Any, model: Any) -> Any:
@@ -489,18 +497,15 @@ def collect_kv_vectors(
 
     from olmlx.engine.flash.prepare import _encode_tokens
 
-    kv_collectors: dict[int, dict[int, dict[str, list[mx.array]]]] = {}
-    for i in range(num_layers):
-        kv_collectors[i] = {}
-        for h in range(n_kv_heads):
-            kv_collectors[i][h] = {"key": [], "value": []}
-
-    tokens_collected = {
-        (i, h, k): 0
-        for i in range(num_layers)
-        for h in range(n_kv_heads)
-        for k in ("key", "value")
+    # Heads are discovered per layer from the cache tensors (``n_kv_heads`` /
+    # ``head_dim`` are the model-wide config values, which per-layer layouts
+    # such as Gemma 4's full-attention layers don't follow), so each layer's
+    # collectors are sized lazily.
+    del n_kv_heads, head_dim
+    kv_collectors: dict[int, dict[int, dict[str, list[mx.array]]]] = {
+        i: {} for i in range(num_layers)
     }
+    tokens_collected: dict[tuple[int, int, str], int] = {}
 
     # Collect post-RoPE K/V vectors by running each sample with a fresh
     # KV cache, then extracting the cached tensors.  This captures keys and
@@ -540,7 +545,7 @@ def collect_kv_vectors(
             cache_entry = prompt_cache[layer_idx]
             # Combined type + shape filter. Rejects SSM cache types (ArraysCache,
             # etc.) and KVCaches whose state doesn't match attention shape.
-            if not _is_attention_cache(cache_entry, head_dim):
+            if not _is_attention_cache(cache_entry):
                 continue
             state = cache_entry.state
             # KVCache.state returns [keys, values] with shape
@@ -548,7 +553,10 @@ def collect_kv_vectors(
             cached_keys = state[0]  # (1, n_kv_heads, seq, head_dim)
             cached_values = state[1]  # (1, n_kv_heads, seq, head_dim)
 
-            for h in range(min(n_kv_heads, cached_keys.shape[1])):
+            for h in range(cached_keys.shape[1]):
+                kv_collectors[layer_idx].setdefault(h, {"key": [], "value": []})
+                tokens_collected.setdefault((layer_idx, h, "key"), 0)
+                tokens_collected.setdefault((layer_idx, h, "value"), 0)
                 if tokens_collected[(layer_idx, h, "key")] < max_tokens_per_head:
                     k_h = cached_keys[0, h, :, :]  # (seq, head_dim)
                     remaining = (
@@ -660,8 +668,8 @@ def calibrate_model(
         for kind in ("key", "value"):
             # Concatenate all heads' data for this layer+kind
             all_chunks = []
-            for head_idx in range(n_kv_heads):
-                all_chunks.extend(kv_collectors[layer_idx][head_idx][kind])
+            for head_chunks in kv_collectors[layer_idx].values():
+                all_chunks.extend(head_chunks[kind])
             if not all_chunks:
                 logger.debug(
                     "No KV data for layer %d %s, skipping",

@@ -355,7 +355,7 @@ def make_spectral_cache(
     import json
 
     from olmlx.engine.spectralquant_calibrate import load_calibration
-    from olmlx.engine.turboquant_cache import _detect_head_dim
+    from olmlx.engine.turboquant_cache import _detect_head_dim, _is_plain_kv_cache
 
     calibration_dir = Path(calibration_dir)
     calibration = load_calibration(calibration_dir)
@@ -391,8 +391,8 @@ def make_spectral_cache(
     sq_count = 0
 
     for i, default in enumerate(default_caches):
-        if default is not None and not isinstance(default, KVCache):
-            # Non-attention cache (e.g. ArraysCache for SSM layers)
+        if default is not None and not _is_plain_kv_cache(default):
+            # Non-attention cache (incl. mlx-vlm sliding/model-specific caches) (e.g. ArraysCache for SSM layers)
             caches.append(default)
             continue
 
