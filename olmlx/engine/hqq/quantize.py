@@ -200,7 +200,7 @@ def hqq_quantize_linear(
     # skips (lazy → load-thread-bound → ``no Stream`` on the first forward),
     # and one model-wide eval would hold every fp16 original plus every
     # layer's solver graph at once (#757).
-    mx.eval(packed, scales, q_biases)
+    mx.eval(packed, scales, q_biases, *([bias] if bias is not None else []))
     return HQQLinear(
         weight=packed,
         scales=scales,
@@ -269,8 +269,11 @@ def quantize_model(
         )
         return
 
-    # Pop as we go so each fp16 original is released once its layer is
-    # quantized and swapped out, bounding peak load memory to ~one layer.
+    # Pop as we go so no list reference outlives the swap: each fp16
+    # original is freed as soon as it's replaced. Peak load memory is then
+    # the not-yet-replaced originals (still held by the model tree) + the
+    # quantized layers so far + one layer's solve — never every original
+    # plus every layer's solver graph at once.
     replacements.reverse()
     while replacements:
         name, linear = replacements.pop()

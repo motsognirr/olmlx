@@ -876,6 +876,18 @@ class TestHqqWeightMaterialization:
             f"quantize_model left HQQ buffers lazy: {res.get('error')!r}"
         )
 
+    def test_quantize_model_materializes_lazy_bias(self):
+        from olmlx.engine.hqq.quantize import HQQConfig, quantize_model
+
+        def _quantize(m):
+            m.l.bias = m.l.bias + 1  # lazy, bound to the load thread
+            quantize_model(m, HQQConfig(bits=4, group_size=64))
+
+        res = self._forward_on_worker(_hqq_quantize_on_thread(_quantize))
+        assert res.get("error") is None, (
+            f"quantize_model left a lazy bias load-bound: {res.get('error')!r}"
+        )
+
     def test_maybe_quantize_model_materializes(self):
         from olmlx.engine.model_manager import ModelManager
 
