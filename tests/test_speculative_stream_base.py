@@ -268,6 +268,19 @@ class TestMultipleEosIds:
 
         assert tokenizer_eos_ids(_Tok()) == frozenset({1, 106})
 
+    def test_tokenizer_eos_ids_numpy_ints(self):
+        import numpy as np
+
+        from olmlx.engine.speculative_stream import tokenizer_eos_ids
+
+        class _Tok:
+            eos_token_id = np.int64(1)
+            eos_token_ids = [np.int64(106)]
+
+        ids = tokenizer_eos_ids(_Tok())
+        assert ids == frozenset({1, 106})
+        assert all(type(t) is int for t in ids)
+
     async def test_async_stream_uses_all_eos_ids(self):
         from olmlx.engine.speculative_stream import async_speculative_stream
 

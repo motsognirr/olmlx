@@ -7,6 +7,7 @@ contract used by the inference pipeline.
 from __future__ import annotations
 
 import logging
+import numbers
 import threading
 import time
 from collections.abc import Collection, Generator
@@ -72,14 +73,15 @@ def tokenizer_eos_ids(tokenizer: Any) -> frozenset[int]:
     past the turn to ``max_tokens`` (#757). mlx-vlm loads leave the raw HF
     tokenizer (what speculative VLM targets pass) without ``eos_token_ids``
     but attach the config's list as ``stopping_criteria`` (Gemma 3:
-    ``[1, 106]``), so that is folded in too. Non-int entries are dropped so a
-    MagicMock tokenizer yields an empty set rather than junk.
+    ``[1, 106]``), so that is folded in too. Ids may be numpy ints; non-integral
+    entries are dropped so a MagicMock tokenizer yields an empty set rather
+    than junk.
     """
     ids: set[int] = set()
     criteria = getattr(tokenizer, "stopping_criteria", None)
     single = getattr(tokenizer, "eos_token_id", None)
-    if isinstance(single, int):
-        ids.add(single)
+    if isinstance(single, numbers.Integral):
+        ids.add(int(single))
     for multi in (
         single,  # some tokenizers/configs carry a list here
         getattr(tokenizer, "eos_token_ids", None),
@@ -87,7 +89,7 @@ def tokenizer_eos_ids(tokenizer: Any) -> frozenset[int]:
         getattr(criteria, "additional_eos_token_ids", None),
     ):
         if isinstance(multi, (set, frozenset, list, tuple)):
-            ids.update(t for t in multi if isinstance(t, int))
+            ids.update(int(t) for t in multi if isinstance(t, numbers.Integral))
     return frozenset(ids)
 
 
