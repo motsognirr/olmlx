@@ -10,6 +10,17 @@ import pytest
 from olmlx.engine.model_manager import CachedPromptState, PromptCacheStore
 
 
+@pytest.fixture(autouse=True)
+def _no_restore_materialize():
+    """These tests exercise store bookkeeping with placeholder caches
+    (strings), which can't be ``mx.eval``'d. The real restore-time
+    materialization (#757) is gated by
+    ``test_thread_local_streams.py::TestDiskRestoredPromptCacheMaterialization``.
+    """
+    with patch("olmlx.engine.prompt_cache.store.materialize_restored_cache"):
+        yield
+
+
 def _make_state(token_id: int = 1) -> CachedPromptState:
     """Create a minimal CachedPromptState for testing."""
     return CachedPromptState(tokens=[token_id], cache=[f"cache_{token_id}"])

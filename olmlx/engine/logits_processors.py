@@ -132,39 +132,65 @@ def _install_grammar_processor(
     return True
 
 
+def _token_ids(tokens) -> list[int]:
+    """History as Python ints.
+
+    mlx-lm's ``generate_step`` passes the history as an ``mx.array``: ``not``
+    on it raises once it holds 2+ tokens, and its 0-d elements hash by object
+    identity, so they never deduplicate in a dict/set (#757).
+    """
+    if isinstance(tokens, mx.array):
+        return tokens.reshape(-1).tolist()
+    return [int(t) for t in tokens]
+
+
+def _make_incremental_penalty_processor(penalty: float, presence: bool):
+    """Shared OpenAI frequency/presence penalty processor.
+
+    Keeps an incremental count dict (O(1) per step) to avoid O(n²) rebuilds
+    for long generations: seeded from the initial history on first call, then
+    bumped by the newest token per step. The logits are fresh every call, so
+    the penalty for *every* counted token is re-applied each step — a
+    presence penalty is ``penalty`` per seen token, a frequency penalty is
+    ``penalty * count``.
+    """
+    counts: dict[int, int] = {}
+    _initialised = False
+
+    def processor(tokens, logits: mx.array) -> mx.array:
+        nonlocal _initialised
+        if len(tokens) == 0 or penalty == 0:
+            return logits
+        vocab_size = logits.shape[-1]
+        if not _initialised:
+            new_ids = _token_ids(tokens)
+            _initialised = True
+        else:
+            new_ids = _token_ids(tokens[-1:])
+        for tid in new_ids:
+            if 0 <= tid < vocab_size:
+                counts[tid] = counts.get(tid, 0) + 1
+        if not counts:
+            return logits
+        ids = mx.array(list(counts.keys()))
+        if presence:
+            amounts = mx.array(penalty, dtype=logits.dtype)
+        else:
+            amounts = (penalty * mx.array(list(counts.values()))).astype(logits.dtype)
+        logits[..., ids] = logits[..., ids] - amounts
+        return logits
+
+    return processor
+
+
 def _make_frequency_penalty_processor(frequency_penalty: float):
     """Create a logits processor that applies OpenAI-style frequency penalty.
 
     Positive values penalize new tokens based on their existing frequency
     in the text so far, decreasing the model's likelihood to repeat the
     same line verbatim.
-
-    Uses an incremental frequency dict (O(1) per step) to avoid O(n²)
-    rebuilds for long generations.  The dict is seeded from the initial
-    token list on first call then incremented by one per step.
     """
-    freq: dict[int, int] = {}
-    _initialised = False
-
-    def processor(tokens: list[int], logits: mx.array) -> mx.array:
-        nonlocal freq, _initialised
-        if not tokens or frequency_penalty == 0:
-            return logits
-        vocab_size = logits.shape[-1]
-        if not _initialised:
-            for tid in tokens:
-                if 0 <= tid < vocab_size:
-                    freq[tid] = freq.get(tid, 0) + 1
-            _initialised = True
-        else:
-            new_tid = tokens[-1]
-            if 0 <= new_tid < vocab_size:
-                freq[new_tid] = freq.get(new_tid, 0) + 1
-        for tid, count in freq.items():
-            logits[..., tid] -= frequency_penalty * count
-        return logits
-
-    return processor
+    return _make_incremental_penalty_processor(frequency_penalty, presence=False)
 
 
 def _make_presence_penalty_processor(presence_penalty: float):
@@ -173,33 +199,8 @@ def _make_presence_penalty_processor(presence_penalty: float):
     Positive values penalize new tokens based on whether they appear
     in the text so far, increasing the model's likelihood to talk about
     new topics.
-
-    Uses an incremental seen set (O(1) per step) to avoid O(n²)
-    set-builds for long generations.  The set is seeded from the
-    initial token list on first call then incremented by one per step.
     """
-    seen: set[int] = set()
-    _initialised = False
-
-    def processor(tokens: list[int], logits: mx.array) -> mx.array:
-        nonlocal seen, _initialised
-        if not tokens or presence_penalty == 0:
-            return logits
-        vocab_size = logits.shape[-1]
-        if not _initialised:
-            for tid in tokens:
-                if 0 <= tid < vocab_size and tid not in seen:
-                    seen.add(tid)
-                    logits[..., tid] -= presence_penalty
-            _initialised = True
-        else:
-            new_tid = tokens[-1]
-            if 0 <= new_tid < vocab_size and new_tid not in seen:
-                seen.add(new_tid)
-                logits[..., new_tid] -= presence_penalty
-        return logits
-
-    return processor
+    return _make_incremental_penalty_processor(presence_penalty, presence=True)
 
 
 # Harmony channel name: the leading word after ``<|channel|>`` (mirrors

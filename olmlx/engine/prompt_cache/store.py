@@ -16,6 +16,7 @@ from collections import OrderedDict
 from pathlib import Path
 from typing import Any
 
+from olmlx.engine.prompt_cache.checkpoint import materialize_restored_cache
 from olmlx.engine.prompt_cache.metrics import CacheMetrics
 from olmlx.engine.prompt_cache.radix import PrefixCacheIndex
 from olmlx.engine.prompt_cache.state import CachedPromptState
@@ -286,6 +287,7 @@ class PromptCacheStore:
                 cache, metadata = load_prompt_cache(
                     str(file_path), return_metadata=True
                 )
+                materialize_restored_cache(cache)
                 tokens = json.loads(metadata.get("tokens", "[]"))
                 # Pre-PR entries lack cache_type / is_checkpoint metadata;
                 # fall through to the CachedPromptState defaults in that
@@ -613,6 +615,7 @@ class PromptCacheStore:
                 cache, metadata = load_prompt_cache(
                     str(file_path), return_metadata=True
                 )
+                materialize_restored_cache(cache)
                 tokens = json.loads(metadata.get("tokens", "[]"))
                 cache_type = metadata.get("cache_type", "assistant")
                 is_checkpoint = metadata.get("is_checkpoint", "0") == "1"

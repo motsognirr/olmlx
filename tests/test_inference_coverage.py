@@ -568,19 +568,19 @@ class TestPenaltyProcessorEdgeCases:
         proc = _make_presence_penalty_processor(0.5)
         proc([0], mx.array([10.0, 10.0]))  # init seeds {0}
         result = proc([0, 1], mx.array([10.0, 10.0]))  # token 1 newly seen
-        assert mx.allclose(result, mx.array([10.0, 9.5])).item()
+        assert mx.allclose(result, mx.array([9.5, 9.5])).item()
 
     def test_presence_incremental_repeat_token_no_double_penalty(self):
         proc = _make_presence_penalty_processor(0.5)
         proc([0], mx.array([10.0, 10.0]))  # init seeds {0}
         result = proc([0, 0], mx.array([10.0, 10.0]))  # 0 already seen
-        assert mx.allclose(result, mx.array([10.0, 10.0])).item()
+        assert mx.allclose(result, mx.array([9.5, 10.0])).item()
 
     def test_presence_incremental_out_of_range_ignored(self):
         proc = _make_presence_penalty_processor(0.5)
         proc([0], mx.array([10.0, 10.0]))
         result = proc([0, 5], mx.array([10.0, 10.0]))  # 5 out of range
-        assert mx.allclose(result, mx.array([10.0, 10.0])).item()
+        assert mx.allclose(result, mx.array([9.5, 10.0])).item()
 
 
 # --------------------------------------------------------------------------- #

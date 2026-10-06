@@ -95,6 +95,15 @@ THINKING_CHUNK_SIZE = 1000
 TEXT_CHUNK_SIZE = 100
 
 
+# Keepalive pings held back waiting for ``cache_info`` before message_start
+# goes out anyway (with zero cache stats). cache_info follows the
+# inference-lock wait, so a queued request legitimately pings first; paths
+# that never send it (speculative, distributed, prompt cache off, panels)
+# must not starve the client of body bytes (#616, #757). 2 → ~10s at the
+# default KEEPALIVE_PING_INTERVAL.
+_MAX_PINGS_BEFORE_MESSAGE_START = 2
+
+
 def _make_msg_id() -> str:
     return f"msg_{uuid.uuid4().hex[:24]}"
 
@@ -829,10 +838,11 @@ async def anthropic_messages(req: AnthropicMessagesRequest, request: Request):
                 # receives keep-alive pings during prefill instead of
                 # buffering them until the first content token arrives.
                 #
-                # Phase 1: Look for cache_info.  Any pings that arrive
-                #          before it are buffered (this window is <1 ms).
-                # Phase 2: After cache_info (or first ping if no cache),
-                #          emit message_start and yield pings directly.
+                # message_start goes out on whichever comes first: cache_info
+                # (carries the cache stats; pings before it are buffered —
+                # e.g. during the inference-lock wait), the first content
+                # event, or the _MAX_PINGS_BEFORE_MESSAGE_START-th ping (paths
+                # that never send cache_info). Pings after it flow directly.
                 cache_read = 0
                 cache_creation = 0
                 message_started = False
@@ -872,6 +882,9 @@ async def anthropic_messages(req: AnthropicMessagesRequest, request: Request):
                         # Emit message_start immediately with cache stats
                         if not message_started:
                             yield _emit_message_start()
+                            for ping in pending_pings:
+                                yield ping
+                            pending_pings.clear()
                         else:
                             logger.warning(
                                 "Duplicate cache_info received after message_start "
@@ -879,19 +892,26 @@ async def anthropic_messages(req: AnthropicMessagesRequest, request: Request):
                                 cache_read,
                                 cache_creation,
                             )
-                        # Replay any pings that arrived before cache_info
-                        for ping in pending_pings:
-                            yield ping
-                        pending_pings.clear()
                     elif isinstance(event, str) and event.startswith("event: ping"):
                         if message_started:
-                            # After message_start: yield pings directly to client
                             yield event
-                        else:
-                            # Before cache_info or content: buffer pings.
-                            # cache_info arrives within ms (before first 5s
-                            # ping), so this buffer is normally empty.
+                        elif len(pending_pings) + 1 < _MAX_PINGS_BEFORE_MESSAGE_START:
+                            # cache_info may still come (it follows the lock
+                            # wait + preflight): hold the ping so the stats
+                            # make it into message_start.
                             pending_pings.append(event)
+                        else:
+                            # Still no cache_info: this path may never send
+                            # one (speculative, distributed, prompt cache
+                            # off, panels). Holding pings until content would
+                            # leave the client with zero body bytes for the
+                            # whole generation (#616, #757), so start the
+                            # message with zero cache stats.
+                            yield _emit_message_start()
+                            for ping in pending_pings:
+                                yield ping
+                            pending_pings.clear()
+                            yield event
                     elif isinstance(event, dict):
                         meta = event
                     else:

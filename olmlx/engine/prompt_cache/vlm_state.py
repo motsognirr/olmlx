@@ -37,7 +37,10 @@ from typing import Any
 
 import mlx.core as mx
 
-from olmlx.engine.prompt_cache.checkpoint import flatten_cache_state
+from olmlx.engine.prompt_cache.checkpoint import (
+    flatten_cache_state,
+    materialize_restored_cache,
+)
 from olmlx.utils.loop_affinity import assert_loop_thread
 
 try:
@@ -284,6 +287,7 @@ class VlmPromptCacheStore:
             from mlx_vlm.generate import PromptCacheState
 
             cache, metadata = load_prompt_cache(str(file_path), return_metadata=True)
+            materialize_restored_cache(cache)
             token_ids = json.loads(metadata.get("token_ids", "[]"))
             state = PromptCacheState()
             state.update(token_ids, cache)

@@ -797,3 +797,160 @@ class TestImageModelMaterialization:
         assert res.get("error") is None, (
             f"_load_model_image left weights/buffers lazy: {res.get('error')!r}"
         )
+
+
+def _hqq_quantize_on_thread(quantize):
+    """Build + quantize a tiny Linear model on one worker thread (the load
+    thread), returning the model for use from another thread."""
+    import mlx.nn as nn
+
+    class _M(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.l = nn.Linear(128, 128)
+
+        def __call__(self, x):
+            return self.l(x)
+
+    def _load():
+        m = _M()
+        mx.eval(m.parameters())
+        quantize(m)
+        return m
+
+    res = _run_in_thread(_load)
+    assert res.get("error") is None, res.get("error")
+    return res["value"]
+
+
+@pytest.mark.usefixtures("metal_default_device")
+class TestHqqWeightMaterialization:
+    """#757: ``HQQLinear`` keeps its packed weight/scales/biases under
+    underscore keys, so ``mx.eval(target.parameters())`` evaluates nothing —
+    the quantized weights stay lazy and bound to the load thread, and the
+    first forward on the generation thread raises ``no Stream``."""
+
+    @staticmethod
+    def _forward_on_worker(model):
+        return _run_in_thread(lambda: mx.eval(model(mx.ones((1, 128)))))
+
+    def test_parameters_eval_alone_crashes_cross_thread(self):
+        # Negative control: the pre-fix load-time eval leaves HQQ lazy.
+        from olmlx.engine.hqq.quantize import HQQConfig, quantize_model
+
+        def _quantize(m):
+            quantize_model(m, HQQConfig(bits=4, group_size=64))
+            mx.eval(m.parameters())
+
+        res = self._forward_on_worker(_hqq_quantize_on_thread(_quantize))
+        assert res.get("error") is not None, (
+            "expected lazy HQQ buffers to be load-thread-bound — if this "
+            "passes, the HQQ materialization may be unnecessary"
+        )
+        assert "Stream" in str(res["error"])
+
+    def test_maybe_quantize_model_materializes(self):
+        from olmlx.engine.model_manager import ModelManager
+
+        model = _hqq_quantize_on_thread(
+            lambda m: ModelManager._maybe_quantize_model(m, False, "hqq:4", "x/y")
+        )
+        res = self._forward_on_worker(model)
+        assert res.get("error") is None, (
+            f"_maybe_quantize_model left HQQ weights lazy: {res.get('error')!r}"
+        )
+
+
+def _filled_kv_layer(n_tokens: int = 3):
+    from mlx_lm.models.cache import KVCache
+
+    layer = KVCache()
+    layer.update_and_fetch(
+        mx.ones((1, 2, n_tokens, 4), dtype=mx.float16),
+        mx.zeros((1, 2, n_tokens, 4), dtype=mx.float16),
+    )
+    mx.eval(layer.state)
+    return layer
+
+
+def _extend_cache_on_worker(cache):
+    """Resume a restored cache on a fresh (generation) thread — the first
+    ``update_and_fetch`` + eval that a forward would do."""
+
+    def _work():
+        for layer in cache:
+            k, v = layer.update_and_fetch(
+                mx.ones((1, 2, 1, 4), dtype=mx.float16),
+                mx.ones((1, 2, 1, 4), dtype=mx.float16),
+            )
+            mx.eval(k, v)
+        return True
+
+    return _run_in_thread(_work)
+
+
+@pytest.mark.usefixtures("metal_default_device")
+class TestDiskRestoredPromptCacheMaterialization:
+    """#757: ``load_prompt_cache`` (``mx.load`` + ``from_state``) runs on an
+    ``asyncio.to_thread`` pool thread with no eval, so the restored cache
+    holds lazy load ops bound to that thread's stream. The first forward on
+    the generation thread then raises ``no Stream`` — after the disk file was
+    already unlinked, so the cache is lost and the request fails."""
+
+    async def test_text_store_async_get_restores_materialized(self, tmp_path):
+        from olmlx.engine.prompt_cache.state import CachedPromptState
+        from olmlx.engine.prompt_cache.store import PromptCacheStore
+
+        store = PromptCacheStore(max_slots=1, disk_path=tmp_path, model_name="m")
+        await store.async_set(
+            "a", CachedPromptState(tokens=[1, 2, 3], cache=[_filled_kv_layer()])
+        )
+        await store.async_set(
+            "b", CachedPromptState(tokens=[4, 5, 6], cache=[_filled_kv_layer()])
+        )  # spills "a"
+        restored = await store.async_get("a")
+        assert restored is not None
+        res = _extend_cache_on_worker(restored.cache)
+        assert res.get("error") is None, (
+            f"disk-restored cache left lazy: {res.get('error')!r}"
+        )
+
+    async def test_text_store_async_take_restores_materialized(self, tmp_path):
+        from olmlx.engine.prompt_cache.state import CachedPromptState
+        from olmlx.engine.prompt_cache.store import PromptCacheStore
+
+        store = PromptCacheStore(max_slots=1, disk_path=tmp_path, model_name="m")
+        await store.async_set(
+            "a", CachedPromptState(tokens=[1, 2, 3], cache=[_filled_kv_layer()])
+        )
+        await store.async_set(
+            "b", CachedPromptState(tokens=[4, 5, 6], cache=[_filled_kv_layer()])
+        )
+        restored = await store.async_take("a")
+        assert restored is not None
+        res = _extend_cache_on_worker(restored.cache)
+        assert res.get("error") is None, (
+            f"disk-restored cache left lazy: {res.get('error')!r}"
+        )
+
+    async def test_vlm_store_async_get_restores_materialized(self, tmp_path):
+        from mlx_vlm.generate import PromptCacheState
+
+        from olmlx.engine.prompt_cache.vlm_state import VlmPromptCacheStore
+
+        def _state(ids):
+            s = PromptCacheState()
+            s.update(ids, [_filled_kv_layer(len(ids))])
+            return s
+
+        store = VlmPromptCacheStore(
+            capacity=1, disk_path=tmp_path, model_name="test-vlm:latest"
+        )
+        await store.async_insert("a", _state([1, 2, 3]))
+        await store.async_insert("b", _state([4, 5, 6]))  # spills "a"
+        restored = await store.async_get("a")
+        assert restored is not None
+        res = _extend_cache_on_worker(restored.cache)
+        assert res.get("error") is None, (
+            f"disk-restored VLM cache left lazy: {res.get('error')!r}"
+        )

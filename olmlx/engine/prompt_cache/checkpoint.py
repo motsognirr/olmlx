@@ -72,6 +72,20 @@ def flatten_cache_state(cache: list[Any]) -> list[Any]:
     return states
 
 
+def materialize_restored_cache(cache: list[Any]) -> None:
+    """Eager-eval a cache freshly read by ``load_prompt_cache`` (#757).
+
+    ``mx.load`` + ``from_state`` leave lazy load ops bound to the reading
+    thread's stream (an ``asyncio.to_thread`` pool thread). The first forward
+    on the generation thread would raise ``no Stream`` after the disk file was
+    already unlinked, losing the cache and failing the request. Materialized
+    leaves carry no stream binding, so they are safe on any thread. Only
+    ``mx.array`` leaves are evaluated: an ``ArraysCache`` can hold ``None``
+    slots.
+    """
+    mx.eval([a for a in flatten_cache_state(cache) if isinstance(a, mx.array)])
+
+
 def snapshot_cache_for_persistence(
     cache: list[Any],
     *,

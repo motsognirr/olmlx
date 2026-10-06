@@ -583,6 +583,35 @@ class TestPresencePenaltyProcessor:
         assert mx.allclose(result, expected).item()
 
 
+class TestPenaltyProcessorsMxArrayHistory:
+    """#757: mlx-lm ``generate_step`` passes the token history as an
+    ``mx.array`` that grows by one per call, not a list."""
+
+    def _drive(self, processor, history, vocab=4):
+        out = None
+        for n in range(1, len(history) + 1):
+            out = processor(mx.array(history[:n]), mx.full((1, vocab), 10.0))
+        return out
+
+    def test_frequency_penalty_multi_token_mx_history(self):
+        processor = _make_frequency_penalty_processor(0.5)
+        result = self._drive(processor, [0, 1, 0])
+        assert mx.allclose(result, mx.array([[9.0, 9.5, 10.0, 10.0]])).item()
+
+    def test_presence_penalty_multi_token_mx_history(self):
+        processor = _make_presence_penalty_processor(0.5)
+        result = self._drive(processor, [0, 1, 0, 2])
+        assert mx.allclose(result, mx.array([[9.5, 9.5, 9.5, 10.0]])).item()
+
+    def test_presence_penalty_persists_across_steps(self):
+        """Every seen token is penalized on every step — the logits are
+        fresh per call, so penalizing only the newly-seen token is wrong."""
+        processor = _make_presence_penalty_processor(0.5)
+        processor([0], mx.array([10.0, 10.0]))
+        result = processor([0, 1], mx.array([10.0, 10.0]))
+        assert mx.allclose(result, mx.array([9.5, 9.5])).item()
+
+
 class TestStopSequenceHandling:
     """Tests for stop sequence handling in _full_completion."""
 

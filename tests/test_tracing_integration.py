@@ -245,8 +245,12 @@ def test_disk_cache_spans(memory_exporter, tmp_path):
         "olmlx.engine.prompt_cache.store.save_prompt_cache", side_effect=fake_save
     ):
         store._save_to_disk(cid, state)
-    with patch(
-        "olmlx.engine.prompt_cache.store.load_prompt_cache", side_effect=fake_load
+    with (
+        patch(
+            "olmlx.engine.prompt_cache.store.load_prompt_cache", side_effect=fake_load
+        ),
+        # Placeholder cache can't be mx.eval'd (#757 restore materialization).
+        patch("olmlx.engine.prompt_cache.store.materialize_restored_cache"),
     ):
         loaded = store._load_from_disk(cid)
     assert loaded is not None

@@ -179,3 +179,83 @@ class TestSpecialTokenTextStripping:
         assert "<|im_end|>" not in responses[0].text, (
             f"prefill EOS leaked: {responses[0].text!r}"
         )
+
+
+class TestMultipleEosIds:
+    """#757: speculative decoding must stop on *any* of the tokenizer's EOS
+    ids (Gemma 3 ``<end_of_turn>``, Llama 3.x eot/eom), like the mlx-lm path
+    does via ``tokenizer.eos_token_ids`` — not just ``eos_token_id``."""
+
+    class _StubDecoder(TestSpecialTokenTextStripping._StubDecoder):
+        """Pads with a non-EOS filler once exhausted, so a missed stop runs
+        to ``max_tokens`` instead of spinning on empty steps forever."""
+
+        def step(self) -> tuple[list[int], int]:
+            accepted, n = super().step()
+            return (accepted, n) if accepted else ([0], 1)
+
+    def test_stops_on_secondary_eos_id(self):
+        from olmlx.engine.speculative_stream import speculative_stream_generate
+
+        decoder = self._StubDecoder([1, 2, 98, 5, 6, 99])
+        responses = list(
+            speculative_stream_generate(
+                decoder,
+                [10],
+                max_tokens=16,
+                cancel_event=threading.Event(),
+                eos_token_ids={98, 99},
+            )
+        )
+        assert [r.token for r in responses] == [1, 2, 98]
+        assert responses[-1].finish_reason == "stop"
+
+    def test_first_token_secondary_eos_stops(self):
+        from olmlx.engine.speculative_stream import speculative_stream_generate
+
+        decoder = self._StubDecoder([98, 5, 6])
+        responses = list(
+            speculative_stream_generate(
+                decoder,
+                [10],
+                max_tokens=16,
+                cancel_event=threading.Event(),
+                eos_token_ids={98, 99},
+            )
+        )
+        assert [r.token for r in responses] == [98]
+
+    def test_tokenizer_eos_ids_union(self):
+        from olmlx.engine.speculative_stream import tokenizer_eos_ids
+
+        class _Tok:
+            eos_token_id = 1
+            eos_token_ids = {106, 1}
+
+        assert tokenizer_eos_ids(_Tok()) == frozenset({1, 106})
+
+    def test_tokenizer_eos_ids_single_only(self):
+        from olmlx.engine.speculative_stream import tokenizer_eos_ids
+
+        class _Tok:
+            eos_token_id = 7
+
+        assert tokenizer_eos_ids(_Tok()) == frozenset({7})
+        assert tokenizer_eos_ids(None) == frozenset()
+
+    async def test_async_stream_uses_all_eos_ids(self):
+        from olmlx.engine.speculative_stream import async_speculative_stream
+
+        class _Tok:
+            eos_token_id = 99
+            eos_token_ids = {98, 99}
+
+            def decode(self, tokens, skip_special_tokens=False):
+                return "".join(f"w{t}" for t in tokens)
+
+        stream = async_speculative_stream(
+            self._StubDecoder([1, 98, 5, 6]), _Tok(), [10], max_tokens=16
+        )
+        tokens = [item.token async for item in stream]
+        await stream.drain_and_join()
+        assert tokens == [1, 98]

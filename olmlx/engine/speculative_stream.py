@@ -9,7 +9,7 @@ from __future__ import annotations
 import logging
 import threading
 import time
-from collections.abc import Generator
+from collections.abc import Collection, Generator
 from typing import Any, Protocol
 
 import mlx.core as mx
@@ -63,6 +63,25 @@ class SpeculativeDecoderProtocol(Protocol):
     def reset(self) -> None: ...
 
 
+def tokenizer_eos_ids(tokenizer: Any) -> frozenset[int]:
+    """Every stop id the tokenizer declares.
+
+    The non-speculative path stops on any id in mlx-lm's
+    ``TokenizerWrapper.eos_token_ids``; a bare ``eos_token_id`` misses the
+    extra end-of-turn ids of Gemma 3 / Llama 3.x, so speculative decoding ran
+    past the turn to ``max_tokens`` (#757). Non-int entries are dropped so a
+    MagicMock tokenizer yields an empty set rather than junk.
+    """
+    ids: set[int] = set()
+    multi = getattr(tokenizer, "eos_token_ids", None)
+    if isinstance(multi, (set, frozenset, list, tuple)):
+        ids.update(t for t in multi if isinstance(t, int))
+    single = getattr(tokenizer, "eos_token_id", None)
+    if isinstance(single, int):
+        ids.add(single)
+    return frozenset(ids)
+
+
 def speculative_stream_generate(
     decoder: SpeculativeDecoderProtocol,
     prompt_tokens: list[int],
@@ -71,6 +90,7 @@ def speculative_stream_generate(
     eos_token_id: int | None = None,
     tokenizer: TokenizerProtocol | None = None,
     segmented: Any = None,
+    eos_token_ids: Collection[int] | None = None,
 ) -> Generator[StreamToken, None, None]:
     """Sync generator that yields StreamToken objects for speculative decoding.
 
@@ -80,6 +100,9 @@ def speculative_stream_generate(
         max_tokens: Maximum number of tokens to generate.
         cancel_event: Set to stop generation.
         eos_token_id: Stop generation when this token is produced.
+        eos_token_ids: Stop on any of these ids too (multi-EOS models such as
+            Gemma 3 ``<end_of_turn>`` or Llama 3.x eot/eom; see
+            ``tokenizer_eos_ids``). Unioned with ``eos_token_id``.
         tokenizer: Tokenizer for incremental text decoding. If None, text is empty.
         segmented: Optional ``SegmentedPrompt`` for cross-request KV reuse
             (#421). Always passed through to ``decoder.prefill`` — every
@@ -87,6 +110,10 @@ def speculative_stream_generate(
             without a snapshot store ignore it.
     """
     from olmlx.engine.speculative import PrefillCancelled
+
+    stop_ids = frozenset(eos_token_ids or ())
+    if eos_token_id is not None:
+        stop_ids = stop_ids | {eos_token_id}
 
     prompt_arr = mx.array([prompt_tokens])
     prompt_len = len(prompt_tokens)
@@ -133,9 +160,7 @@ def speculative_stream_generate(
         generation_tps=gen_count / max(prefill_elapsed, 1e-9),
     )
 
-    if (
-        eos_token_id is not None and first_token == eos_token_id
-    ) or cancel_event.is_set():
+    if first_token in stop_ids or cancel_event.is_set():
         return
 
     def _log_stats():
@@ -178,7 +203,7 @@ def speculative_stream_generate(
                 new_text = ""
 
             finish = None
-            if eos_token_id is not None and token == eos_token_id:
+            if token in stop_ids:
                 finish = "stop"
             elif gen_count >= max_tokens:
                 finish = "length"
@@ -223,7 +248,7 @@ def async_speculative_stream(
     else:
         prompt_tokens = prompt
 
-    eos_token_id = getattr(tokenizer, "eos_token_id", None)
+    eos_ids = tokenizer_eos_ids(tokenizer)
 
     def gen_factory(cancel_event: threading.Event):
         return speculative_stream_generate(
@@ -231,7 +256,7 @@ def async_speculative_stream(
             prompt_tokens,
             max_tokens=max_tokens,
             cancel_event=cancel_event,
-            eos_token_id=eos_token_id,
+            eos_token_ids=eos_ids,
             tokenizer=tokenizer,
             segmented=segmented,
         )

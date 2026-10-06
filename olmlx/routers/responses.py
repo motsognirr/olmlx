@@ -273,6 +273,21 @@ def _build_output_items(
     return items
 
 
+def _in_progress_skeleton(item: dict) -> dict:
+    """The ``response.output_item.added`` form of a finished output item.
+
+    Clients (the openai SDK accumulator) append every following
+    ``content_part.added`` / ``*.delta`` onto the added item, so it must carry
+    no content yet: a finished item there doubles its text/arguments (#757).
+    Reasoning items get no deltas on the buffered path, so they go as-is.
+    """
+    if item["type"] == "message":
+        return {**item, "status": "in_progress", "content": []}
+    if item["type"] == "function_call":
+        return {**item, "status": "in_progress", "arguments": ""}
+    return item
+
+
 def _usage_dict(stats) -> dict:
     if stats is None:
         return {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
@@ -416,7 +431,7 @@ async def _stream_response(
         for out_index, item in enumerate(output_items):
             yield ev(
                 "response.output_item.added",
-                {"output_index": out_index, "item": item},
+                {"output_index": out_index, "item": _in_progress_skeleton(item)},
             )
             if item["type"] == "message":
                 part = item["content"][0]
@@ -598,7 +613,7 @@ async def _stream_response(
                         "response.output_item.added",
                         {
                             "output_index": message_index,
-                            "item": message_item("in_progress"),
+                            "item": {**message_item("in_progress"), "content": []},
                         },
                     )
                 )
