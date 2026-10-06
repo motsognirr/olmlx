@@ -260,6 +260,14 @@ class TestMultipleEosIds:
 
         assert tokenizer_eos_ids(_HFTok()) == frozenset({1, 106, 107})
 
+    def test_tokenizer_eos_ids_list_valued_eos_token_id(self):
+        from olmlx.engine.speculative_stream import tokenizer_eos_ids
+
+        class _Tok:
+            eos_token_id = [1, 106]
+
+        assert tokenizer_eos_ids(_Tok()) == frozenset({1, 106})
+
     async def test_async_stream_uses_all_eos_ids(self):
         from olmlx.engine.speculative_stream import async_speculative_stream
 

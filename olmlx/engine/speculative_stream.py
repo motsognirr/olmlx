@@ -77,16 +77,17 @@ def tokenizer_eos_ids(tokenizer: Any) -> frozenset[int]:
     """
     ids: set[int] = set()
     criteria = getattr(tokenizer, "stopping_criteria", None)
+    single = getattr(tokenizer, "eos_token_id", None)
+    if isinstance(single, int):
+        ids.add(single)
     for multi in (
+        single,  # some tokenizers/configs carry a list here
         getattr(tokenizer, "eos_token_ids", None),
         getattr(criteria, "eos_token_ids", None),
         getattr(criteria, "additional_eos_token_ids", None),
     ):
         if isinstance(multi, (set, frozenset, list, tuple)):
             ids.update(t for t in multi if isinstance(t, int))
-    single = getattr(tokenizer, "eos_token_id", None)
-    if isinstance(single, int):
-        ids.add(single)
     return frozenset(ids)
 
 
