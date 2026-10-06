@@ -1639,6 +1639,55 @@ class TestVlmUsesCache:
         assert "prompt_cache" not in mock_stream_fn.call_args.kwargs
 
     @pytest.mark.asyncio
+    async def test_streaming_quant_cache_failure_raises_before_response_starts(
+        self, mock_manager
+    ):
+        """Building the quant cache can fail (bad head_dim, missing spectral /
+        shard calibration). That must surface before the ``cache_info`` chunk
+        — the chunk starts the HTTP response, after which the router can only
+        send an in-stream error instead of a clean 4xx/5xx."""
+        from olmlx.engine.inference import generate_chat
+
+        lm = self._setup_vlm(mock_manager)
+        lm.kv_cache_quant = "spectral:4"
+
+        mock_mlx_vlm = MagicMock()
+        mock_mlx_vlm.apply_chat_template.return_value = "vlm prompt"
+        mock_mlx_vlm_generate = MagicMock()
+        mock_mlx_vlm_generate.PromptCacheState = MagicMock(return_value=MagicMock())
+        chunks: list = []
+
+        with (
+            patch("olmlx.engine.inference.mx", MagicMock()),
+            patch.dict(
+                "sys.modules",
+                {"mlx_vlm": mock_mlx_vlm, "mlx_vlm.generate": mock_mlx_vlm_generate},
+            ),
+            patch(
+                "olmlx.engine.inference._make_prompt_cache_for_lm",
+                side_effect=ValueError("no spectral calibration"),
+            ),
+            patch("olmlx.engine.inference.settings") as mock_settings,
+        ):
+            mock_settings.prompt_cache = True
+            mock_settings.prompt_cache_max_tokens = 32768
+            mock_settings.default_keep_alive = "5m"
+            mock_settings.inference_timeout = None
+            mock_settings.sync_mode = "full"
+            gen = await generate_chat(
+                mock_manager,
+                "qwen3",
+                [{"role": "user", "content": "describe"}],
+                stream=True,
+            )
+            with pytest.raises(ValueError, match="no spectral calibration"):
+                async for chunk in gen:
+                    chunks.append(chunk)
+
+        # Only the prepended thinking_expected meta chunk may precede the error.
+        assert not any(c.get("cache_info") for c in chunks), chunks
+
+    @pytest.mark.asyncio
     async def test_vlm_non_streaming_error_still_finalizes_cache(self, mock_manager):
         """A mid-generation failure must still materialize (and shed) the
         quant cache on the worker: on a prefix hit mlx-vlm generates into the

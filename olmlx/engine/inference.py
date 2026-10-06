@@ -3488,6 +3488,16 @@ async def _stream_completion(
             _recheck_window_if_eviction_cache_lost(
                 lm, gen_kwargs, prompt, full_prompt_tokens, use_prompt_cache
             )
+        # Before the cache_info yield: building the quant cache can fail
+        # (head_dim, missing calibration) and must surface as a clean error.
+        # Mirrors the speculative decision made below.
+        _attach_kv_quant_cache(
+            lm,
+            gen_kwargs,
+            will_speculate=bool(lm.is_speculative)
+            and not (images or audio_paths)
+            and not grammar_active,
+        )
 
         # Yield cache stats after the pre-flight check so routers can
         # use them.  This starts the HTTP response — no 503 after this.
@@ -3533,7 +3543,6 @@ async def _stream_completion(
             use_speculative = False
         else:
             use_speculative = lm.is_speculative and not (images or audio_paths)
-        _attach_kv_quant_cache(lm, gen_kwargs, will_speculate=bool(use_speculative))
 
         # prompt is a str or a token-id list; only the latter gives a count here.
         _prefill_prompt_tokens = len(prompt) if isinstance(prompt, list) else None

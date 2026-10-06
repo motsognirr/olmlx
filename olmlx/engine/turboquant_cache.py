@@ -592,6 +592,13 @@ def _vlm_kv_cache_cls() -> type | None:
     try:
         from mlx_vlm.models.cache import KVCache as VlmKVCache
     except ImportError:
+        # Memoized, so this logs once. Silent would reproduce the bug this
+        # guards against: kv_cache_quant quietly ignored on every VLM.
+        logger.warning(
+            "mlx-vlm cache classes not importable; kv_cache_quant will not "
+            "apply to VLM models",
+            exc_info=True,
+        )
         return None
     return VlmKVCache
 

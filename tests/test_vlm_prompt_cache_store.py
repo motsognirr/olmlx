@@ -189,6 +189,38 @@ async def test_quantized_state_not_spilled(tmp_path):
     assert list(tmp_path.rglob("*.safetensors")) == []
 
 
+async def test_quantized_spill_skip_logged_once_at_info(tmp_path, caplog):
+    """Dropping an evicted entry instead of spilling it is a behavior change an
+    operator who enabled disk spill should see — once per store, not per
+    eviction, and not only at DEBUG."""
+    from mlx_vlm.generate import PromptCacheState
+
+    from olmlx.engine.kvarn import KVarNRotation
+    from olmlx.engine.kvarn_cache import KVarNKVCache
+
+    def _quant_state():
+        layer = KVarNKVCache(
+            key_bits=4,
+            value_bits=2,
+            rotation_key=KVarNRotation(head_dim=16, seed=0),
+            rotation_value=KVarNRotation(head_dim=16, seed=1),
+        )
+        layer.update_and_fetch(
+            mx.ones((1, 2, 3, 16), dtype=mx.float16),
+            mx.ones((1, 2, 3, 16), dtype=mx.float16),
+        )
+        state = PromptCacheState()
+        state.update([1, 2, 3], [layer])
+        return state
+
+    store = _disk_store(tmp_path)
+    with caplog.at_level("INFO"):
+        for cid in ("a", "b", "c"):  # "a" then "b" evicted and skipped
+            await store.async_insert(cid, _quant_state())
+    hits = [r for r in caplog.records if "disk spill" in r.getMessage()]
+    assert len(hits) == 1 and hits[0].levelname == "INFO"
+
+
 async def test_empty_state_not_spilled(tmp_path):
     """A never-filled state (cache is None) evicted before use writes nothing."""
     from mlx_vlm.generate import PromptCacheState

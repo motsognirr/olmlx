@@ -737,3 +737,49 @@ class TestRotationReuse:
         b = make_kvarn_cache(_mock_model(2), key_bits=4, value_bits=2)
         assert a[1].rotation_key is b[1].rotation_key
         assert a[0].rotation_key is not a[0].rotation_value
+
+    def test_rotation_memos_cleared_on_model_close(self):
+        """The memo is process-global; it must not outlive the model that
+        populated it (each rotation pair is up to ~2 MB at D=512)."""
+        from olmlx.engine.kvarn_cache import _shared_kvarn_rotation, make_kvarn_cache
+        from olmlx.engine.model_manager import ModelManager
+        from olmlx.engine.turboquant_cache import (
+            make_turboquant_cache,
+            shared_turboquant_rotation,
+        )
+
+        make_turboquant_cache(_mock_model(2), bits=4)
+        make_kvarn_cache(_mock_model(2), key_bits=4, value_bits=2)
+        lm = MagicMock(
+            kv_cache_quant="turboquant:4",
+            is_whisper=False,
+            is_tts=False,
+            is_image=False,
+            adapter_base=None,
+            weight_store=None,
+            speculative_decoder=None,
+        )
+        lm.model.prefetcher = None
+        ModelManager._close_loaded_model(lm)
+        assert shared_turboquant_rotation.cache_info().currsize == 0
+        assert _shared_kvarn_rotation.cache_info().currsize == 0
+
+
+class TestVlmKvCacheClassImport:
+    def test_missing_mlx_vlm_cache_module_warns_once(self, caplog, monkeypatch):
+        """A silent fallback here would re-create the exact no-op this guards
+        against (kv_cache_quant ignored on every VLM) with no log line."""
+        import sys
+
+        from olmlx.engine.turboquant_cache import _is_plain_kv_cache, _vlm_kv_cache_cls
+
+        _vlm_kv_cache_cls.cache_clear()
+        monkeypatch.setitem(sys.modules, "mlx_vlm.models.cache", None)
+        try:
+            with caplog.at_level("WARNING"):
+                assert _is_plain_kv_cache(object()) is False
+                assert _is_plain_kv_cache(object()) is False
+            hits = [r for r in caplog.records if "mlx-vlm" in r.getMessage()]
+            assert len(hits) == 1
+        finally:
+            _vlm_kv_cache_cls.cache_clear()
