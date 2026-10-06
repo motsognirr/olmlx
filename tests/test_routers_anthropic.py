@@ -738,10 +738,12 @@ class TestAnthropicEndpoint:
             for line in message.get("body", b"").decode().splitlines():
                 if line.startswith("event: "):
                     seen.append(line[len("event: ") :])
-            if "ping" in seen and not gate.is_set():
-                # message_start must already be out, ahead of any content.
-                assert seen[0] == "message_start", seen
-                gate.set()
+                elif line == ": ping" and not gate.is_set():
+                    # Keepalive bytes reach the client while generation is
+                    # silent, without committing message_start (its cache
+                    # stats aren't known yet) or any content.
+                    assert seen == [], seen
+                    gate.set()
 
         scope = {
             "type": "http",
@@ -762,7 +764,8 @@ class TestAnthropicEndpoint:
             patch("olmlx.routers.anthropic.KEEPALIVE_PING_INTERVAL", 0.05),
         ):
             await asyncio.wait_for(app(scope, receive, send), timeout=10)
-        assert gate.is_set(), f"no ping reached the client: {seen}"
+        assert gate.is_set(), f"no keepalive reached the client: {seen}"
+        assert seen[0] == "message_start", seen
         assert seen[-1] == "message_stop", seen
 
     async def test_streaming_tools_buffered_stop_sequence_hit(self, app_client):

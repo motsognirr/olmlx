@@ -95,13 +95,11 @@ THINKING_CHUNK_SIZE = 1000
 TEXT_CHUNK_SIZE = 100
 
 
-# Keepalive pings held back waiting for ``cache_info`` before message_start
-# goes out anyway (with zero cache stats). cache_info follows the
-# inference-lock wait, so a queued request legitimately pings first; paths
-# that never send it (speculative, distributed, prompt cache off, panels)
-# must not starve the client of body bytes (#616, #757). 2 → ~10s at the
-# default KEEPALIVE_PING_INTERVAL.
-_MAX_PINGS_BEFORE_MESSAGE_START = 2
+# Keepalive sent before message_start. cache_info follows the inference-lock
+# wait, and some paths never send it, so message_start can't go out early
+# without losing the cache stats. An SSE comment keeps body bytes flowing
+# (client read timeouts, #616) and is ignored by SSE parsers (#757).
+_SSE_KEEPALIVE_COMMENT = ": ping\n\n"
 
 
 def _make_msg_id() -> str:
@@ -838,15 +836,13 @@ async def anthropic_messages(req: AnthropicMessagesRequest, request: Request):
                 # receives keep-alive pings during prefill instead of
                 # buffering them until the first content token arrives.
                 #
-                # message_start goes out on whichever comes first: cache_info
-                # (carries the cache stats; pings before it are buffered —
-                # e.g. during the inference-lock wait), the first content
-                # event, or the _MAX_PINGS_BEFORE_MESSAGE_START-th ping (paths
-                # that never send cache_info). Pings after it flow directly.
+                # message_start goes out on cache_info (carries the cache
+                # stats) or the first content event, whichever comes first.
+                # Keepalives before it are sent as SSE comments; after it, as
+                # ping events.
                 cache_read = 0
                 cache_creation = 0
                 message_started = False
-                pending_pings: list[str] = []
 
                 def _emit_message_start():
                     nonlocal message_started
@@ -882,9 +878,6 @@ async def anthropic_messages(req: AnthropicMessagesRequest, request: Request):
                         # Emit message_start immediately with cache stats
                         if not message_started:
                             yield _emit_message_start()
-                            for ping in pending_pings:
-                                yield ping
-                            pending_pings.clear()
                         else:
                             logger.warning(
                                 "Duplicate cache_info received after message_start "
@@ -895,38 +888,24 @@ async def anthropic_messages(req: AnthropicMessagesRequest, request: Request):
                     elif isinstance(event, str) and event.startswith("event: ping"):
                         if message_started:
                             yield event
-                        elif len(pending_pings) + 1 < _MAX_PINGS_BEFORE_MESSAGE_START:
-                            # cache_info may still come (it follows the lock
-                            # wait + preflight): hold the ping so the stats
-                            # make it into message_start.
-                            pending_pings.append(event)
                         else:
-                            # Still no cache_info: this path may never send
-                            # one (speculative, distributed, prompt cache
-                            # off, panels). Holding pings until content would
-                            # leave the client with zero body bytes for the
-                            # whole generation (#616, #757), so start the
-                            # message with zero cache stats.
-                            yield _emit_message_start()
-                            for ping in pending_pings:
-                                yield ping
-                            pending_pings.clear()
-                            yield event
+                            # cache_info may still come (it follows the lock
+                            # wait + preflight) or never (speculative,
+                            # distributed, prompt cache off, panels). Either
+                            # way keep body bytes flowing without committing
+                            # message_start before its stats are known: SSE
+                            # parsers ignore comment lines (#616, #757).
+                            yield _SSE_KEEPALIVE_COMMENT
                     elif isinstance(event, dict):
                         meta = event
                     else:
                         if not message_started:
                             # Content arrived before cache_info — no-cache case
                             yield _emit_message_start()
-                            for ping in pending_pings:
-                                yield ping
-                            pending_pings.clear()
                         yield event
 
                 if not message_started:
                     yield _emit_message_start()
-                    for ping in pending_pings:
-                        yield ping
 
                 yield _sse(
                     "message_delta",
