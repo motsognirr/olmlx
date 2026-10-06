@@ -409,19 +409,46 @@ def _cache_needs_materialize(cache: Any) -> bool:
     )
 
 
-def vlm_generation_caches(gen_kwargs: dict[str, Any]) -> list[Any]:
-    """The caches an ``mlx_vlm.stream_generate`` call may generate into.
+def generation_caches(gen_kwargs: dict[str, Any]) -> list[Any]:
+    """The caches a ``stream_generate`` call may generate into.
 
-    mlx-vlm uses the passed ``prompt_cache`` on a miss, but on a prefix hit it
-    swaps in (and trims) the cache held by ``prompt_cache_state`` instead, so
-    both must be finalized after generation.
+    The passed ``prompt_cache``, plus — for mlx-vlm — the cache held by
+    ``prompt_cache_state``, which mlx-vlm swaps in (and trims) instead on a
+    prefix hit. Both are finalized after generation.
     """
     state = gen_kwargs.get("prompt_cache_state")
     return [gen_kwargs.get("prompt_cache"), getattr(state, "cache", None)]
 
 
-def _finalize_lazy_caches(gen: Any, caches: list[Any]) -> Any:
-    """Wrap ``gen`` so lazy-state ``caches`` are materialized when it ends.
+def release_transient_cache_buffers(cache: Any) -> None:
+    """Drop recoverable full-precision side buffers (TurboQuant/KVarN).
+
+    The text store does this at its insert chokepoint
+    (``_shed_transient_buffers``); mlx-vlm's ``PromptCacheState`` has none, so
+    the VLM path sheds at end of generation instead. The next
+    ``update_and_fetch`` rebuilds the buffers from the packed state. Must run
+    after ``materialize_lazy_cache_state``. Duck-typed like it.
+    """
+    for layer in cache or ():
+        fn = getattr(layer, "release_dequant_buffers", None)
+        if callable(fn):
+            fn()
+
+
+def finalize_generation_caches(caches: list[Any], *, shed: bool) -> None:
+    """Materialize (and, when ``shed``, drop the side buffers of) ``caches``.
+
+    Runs on the generating worker after generation — including after a
+    failure, since a cache mlx-vlm reused in place stays in its store.
+    """
+    for cache in caches:
+        materialize_lazy_cache_state(cache)
+        if shed:
+            release_transient_cache_buffers(cache)
+
+
+def _finalize_lazy_caches(gen: Any, caches: list[Any], *, shed: bool) -> Any:
+    """Wrap ``gen`` so lazy-state ``caches`` are finalized when it ends.
 
     The wrapper's ``finally`` runs on the generating worker on both exhaustion
     and ``gen.close()`` (cancel), and ``mx.eval`` blocks until done, so the
@@ -436,8 +463,7 @@ def _finalize_lazy_caches(gen: Any, caches: list[Any]) -> Any:
         try:
             yield from gen
         finally:
-            for cache in caches:
-                materialize_lazy_cache_state(cache)
+            finalize_generation_caches(caches, shed=shed)
 
     return _finalizing()
 
@@ -496,8 +522,9 @@ def async_mlx_stream(
             )
             # A ``kv_cache_quant`` VLM generates into a lazy-state cache too:
             # the fresh ``prompt_cache``, or on a prefix hit the cache mlx-vlm
-            # reuses from ``prompt_cache_state`` (see ``vlm_generation_caches``).
-            return _finalize_lazy_caches(gen, vlm_generation_caches(kwargs))
+            # reuses from ``prompt_cache_state`` (see ``generation_caches``).
+            # Shed here: the VLM store has no shed-on-insert chokepoint.
+            return _finalize_lazy_caches(gen, generation_caches(kwargs), shed=True)
         else:
             import mlx_lm
 
@@ -524,7 +551,9 @@ def async_mlx_stream(
             # Materialize them on the generating worker before the cache is
             # stored and reused by a different worker thread (which would
             # otherwise crash: "no Stream(gpu, N) in current thread").
-            return _finalize_lazy_caches(gen, [gen_kwargs.get("prompt_cache")])
+            # Not shed: the text store sheds at insert, after its store-time
+            # trim (which needs no side buffer either way).
+            return _finalize_lazy_caches(gen, generation_caches(gen_kwargs), shed=False)
 
     stream = CancellableStream(gen_factory, is_vlm=is_vlm, trace_context=trace_context)
     stream.start()

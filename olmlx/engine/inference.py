@@ -98,8 +98,9 @@ from olmlx.utils import tracing as _tracing
 from olmlx.utils.audio_input import cleanup_temp_audio, materialize_audio
 from olmlx.utils.streaming import (
     async_mlx_stream,
+    finalize_generation_caches,
+    generation_caches,
     materialize_lazy_cache_state,
-    vlm_generation_caches,
 )
 from olmlx.utils.timing import Timer, TimingStats
 
@@ -1282,21 +1283,36 @@ def _make_prompt_cache_for_lm(lm: LoadedModel) -> list:
     return make_prompt_cache(cache_model)
 
 
-def _attach_vlm_kv_quant_cache(lm: LoadedModel, gen_kwargs: dict) -> None:
-    """Hand mlx-vlm the ``kv_cache_quant`` cache for this VLM generation.
+def _attach_kv_quant_cache(
+    lm: LoadedModel, gen_kwargs: dict, *, will_speculate: bool
+) -> None:
+    """Hand generation the ``kv_cache_quant`` cache when setup left none.
 
-    ``mlx_vlm.stream_generate`` builds a plain fp16 cache unless one is passed
-    as ``prompt_cache``, so without this the setting is silently ignored on
-    every VLM. On a prefix hit mlx-vlm swaps in the ``PromptCacheState``'s
-    cache (a quant cache from the previous turn) instead. Built on the event
-    loop like the text path's: the rotations are eager-eval'd at construction,
-    and the generating worker materializes the packed buffers at the end
-    (``vlm_generation_caches``). Called after the KV preflight so its
-    memory-pressure ``prompt_cache`` pop (text-store re-insert) never sees it.
-    Identity/type checks so a MagicMock ``lm`` can't route here.
+    ``mlx_lm`` / ``mlx_vlm`` ``stream_generate`` build a plain fp16 cache unless
+    one is passed as ``prompt_cache``, so without this the setting is silently
+    ignored on every VLM (its prompt cache is mlx-vlm's ``PromptCacheState``),
+    and on text models whenever the prompt cache is off. When text prompt-cache
+    setup already installed a cache it is kept. On a VLM prefix hit mlx-vlm
+    swaps in the ``PromptCacheState``'s cache (a quant cache from the previous
+    turn) instead.
+
+    Built on the event loop like the text path's: the rotations are
+    eager-eval'd at construction, and the generating worker materializes the
+    packed buffers at the end (``generation_caches``). Called after the KV
+    preflight so its memory-pressure ``prompt_cache`` pop (text-store
+    re-insert) never sees it. Skipped for speculative requests (the decoders
+    never read ``prompt_cache``) and distributed models (workers build their
+    own caches; ``prompt_cache`` is never broadcast). Identity/type checks so a
+    MagicMock ``lm`` can't route here.
     """
-    if lm.is_vlm is True and isinstance(lm.kv_cache_quant, str):
-        gen_kwargs["prompt_cache"] = _make_prompt_cache_for_lm(lm)
+    if (
+        will_speculate
+        or lm.is_distributed is True
+        or not isinstance(lm.kv_cache_quant, str)
+        or "prompt_cache" in gen_kwargs
+    ):
+        return
+    gen_kwargs["prompt_cache"] = _make_prompt_cache_for_lm(lm)
 
 
 def _extract_images(messages: list[dict]) -> list[str] | None:
@@ -3472,7 +3488,6 @@ async def _stream_completion(
             _recheck_window_if_eviction_cache_lost(
                 lm, gen_kwargs, prompt, full_prompt_tokens, use_prompt_cache
             )
-        _attach_vlm_kv_quant_cache(lm, gen_kwargs)
 
         # Yield cache stats after the pre-flight check so routers can
         # use them.  This starts the HTTP response — no 503 after this.
@@ -3518,6 +3533,7 @@ async def _stream_completion(
             use_speculative = False
         else:
             use_speculative = lm.is_speculative and not (images or audio_paths)
+        _attach_kv_quant_cache(lm, gen_kwargs, will_speculate=bool(use_speculative))
 
         # prompt is a str or a token-id list; only the latter gives a count here.
         _prefill_prompt_tokens = len(prompt) if isinstance(prompt, list) else None
@@ -4074,7 +4090,15 @@ async def _full_completion(
                         lm, gen_kwargs, prompt, full_prompt_tokens, use_prompt_cache
                     )
 
-                _attach_vlm_kv_quant_cache(lm, gen_kwargs)
+                # Mirrors _generate_sync's branch choice: a VLM request with
+                # media and a grammar request never take the speculative path.
+                _attach_kv_quant_cache(
+                    lm,
+                    gen_kwargs,
+                    will_speculate=lm.is_speculative is True
+                    and not grammar_active
+                    and not (lm.is_vlm and (images or audio)),
+                )
                 result_dict = await _full_completion_inner(
                     lm,
                     prompt,
@@ -4235,167 +4259,184 @@ async def _full_completion_inner(
         else:
             use_speculative = lm.is_speculative
 
-        if lm.is_vlm and (images or audio_paths):
-            if lm.is_speculative:
-                logger.debug("speculative decoding skipped: request includes images")
-            import mlx_vlm
-            from mlx_vlm.generate import (
-                generation_stream,
-            )  # used by mx.synchronize below
+        try:
+            if lm.is_vlm and (images or audio_paths):
+                if lm.is_speculative:
+                    logger.debug(
+                        "speculative decoding skipped: request includes images"
+                    )
+                import mlx_vlm
+                from mlx_vlm.generate import (
+                    generation_stream,
+                )  # used by mx.synchronize below
 
-            # Drain stream_generate (not generate): it forwards prompt_cache_state
-            # + logits_processors and yields GenerationResult with real token
-            # counts. Return (last_result, full_text) so the downstream tuple
-            # unpacking captures prompt/generation token counts (#429).
-            result = None
-            text_parts = []
-            for response in mlx_vlm.stream_generate(  # pyright: ignore[reportPrivateImportUsage]
-                lm.model,
-                lm.tokenizer,
-                prompt=prompt,
-                image=images,
-                audio=audio_paths,
-                max_tokens=max_tokens,
-                **gen_kwargs,
-            ):
-                text_parts.append(response.text)
-                result = response
-            if result is not None:
-                result = (result, "".join(text_parts))
-        elif use_speculative:
-            import threading
-
-            from olmlx.engine.speculative_stream import (
-                speculative_stream_generate,
-            )
-
-            if isinstance(prompt, str):
-                # BOS heuristic (see the buffered speculative path / #633):
-                # plain ``.encode`` would double the BOS on BOS-prefixed
-                # templates, diverging from the non-speculative path.
-                prompt_tokens = tokenize_for_cache(lm.text_tokenizer, prompt)
-            else:
-                prompt_tokens = prompt
-
-            cancel = threading.Event()
-            eos_token_id = getattr(lm.text_tokenizer, "eos_token_id", None)
-            result = None
-            text_parts = []
-            for response in speculative_stream_generate(
-                lm.speculative_decoder,
-                prompt_tokens,
-                max_tokens=max_tokens,
-                cancel_event=cancel,
-                eos_token_id=eos_token_id,
-                tokenizer=lm.text_tokenizer,
-            ):
-                text_parts.append(response.text)
-                # Collect produced token ids for the Ollama continuation
-                # context (#656) — the speculative branch, unlike the mlx-lm
-                # branch above, otherwise never populates this and would return
-                # a prompt-only context for speculative models.
-                if generated_tokens_out is not None:
-                    tok_id = getattr(response, "token", None)
-                    if tok_id is not None:
-                        generated_tokens_out.append(tok_id)
-                result = response
-            if result is not None:
-                result = (result, "".join(text_parts))
-            # Speculative decoding does not use mlx_lm's generation_stream,
-            # so sync the default stream only.
-            mx.synchronize()
-            return result
-        elif lm.is_vlm:
-            import mlx_vlm
-            from mlx_vlm.generate import (
-                generation_stream,
-            )  # used by mx.synchronize below
-
-            result = None
-            text_parts = []
-            for response in mlx_vlm.stream_generate(  # pyright: ignore[reportPrivateImportUsage]
-                lm.model,
-                lm.tokenizer,
-                prompt=prompt,
-                image=images,
-                audio=audio_paths,
-                max_tokens=max_tokens,
-                **gen_kwargs,
-            ):
-                text_parts.append(response.text)
-                result = response
-            if result is not None:
-                result = (result, "".join(text_parts))
-        else:
-            import mlx_lm
-
-            # Use stream_generate to capture token counts (generate() discards them).
-            # Accumulate text segments since each yield is incremental.
-            # When prompt caching is active the caller passes a list buffer
-            # via generated_tokens_out so _store_prompt_cache_after_generation
-            # can persist the produced token IDs alongside the prompt prefix.
-            result = None
-            text_parts = []
-            # Feed a StopScanner so a stop-sequence match halts decoding at the
-            # earliest match instead of running on to max_tokens and truncating
-            # post-hoc — the latter wastes GPU time under the inference lock and
-            # stores post-stop tokens in the prompt cache (#613). The full text
-            # (including the stop marker) is kept so the caller's post-hoc
-            # truncate_at_stop_match still trims it and sets finish_reason.
-            stop_scanner = (
-                StopScanner(stop_sequences, thinking_aware=thinking_expected)
-                if stop_sequences
-                else None
-            )
-            mlx_gen = mlx_lm.stream_generate(
-                lm.model,
-                lm.tokenizer,
-                prompt=prompt,
-                max_tokens=max_tokens,
-                **gen_kwargs,
-            )
-            try:
-                for response in mlx_gen:
+                # Drain stream_generate (not generate): it forwards prompt_cache_state
+                # + logits_processors and yields GenerationResult with real token
+                # counts. Return (last_result, full_text) so the downstream tuple
+                # unpacking captures prompt/generation token counts (#429).
+                result = None
+                text_parts = []
+                for response in mlx_vlm.stream_generate(  # pyright: ignore[reportPrivateImportUsage]
+                    lm.model,
+                    lm.tokenizer,
+                    prompt=prompt,
+                    image=images,
+                    audio=audio_paths,
+                    max_tokens=max_tokens,
+                    **gen_kwargs,
+                ):
                     text_parts.append(response.text)
+                    result = response
+                if result is not None:
+                    result = (result, "".join(text_parts))
+            elif use_speculative:
+                import threading
+
+                from olmlx.engine.speculative_stream import (
+                    speculative_stream_generate,
+                )
+
+                if isinstance(prompt, str):
+                    # BOS heuristic (see the buffered speculative path / #633):
+                    # plain ``.encode`` would double the BOS on BOS-prefixed
+                    # templates, diverging from the non-speculative path.
+                    prompt_tokens = tokenize_for_cache(lm.text_tokenizer, prompt)
+                else:
+                    prompt_tokens = prompt
+
+                cancel = threading.Event()
+                eos_token_id = getattr(lm.text_tokenizer, "eos_token_id", None)
+                result = None
+                text_parts = []
+                for response in speculative_stream_generate(
+                    lm.speculative_decoder,
+                    prompt_tokens,
+                    max_tokens=max_tokens,
+                    cancel_event=cancel,
+                    eos_token_id=eos_token_id,
+                    tokenizer=lm.text_tokenizer,
+                ):
+                    text_parts.append(response.text)
+                    # Collect produced token ids for the Ollama continuation
+                    # context (#656) — the speculative branch, unlike the mlx-lm
+                    # branch above, otherwise never populates this and would return
+                    # a prompt-only context for speculative models.
                     if generated_tokens_out is not None:
                         tok_id = getattr(response, "token", None)
                         if tok_id is not None:
                             generated_tokens_out.append(tok_id)
-                        else:
-                            logger.debug(
-                                "Skipping token with None ID at generation step %d "
-                                "(cache token sequence will be incomplete)",
-                                len(generated_tokens_out),
-                            )
                     result = response
-                    if stop_scanner is not None:
-                        _, stop_hit = stop_scanner.feed(response.text or "")
-                        if stop_hit:
-                            break
-            finally:
-                # Close the generator explicitly on an early (stop) break so
-                # mlx-lm's wired_limit.__exit__ runs its generation-stream sync
-                # now, on this worker thread — mirrors CancellableStream._run.
-                # Guarded: mlx_lm.stream_generate returns a real generator, but
-                # tests may substitute a plain iterator with no close(). The
-                # close itself is wrapped like CancellableStream._run — GPU
-                # teardown (wired_limit sync) can raise, and an exception here
-                # would supersede a real in-flight error from the loop body.
-                _close = getattr(mlx_gen, "close", None)
-                if callable(_close):
-                    try:
-                        _close()
-                    except Exception:
-                        logger.debug(
-                            "stream_generate close() failed during teardown",
-                            exc_info=True,
-                        )
-            # Store full text on the result for downstream extraction
-            if result is not None:
-                result = (result, "".join(text_parts))
-            from mlx_lm.generate import (
-                generation_stream,
-            )  # used by mx.synchronize below
+                if result is not None:
+                    result = (result, "".join(text_parts))
+                # Speculative decoding does not use mlx_lm's generation_stream,
+                # so sync the default stream only.
+                mx.synchronize()
+                return result
+            elif lm.is_vlm:
+                import mlx_vlm
+                from mlx_vlm.generate import (
+                    generation_stream,
+                )  # used by mx.synchronize below
+
+                result = None
+                text_parts = []
+                for response in mlx_vlm.stream_generate(  # pyright: ignore[reportPrivateImportUsage]
+                    lm.model,
+                    lm.tokenizer,
+                    prompt=prompt,
+                    image=images,
+                    audio=audio_paths,
+                    max_tokens=max_tokens,
+                    **gen_kwargs,
+                ):
+                    text_parts.append(response.text)
+                    result = response
+                if result is not None:
+                    result = (result, "".join(text_parts))
+            else:
+                import mlx_lm
+
+                # Use stream_generate to capture token counts (generate() discards them).
+                # Accumulate text segments since each yield is incremental.
+                # When prompt caching is active the caller passes a list buffer
+                # via generated_tokens_out so _store_prompt_cache_after_generation
+                # can persist the produced token IDs alongside the prompt prefix.
+                result = None
+                text_parts = []
+                # Feed a StopScanner so a stop-sequence match halts decoding at the
+                # earliest match instead of running on to max_tokens and truncating
+                # post-hoc — the latter wastes GPU time under the inference lock and
+                # stores post-stop tokens in the prompt cache (#613). The full text
+                # (including the stop marker) is kept so the caller's post-hoc
+                # truncate_at_stop_match still trims it and sets finish_reason.
+                stop_scanner = (
+                    StopScanner(stop_sequences, thinking_aware=thinking_expected)
+                    if stop_sequences
+                    else None
+                )
+                mlx_gen = mlx_lm.stream_generate(
+                    lm.model,
+                    lm.tokenizer,
+                    prompt=prompt,
+                    max_tokens=max_tokens,
+                    **gen_kwargs,
+                )
+                try:
+                    for response in mlx_gen:
+                        text_parts.append(response.text)
+                        if generated_tokens_out is not None:
+                            tok_id = getattr(response, "token", None)
+                            if tok_id is not None:
+                                generated_tokens_out.append(tok_id)
+                            else:
+                                logger.debug(
+                                    "Skipping token with None ID at generation step %d "
+                                    "(cache token sequence will be incomplete)",
+                                    len(generated_tokens_out),
+                                )
+                        result = response
+                        if stop_scanner is not None:
+                            _, stop_hit = stop_scanner.feed(response.text or "")
+                            if stop_hit:
+                                break
+                finally:
+                    # Close the generator explicitly on an early (stop) break so
+                    # mlx-lm's wired_limit.__exit__ runs its generation-stream sync
+                    # now, on this worker thread — mirrors CancellableStream._run.
+                    # Guarded: mlx_lm.stream_generate returns a real generator, but
+                    # tests may substitute a plain iterator with no close(). The
+                    # close itself is wrapped like CancellableStream._run — GPU
+                    # teardown (wired_limit sync) can raise, and an exception here
+                    # would supersede a real in-flight error from the loop body.
+                    _close = getattr(mlx_gen, "close", None)
+                    if callable(_close):
+                        try:
+                            _close()
+                        except Exception:
+                            logger.debug(
+                                "stream_generate close() failed during teardown",
+                                exc_info=True,
+                            )
+                # Store full text on the result for downstream extraction
+                if result is not None:
+                    result = (result, "".join(text_parts))
+                from mlx_lm.generate import (
+                    generation_stream,
+                )  # used by mx.synchronize below
+        except BaseException:
+            # A failure must still finalize: on a VLM prefix hit mlx-vlm
+            # generated into the stored PromptCacheState's cache in place, and
+            # it stays in the VLM store. Never mask the original error.
+            try:
+                finalize_generation_caches(
+                    generation_caches(gen_kwargs), shed=lm.is_vlm is True
+                )
+            except Exception:
+                logger.warning(
+                    "KV cache finalization failed after a generation error",
+                    exc_info=True,
+                )
+            raise
 
         # Flat-path lazy-state caches (TurboQuant) leave their packed buffers
         # bound to this worker thread's Metal stream (the fetch path returns
@@ -4404,15 +4445,13 @@ async def _full_completion_inner(
         # before the cache is stored and reused from another worker thread —
         # symmetric with the streaming path's gen_factory finalizer. A VLM may
         # have generated into its PromptCacheState's cache instead (prefix
-        # hit), so both are covered (``vlm_generation_caches``). Skipped by
-        # the speculative branch, which returns above and does not build these
-        # caches. No-op for plain/Spectral/Shard caches.
-        for cache in (
-            vlm_generation_caches(gen_kwargs)
-            if lm.is_vlm
-            else [gen_kwargs.get("prompt_cache")]
-        ):
-            materialize_lazy_cache_state(cache)
+        # hit), so both are covered (``generation_caches``), and VLM caches
+        # also shed their side buffers (the VLM store has no shed-on-insert
+        # chokepoint). Skipped by the speculative branch, which returns above
+        # and does not build these caches. No-op for plain/Spectral/Shard.
+        finalize_generation_caches(
+            generation_caches(gen_kwargs), shed=lm.is_vlm is True
+        )
 
         # Sync the generation_stream specifically — mlx_lm/mlx_vlm run GPU
         # work on this module-level stream, not the default stream.  Without

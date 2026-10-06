@@ -7,6 +7,7 @@ dequantizes on fetch, providing transparent memory compression.
 from __future__ import annotations
 
 import copy
+import functools
 import logging
 from collections.abc import Callable
 from typing import Any
@@ -581,13 +582,18 @@ def _is_plain_kv_cache(cache: Any) -> bool:
     unquantized. mlx-vlm subclasses are excluded — they carry model-specific
     state the attention reads (Qwen3.8's ``QSAKVCache`` sparse-indexer keys).
     """
-    if isinstance(cache, KVCache):
-        return True
+    return isinstance(cache, KVCache) or type(cache) is _vlm_kv_cache_cls()
+
+
+@functools.cache
+def _vlm_kv_cache_cls() -> type | None:
+    # Resolved once, lazily: importing mlx_vlm at module import would pull its
+    # whole package into every text-only process.
     try:
         from mlx_vlm.models.cache import KVCache as VlmKVCache
     except ImportError:
-        return False
-    return type(cache) is VlmKVCache
+        return None
+    return VlmKVCache
 
 
 def build_kv_quant_caches(

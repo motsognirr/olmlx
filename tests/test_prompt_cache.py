@@ -1638,6 +1638,63 @@ class TestVlmUsesCache:
 
         assert "prompt_cache" not in mock_stream_fn.call_args.kwargs
 
+    @pytest.mark.asyncio
+    async def test_vlm_non_streaming_error_still_finalizes_cache(self, mock_manager):
+        """A mid-generation failure must still materialize (and shed) the
+        quant cache on the worker: on a prefix hit mlx-vlm generates into the
+        stored PromptCacheState's cache in place, which stays in the VLM store
+        and would otherwise be a dead-thread-bound lazy graph for the next
+        request on that cache_id."""
+        from olmlx.engine.inference import generate_chat
+
+        lm = self._setup_vlm(mock_manager)
+        lm.kv_cache_quant = "kvarn:k4v2"
+        events: list[str] = []
+
+        class _Quant:
+            def ensure_state_materialized(self):
+                events.append("materialize")
+
+            def release_dequant_buffers(self):
+                events.append("release")
+
+        def _failing_stream(*args, **kwargs):
+            yield _make_gen_response("Hi", 100, prompt_tokens=5, generation_tokens=1)
+            raise RuntimeError("[metal::malloc] simulated OOM")
+
+        mock_mlx_vlm = MagicMock()
+        mock_mlx_vlm.apply_chat_template.return_value = "vlm prompt"
+        mock_mlx_vlm.stream_generate = _failing_stream
+        mock_mlx_vlm_generate = MagicMock()
+        mock_mlx_vlm_generate.PromptCacheState = MagicMock(return_value=MagicMock())
+
+        with (
+            patch("olmlx.engine.inference.mx", MagicMock()),
+            patch.dict(
+                "sys.modules",
+                {"mlx_vlm": mock_mlx_vlm, "mlx_vlm.generate": mock_mlx_vlm_generate},
+            ),
+            patch(
+                "olmlx.engine.inference._make_prompt_cache_for_lm",
+                return_value=[_Quant()],
+            ),
+            patch("olmlx.engine.inference.settings") as mock_settings,
+        ):
+            mock_settings.prompt_cache = True
+            mock_settings.prompt_cache_max_tokens = 32768
+            mock_settings.default_keep_alive = "5m"
+            mock_settings.inference_timeout = None
+            mock_settings.sync_mode = "full"
+            with pytest.raises(RuntimeError, match="simulated OOM"):
+                await generate_chat(
+                    mock_manager,
+                    "qwen3",
+                    [{"role": "user", "content": "describe"}],
+                    stream=False,
+                )
+
+        assert events == ["materialize", "release"]
+
     # test_vlm_passes_input_ids_not_token_list was removed in #429:
     # the input_ids workaround that passed text-only tokens (dropping images)
     # is gone.  Task 6 redirects VLMs to _setup_vlm_prompt_cache which never
@@ -3231,3 +3288,115 @@ class TestCacheListContainsLazyState:
         # MagicMock answers True to any hasattr; the class-name match must not
         # be fooled (guards the prompt-cache flat-path tests that use mocks).
         assert _cache_list_contains_lazy_state([MagicMock()]) is False
+
+
+class TestKvQuantCacheAttach:
+    """``kv_cache_quant`` must reach generation even when no prompt cache was
+    set up: mlx-lm / mlx-vlm otherwise build a plain fp16 cache, silently
+    ignoring the setting (VLMs always; text models with the prompt cache off).
+    """
+
+    @staticmethod
+    def _lm(**overrides):
+        lm = MagicMock()
+        lm.kv_cache_quant = "turboquant:4"
+        lm.is_distributed = False
+        for k, v in overrides.items():
+            setattr(lm, k, v)
+        return lm
+
+    def test_attaches_when_no_cache_was_set_up(self):
+        from olmlx.engine.inference import _attach_kv_quant_cache
+
+        lm = self._lm()
+        gen_kwargs: dict = {}
+        with patch(
+            "olmlx.engine.inference._make_prompt_cache_for_lm", return_value=["q"]
+        ) as make:
+            _attach_kv_quant_cache(lm, gen_kwargs, will_speculate=False)
+        make.assert_called_once_with(lm)
+        assert gen_kwargs["prompt_cache"] == ["q"]
+
+    def test_keeps_cache_from_prompt_cache_setup(self):
+        from olmlx.engine.inference import _attach_kv_quant_cache
+
+        existing = ["existing"]
+        gen_kwargs = {"prompt_cache": existing}
+        with patch("olmlx.engine.inference._make_prompt_cache_for_lm") as make:
+            _attach_kv_quant_cache(self._lm(), gen_kwargs, will_speculate=False)
+        make.assert_not_called()
+        assert gen_kwargs["prompt_cache"] is existing
+
+    @pytest.mark.parametrize(
+        "overrides,will_speculate",
+        [
+            # Speculative decoders never read gen_kwargs["prompt_cache"].
+            ({}, True),
+            # Workers build their own caches; a mismatched layout across ranks
+            # would diverge (prompt_cache is never broadcast).
+            ({"is_distributed": True}, False),
+            ({"kv_cache_quant": None}, False),
+            # MagicMock-safe: a non-str setting must not reach the parser.
+            ({"kv_cache_quant": MagicMock()}, False),
+        ],
+    )
+    def test_skips(self, overrides, will_speculate):
+        from olmlx.engine.inference import _attach_kv_quant_cache
+
+        gen_kwargs: dict = {}
+        with patch("olmlx.engine.inference._make_prompt_cache_for_lm") as make:
+            _attach_kv_quant_cache(
+                self._lm(**overrides), gen_kwargs, will_speculate=will_speculate
+            )
+        make.assert_not_called()
+        assert "prompt_cache" not in gen_kwargs
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("stream", [True, False])
+    async def test_text_model_with_prompt_cache_off_gets_quant_cache(
+        self, mock_manager, stream
+    ):
+        import mlx_lm
+
+        from olmlx.engine.inference import generate_chat
+
+        lm = mock_manager._loaded["qwen3:latest"]
+        lm.kv_cache_quant = "turboquant:4"
+        lm.tokenizer.apply_chat_template = MagicMock(return_value="formatted prompt")
+        quant_cache = [MagicMock(spec=[])]
+
+        mock_stream_fn = MagicMock(
+            return_value=_make_mock_stream(_make_stream_tokens("Hi", prompt_tokens=5))
+        )
+        mock_stream_generate = MagicMock(
+            return_value=iter(
+                [_make_gen_response("Hi", 100, prompt_tokens=5, generation_tokens=1)]
+            )
+        )
+        with (
+            patch("olmlx.engine.inference.mx", MagicMock()),
+            patch("olmlx.engine.inference.async_mlx_stream", mock_stream_fn),
+            patch.object(mlx_lm, "stream_generate", mock_stream_generate),
+            patch(
+                "olmlx.engine.inference._make_prompt_cache_for_lm",
+                return_value=quant_cache,
+            ),
+            patch("olmlx.engine.inference.settings") as mock_settings,
+        ):
+            mock_settings.prompt_cache = False
+            mock_settings.prompt_cache_max_tokens = 32768
+            mock_settings.default_keep_alive = "5m"
+            mock_settings.inference_timeout = None
+            mock_settings.sync_mode = "full"
+            result = await generate_chat(
+                mock_manager,
+                "qwen3",
+                [{"role": "user", "content": "hi"}],
+                stream=stream,
+            )
+            if stream:
+                async for _ in result:
+                    pass
+
+        used = mock_stream_fn if stream else mock_stream_generate
+        assert used.call_args.kwargs["prompt_cache"] is quant_cache

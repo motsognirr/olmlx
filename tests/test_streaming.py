@@ -231,6 +231,71 @@ class TestAsyncMlxStream:
         assert sorted(calls) == ["fresh", "reused"]
 
     @pytest.mark.asyncio
+    async def test_vlm_quant_cache_sheds_dequant_buffers_after_materialize(self):
+        """mlx-vlm keeps the cache in the VLM store, which (unlike the text
+        store) has no shed-on-insert chokepoint — so the VLM finalizer drops
+        the TurboQuant/KVarN full-precision side buffer itself, after the
+        packed state is materialized. Without it a stored quantized VLM
+        conversation is larger than an fp16 one."""
+        mock_mlx_vlm = MagicMock()
+        mock_mlx_vlm.stream_generate = MagicMock(
+            return_value=iter([MagicMock(text="hi", finish_reason="stop")])
+        )
+        events: list[str] = []
+
+        class _Quant:
+            def ensure_state_materialized(self):
+                events.append("materialize")
+
+            def release_dequant_buffers(self):
+                events.append("release")
+
+        with patch.dict("sys.modules", {"mlx_vlm": mock_mlx_vlm}):
+            stream = async_mlx_stream(
+                MagicMock(),
+                MagicMock(),
+                "prompt",
+                max_tokens=10,
+                is_vlm=True,
+                prompt_cache=[_Quant()],
+            )
+            async for _ in stream:
+                pass
+
+        assert events == ["materialize", "release"]
+
+    @pytest.mark.asyncio
+    async def test_text_finalizer_keeps_dequant_buffers(self):
+        """The text path sheds at its store's insert chokepoint (after the
+        store-time trim), so its finalizer must not shed early."""
+        mock_mlx_lm = MagicMock()
+        mock_mlx_lm.stream_generate = MagicMock(
+            return_value=iter([MagicMock(text="hi", finish_reason="stop")])
+        )
+        events: list[str] = []
+
+        class _Quant:
+            def ensure_state_materialized(self):
+                events.append("materialize")
+
+            def release_dequant_buffers(self):
+                events.append("release")
+
+        with patch.dict("sys.modules", {"mlx_lm": mock_mlx_lm}):
+            stream = async_mlx_stream(
+                MagicMock(),
+                MagicMock(),
+                "prompt",
+                max_tokens=10,
+                is_vlm=False,
+                prompt_cache=[_Quant()],
+            )
+            async for _ in stream:
+                pass
+
+        assert events == ["materialize"]
+
+    @pytest.mark.asyncio
     async def test_error_propagation(self):
         mock_mlx_lm = MagicMock()
         mock_mlx_lm.stream_generate = MagicMock(

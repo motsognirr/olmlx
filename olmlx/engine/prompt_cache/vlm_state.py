@@ -217,6 +217,14 @@ class VlmPromptCacheStore:
         cache = getattr(state, "cache", None)
         if not cache:
             return  # never-filled state (inserted empty, evicted before use)
+        from olmlx.engine.cache_capabilities import _is_serializable_cache
+
+        if not _is_serializable_cache(cache):
+            # kv_cache_quant caches reject state restoration: a written file
+            # could never be loaded back, yet would count against the byte
+            # cap and push restorable files out. Drop it like disk-off does.
+            logger.debug("VLM disk spill: skipping non-serializable '%s'", cache_id)
+            return
         try:
             states = flatten_cache_state(cache)
             if states:
