@@ -79,11 +79,22 @@ def materialize_restored_cache(cache: list[Any]) -> None:
     thread's stream (an ``asyncio.to_thread`` pool thread). The first forward
     on the generation thread would raise ``no Stream`` after the disk file was
     already unlinked, losing the cache and failing the request. Materialized
-    leaves carry no stream binding, so they are safe on any thread. Only
-    ``mx.array`` leaves are evaluated: an ``ArraysCache`` can hold ``None``
-    slots.
+    leaves carry no stream binding, so they are safe on any thread.
+    ``flatten_cache_state`` keeps an ``ArraysCache``'s list-valued state
+    nested, so walk lists/tuples down to the ``mx.array`` leaves (skipping its
+    ``None`` slots).
     """
-    mx.eval([a for a in flatten_cache_state(cache) if isinstance(a, mx.array)])
+    leaves: list[mx.array] = []
+
+    def _collect(value: Any) -> None:
+        if isinstance(value, mx.array):
+            leaves.append(value)
+        elif isinstance(value, (list, tuple)):
+            for item in value:
+                _collect(item)
+
+    _collect(flatten_cache_state(cache))
+    mx.eval(leaves)
 
 
 def snapshot_cache_for_persistence(

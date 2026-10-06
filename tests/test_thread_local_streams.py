@@ -954,3 +954,37 @@ class TestDiskRestoredPromptCacheMaterialization:
         assert res.get("error") is None, (
             f"disk-restored VLM cache left lazy: {res.get('error')!r}"
         )
+
+    async def test_text_store_restores_arrays_cache_materialized(self, tmp_path):
+        """Hybrid (GDN) caches carry an ``ArraysCache`` whose ``state`` is a
+        *list*; ``flatten_cache_state`` keeps it nested, so the leaves inside
+        must be materialized too (and its ``None`` slots skipped)."""
+        from mlx_lm.models.cache import ArraysCache
+
+        from olmlx.engine.prompt_cache.state import CachedPromptState
+        from olmlx.engine.prompt_cache.store import PromptCacheStore
+
+        def _hybrid_cache():
+            arrays = ArraysCache(size=2)
+            arrays[0] = mx.ones((1, 4, 8))
+            arrays[1] = mx.zeros((1, 2, 4, 4))
+            mx.eval(arrays.state)
+            return [_filled_kv_layer(), arrays]
+
+        store = PromptCacheStore(max_slots=1, disk_path=tmp_path, model_name="m")
+        await store.async_set(
+            "a", CachedPromptState(tokens=[1, 2, 3], cache=_hybrid_cache())
+        )
+        await store.async_set(
+            "b", CachedPromptState(tokens=[4, 5, 6], cache=_hybrid_cache())
+        )
+        restored = await store.async_get("a")
+        assert restored is not None
+        arrays = restored.cache[1]
+
+        res = _run_in_thread(
+            lambda: mx.eval([a + 1 for a in arrays.state if a is not None])
+        )
+        assert res.get("error") is None, (
+            f"disk-restored ArraysCache left lazy: {res.get('error')!r}"
+        )
