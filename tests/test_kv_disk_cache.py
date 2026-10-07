@@ -946,18 +946,29 @@ class TestStaleTempSpillPurge:
         with patch("pathlib.Path.iterdir", side_effect=PermissionError("denied")):
             store._purge_stale_temp_spills(store._disk_dir())  # must not raise
 
-    def test_clear_disk_purges_stale_temps(self, tmp_path):
-        import os
-        import time
-
+    def test_clear_disk_purges_all_temps_and_counts_them(self, tmp_path):
+        # Teardown: even a just-orphaned temp goes (nothing is in flight).
         store = PromptCacheStore(
             max_slots=1, disk_path=tmp_path, model_name="test-model"
         )
         tmp_dir = store._disk_dir() / ".tmp"
         tmp_dir.mkdir(parents=True)
-        stale = tmp_dir / "a.1.safetensors"
-        stale.write_bytes(b"x")
-        old = time.time() - 2 * 3600
-        os.utime(stale, (old, old))
-        store.clear_disk()
-        assert not stale.exists()
+        fresh = tmp_dir / "a.1.safetensors"
+        fresh.write_bytes(b"x")
+        (store._disk_dir() / "b.safetensors").write_bytes(b"y")
+        assert store.clear_disk() == 2
+        assert not fresh.exists()
+
+    def test_cleanup_sweeps_temps_once_per_store(self, tmp_path):
+        from unittest.mock import patch
+
+        store = PromptCacheStore(
+            max_slots=1, disk_path=tmp_path, model_name="test-model"
+        )
+        store._disk_dir().mkdir(parents=True)
+        with patch.object(
+            PromptCacheStore, "_purge_stale_temp_spills", return_value=0
+        ) as purge:
+            store._cleanup_disk()
+            store._cleanup_disk()
+        assert purge.call_count == 1

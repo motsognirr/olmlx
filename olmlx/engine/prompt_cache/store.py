@@ -235,6 +235,7 @@ class PromptCacheStore:
         self._disk_max_bytes = disk_max_bytes
         self._ram_budget_bytes = ram_budget_bytes
         self._evict_generation = 0  # bumped by async_evict_all_to_disk
+        self._temp_spills_swept = False  # see _cleanup_disk
         self._radix = PrefixCacheIndex()
         self.metrics = CacheMetrics()
 
@@ -447,31 +448,38 @@ class PromptCacheStore:
         )
 
     @staticmethod
-    def _purge_stale_temp_spills(disk_dir: Path) -> None:
+    def _purge_stale_temp_spills(
+        disk_dir: Path, max_age: float = _STALE_TEMP_SPILL_SECONDS
+    ) -> int:
         """Remove spill temp files a crash left in ``.tmp/`` (#760).
 
         ``_save_to_disk``'s ``finally`` removes its temp file on any
         exception, but not if the process dies mid-write; such files are
         invisible to the ``*.safetensors`` accounting and eviction above. Only
         files older than ``_STALE_TEMP_SPILL_SECONDS`` are removed, so a write
-        in flight (from this or another store on the same model dir) is safe.
+        in flight (from this or another store on the same model dir) is safe;
+        ``max_age=0`` removes every temp (teardown, nothing in flight).
+        Returns the number of files removed.
         """
         tmp_dir = disk_dir / ".tmp"
-        cutoff = time.time() - _STALE_TEMP_SPILL_SECONDS
+        cutoff = time.time() - max_age
+        removed = 0
         try:
             entries = list(tmp_dir.iterdir())
         except OSError:
             # Missing (the common case), vanished under a concurrent
             # clear(), or unreadable: nothing to purge. Never raise — the
             # caller runs after a *successful* spill (#769 review).
-            return
+            return 0
         for f in entries:
             try:
-                if f.is_file() and f.stat().st_mtime < cutoff:
+                if f.is_file() and f.stat().st_mtime <= cutoff:
                     f.unlink(missing_ok=True)
+                    removed += 1
                     logger.info("Disk cache cleanup: removed stale temp %s", f)
             except OSError:
                 continue
+        return removed
 
     def _cleanup_disk(self) -> None:
         """Refresh bytes_on_disk and, if a size cap is set, remove
@@ -483,7 +491,12 @@ class PromptCacheStore:
         if not disk_dir.exists():
             self.metrics.bytes_on_disk = 0
             return
-        self._purge_stale_temp_spills(disk_dir)
+        # Crash leftovers only accumulate across restarts, so one sweep per
+        # store is enough — not a .tmp scan on every spill, which can run on
+        # the event loop via the sync set() path (#769 review).
+        if not self._temp_spills_swept:
+            self._temp_spills_swept = True
+            self._purge_stale_temp_spills(disk_dir)
         # Single stat pass: collect (path, size, mtime) to avoid double-stat
         file_info = []
         for f in disk_dir.glob("*.safetensors"):
@@ -652,9 +665,10 @@ class PromptCacheStore:
                 removed += 1
             except OSError:
                 logger.debug("Failed to remove stale disk cache %s", f, exc_info=True)
-        # Also reclaim crash-orphaned spill temps: a model that never spills
-        # again would otherwise keep them forever (#769 review).
-        self._purge_stale_temp_spills(disk_dir)
+        # Also reclaim crash-orphaned spill temps — all of them, however
+        # recent: this teardown runs for models that never spill, so nothing
+        # is in flight and nothing later would reclaim them (#769 review).
+        removed += self._purge_stale_temp_spills(disk_dir, max_age=0)
         # Recompute rather than zero so any files that survived an
         # unlink failure are still reflected in the metric.
         self._refresh_disk_bytes()

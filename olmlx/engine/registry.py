@@ -2080,7 +2080,7 @@ class ModelRegistry:
         if not dependents:
             return []
         # Snapshot everything the promotion touches, so a failed write can
-        # put memory back exactly as it was (#769 review).
+        # put memory back in line with what's on disk (#769 review).
         _absent = object()
         snapshot = {
             alias: (
@@ -2131,6 +2131,11 @@ class ModelRegistry:
         except Exception:
             # models.json has the standalone entries, aliases.json still the
             # aliases (which resolve() prefers): restore just the aliases.
+            # The mapping bookkeeping is deliberately left as is — the
+            # successful _save_mappings() above already made _mappings,
+            # _dirty_keys, _removed_keys and _raw_unrecognized describe what
+            # models.json now holds, so rolling them back would desync memory
+            # from disk.
             _restore(mappings_too=False)
             raise
         return dependents
