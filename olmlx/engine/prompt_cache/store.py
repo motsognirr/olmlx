@@ -64,7 +64,9 @@ def _spill_temp_path(tmp_dir: Path, file_path: Path) -> Path:
     )
 
 
-_SPILL_WRITER_RE = re.compile(r"([0-9]+)-([0-9a-f]{8})", re.ASCII)
+# At most 10 digits: covers pid_t, and keeps int() clear of CPython's
+# int/str digit limit (a ValueError, not the OSError the sweep tolerates).
+_SPILL_WRITER_RE = re.compile(r"([0-9]{1,10})-([0-9a-f]{8})", re.ASCII)
 
 
 def _spill_temp_pid(path: Path) -> int | None:
@@ -515,10 +517,10 @@ class PromptCacheStore:
         Each temp names its writer's PID and host (``_spill_temp_path``). A
         temp written on this host is a leftover when that process is gone,
         however recent the crash, while temps of a live local process (this
-        one, or another server here) are never touched (#769 review). A
-        recycled PID errs the same way: the orphan is kept, never a live
-        write deleted. Temps from another host (a shared volume), or without
-        a parseable writer, fall back to a generous age check.
+        one, or another server here) are kept until the generous age bound
+        no real spill reaches (#769 review), which also caps how long a
+        recycled PID can keep an orphan. Temps from another host (a shared
+        volume), or without a parseable writer, use that age bound alone.
         Returns the number of files removed.
         """
         tmp_dir = disk_dir / ".tmp"
@@ -536,10 +538,10 @@ class PromptCacheStore:
                 if not f.is_file():
                     continue
                 pid = _spill_temp_pid(f)
-                if pid is not None:
-                    if _pid_alive(pid):
-                        continue
-                elif f.stat().st_mtime > cutoff:
+                # A live local writer keeps its temp, unless the temp is past
+                # the age no real spill reaches: then the "live" PID was
+                # recycled by an unrelated process, so reclaim it anyway.
+                if (pid is None or _pid_alive(pid)) and f.stat().st_mtime > cutoff:
                     continue
                 f.unlink(missing_ok=True)
                 removed += 1

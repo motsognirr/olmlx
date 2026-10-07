@@ -949,9 +949,7 @@ class TestStaleTempSpillPurge:
 
         store, tmp_dir = self._store(tmp_path)
         inflight = tmp_dir / f"a.b-x.{os.getpid()}-{_host_token()}.abc.safetensors"
-        inflight.write_bytes(b"x")
-        old = 0
-        os.utime(inflight, (old, old))  # age alone must not condemn it
+        inflight.write_bytes(b"x")  # fresh, as a write in flight is
         store._cleanup_disk()
         store.clear_disk()
         assert inflight.exists()
@@ -1034,7 +1032,24 @@ class TestStaleTempSpillPurge:
             f"a.0-{h}.u.safetensors",
             f"a.1-{h}.u.safetensors",
             f"a.{10**20}-{h}.u.safetensors",
+            f"a.{'9' * 5000}-{h}.u.safetensors",
             "a.b.c.d.e",
             "x",
         ):
             assert _spill_temp_pid(tmp_path / name) is None
+
+    def test_recycled_pid_orphan_reclaimed_after_age_bound(self, tmp_path):
+        import os
+        import time
+
+        from olmlx.engine.prompt_cache.store import _host_token
+
+        store, tmp_dir = self._store(tmp_path)
+        # Our own (live) PID stands in for a recycled one; past the age
+        # bound no real spill is still writing, so it goes.
+        orphan = tmp_dir / f"a.{os.getpid()}-{_host_token()}.u.safetensors"
+        orphan.write_bytes(b"x")
+        old = time.time() - 25 * 3600
+        os.utime(orphan, (old, old))
+        store._cleanup_disk()
+        assert not orphan.exists()
