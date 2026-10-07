@@ -2077,27 +2077,62 @@ class ModelRegistry:
             for alias in list(self._aliases)
             if alias != normalized and normalized in self.alias_chain(alias)[1:]
         ]
-        previous = {alias: self._aliases[alias] for alias in dependents}
+        if not dependents:
+            return []
+        # Snapshot everything the promotion touches, so a failed write can
+        # put memory back exactly as it was (#769 review).
+        _absent = object()
+        snapshot = {
+            alias: (
+                self._aliases[alias],
+                self._mappings.get(alias, _absent),
+                self._raw_unrecognized.get(alias, _absent),
+                alias in self._dirty_keys,
+                alias in self._removed_keys,
+            )
+            for alias in dependents
+        }
+
+        def _restore(*, mappings_too: bool) -> None:
+            for alias, (target, mapping, raw, dirty, removed) in snapshot.items():
+                self._aliases[alias] = target
+                if not mappings_too:
+                    continue
+                if mapping is _absent:
+                    self._mappings.pop(alias, None)
+                else:
+                    self._mappings[alias] = mapping
+                if raw is not _absent:
+                    self._raw_unrecognized[alias] = raw
+                (self._dirty_keys.add if dirty else self._dirty_keys.discard)(alias)
+                (self._removed_keys.add if removed else self._removed_keys.discard)(
+                    alias
+                )
+
         for alias in dependents:
             del self._aliases[alias]
             self._mappings[alias] = mc
             self._raw_unrecognized.pop(alias, None)
             self._dirty_keys.add(alias)
             self._removed_keys.discard(alias)
-        if dependents:
-            # Mappings first: the reverse order could drop the names from
-            # aliases.json before models.json gained them, orphaning them
-            # after a restart.
+        # Mappings first: the reverse order could drop the names from
+        # aliases.json before models.json gained them, orphaning them after a
+        # restart. Either write failing restores memory to match disk and
+        # re-raises, so the caller never goes on to remove *name* — the
+        # aliases still need it.
+        try:
             self._save_mappings()
-            try:
-                self._save_aliases()
-            except Exception:
-                # aliases.json still holds the old aliases, which resolve()
-                # prefers over the new standalone entries. Restore them in
-                # memory too, so memory matches disk, and raise so the caller
-                # never goes on to remove *name* — the aliases still need it.
-                self._aliases.update(previous)
-                raise
+        except Exception:
+            # Nothing reached disk: undo the whole promotion.
+            _restore(mappings_too=True)
+            raise
+        try:
+            self._save_aliases()
+        except Exception:
+            # models.json has the standalone entries, aliases.json still the
+            # aliases (which resolve() prefers): restore just the aliases.
+            _restore(mappings_too=False)
+            raise
         return dependents
 
     def remove(self, name: str):
