@@ -645,6 +645,27 @@ class SpeculativeDecoder(SpecDecoderBase):
             )
             self._use_tree = False
 
+    def _disable_tree_on_rotating_cache(self) -> None:
+        """Fall back to linear speculation on sliding-window caches (#761).
+
+        ``_step_tree`` writes sibling branches into the caches and rolls them
+        back with ``trim_prompt_cache``, which no-ops once a
+        ``RotatingKVCache`` window has filled, so rejected nodes would stay
+        resident (gpt-oss, Gemma 3, Step-3.5). Linear speculation trims with
+        the rotating-aware ``_trim_recent_cache`` (#605) and is correct there.
+        """
+        if not self._use_tree:
+            return
+        caches = (self._target_cache or []) + (self._draft_cache or [])
+        # By class name: mlx-vlm's RotatingKVCache doesn't subclass mlx-lm's.
+        if any(type(c).__name__ == "RotatingKVCache" for c in caches):
+            logger.warning(
+                "Tree speculation (tree_width>=2) is not supported on "
+                "sliding-window (RotatingKVCache) models; falling back to "
+                "linear speculation."
+            )
+            self._use_tree = False
+
     def close(self) -> None:
         """Release the GDN class-level monkey-patch (idempotent).
 
@@ -745,6 +766,7 @@ class SpeculativeDecoder(SpecDecoderBase):
 
         self._target_cache = make_prompt_cache(self._target)
         self._draft_cache = make_prompt_cache(self._draft)
+        self._disable_tree_on_rotating_cache()
 
         # Observed on mlx-vlm 0.4.4 with Qwen3_5: the language model caches
         # `_position_ids` and `_rope_deltas` on the module instance across
