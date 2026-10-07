@@ -1033,6 +1033,7 @@ class TestStaleTempSpillPurge:
             f"a.\u00b2-{h}.u.safetensors",
             f"a.0-{h}.u.safetensors",
             f"a.1-{h}.u.safetensors",
+            f"a.{10**20}-{h}.u.safetensors",
             "a.b.c.d.e",
             "x",
         ):

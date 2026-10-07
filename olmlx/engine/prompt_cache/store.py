@@ -13,6 +13,7 @@ import os
 import re
 import shutil
 import socket
+import threading
 import time
 import uuid
 from collections import OrderedDict
@@ -77,8 +78,9 @@ def _spill_temp_pid(path: Path) -> int | None:
     if m is None or m.group(2) != _host_token():
         return None
     pid = int(m.group(1))
-    # 0/1 would make os.kill probe a process group / init.
-    return pid if pid > 1 else None
+    # 0/1 would make os.kill probe a process group / init; past pid_t it
+    # would raise OverflowError instead of answering.
+    return pid if 1 < pid <= 2**31 - 1 else None
 
 
 def _pid_alive(pid: int) -> bool:
@@ -290,6 +292,7 @@ class PromptCacheStore:
         self._ram_budget_bytes = ram_budget_bytes
         self._evict_generation = 0  # bumped by async_evict_all_to_disk
         self._last_temp_sweep: float | None = None  # see _cleanup_disk
+        self._temp_sweep_lock = threading.Lock()
         self._radix = PrefixCacheIndex()
         self.metrics = CacheMetrics()
 
@@ -558,12 +561,17 @@ class PromptCacheStore:
         # Rate-limited, not per spill: the sync set() path runs this on the
         # event loop. Periodic rather than once, so a writer that crashes
         # after a sweep is still reclaimed (#769 review).
+        # Reached from the loop and from to_thread workers: claim the sweep
+        # under a lock so concurrent spills don't both scan.
         now = time.monotonic()
-        if (
-            self._last_temp_sweep is None
-            or now - self._last_temp_sweep >= _TEMP_SWEEP_INTERVAL_SECONDS
-        ):
-            self._last_temp_sweep = now
+        with self._temp_sweep_lock:
+            due = (
+                self._last_temp_sweep is None
+                or now - self._last_temp_sweep >= _TEMP_SWEEP_INTERVAL_SECONDS
+            )
+            if due:
+                self._last_temp_sweep = now
+        if due:
             self._purge_stale_temp_spills(disk_dir)
         # Single stat pass: collect (path, size, mtime) to avoid double-stat
         file_info = []
