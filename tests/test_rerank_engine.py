@@ -140,3 +140,27 @@ def test_score_pairs_bounded_by_position_table():
     tok = _FakeTokenizer(model_max_length=512)
     _score_pairs(model, tok, "q", ["a"], max_tokens_per_doc=4096)
     assert tok.seen_max_length == 100
+
+
+def _len_tokenizer():
+    tok = _FakeTokenizer()
+    tok.encode = lambda text, add_special_tokens=False: list(range(len(text)))
+    tok.decode = lambda ids: "x" * len(ids)
+    tok.num_special_tokens_to_add = lambda pair=True: 4
+    return tok
+
+
+def test_score_pairs_small_window_still_bounds_query():
+    # #768 review: a tiny max_tokens_per_doc must not skip query trimming.
+    tok = _len_tokenizer()
+    _score_pairs(_FakeModel([0.0]), tok, "q" * 500, ["a"], max_tokens_per_doc=10)
+    assert len(tok.seen_query) == (10 - 4) - (10 - 4) // 2
+
+
+def test_score_pairs_window_too_small_rejected():
+    import pytest
+
+    with pytest.raises(ValueError, match="max_tokens_per_doc"):
+        _score_pairs(
+            _FakeModel([0.0]), _len_tokenizer(), "q", ["a"], max_tokens_per_doc=5
+        )

@@ -5265,9 +5265,16 @@ def _fit_rerank_query(tokenizer: Any, query: str, max_len: int) -> str:
         specials = int(tokenizer.num_special_tokens_to_add(pair=True))
     except Exception:  # noqa: BLE001 — conservative default for RoBERTa pairs
         specials = 4
-    budget = max_len - specials - _RERANK_MIN_DOC_TOKENS
+    avail = max_len - specials
+    if avail < 2:
+        raise ValueError(
+            f"max_tokens_per_doc={max_len} leaves no room for the query and a "
+            "document; use a larger value"
+        )
+    # Reserve doc room, but never the whole window on a tiny max_len (#768).
+    budget = avail - min(_RERANK_MIN_DOC_TOKENS, avail // 2)
     ids = tokenizer.encode(query, add_special_tokens=False)
-    if budget <= 0 or len(ids) <= budget:
+    if len(ids) <= budget:
         return query
     return tokenizer.decode(ids[:budget])
 
