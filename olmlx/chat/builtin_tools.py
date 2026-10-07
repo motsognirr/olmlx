@@ -428,10 +428,12 @@ async def _handle_question(args: dict) -> str:
 
 
 def _is_valid_timeout(value: Any) -> bool:
+    # ``isnan`` only on floats: a huge JSON integer can't convert to float
+    # and would raise ``OverflowError``.
     return (
         not isinstance(value, bool)
         and isinstance(value, (int, float))
-        and not math.isnan(value)
+        and not (isinstance(value, float) and math.isnan(value))
         and value > 0
     )
 
@@ -442,11 +444,13 @@ def _resolve_bash_timeout(value: Any) -> float:
     Model-supplied JSON may carry ``null``, a string, a bool or a
     non-positive/NaN number — any of which would otherwise reach
     ``wait_for`` (``None`` there means wait forever). Those fall back to the
-    default; an over-large value is clamped to ``_BASH_MAX_TIMEOUT``.
+    default. Clamping a model-supplied value to ``_BASH_MAX_TIMEOUT`` happens
+    in ``BuiltinToolManager.call_tool``, so an operator-configured
+    ``tool_timeout`` is never capped.
     """
     if not _is_valid_timeout(value):
         return _BASH_DEFAULT_TIMEOUT
-    return min(value, _BASH_MAX_TIMEOUT)
+    return value
 
 
 async def _handle_bash(args: dict) -> str | ToolError:
@@ -1081,12 +1085,16 @@ class BuiltinToolManager:
         # tool_timeout is the default bash bound; the model's explicit
         # timeout arg stays the more specific override. Other builtin
         # handlers keep their own internal bounds (grep/web 30s).
-        if (
-            name == "bash"
-            and not _is_valid_timeout(arguments.get("timeout"))
-            and self._config.tool_timeout is not None
-        ):
-            arguments = {**arguments, "timeout": self._config.tool_timeout}
+        # A valid model-supplied timeout is capped at _BASH_MAX_TIMEOUT (an
+        # unbounded value would pin the turn); the operator's configured
+        # tool_timeout is trusted as-is (#759).
+        if name == "bash":
+            model_timeout = arguments.get("timeout")
+            if _is_valid_timeout(model_timeout):
+                if model_timeout > _BASH_MAX_TIMEOUT:
+                    arguments = {**arguments, "timeout": _BASH_MAX_TIMEOUT}
+            elif self._config.tool_timeout is not None:
+                arguments = {**arguments, "timeout": self._config.tool_timeout}
         # write_file/edit_file honor the configured workspace sandbox (#611):
         # when write_root is set, absolute-path writes that escape it are
         # rejected. write_root is None for interactive chat (unchanged).

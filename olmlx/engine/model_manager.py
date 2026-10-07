@@ -80,6 +80,11 @@ from olmlx.engine.loaded_model import (  # noqa: F401
 
 logger = logging.getLogger(__name__)
 
+#: Upper bound on how long ``stop()`` waits for orphaned load threads and
+#: in-flight result closes before abandoning them (Python can't interrupt
+#: native threads).
+_STOP_DRAIN_TIMEOUT = 5.0
+
 #: Default max tokens collected per head during SpectralQuant calibration.
 #: Duplicated from spectralquant_calibrate (which imports numpy/mlx_lm
 #: eagerly) to avoid pulling those imports into lightweight CLI paths.
@@ -154,21 +159,19 @@ class ModelManager(SpeculativeLoaderMixin):
         pending_loads = list(self._pending_load_tasks.items())
         pending_closes = list(self._pending_result_closes.values())
         if pending_loads or pending_closes:
-            try:
-                await asyncio.wait_for(
-                    asyncio.gather(
-                        *(task for _, task in pending_loads),
-                        *pending_closes,
-                        return_exceptions=True,
-                    ),
-                    timeout=5.0,
-                )
-            except asyncio.TimeoutError:
-                pass
-            # Drained only if every load thread and close actually finished.
-            drained = all(task.done() for _, task in pending_loads) and all(
-                fut.done() for fut in pending_closes
+            # ``asyncio.wait`` (not ``wait_for(gather(...))``) so a timeout
+            # leaves the tasks running: cancelling a ``to_thread`` task marks
+            # it done while its thread still allocates, which would both read
+            # as "drained" (flushing Metal under the live thread) and discard
+            # a load result that still needs closing.
+            _done, not_done = await asyncio.wait(
+                [task for _, task in pending_loads] + pending_closes,
+                timeout=_STOP_DRAIN_TIMEOUT,
             )
+            for fut in _done:
+                if not fut.cancelled():
+                    fut.exception()  # retrieve so it isn't logged as unhandled
+            drained = not not_done
             if not drained:
                 logger.warning(
                     "Timed out waiting for orphaned load thread(s) / result "

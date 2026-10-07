@@ -386,6 +386,31 @@ class TestBash:
         assert "timed out after 0.2s" in result.message
 
     @pytest.mark.asyncio
+    async def test_bash_huge_int_timeout_does_not_raise(self, manager, monkeypatch):
+        """A huge JSON integer (no float conversion) must clamp, not raise
+        OverflowError out of call_tool."""
+        monkeypatch.setattr("olmlx.chat.builtin_tools._BASH_MAX_TIMEOUT", 0.2)
+        result = await manager.call_tool(
+            "bash", {"command": "sleep 5", "timeout": 10**400}
+        )
+        assert isinstance(result, ToolError)
+        assert "timed out after 0.2s" in result.message
+
+    @pytest.mark.asyncio
+    async def test_bash_configured_timeout_is_not_clamped(self, tmp_path, monkeypatch):
+        """The operator's tool_timeout is trusted; only model-supplied values
+        are capped at _BASH_MAX_TIMEOUT."""
+        monkeypatch.setattr("olmlx.chat.builtin_tools._BASH_MAX_TIMEOUT", 0.05)
+        config = ChatConfig(
+            model_name="test:latest",
+            plans_dir=tmp_path / "plans",
+            tool_timeout=5.0,
+        )
+        manager = BuiltinToolManager(config)
+        result = await manager.call_tool("bash", {"command": "sleep 0.3; echo ok"})
+        assert result.strip() == "ok"
+
+    @pytest.mark.asyncio
     @pytest.mark.parametrize("huge", [1e9, float("inf")])
     async def test_bash_oversized_timeout_is_clamped(self, manager, monkeypatch, huge):
         monkeypatch.setattr("olmlx.chat.builtin_tools._BASH_MAX_TIMEOUT", 0.2)

@@ -7240,3 +7240,48 @@ class TestFailedLoadClosesResources:
             await manager.stop()
             assert close_done.is_set()
         assert not any(flushed_before_close)
+
+    @pytest.mark.asyncio
+    async def test_stop_drain_timeout_does_not_flush_or_cancel_load(
+        self, registry, mock_store, monkeypatch
+    ):
+        """If the stop() drain times out, the still-running load must not be
+        cancelled (its result must stay closable) and Metal must not be
+        flushed underneath the live thread."""
+        monkeypatch.setattr(
+            "olmlx.engine.model_manager.settings.model_load_timeout", 0.05
+        )
+        monkeypatch.setattr("olmlx.engine.model_manager._STOP_DRAIN_TIMEOUT", 0.1)
+        manager = ModelManager(registry, mock_store)
+        tok = MagicMock()
+        tok.chat_template = None
+        release = threading.Event()
+
+        def slow_load(*a, **kw):
+            release.wait(5)
+            return (self._model_with_store(), tok, False, TemplateCaps(), None)
+
+        flushes: list[bool] = []
+
+        async def fake_flush():
+            flushes.append(not release.is_set())
+
+        patches = self._common_patches(lambda: 1 * self.GB)
+        with (
+            patch.object(manager, "_load_model", side_effect=slow_load),
+            patches[0],
+            patches[1],
+            patches[2],
+            patches[3],
+            patches[4],
+            patches[5],
+        ):
+            with pytest.raises(ModelLoadTimeoutError):
+                await manager.ensure_loaded("qwen3")
+            load_task = manager._pending_load_tasks["qwen3:latest"]
+            with patch.object(manager, "_flush_metal", side_effect=fake_flush):
+                await manager.stop()
+            assert not load_task.cancelled()
+            assert not any(flushes)
+            release.set()
+            await load_task
