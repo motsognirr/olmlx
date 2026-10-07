@@ -2016,3 +2016,53 @@ class TestDegradedShutdownWarning:
         assert "1" in warnings[0].getMessage(), (
             "warning must identify which worker failed"
         )
+
+
+class TestDistributedTokenIdPrompt:
+    """#760 item 1: /api/generate's context path feeds a ``list[int]`` prompt.
+    The broadcast must not call ``tokenize_for_cache`` on it (``.startswith``
+    on a list → AttributeError), and the workers must generate from the same
+    token ids rank 0 uses."""
+
+    def test_payload_for_token_id_prompt_sends_ids(self):
+        from olmlx.engine.inference import _distributed_prompt_payload
+
+        lm = MagicMock()
+        lm.text_tokenizer.bos_token = "<s>"
+        tokens, text = _distributed_prompt_payload(lm, [5, 6, 7], None)
+        assert tokens == [5, 6, 7]
+        assert text == ""
+
+    def test_payload_for_string_prompt_keeps_text(self):
+        from olmlx.engine.inference import _distributed_prompt_payload
+
+        lm = MagicMock()
+        tokens, text = _distributed_prompt_payload(lm, "hello", [1, 2])
+        assert tokens == [1, 2]
+        assert text == "hello"
+
+    def test_worker_generates_from_ids_when_text_empty(self):
+        from olmlx.engine.distributed import InferenceRequest
+
+        req = InferenceRequest.from_json(
+            InferenceRequest(
+                prompt_tokens=[5, 6, 7],
+                prompt_text="",
+                max_tokens=4,
+                gen_kwargs={},
+                action="generate",
+            ).to_json()
+        )
+        assert req.generation_prompt == [5, 6, 7]
+
+    def test_worker_prefers_text_when_present(self):
+        from olmlx.engine.distributed import InferenceRequest
+
+        req = InferenceRequest(
+            prompt_tokens=[1],
+            prompt_text="hi",
+            max_tokens=4,
+            gen_kwargs={},
+            action="generate",
+        )
+        assert req.generation_prompt == "hi"

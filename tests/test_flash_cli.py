@@ -65,7 +65,9 @@ class TestFlashInfo:
 
         mock_store_cls = MagicMock()
         mock_store = mock_store_cls.return_value
-        mock_store.local_path.return_value = tmp_path / "model"
+        mock_store.model_dir.return_value = mock_store.local_path.return_value = (
+            tmp_path / "model"
+        )
 
         with (
             patch("olmlx.cli.models_cmd.ensure_config"),
@@ -122,7 +124,9 @@ class TestFlashInfo:
 
         mock_store_cls = MagicMock()
         mock_store = mock_store_cls.return_value
-        mock_store.local_path.return_value = model_dir
+        mock_store.model_dir.return_value = mock_store.local_path.return_value = (
+            model_dir
+        )
 
         with patch("olmlx.cli.models_cmd.ensure_config"):
             import olmlx.engine.registry as reg_mod

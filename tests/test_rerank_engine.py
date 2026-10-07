@@ -14,6 +14,8 @@ class _FakeTokenizer:
         import numpy as np
 
         self.seen_max_length = max_length
+        self.seen_truncation = truncation
+        self.seen_query = query[0]
         n = len(documents)
         ids = np.ones((n, 4), dtype=np.int64) * 5
         mask = np.ones((n, 4), dtype=np.int64)
@@ -106,3 +108,59 @@ def test_build_rerank_results_top_n_clamped():
         return_documents=False,
     )
     assert len(results) == 2
+
+
+def test_score_pairs_keeps_fitting_query_intact():
+    # PR #768 review: docs absorb truncation; a query that fits is untouched
+    # (longest_first would have trimmed it too, changing scores).
+    tok = _FakeTokenizer()
+    tok.encode = lambda text, add_special_tokens=False: list(range(len(text)))
+    tok.decode = lambda ids: "x" * len(ids)
+    tok.num_special_tokens_to_add = lambda pair=True: 4
+    _score_pairs(_FakeModel([0.0]), tok, "q" * 50, ["a"], max_tokens_per_doc=128)
+    assert tok.seen_truncation == "only_second"
+    assert tok.seen_query == "q" * 50
+
+
+def test_score_pairs_shortens_over_window_query():
+    # #760: a query that alone exceeds the window is trimmed up front, leaving
+    # room for the doc, instead of crashing / overrunning the position table.
+    tok = _FakeTokenizer()
+    tok.encode = lambda text, add_special_tokens=False: list(range(len(text)))
+    tok.decode = lambda ids: "x" * len(ids)
+    tok.num_special_tokens_to_add = lambda pair=True: 4
+    _score_pairs(_FakeModel([0.0]), tok, "q" * 500, ["a"], max_tokens_per_doc=128)
+    assert len(tok.seen_query) == 128 - 4 - 8
+
+
+def test_score_pairs_bounded_by_position_table():
+    # A tokenizer limit past the model's position table must not win.
+    model = _FakeModel([0.0])
+    model.max_input_tokens = 100
+    tok = _FakeTokenizer(model_max_length=512)
+    _score_pairs(model, tok, "q", ["a"], max_tokens_per_doc=4096)
+    assert tok.seen_max_length == 100
+
+
+def _len_tokenizer():
+    tok = _FakeTokenizer()
+    tok.encode = lambda text, add_special_tokens=False: list(range(len(text)))
+    tok.decode = lambda ids: "x" * len(ids)
+    tok.num_special_tokens_to_add = lambda pair=True: 4
+    return tok
+
+
+def test_score_pairs_small_window_still_bounds_query():
+    # #768 review: a tiny max_tokens_per_doc must not skip query trimming.
+    tok = _len_tokenizer()
+    _score_pairs(_FakeModel([0.0]), tok, "q" * 500, ["a"], max_tokens_per_doc=10)
+    assert len(tok.seen_query) == (10 - 4) - (10 - 4) // 2
+
+
+def test_score_pairs_window_too_small_rejected():
+    import pytest
+
+    with pytest.raises(ValueError, match="max_tokens_per_doc"):
+        _score_pairs(
+            _FakeModel([0.0]), _len_tokenizer(), "q", ["a"], max_tokens_per_doc=5
+        )

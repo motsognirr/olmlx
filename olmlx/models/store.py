@@ -309,6 +309,21 @@ class ModelStore:
         """Return the local directory for a HF repo ID."""
         return self.models_dir / _safe_dir_name(hf_path)
 
+    def model_dir(self, hf_path: str) -> Path:
+        """The directory a model is actually served from.
+
+        The MLX-converted directory when an AWQ/GPTQ pull produced one (its
+        raw download may have been removed — ``awq_gptq_remove_source``), else
+        the download directory. Readers of a model's files and of artifacts
+        written next to them (``flash/``, ``spectral/``, ...) must use this
+        rather than :meth:`local_path`, which is always the raw download
+        location (#760).
+        """
+        converted = _converted_path(self.models_dir, hf_path)
+        if _is_valid_mlx_dir(converted):
+            return converted
+        return self.local_path(hf_path)
+
     def adapter_local_path(self, hf_path: str) -> Path:
         """Return the local directory for a LoRA adapter repo ID (issue #362).
 

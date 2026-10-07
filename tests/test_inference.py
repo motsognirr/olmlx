@@ -2725,6 +2725,63 @@ class TestGenerateChatEnableThinking:
         assert call_kwargs["enable_thinking"] is True
 
 
+class TestPerModelDefaultSystem:
+    """Modelfile ``SYSTEM`` (#760) reaches the prompt as a default system
+    message; a system turn / ``system`` from the request wins."""
+
+    async def _chat(self, mock_manager, messages):
+        lm = mock_manager._loaded["qwen3:latest"]
+        lm.tokenizer.apply_chat_template = MagicMock(return_value="formatted prompt")
+        with (
+            patch("olmlx.engine.inference.mx", MagicMock()),
+            patch("olmlx.engine.inference.settings.prompt_cache", False),
+            patch(
+                "olmlx.engine.inference.asyncio.to_thread", new_callable=AsyncMock
+            ) as mock_thread,
+        ):
+            mock_thread.return_value = "response"
+            await generate_chat(mock_manager, "qwen3", messages, stream=False)
+        return lm.tokenizer.apply_chat_template.call_args[0][0]
+
+    @pytest.mark.asyncio
+    async def test_chat_prepends_default_system(self, mock_manager):
+        mock_manager._loaded["qwen3:latest"].default_system = "Be terse."
+        msgs = await self._chat(mock_manager, [{"role": "user", "content": "hi"}])
+        assert msgs[0] == {"role": "system", "content": "Be terse."}
+        assert msgs[1]["role"] == "user"
+
+    @pytest.mark.asyncio
+    async def test_chat_request_system_wins(self, mock_manager):
+        mock_manager._loaded["qwen3:latest"].default_system = "Be terse."
+        msgs = await self._chat(
+            mock_manager,
+            [
+                {"role": "system", "content": "Mine."},
+                {"role": "user", "content": "hi"},
+            ],
+        )
+        assert [m["content"] for m in msgs if m["role"] == "system"] == ["Mine."]
+
+    @pytest.mark.asyncio
+    async def test_completion_uses_default_system(self, mock_manager):
+        lm = mock_manager._loaded["qwen3:latest"]
+        lm.default_system = "Be terse."
+        lm.tokenizer.apply_chat_template = MagicMock(return_value="formatted prompt")
+        with (
+            patch("olmlx.engine.inference.mx", MagicMock()),
+            patch("olmlx.engine.inference.settings.prompt_cache", False),
+            patch(
+                "olmlx.engine.inference.asyncio.to_thread", new_callable=AsyncMock
+            ) as mock_thread,
+        ):
+            mock_thread.return_value = "response"
+            await generate_completion(
+                mock_manager, "qwen3", "hi", stream=False, apply_chat_template=True
+            )
+        msgs = lm.tokenizer.apply_chat_template.call_args[0][0]
+        assert msgs[0] == {"role": "system", "content": "Be terse."}
+
+
 class TestGenerateChatPerModelPromptCache:
     """Per-model ``prompt_cache`` override (set in models.json) takes
     precedence over the global ``OLMLX_PROMPT_CACHE`` setting.

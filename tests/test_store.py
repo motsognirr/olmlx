@@ -1091,3 +1091,21 @@ class TestStaleManifestRefresh:
         assert len(results) == 1
         assert results[0].parameter_size == "494M"
         assert mock_store.show(self.HF) is not None
+
+
+class TestModelDir:
+    """#760 item 7: after an AWQ/GPTQ conversion (raw download removed),
+    readers must find the converted directory."""
+
+    def test_prefers_converted_dir(self, mock_store):
+        from olmlx.models.store import _converted_path
+
+        hf = "org/awq-model"
+        converted = _converted_path(mock_store.models_dir, hf)
+        converted.mkdir(parents=True)
+        (converted / "config.json").write_text("{}")
+        (converted / "model.safetensors").write_bytes(b"")
+        assert mock_store.model_dir(hf) == converted
+
+    def test_falls_back_to_download_dir(self, mock_store):
+        assert mock_store.model_dir("org/plain") == mock_store.local_path("org/plain")

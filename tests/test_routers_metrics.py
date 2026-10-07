@@ -122,3 +122,41 @@ def test_surface_var_survives_into_streaming_body():
     resp = client.get("/v1/chat/completions")
     assert resp.status_code == 200
     assert seen == ["openai", "openai", "openai"]
+
+
+async def test_in_flight_released_when_body_never_iterated():
+    """#760 item 13: if the response is dropped before its body iterator
+    starts (cancelled between ``call_next`` and the first chunk), the
+    generator's ``finally`` never runs. In-flight must still be released,
+    exactly once."""
+    import gc
+
+    from starlette.requests import Request
+
+    from olmlx.app import MetricsMiddleware
+
+    async def inner_app(scope, receive, send):  # pragma: no cover - unused
+        pass
+
+    mw = MetricsMiddleware(inner_app)
+    scope = {
+        "type": "http",
+        "method": "GET",
+        "path": "/api/never-iterated",
+        "headers": [],
+        "query_string": b"",
+    }
+    request = Request(scope)
+
+    async def body():
+        yield b"x"
+
+    async def call_next(_req):
+        return StreamingResponse(body())
+
+    baseline = metrics.HTTP_IN_FLIGHT._value.get()
+    response = await mw.dispatch(request, call_next)
+    assert metrics.HTTP_IN_FLIGHT._value.get() == baseline + 1.0
+    del response
+    gc.collect()
+    assert metrics.HTTP_IN_FLIGHT._value.get() == baseline

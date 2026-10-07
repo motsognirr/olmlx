@@ -6,13 +6,14 @@ from olmlx.utils.images import ensure_image_data_uris
 from olmlx.schemas.common import (
     ModelName,
     ModelOptions,
-    validate_non_empty_text_input,
 )
 
 
 class GenerateRequest(BaseModel):
     model: ModelName
-    prompt: str = Field(..., max_length=1_000_000)
+    # Empty/missing is Ollama's load (or, with keep_alive 0, unload) request
+    # (#760); the router answers it before any inference.
+    prompt: str = Field("", max_length=1_000_000)
     suffix: str | None = None
     images: list[str] | None = None
     system: str | None = None
@@ -32,11 +33,6 @@ class GenerateRequest(BaseModel):
     def wrap_raw_base64_images(cls, v: list[str] | None) -> list[str] | None:
         # Ollama sends raw base64; mlx_vlm would open() it as a path (#714).
         return ensure_image_data_uris(v)
-
-    @field_validator("prompt")
-    @classmethod
-    def validate_prompt_non_empty(cls, v: str) -> str:
-        return validate_non_empty_text_input(v, "prompt")
 
 
 class GenerateResponse(BaseModel):

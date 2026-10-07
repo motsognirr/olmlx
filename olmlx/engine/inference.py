@@ -169,6 +169,23 @@ def _maybe_broadcast_distributed(
         distributed_barrier()
 
 
+def _distributed_prompt_payload(
+    lm, prompt: str | list[int], prompt_tokens: list[int] | None
+) -> tuple[list[int], str]:
+    """Return ``(prompt_tokens, prompt_text)`` for a distributed broadcast.
+
+    Workers generate from ``prompt_text`` (avoids a tokenizer round-trip
+    mismatch), but a ``list[int]`` prompt — ``/api/generate``'s context path
+    (#656) — is already exact token ids: send those with an empty text so the
+    workers feed ``stream_generate`` the same ids as rank 0 (#760).
+    """
+    if isinstance(prompt, list):
+        return list(prompt), ""
+    if prompt_tokens is None:
+        prompt_tokens = tokenize_for_cache(lm.text_tokenizer, prompt)
+    return prompt_tokens, prompt
+
+
 # Metal does not support concurrent command buffer submission across any
 # models — they all share the same Metal device and command queue.  A per-model
 # lock would still allow interleaved GPU work from different models, risking
@@ -1475,6 +1492,14 @@ async def generate_completion(
         # (otherwise the splitter would arm the orphan-</think> buffer for thinking
         # the model was told not to produce).
         effective_thinking = enable_thinking if enable_thinking is not None else False
+        # Per-model default system prompt (Modelfile SYSTEM, #760); a request
+        # ``system`` wins, and raw mode (no template) never gets one.
+        if (
+            system is None
+            and apply_chat_template
+            and isinstance(lm.default_system, str)
+        ):
+            system = lm.default_system
 
         if apply_chat_template and not lm.is_vlm:
             messages: list[dict] = []
@@ -3489,7 +3514,8 @@ async def _stream_completion(
     generated_tokens: list[int] = []
     full_prompt_tokens: list[int] | None = None
     # Save original string prompt before cache setup may replace it with token IDs.
-    # prompt is always str at entry; cache setup may later reassign it to list[int].
+    # A str at entry except /api/generate's context path (#656), which passes
+    # list[int]; cache setup may later reassign a str to list[int].
     original_prompt = prompt
     # Pop stop sequences before cache setup / stream creation so they are not
     # forwarded to mlx-lm (which does not support them).
@@ -3588,19 +3614,15 @@ async def _stream_completion(
         # Strip prompt_cache and input_ids — these are local MLX objects
         # that cannot be serialized to JSON for the sideband protocol.
         if lm.is_distributed:
-            tokens = (
-                prompt_tokens
-                if prompt_tokens is not None
-                else tokenize_for_cache(lm.text_tokenizer, original_prompt)
+            tokens, text = _distributed_prompt_payload(
+                lm, original_prompt, prompt_tokens
             )
             broadcast_kwargs = {
                 k: v
                 for k, v in gen_kwargs.items()
                 if k not in ("prompt_cache", "input_ids")
             }
-            _maybe_broadcast_distributed(
-                lm, tokens, original_prompt, max_tokens, broadcast_kwargs
-            )
+            _maybe_broadcast_distributed(lm, tokens, text, max_tokens, broadcast_kwargs)
 
         if lm.is_speculative and not (images or audio_paths) and grammar_active:
             # Speculative decoders do not consume gen_kwargs["logits_processors"],
@@ -4323,8 +4345,8 @@ async def _full_completion_inner(
         # computation at the same time (avoids all_sum timeout).
         # Must happen before _apply_seed which pops seed from gen_kwargs.
         if lm.is_distributed:
-            tokens = tokenize_for_cache(lm.text_tokenizer, prompt)
-            _maybe_broadcast_distributed(lm, tokens, prompt, max_tokens, gen_kwargs)
+            tokens, text = _distributed_prompt_payload(lm, prompt, None)
+            _maybe_broadcast_distributed(lm, tokens, text, max_tokens, gen_kwargs)
 
         _apply_seed(gen_kwargs, consume=not lm.is_vlm)
 
@@ -4772,6 +4794,14 @@ async def generate_chat(
         # caller didn't pass one. An explicit caller value still wins.
         if reasoning_effort is None and lm.reasoning_effort is not None:
             reasoning_effort = lm.reasoning_effort
+
+        # Per-model default system prompt (Modelfile SYSTEM, #760) applies
+        # when the conversation carries no system turn of its own. isinstance:
+        # a MagicMock lm must not inject a system message.
+        if isinstance(lm.default_system, str) and not any(
+            m.get("role") in ("system", "developer") for m in messages
+        ):
+            messages = [{"role": "system", "content": lm.default_system}, *messages]
 
         # Templates that raise on a non-leading system turn (Qwen3.5/3.6) get
         # every system/developer turn folded into the leading one; templates
@@ -5262,6 +5292,40 @@ async def generate_embeddings(
         lm.release_ref()
 
 
+# Doc tokens always left after a shortened query, plus slack for a decode →
+# re-encode round trip that comes back a token or two longer.
+_RERANK_MIN_DOC_TOKENS = 8
+
+
+def _fit_rerank_query(tokenizer: Any, query: str, max_len: int) -> str:
+    """Shorten *query* only when it alone can't fit in *max_len* (#760).
+
+    ``truncation="only_second"`` can't trim the query: on such a query fast
+    tokenizers raise and slow ones return it untruncated, overrunning the
+    position table. ``longest_first`` would avoid that but also trims every
+    long-but-fitting query, changing scores for ordinary requests. So trim
+    the query up front, here, and only when it's over the window.
+    """
+    if not hasattr(tokenizer, "encode") or not hasattr(tokenizer, "decode"):
+        return query
+    try:
+        specials = int(tokenizer.num_special_tokens_to_add(pair=True))
+    except Exception:  # noqa: BLE001 — conservative default for RoBERTa pairs
+        specials = 4
+    avail = max_len - specials
+    if avail < 2:
+        raise ValueError(
+            f"max_tokens_per_doc={max_len} leaves no room for the query and a "
+            "document; use a larger value"
+        )
+    # Reserve doc room, but never the whole window on a tiny max_len (#768).
+    budget = avail - min(_RERANK_MIN_DOC_TOKENS, avail // 2)
+    ids = tokenizer.encode(query, add_special_tokens=False)
+    if len(ids) <= budget:
+        return query
+    return tokenizer.decode(ids[:budget])
+
+
 def _score_pairs(
     model,
     tokenizer,
@@ -5279,6 +5343,13 @@ def _score_pairs(
     if model_max > 100_000:
         model_max = 512
     max_len = min(max_tokens_per_doc, model_max)
+    # Never past the model's position table (#760): beyond it the embedding
+    # gather reads out of bounds. ``isinstance``: fakes/mocks may lack it.
+    table = getattr(model, "max_input_tokens", None)
+    if isinstance(table, int) and table > 0:
+        max_len = min(max_len, table)
+
+    query = _fit_rerank_query(tokenizer, query, max_len)
 
     scores: list[float] = []
     for start in range(0, len(documents), batch_size):
@@ -5286,6 +5357,8 @@ def _score_pairs(
         enc = tokenizer(
             [query] * len(chunk),
             chunk,
+            # Docs absorb the truncation; an over-long query was already
+            # shortened by _fit_rerank_query above.
             truncation="only_second",
             max_length=max_len,
             padding=True,
@@ -5433,7 +5506,7 @@ async def generate_transcription(
         # Resolve the on-disk path used as path_or_hf_repo so the ModelHolder
         # cache key matches what we inject.
         if manager.store is not None:
-            load_path = str(manager.store.local_path(lm.hf_path))
+            load_path = str(manager.store.model_dir(lm.hf_path))
         else:
             load_path = lm.hf_path
 

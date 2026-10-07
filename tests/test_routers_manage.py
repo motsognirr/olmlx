@@ -263,7 +263,7 @@ class TestManageRouter:
     @pytest.mark.asyncio
     async def test_warmup_model_not_found(self, app_client):
         resp = await app_client.post("/api/warmup", json={"model": "nonexistent-model"})
-        assert resp.status_code == 400
+        assert resp.status_code == 404  # #760
 
     @pytest.mark.asyncio
     async def test_pull_error_non_streaming(self, app_client):
@@ -337,3 +337,290 @@ class TestManageRouter:
             )
         assert resp.status_code == 200
         assert aclose_explicitly_called is True
+
+
+class TestCreateParity:
+    """#760 item 2: /api/create keeps SYSTEM/PARAMETER, accepts the newer
+    ``{"model","from","system","parameters"}`` shape, and parses multi-line
+    ``SYSTEM \"\"\"...\"\"\"``."""
+
+    async def _create(self, app_client, body):
+        return await app_client.post("/api/create", json={"stream": False, **body})
+
+    async def test_modelfile_system_and_parameter_persist(self, app_client, registry):
+        resp = await self._create(
+            app_client,
+            {
+                "model": "helper",
+                "modelfile": (
+                    "FROM qwen3:latest\n"
+                    "PARAMETER temperature 0.5\n"
+                    "PARAMETER top_k 20\n"
+                    "SYSTEM You are helpful"
+                ),
+            },
+        )
+        assert resp.status_code == 200, resp.text
+        mc = registry.resolve("helper")
+        assert mc.hf_path == "Qwen/Qwen3-8B-MLX"
+        assert mc.system == "You are helpful"
+        assert mc.options == {"temperature": 0.5, "top_k": 20}
+
+    async def test_multiline_system(self, app_client, registry):
+        resp = await self._create(
+            app_client,
+            {
+                "model": "helper",
+                "modelfile": (
+                    'FROM qwen3:latest\nSYSTEM """\nLine one.\nLine two.\n"""\n'
+                    "PARAMETER temperature 0.1"
+                ),
+            },
+        )
+        assert resp.status_code == 200, resp.text
+        mc = registry.resolve("helper")
+        assert mc.system == "Line one.\nLine two."
+        assert mc.options == {"temperature": 0.1}
+
+    async def test_stop_parameters_accumulate(self, app_client, registry):
+        resp = await self._create(
+            app_client,
+            {
+                "model": "helper",
+                "modelfile": (
+                    'FROM qwen3:latest\nPARAMETER stop "<|end|>"\nPARAMETER stop USER:'
+                ),
+            },
+        )
+        assert resp.status_code == 200, resp.text
+        assert registry.resolve("helper").options == {"stop": ["<|end|>", "USER:"]}
+
+    async def test_new_request_shape(self, app_client, registry):
+        resp = await self._create(
+            app_client,
+            {
+                "model": "helper",
+                "from": "qwen3:latest",
+                "system": "Be terse.",
+                "parameters": {"temperature": 0.3, "stop": "END", "num_ctx": 8192},
+            },
+        )
+        assert resp.status_code == 200, resp.text
+        mc = registry.resolve("helper")
+        assert mc.system == "Be terse."
+        # num_ctx has no olmlx equivalent: ignored, not a 400.
+        assert mc.options == {"temperature": 0.3, "stop": ["END"]}
+
+    async def test_from_only_is_plain_alias(self, app_client, registry):
+        resp = await self._create(app_client, {"model": "helper", "from": "qwen3"})
+        assert resp.status_code == 200, resp.text
+        mc = registry.resolve("helper")
+        assert mc.hf_path == "Qwen/Qwen3-8B-MLX"
+        assert mc.system is None and mc.options == {}
+
+    async def test_recreate_replaces_existing_alias(self, app_client, registry):
+        await self._create(app_client, {"model": "helper", "from": "qwen3"})
+        resp = await self._create(
+            app_client, {"model": "helper", "from": "qwen3", "system": "New"}
+        )
+        assert resp.status_code == 200, resp.text
+        assert registry.resolve("helper").system == "New"
+
+    async def test_bad_parameter_value_is_400(self, app_client):
+        resp = await self._create(
+            app_client,
+            {"model": "helper", "modelfile": "FROM qwen3\nPARAMETER temperature hot"},
+        )
+        assert resp.status_code == 400
+
+    @pytest.mark.parametrize(
+        "body",
+        [
+            {"modelfile": "FROM qwen3\nTEMPLATE {{ .Prompt }}"},
+            {"modelfile": "FROM qwen3\nADAPTER ./lora.gguf"},
+            {"from": "qwen3", "template": "{{ .Prompt }}"},
+            {"from": "qwen3", "files": {"model.gguf": "sha256:abc"}},
+            {"from": "qwen3", "adapters": {"a.gguf": "sha256:abc"}},
+        ],
+    )
+    async def test_unsupported_features_are_400(self, app_client, registry, body):
+        resp = await self._create(app_client, {"model": "helper", **body})
+        assert resp.status_code == 400
+        assert registry.resolve("helper") is None
+
+    async def test_missing_from_is_400(self, app_client):
+        resp = await self._create(app_client, {"model": "helper", "system": "x"})
+        assert resp.status_code == 400
+
+
+class TestDeleteParity:
+    """#760 item 5: /api/delete must not mutate the registry before deciding
+    404, and deleting a name that shares weights with another entry must not
+    remove those weights."""
+
+    async def test_unknown_model_404_without_side_effects(self, app_client, registry):
+        before = dict(registry.list_models())
+        resp = await app_client.request(
+            "DELETE", "/api/delete", json={"model": "nonexistent"}
+        )
+        assert resp.status_code == 404
+        assert registry.list_models() == before
+
+    async def test_delete_alias_keeps_base_weights(
+        self, app_client, registry, tmp_path
+    ):
+        from olmlx.models.manifest import ModelManifest
+
+        store = app_client._transport.app.state.model_store
+        model_dir = store.local_path("Qwen/Qwen3-8B-MLX")
+        model_dir.mkdir(parents=True)
+        (model_dir / "config.json").write_text("{}")
+        ModelManifest(name="qwen3:latest", hf_path="Qwen/Qwen3-8B-MLX").save(
+            model_dir / "manifest.json"
+        )
+        resp = await app_client.post(
+            "/api/copy", json={"source": "qwen3", "destination": "mine"}
+        )
+        assert resp.status_code == 200
+
+        resp = await app_client.request("DELETE", "/api/delete", json={"model": "mine"})
+        assert resp.status_code == 200
+        assert registry.resolve("mine") is None
+        assert model_dir.exists()
+        assert registry.resolve("qwen3") is not None
+
+    async def test_delete_alias_without_weights_succeeds(self, app_client, registry):
+        resp = await app_client.post(
+            "/api/copy", json={"source": "qwen3", "destination": "mine"}
+        )
+        assert resp.status_code == 200
+        resp = await app_client.request("DELETE", "/api/delete", json={"model": "mine"})
+        assert resp.status_code == 200
+        assert registry.resolve("mine") is None
+
+    async def test_recreate_plain_over_derived_entry(self, app_client, registry):
+        await app_client.post(
+            "/api/create",
+            json={"model": "helper", "from": "qwen3", "system": "Old", "stream": False},
+        )
+        resp = await app_client.post(
+            "/api/create", json={"model": "helper", "from": "qwen3", "stream": False}
+        )
+        assert resp.status_code == 200
+        mc = registry.resolve("helper")
+        assert mc.system is None
+        assert "helper:latest" not in registry._mappings
+
+
+class TestCreateDeleteReviewFollowups:
+    """PR #768 review: failed re-create keeps the old entry; aliases never
+    dangle when their target is removed or replaced."""
+
+    async def test_invalid_recreate_keeps_existing_entry(self, app_client, registry):
+        await app_client.post(
+            "/api/create",
+            json={"model": "helper", "from": "qwen3", "system": "Old", "stream": False},
+        )
+        resp = await app_client.post(
+            "/api/create",
+            json={
+                "model": "helper",
+                "modelfile": "FROM qwen3\nPARAMETER num_predict 0",
+                "stream": False,
+            },
+        )
+        assert resp.status_code == 400
+        assert registry.resolve("helper").system == "Old"
+
+    async def test_create_from_own_alias_rejected(self, app_client, registry):
+        # x → helper (alias); "create helper FROM x" would orphan x.
+        await app_client.post(
+            "/api/create",
+            json={"model": "helper", "from": "qwen3", "system": "S", "stream": False},
+        )
+        await app_client.post(
+            "/api/copy", json={"source": "helper", "destination": "x"}
+        )
+        resp = await app_client.post(
+            "/api/create", json={"model": "helper", "from": "x", "stream": False}
+        )
+        assert resp.status_code == 400
+        assert registry.resolve("x").system == "S"
+
+    async def test_delete_canonical_promotes_alias(self, app_client, registry):
+        await app_client.post(
+            "/api/create",
+            json={"model": "base2", "from": "qwen3", "system": "S", "stream": False},
+        )
+        await app_client.post("/api/copy", json={"source": "base2", "destination": "a"})
+        resp = await app_client.request(
+            "DELETE", "/api/delete", json={"model": "base2"}
+        )
+        assert resp.status_code == 200
+        assert registry.resolve("base2") is None
+        mc = registry.resolve("a")
+        assert mc.hf_path == "Qwen/Qwen3-8B-MLX"
+        assert mc.system == "S"
+
+    async def test_recreate_target_keeps_alias_resolvable(self, app_client, registry):
+        await app_client.post(
+            "/api/create",
+            json={"model": "base2", "from": "qwen3", "system": "S", "stream": False},
+        )
+        await app_client.post("/api/copy", json={"source": "base2", "destination": "a"})
+        resp = await app_client.post(
+            "/api/create", json={"model": "base2", "from": "llama3:8b", "stream": False}
+        )
+        assert resp.status_code == 200
+        assert registry.resolve("a").hf_path == "Qwen/Qwen3-8B-MLX"
+        assert registry.resolve("base2").hf_path == "mlx-community/Llama-3-8B-Instruct"
+
+    @pytest.mark.parametrize("stop", [5, [1, 2], {"a": 1}])
+    async def test_bad_stop_parameter_is_400(self, app_client, registry, stop):
+        resp = await app_client.post(
+            "/api/create",
+            json={
+                "model": "helper",
+                "from": "qwen3",
+                "parameters": {"stop": stop},
+                "stream": False,
+            },
+        )
+        assert resp.status_code == 400
+        assert registry.resolve("helper") is None
+
+    async def test_null_parameter_ignored(self, app_client, registry):
+        resp = await app_client.post(
+            "/api/create",
+            json={
+                "model": "helper",
+                "from": "qwen3",
+                "parameters": {"stop": None, "temperature": 0.2},
+                "stream": False,
+            },
+        )
+        assert resp.status_code == 200
+        assert registry.resolve("helper").options == {"temperature": 0.2}
+
+    async def test_recreate_alias_from_itself_applies_system(
+        self, app_client, registry
+    ):
+        # #768 review: "create a FROM a" where a is an alias must not leave the
+        # alias shadowing the new entry.
+        await app_client.post("/api/copy", json={"source": "qwen3", "destination": "a"})
+        resp = await app_client.post(
+            "/api/create",
+            json={"model": "a", "from": "a", "system": "New", "stream": False},
+        )
+        assert resp.status_code == 200
+        mc = registry.resolve("a")
+        assert mc.system == "New"
+        assert mc.hf_path == "Qwen/Qwen3-8B-MLX"
+
+    async def test_recreate_self_without_changes_is_noop(self, app_client, registry):
+        before = registry.resolve("qwen3")
+        resp = await app_client.post(
+            "/api/create", json={"model": "qwen3", "from": "qwen3", "stream": False}
+        )
+        assert resp.status_code == 200
+        assert registry.resolve("qwen3") == before

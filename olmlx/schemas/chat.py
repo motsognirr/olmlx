@@ -49,7 +49,9 @@ class Tool(BaseModel):
 
 class ChatRequest(BaseModel):
     model: ModelName
-    messages: list[Message]
+    # Empty/missing is Ollama's load (or, with keep_alive 0, unload) request
+    # (#760); the router answers it before any inference.
+    messages: list[Message] = Field(default_factory=list)
     tools: list[Tool] | None = None
     # Ollama accepts either ``"json"`` (any JSON value) or a JSON Schema
     # dict (strict adherence). Both are passed through to xgrammar.
@@ -58,13 +60,6 @@ class ChatRequest(BaseModel):
     think: bool | str | None = None
     options: ModelOptions | None = None
     keep_alive: int | str | None = None
-
-    @field_validator("messages")
-    @classmethod
-    def validate_messages_non_empty(cls, v: list[Message]) -> list[Message]:
-        if not v:
-            raise ValueError("messages cannot be empty")
-        return v
 
 
 class ChatResponse(BaseModel):

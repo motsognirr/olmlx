@@ -301,3 +301,34 @@ def test_estimate_state_bytes_does_not_double_count_quant_state_slices():
     assert nbytes == expected, (
         f"expected {expected} bytes (full packed buffers, counted once), got {nbytes}"
     )
+
+
+def test_estimate_state_bytes_skips_shared_calibration_constants():
+    """#760 item 10: Shard/Spectral caches share their read-only calibration
+    constants by reference across every entry (``_SHARED_CONSTANTS``,
+    #634). Charging them per entry overcharged ~16–20 MB per entry on a
+    32-layer model and fired the RAM-budget soft eviction early."""
+    import mlx.core as mx
+
+    from olmlx.engine.prompt_cache.store import _estimate_state_bytes
+    from olmlx.engine.shardquant_cache import ShardKVCache
+    from olmlx.engine.spectralquant_cache import SpectralQuantKVCache
+
+    class _ShardLike:
+        _SHARED_CONSTANTS = ShardKVCache._SHARED_CONSTANTS
+
+        def __init__(self):
+            self.k_basis = mx.zeros((8, 128, 128))
+            self.v_rotation = mx.zeros((128, 128))
+            self.v_codebooks = mx.zeros((4, 256, 32))
+            self.k_mean = mx.zeros((8, 128))
+            self._k_idx = mx.zeros((1, 8, 16, 32), dtype=mx.uint8)
+
+    layer = _ShardLike()
+    state = CachedPromptState(tokens=[1], cache=[layer])
+    assert _estimate_state_bytes(state) == layer._k_idx.nbytes
+    # The real classes declare the constants the estimator keys off.
+    assert {"k_basis", "v_rotation", "v_codebooks", "k_mean"} <= (
+        ShardKVCache._SHARED_CONSTANTS
+    )
+    assert SpectralQuantKVCache._SHARED_CONSTANTS

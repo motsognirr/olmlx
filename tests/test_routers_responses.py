@@ -712,6 +712,53 @@ class TestStreaming:
         assert reasoning_item["content"][0]["text"] == "step"
 
     @pytest.mark.asyncio
+    async def test_late_thinking_not_streamed_as_output_text(self, app_client):
+        # #760: thinking arriving after the message opened (gpt-oss: a
+        # commentary preamble, then analysis) must not leak into output_text.
+        # It becomes a second reasoning item after the message.
+        async def mock_stream(*args, **kwargs):
+            async def gen():
+                yield {"thinking_expected": True}
+                yield {"text": "<think>first</think>Preamble.", "done": False}
+                yield {"thinking": "late analysis", "text": "", "done": False}
+                yield {"text": " Answer", "done": False}
+                yield {"text": "", "done": True, "stats": TimingStats()}
+
+            return gen()
+
+        with patch("olmlx.routers.responses.generate_chat", side_effect=mock_stream):
+            resp = await app_client.post(
+                "/v1/responses",
+                json={
+                    "model": "qwen3",
+                    "input": "q",
+                    "stream": True,
+                    "reasoning": {"effort": "high"},
+                },
+            )
+        events = _parse_sse(resp.text)
+        visible = "".join(
+            e["data"]["delta"]
+            for e in events
+            if e["event"] == "response.output_text.delta"
+        )
+        assert visible == "Preamble. Answer"
+        assert "late analysis" not in visible
+        final = events[-1]["data"]["response"]
+        kinds = [it["type"] for it in final["output"]]
+        assert kinds == ["reasoning", "message", "reasoning"]
+        assert final["output"][2]["content"][0]["text"] == "late analysis"
+        # Every added item is done before the next is added, indices in order.
+        added = [
+            e["data"]["output_index"]
+            for e in events
+            if e["event"] == "response.output_item.added"
+        ]
+        assert added == [0, 1, 2]
+        ids = [it["id"] for it in final["output"]]
+        assert len(set(ids)) == 3
+
+    @pytest.mark.asyncio
     async def test_done_honored_when_combined_with_thinking_expected(self, app_client):
         # A terminal chunk that also carries `thinking_expected` must still be
         # treated as done — its stats/done_reason can't be dropped.

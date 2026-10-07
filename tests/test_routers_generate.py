@@ -427,27 +427,60 @@ class TestFormatField:
         assert spec.schema == schema
 
 
-class TestEmptyPromptRejected:
-    @pytest.mark.asyncio
-    async def test_api_generate_rejects_empty_prompt(self, app_client):
-        resp = await app_client.post(
-            "/api/generate",
-            json={"model": "qwen3", "prompt": ""},
-        )
-        assert resp.status_code == 400
-        body = resp.text.lower()
-        assert "prompt" in body
-        assert "empty" in body
+class TestLoadUnloadRequests:
+    """#760 item 3: an empty/missing prompt is Ollama's preload request;
+    with ``keep_alive: 0`` it unloads. Never reaches inference."""
 
     @pytest.mark.asyncio
-    async def test_api_generate_rejects_missing_prompt(self, app_client):
+    @pytest.mark.parametrize("body", [{"prompt": ""}, {}])
+    async def test_empty_prompt_loads(self, app_client, body):
+        manager = app_client._transport.app.state.model_manager
+        with (
+            patch.object(manager, "ensure_loaded", new_callable=AsyncMock) as load,
+            patch(
+                "olmlx.routers.generate.generate_completion", new_callable=AsyncMock
+            ) as gen,
+        ):
+            resp = await app_client.post(
+                "/api/generate", json={"model": "qwen3", **body}
+            )
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["done"] is True
+        assert data["done_reason"] == "load"
+        assert data["response"] == ""
+        load.assert_awaited_once()
+        gen.assert_not_called()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("keep_alive", [0, "0", "0s"])
+    async def test_empty_prompt_keep_alive_zero_unloads(self, app_client, keep_alive):
+        manager = app_client._transport.app.state.model_manager
+        with patch.object(manager, "unload", new_callable=AsyncMock) as unload:
+            unload.return_value = True
+            resp = await app_client.post(
+                "/api/generate", json={"model": "qwen3", "keep_alive": keep_alive}
+            )
+        assert resp.status_code == 200
+        assert resp.json()["done_reason"] == "unload"
+        unload.assert_awaited_once_with("qwen3")
+
+    @pytest.mark.asyncio
+    async def test_unload_when_not_loaded_still_succeeds(self, app_client):
+        resp = await app_client.post(
+            "/api/generate", json={"model": "llama3:8b", "keep_alive": 0}
+        )
+        assert resp.status_code == 200
+        assert resp.json()["done_reason"] == "unload"
+
+    @pytest.mark.asyncio
+    async def test_empty_prompt_with_images_rejected(self, app_client):
         resp = await app_client.post(
             "/api/generate",
-            json={"model": "qwen3"},
+            json={"model": "qwen3", "prompt": "", "images": ["aGk="]},
         )
         assert resp.status_code == 400
-        body = resp.text.lower()
-        assert "prompt" in body
+        assert "prompt" in resp.text.lower()
 
 
 class TestNumPredictZeroRejected:

@@ -47,5 +47,57 @@ def test_check_voice_deps_missing_audio_transitives(monkeypatch, missing):
 def test_check_voice_deps_present(monkeypatch):
     for mod in ("sounddevice", "mlx_audio", "misaki", "en_core_web_sm"):
         monkeypatch.setitem(sys.modules, mod, types.ModuleType(mod))
+    monkeypatch.setattr("shutil.which", lambda name: f"/usr/bin/{name}")
     # Should not raise.
     _check_voice_deps()
+
+
+def test_check_voice_deps_missing_ffmpeg(monkeypatch, capsys):
+    # Whisper decodes the recording through ffmpeg; without it every
+    # push-to-talk turn fails, so front-load it like the Python deps (#760).
+    for mod in ("sounddevice", "mlx_audio", "misaki", "en_core_web_sm"):
+        monkeypatch.setitem(sys.modules, mod, types.ModuleType(mod))
+    monkeypatch.setattr("shutil.which", lambda name: None)
+    with pytest.raises(SystemExit):
+        _check_voice_deps()
+    assert "ffmpeg" in capsys.readouterr().err
+
+
+class _FakeTui:
+    def __init__(self):
+        self.errors: list[str] = []
+
+    def display_error(self, msg):
+        self.errors.append(msg)
+
+
+@pytest.mark.parametrize(
+    "exc",
+    [
+        ValueError("Audio decoding failed: ffmpeg was not found on PATH."),
+        RuntimeError("no input device"),
+    ],
+)
+async def test_listen_failure_reports_and_continues(exc):
+    """#760 item 12: ``generate_transcription`` raises ``ValueError`` (e.g.
+    ffmpeg missing, a bad decode). It must be reported in the chat session,
+    not escape to the outer handler that exits ``olmlx chat``."""
+    from olmlx.cli.chat_cmd import _listen_or_report
+
+    class _Voice:
+        async def listen(self):
+            raise exc
+
+    tui = _FakeTui()
+    assert await _listen_or_report(_Voice(), tui) is None
+    assert tui.errors == [str(exc)]
+
+
+async def test_listen_success_returns_text():
+    from olmlx.cli.chat_cmd import _listen_or_report
+
+    class _Voice:
+        async def listen(self):
+            return "hello"
+
+    assert await _listen_or_report(_Voice(), _FakeTui()) == "hello"

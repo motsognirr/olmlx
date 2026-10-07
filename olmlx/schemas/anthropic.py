@@ -1,6 +1,13 @@
 from typing import Any
 
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    Field,
+    SerializerFunctionWrapHandler,
+    field_validator,
+    model_serializer,
+    model_validator,
+)
 
 from olmlx.schemas.common import ModelName
 
@@ -209,3 +216,13 @@ class AnthropicMessagesResponse(BaseModel):
     stop_reason: str | None = None
     stop_sequence: str | None = None
     usage: AnthropicUsage
+
+    @model_serializer(mode="wrap")
+    def _keep_stop_fields(self, handler: SerializerFunctionWrapHandler) -> dict:
+        # The route serializes with exclude_none (so content blocks drop their
+        # unused fields), but Anthropic always sends ``stop_reason`` and
+        # ``stop_sequence``, null included (#760).
+        data = handler(self)
+        data.setdefault("stop_reason", self.stop_reason)
+        data.setdefault("stop_sequence", self.stop_sequence)
+        return data

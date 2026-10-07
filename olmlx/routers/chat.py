@@ -10,7 +10,11 @@ from olmlx.config import settings
 from olmlx.engine.grammar import parse_response_format
 from olmlx.engine.inference import generate_chat
 from olmlx.engine.panel import panel_generate_chat
-from olmlx.routers.common import format_error, resolve_think_flag
+from olmlx.routers.common import (
+    format_error,
+    load_or_unload_response,
+    resolve_think_flag,
+)
 from olmlx.routers.streaming_common import (
     collect_stream,
     parse_model_output_post,
@@ -163,6 +167,10 @@ async def _stream_chat_with_tools(
 
 @router.post("/api/chat")
 async def chat(req: ChatRequest, request: Request):
+    if not req.messages:
+        return await load_or_unload_response(
+            request, req.model, req.keep_alive, chat=True
+        )
     manager = request.app.state.model_manager
     options = req.options.model_dump(exclude_none=True) if req.options else {}
     messages = [m.model_dump(exclude_none=True) for m in req.messages]

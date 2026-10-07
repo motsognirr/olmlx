@@ -2031,3 +2031,20 @@ class TestFlashPrefetchSpeculativePromotionRegistry:
             }
         )
         assert mc.flash_speculative_draft_model == "org/model"
+
+
+class TestModelConfigSystem:
+    """Per-model default system prompt (Modelfile SYSTEM, #760)."""
+
+    def test_default_none(self):
+        assert ModelConfig.from_entry({"hf_path": "org/model"}).system is None
+
+    def test_round_trip(self):
+        mc = ModelConfig(hf_path="org/model", system="Be terse.")
+        entry = mc.to_entry()
+        assert entry["system"] == "Be terse."
+        assert ModelConfig.from_entry(entry).system == "Be terse."
+
+    def test_non_str_rejected(self):
+        with pytest.raises(ValueError, match="system"):
+            ModelConfig.from_entry({"hf_path": "org/model", "system": 3})

@@ -39,20 +39,24 @@ def _resolve_and_download(model: str, *, download: bool = True):
     clean message to stderr and exits 1 instead — matching ``cmd_models_pull``.
 
     ``download=False`` (used by ``flash info``) returns the local path via
-    ``local_path`` without fetching. ``ModelsConfigError`` is re-raised so
+    ``model_dir`` without fetching. ``ModelsConfigError`` is re-raised so
     ``cli_main``'s dedicated handler can report it (naming the file) rather
     than collapsing it into a generic exit.
     """
     from olmlx.engine.registry import ModelsConfigError
+    from olmlx.models.store import _strip_ollama_tag
 
     try:
         store = _create_store()
         resolved = store.registry.resolve(model)
         hf_path = resolved.hf_path if resolved is not None else model
+        # Ollama-style tag off, as every other store consumer does — a tagged
+        # path would name a different (nonexistent) store directory.
+        hf_path = _strip_ollama_tag(hf_path)
         if download:
             local_dir = store.ensure_downloaded(hf_path)
         else:
-            local_dir = store.local_path(hf_path)
+            local_dir = store.model_dir(hf_path)
     except ModelsConfigError:
         raise
     except Exception as exc:
