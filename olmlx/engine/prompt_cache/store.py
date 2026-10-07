@@ -36,18 +36,19 @@ logger = logging.getLogger(__name__)
 
 
 def _checkpoint_kv_depth(cache: Any) -> int | None:
-    """KV depth of the first layer exposing an int ``offset``, else None.
+    """KV depth shared by every layer exposing an int ``offset``, else None.
 
     Recurrent ``ArraysCache`` layers carry no offset; a hybrid's attention
     layers do. Exact ``int`` so a MagicMock layer never reports a depth.
+    Layers that disagree make the depth unknown (None) rather than a
+    mismatch, so an exotic layout can't get every checkpoint refused.
     """
     if not isinstance(cache, (list, tuple)):
         return None
-    for layer in cache:
-        offset = getattr(layer, "offset", None)
-        if type(offset) is int:
-            return offset
-    return None
+    offsets = {
+        layer.offset for layer in cache if type(getattr(layer, "offset", None)) is int
+    }
+    return offsets.pop() if len(offsets) == 1 else None
 
 
 # Layer classes the byte estimator failed to size (issue #465). Warned once

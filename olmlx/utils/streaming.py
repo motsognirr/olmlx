@@ -538,6 +538,18 @@ def async_mlx_stream(
             gen_kwargs = dict(prompt=prompt, max_tokens=max_tokens, **kwargs)
             gen_kwargs.pop("prompt_progress_callback", None)  # we control this below
 
+            if (
+                deferred_prefill is not None
+                and cancel_event is not None
+                and cancel_event.is_set()
+            ):
+                # Cancelled mid-prefill: the cache covers only a prefix of the
+                # prompt, so don't decode from it (#761). Still finalize the
+                # lazy-state caches on this worker.
+                return _finalize_lazy_caches(
+                    iter(()), generation_caches(gen_kwargs), shed=False
+                )
+
             if use_prefill_callback:
                 gen_kwargs["prompt_progress_callback"] = _make_prefill_progress(
                     cancel_event, memory_limit=memory_limit

@@ -1059,3 +1059,43 @@ def test_drive_pure_rotating_cancel_before_prefill_skips_snapshot():
     )
     assert model.calls == []
     assert len(store) == 0
+
+
+def test_async_mlx_stream_skips_generation_after_cancelled_prefill(monkeypatch):
+    """#766 review: a cancel during the deferred prefill must not go on to
+    decode from a cache that covers only a prefix of the prompt."""
+    import olmlx.utils.streaming as streaming_mod
+
+    generated: list[int] = []
+
+    def fake_stream_generate(model, tokenizer, **kwargs):
+        generated.append(1)
+        yield from ()
+
+    monkeypatch.setattr("mlx_lm.stream_generate", fake_stream_generate)
+
+    def deferred(cancel_event):
+        cancel_event.set()  # client disconnected mid-prefill
+
+    async def _go():
+        stream = streaming_mod.async_mlx_stream(
+            object(), object(), [1], max_tokens=4, deferred_prefill=deferred
+        )
+        async for _tok in stream:
+            pass
+        await stream.drain_and_join()
+
+    asyncio.run(_go())
+    assert generated == []
+
+
+def test_checkpoint_kv_depth_unknown_when_layers_disagree():
+    """#766 review: a layout whose offset-bearing layers disagree (e.g. a
+    model-specific cache with a different offset meaning) must not make every
+    checkpoint insert be refused; the guard only applies to a clear depth."""
+    from olmlx.engine.prompt_cache.store import _checkpoint_kv_depth
+
+    a, b = SimpleNamespace(offset=4), SimpleNamespace(offset=2)
+    assert _checkpoint_kv_depth([a, a]) == 4
+    assert _checkpoint_kv_depth([a, b]) is None
+    assert _checkpoint_kv_depth([SimpleNamespace(), a]) == 4
