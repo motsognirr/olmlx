@@ -36,9 +36,38 @@ except ImportError:  # pragma: no cover
 
 logger = logging.getLogger(__name__)
 
-#: Age after which a spill temp file is a crash leftover, not a write in
-#: flight (a spill of even a very long context takes seconds).
+#: Age after which a spill temp *without* a writer PID in its name (an older
+#: naming scheme) is treated as a crash leftover rather than a write in flight.
 _STALE_TEMP_SPILL_SECONDS = 3600
+
+
+def _spill_temp_path(tmp_dir: Path, file_path: Path) -> Path:
+    """``<stem>.<pid>.<uuid>.safetensors``: the PID lets a later sweep tell a
+    dead writer's leftover from a live write (``_purge_stale_temp_spills``).
+    Keeps the suffix because mlx appends one otherwise."""
+    return tmp_dir / f"{file_path.stem}.{os.getpid()}.{uuid.uuid4().hex}.safetensors"
+
+
+def _spill_temp_pid(path: Path) -> int | None:
+    """The writer PID encoded by ``_spill_temp_path``, or ``None``."""
+    parts = path.name.rsplit(".", 3)
+    if len(parts) != 4 or not parts[1].isdigit():
+        return None
+    return int(parts[1])
+
+
+def _pid_alive(pid: int) -> bool:
+    if pid == os.getpid():
+        return True
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True  # exists, owned by someone else
+    except OSError:
+        return False
+    return True
 
 
 def _checkpoint_kv_depth(cache: Any) -> int | None:
@@ -294,7 +323,7 @@ class PromptCacheStore:
                 # it keeps the suffix because mlx appends one otherwise.
                 tmp_dir = disk_dir / ".tmp"
                 tmp_dir.mkdir(exist_ok=True)
-                tmp_path = tmp_dir / f"{file_path.stem}.{uuid.uuid4().hex}.safetensors"
+                tmp_path = _spill_temp_path(tmp_dir, file_path)
                 try:
                     save_prompt_cache(str(tmp_path), state.cache, metadata)
                     os.replace(tmp_path, file_path)
@@ -448,22 +477,21 @@ class PromptCacheStore:
         )
 
     @staticmethod
-    def _purge_stale_temp_spills(
-        disk_dir: Path, max_age: float = _STALE_TEMP_SPILL_SECONDS
-    ) -> int:
+    def _purge_stale_temp_spills(disk_dir: Path) -> int:
         """Remove spill temp files a crash left in ``.tmp/`` (#760).
 
         ``_save_to_disk``'s ``finally`` removes its temp file on any
         exception, but not if the process dies mid-write; such files are
-        invisible to the ``*.safetensors`` accounting and eviction above. Only
-        files older than ``_STALE_TEMP_SPILL_SECONDS`` are removed, so a write
-        in flight (from this or another store on the same model dir) is safe;
-        ``max_age=0`` removes every temp (teardown, nothing in flight).
+        invisible to the ``*.safetensors`` accounting and eviction above.
+
+        Each temp names its writer's PID (``_spill_temp_path``). A temp is a
+        leftover when that process is gone, however recent the crash, while
+        temps of a live process (this one, or another server on the same
+        dir) are never touched, so a write in flight is always safe (#769
+        review). Temps without a parseable PID fall back to an age check.
         Returns the number of files removed.
         """
         tmp_dir = disk_dir / ".tmp"
-        cutoff = time.time() - max_age
-        removed = 0
         try:
             entries = list(tmp_dir.iterdir())
         except OSError:
@@ -471,12 +499,21 @@ class PromptCacheStore:
             # clear(), or unreadable: nothing to purge. Never raise — the
             # caller runs after a *successful* spill (#769 review).
             return 0
+        cutoff = time.time() - _STALE_TEMP_SPILL_SECONDS
+        removed = 0
         for f in entries:
             try:
-                if f.is_file() and f.stat().st_mtime <= cutoff:
-                    f.unlink(missing_ok=True)
-                    removed += 1
-                    logger.info("Disk cache cleanup: removed stale temp %s", f)
+                if not f.is_file():
+                    continue
+                pid = _spill_temp_pid(f)
+                if pid is not None:
+                    if _pid_alive(pid):
+                        continue
+                elif f.stat().st_mtime > cutoff:
+                    continue
+                f.unlink(missing_ok=True)
+                removed += 1
+                logger.info("Disk cache cleanup: removed orphaned temp %s", f)
             except OSError:
                 continue
         return removed
@@ -491,9 +528,10 @@ class PromptCacheStore:
         if not disk_dir.exists():
             self.metrics.bytes_on_disk = 0
             return
-        # Crash leftovers only accumulate across restarts, so one sweep per
-        # store is enough — not a .tmp scan on every spill, which can run on
-        # the event loop via the sync set() path (#769 review).
+        # Crash leftovers come only from dead processes, which the PID check
+        # recognizes at any age, so one sweep per store is enough — not a
+        # .tmp scan on every spill, which can run on the event loop via the
+        # sync set() path (#769 review).
         if not self._temp_spills_swept:
             self._temp_spills_swept = True
             self._purge_stale_temp_spills(disk_dir)
@@ -665,10 +703,10 @@ class PromptCacheStore:
                 removed += 1
             except OSError:
                 logger.debug("Failed to remove stale disk cache %s", f, exc_info=True)
-        # Also reclaim crash-orphaned spill temps — all of them, however
-        # recent: this teardown runs for models that never spill, so nothing
-        # is in flight and nothing later would reclaim them (#769 review).
-        removed += self._purge_stale_temp_spills(disk_dir, max_age=0)
+        # Also reclaim crash-orphaned spill temps (dead writers only, so a
+        # spill still in flight survives): these models never spill, so
+        # nothing later would reclaim them (#769 review).
+        removed += self._purge_stale_temp_spills(disk_dir)
         # Recompute rather than zero so any files that survived an
         # unlink failure are still reflected in the metric.
         self._refresh_disk_bytes()

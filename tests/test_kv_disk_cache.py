@@ -912,60 +912,86 @@ class TestDiskSpillAtomicWrite:
 
 
 class TestStaleTempSpillPurge:
-    """#760 follow-up: crash-orphaned spill temps are purged by disk
-    cleanup; a fresh (in-flight) temp is left alone."""
+    """#760 follow-up / #769 review: crash-orphaned spill temps are purged;
+    a temp whose writer is alive (a write in flight) never is."""
 
-    def test_cleanup_removes_only_stale_temps(self, tmp_path):
-        import os
-        import time
-
+    @staticmethod
+    def _store(tmp_path):
         store = PromptCacheStore(
             max_slots=1, disk_path=tmp_path, model_name="test-model"
         )
         tmp_dir = store._disk_dir() / ".tmp"
         tmp_dir.mkdir(parents=True)
-        stale = tmp_dir / "a.1.safetensors"
-        fresh = tmp_dir / "b.2.safetensors"
+        return store, tmp_dir
+
+    @staticmethod
+    def _dead_pid():
+        import subprocess
+        import sys
+
+        proc = subprocess.Popen([sys.executable, "-c", "pass"])
+        proc.wait()
+        return proc.pid
+
+    def test_dead_writer_temp_removed_even_if_fresh(self, tmp_path):
+        store, tmp_dir = self._store(tmp_path)
+        orphan = tmp_dir / f"a-x.{self._dead_pid()}.abc.safetensors"
+        orphan.write_bytes(b"x")
+        store._cleanup_disk()
+        assert not orphan.exists()
+
+    def test_live_writer_temp_kept_even_by_clear_disk(self, tmp_path):
+        import os
+
+        store, tmp_dir = self._store(tmp_path)
+        inflight = tmp_dir / f"a.b-x.{os.getpid()}.abc.safetensors"
+        inflight.write_bytes(b"x")
+        old = 0
+        os.utime(inflight, (old, old))  # age alone must not condemn it
+        store._cleanup_disk()
+        store.clear_disk()
+        assert inflight.exists()
+
+    def test_legacy_name_falls_back_to_age(self, tmp_path):
+        import os
+        import time
+
+        store, tmp_dir = self._store(tmp_path)
+        stale = tmp_dir / "a.deadbeef.safetensors"
+        fresh = tmp_dir / "b.cafebabe.safetensors"
         stale.write_bytes(b"x")
         fresh.write_bytes(b"y")
         old = time.time() - 2 * 3600
         os.utime(stale, (old, old))
-
         store._cleanup_disk()
-
         assert not stale.exists()
         assert fresh.exists()
+
+    def test_spill_temp_name_carries_pid(self, tmp_path):
+        import os
+
+        from olmlx.engine.prompt_cache.store import _spill_temp_path, _spill_temp_pid
+
+        p = _spill_temp_path(tmp_path, tmp_path / "x.y-123.safetensors")
+        assert _spill_temp_pid(p) == os.getpid()
 
     def test_purge_tolerates_unreadable_tmp_dir(self, tmp_path):
         from unittest.mock import patch
 
-        store = PromptCacheStore(
-            max_slots=1, disk_path=tmp_path, model_name="test-model"
-        )
-        (store._disk_dir() / ".tmp").mkdir(parents=True)
+        store, _ = self._store(tmp_path)
         with patch("pathlib.Path.iterdir", side_effect=PermissionError("denied")):
-            store._purge_stale_temp_spills(store._disk_dir())  # must not raise
+            assert store._purge_stale_temp_spills(store._disk_dir()) == 0
 
-    def test_clear_disk_purges_all_temps_and_counts_them(self, tmp_path):
-        # Teardown: even a just-orphaned temp goes (nothing is in flight).
-        store = PromptCacheStore(
-            max_slots=1, disk_path=tmp_path, model_name="test-model"
-        )
-        tmp_dir = store._disk_dir() / ".tmp"
-        tmp_dir.mkdir(parents=True)
-        fresh = tmp_dir / "a.1.safetensors"
-        fresh.write_bytes(b"x")
+    def test_clear_disk_counts_purged_temps(self, tmp_path):
+        store, tmp_dir = self._store(tmp_path)
+        (tmp_dir / f"a.{self._dead_pid()}.abc.safetensors").write_bytes(b"x")
         (store._disk_dir() / "b.safetensors").write_bytes(b"y")
         assert store.clear_disk() == 2
-        assert not fresh.exists()
 
     def test_cleanup_sweeps_temps_once_per_store(self, tmp_path):
         from unittest.mock import patch
 
-        store = PromptCacheStore(
-            max_slots=1, disk_path=tmp_path, model_name="test-model"
-        )
-        store._disk_dir().mkdir(parents=True)
+        store, _ = self._store(tmp_path)
         with patch.object(
             PromptCacheStore, "_purge_stale_temp_spills", return_value=0
         ) as purge:
