@@ -108,8 +108,18 @@ def coerce_parameters(params: dict[str, Any]) -> dict[str, Any]:
         if key not in VALID_OPTION_KEYS:
             logger.info("Ignoring unsupported model parameter %r", key)
             continue
+        if value is None:
+            continue
         if key == "stop":
-            out[key] = [value] if isinstance(value, str) else list(value)
+            if isinstance(value, str):
+                value = [value]
+            if not isinstance(value, list) or not all(
+                isinstance(v, str) for v in value
+            ):
+                raise ValueError(
+                    "parameter 'stop' must be a string or a list of strings"
+                )
+            out[key] = list(value)
             continue
         if isinstance(value, str):
             try:

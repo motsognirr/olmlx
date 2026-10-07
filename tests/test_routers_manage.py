@@ -574,3 +574,30 @@ class TestCreateDeleteReviewFollowups:
         assert resp.status_code == 200
         assert registry.resolve("a").hf_path == "Qwen/Qwen3-8B-MLX"
         assert registry.resolve("base2").hf_path == "mlx-community/Llama-3-8B-Instruct"
+
+    @pytest.mark.parametrize("stop", [5, [1, 2], {"a": 1}])
+    async def test_bad_stop_parameter_is_400(self, app_client, registry, stop):
+        resp = await app_client.post(
+            "/api/create",
+            json={
+                "model": "helper",
+                "from": "qwen3",
+                "parameters": {"stop": stop},
+                "stream": False,
+            },
+        )
+        assert resp.status_code == 400
+        assert registry.resolve("helper") is None
+
+    async def test_null_parameter_ignored(self, app_client, registry):
+        resp = await app_client.post(
+            "/api/create",
+            json={
+                "model": "helper",
+                "from": "qwen3",
+                "parameters": {"stop": None, "temperature": 0.2},
+                "stream": False,
+            },
+        )
+        assert resp.status_code == 200
+        assert registry.resolve("helper").options == {"temperature": 0.2}
