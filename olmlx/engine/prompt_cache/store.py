@@ -34,6 +34,22 @@ except ImportError:  # pragma: no cover
 
 logger = logging.getLogger(__name__)
 
+
+def _checkpoint_kv_depth(cache: Any) -> int | None:
+    """KV depth of the first layer exposing an int ``offset``, else None.
+
+    Recurrent ``ArraysCache`` layers carry no offset; a hybrid's attention
+    layers do. Exact ``int`` so a MagicMock layer never reports a depth.
+    """
+    if not isinstance(cache, (list, tuple)):
+        return None
+    for layer in cache:
+        offset = getattr(layer, "offset", None)
+        if type(offset) is int:
+            return offset
+    return None
+
+
 # Layer classes the byte estimator failed to size (issue #465). Warned once
 # per class so bytes_in_ram undercounting is visible without log spam.
 _UNSIZED_LAYER_CLASSES: set[type] = set()
@@ -911,7 +927,19 @@ class PromptCacheStore:
         """Add a checkpoint state, keyed by its tokens.
 
         Re-inserting with the same tokens replaces the prior entry.
+
+        Refuses (with a warning) a state whose KV depth disagrees with its
+        token key: a warm start trusts ``len(state.tokens)`` as the covered
+        depth, so a short cache would silently skip prefilling the rest (#761).
         """
+        depth = _checkpoint_kv_depth(state.cache)
+        if depth is not None and depth != len(state.tokens):
+            logger.warning(
+                "Refusing checkpoint: cache depth %d != %d key tokens",
+                depth,
+                len(state.tokens),
+            )
+            return
         cid = self._checkpoint_cache_id(state.tokens)
         evicted = self.set(cid, state)
         if evicted is not None:

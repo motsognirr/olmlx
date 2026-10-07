@@ -1775,9 +1775,14 @@ def _drive_segmented_prefill(
         prefill_stream = mx.default_stream(mx.default_device())
     pure_rotating = _is_pure_rotating_cache(cache)
 
-    def _run(start: int, end: int) -> None:
+    def _run(start: int, end: int) -> bool:
+        """Prefill ``flat[start:end]``; return False iff a cancel cut it short.
+
+        A cancelled run leaves the cache holding only a prefix of the span, so
+        callers must not snapshot it under the full span's token key (#761).
+        """
         if end <= start:
-            return
+            return True
         with mx.stream(prefill_stream):
             if pure_rotating:
                 # Sliding-window models (gpt-oss, Step-3.5, Gemma 3): feed the
@@ -1795,7 +1800,7 @@ def _drive_segmented_prefill(
                 pos = start
                 while pos < end:
                     if cancel_event is not None and cancel_event.is_set():
-                        return
+                        return False
                     stop = min(pos + _PREFILL_CHUNK, end)
                     model(
                         mx.array(flat[pos:stop], dtype=mx.int32)[None, :], cache=cache
@@ -1803,6 +1808,7 @@ def _drive_segmented_prefill(
                     mx.eval(flatten_cache_state(cache))
                     mx.clear_cache()
                     pos = stop
+        return True
 
     if pure_rotating:
         # Sliding-window models (gpt-oss, Step-3.5, Gemma 3) must be prefilled
@@ -1817,8 +1823,12 @@ def _drive_segmented_prefill(
             already_covered_tokens,
             final_prefill_end,
         )
-        _run(already_covered_tokens, final_prefill_end)
-        if final_prefill_end > already_covered_tokens and segmented.segments:
+        completed = _run(already_covered_tokens, final_prefill_end)
+        if (
+            completed
+            and final_prefill_end > already_covered_tokens
+            and segmented.segments
+        ):
             snap = snapshot_cache_for_persistence(cache, eager_eval=False)
             insert_checkpoint(
                 CachedPromptState(
@@ -1836,7 +1846,11 @@ def _drive_segmented_prefill(
         _run(already_covered_tokens, final_prefill_end)
     else:
         # Chunk 1: uncovered prefix up to the deepest interior boundary.
-        _run(already_covered_tokens, deepest_boundary)
+        # A cancel mid-chunk leaves only a prefix in the cache; snapshotting
+        # it under ``flat[:deepest_boundary]`` would make a retry skip the
+        # unfilled context (#761).
+        if not _run(already_covered_tokens, deepest_boundary):
+            return [flat[-1]]
         # Snapshot at the boundary.  eager_eval=False because ``_run``'s
         # inner ``mx.eval(flatten_cache_state(cache))`` just materialised
         # the state on the prefill stream; deepcopy alone is sufficient.
@@ -2385,6 +2399,12 @@ class _PreflightResult:
 
     prompt: str | list[int] = ""
     memory_limit: int = 0
+    cache_read_tokens: int | None = None
+    cache_creation_tokens: int | None = None
+    # True when memory pressure popped ``prompt_cache``: the caller must then
+    # drop any ``deferred_prefill``/trim, which would only act on the
+    # orphaned cache (#761).
+    cache_dropped: bool = False
 
 
 async def _kv_cache_preflight_check(
@@ -2397,12 +2417,18 @@ async def _kv_cache_preflight_check(
     cache_creation_tokens: int,
     full_prompt_tokens: list[int] | None,
     cache_id: str,
+    has_deferred_prefill: bool = False,
 ) -> _PreflightResult:
     """Estimate KV cache memory and reject if it would exceed the limit.
 
     Evicts prompt caches under pressure and restores prompt if needed.
     Mutates gen_kwargs in place (may remove prompt_cache and input_ids).
     Raises MemoryError if the KV cache would exceed the memory limit.
+
+    ``has_deferred_prefill``: setup deferred the prefill (checkpoint path) or
+    trim (flat lazy-state path) to the worker, so the working cache does not
+    yet match ``full_prompt_tokens[:cache_read_tokens]`` and the prompt may be
+    a suffix even when ``cache_read_tokens == 0``.
     """
     result = _PreflightResult(prompt=prompt)
 
@@ -2452,8 +2478,11 @@ async def _kv_cache_preflight_check(
             # (which normally cleans up) isn't reached on the MemoryError
             # path.  Dropping the working reference still frees memory;
             # the eviction below runs regardless to flush other entries.
+            result.cache_dropped = had_cache
             if had_cache:
-                if not lm.supports_cache_persistence:
+                if not lm.supports_cache_persistence or has_deferred_prefill:
+                    # A deferred prefill/trim hasn't run yet, so the working
+                    # cache doesn't match its key — never re-store it (#761).
                     lm.prompt_cache_store.remove(cache_id)
                 elif full_prompt_tokens is not None:
                     await lm.prompt_cache_store.async_set(
@@ -2469,7 +2498,10 @@ async def _kv_cache_preflight_check(
             mx.clear_cache()
             # Re-estimate for the full generation window
             estimate_tokens = num_prefill_tokens
-            if had_cache and cache_read_tokens > 0:
+            # A checkpoint cold start hands back a one-token suffix with
+            # cache_read_tokens == 0 (the rest is in the deferred prefill), so
+            # the full prompt must come back for it too (#761).
+            if had_cache and (cache_read_tokens > 0 or has_deferred_prefill):
                 estimate_tokens = cache_read_tokens + num_prefill_tokens
                 if full_prompt_tokens is not None and not lm.is_vlm:
                     result.prompt = full_prompt_tokens
@@ -3511,9 +3543,16 @@ async def _stream_completion(
             cache_creation_tokens=cache_creation_tokens,
             full_prompt_tokens=full_prompt_tokens,
             cache_id=cache_id,
+            has_deferred_prefill=cs.deferred_prefill is not None,
         )
         prompt = pf.prompt
         memory_limit = pf.memory_limit
+        if pf.cache_dropped:
+            cs.deferred_prefill = None
+        if pf.cache_read_tokens is not None:
+            cache_read_tokens = pf.cache_read_tokens
+        if pf.cache_creation_tokens is not None:
+            cache_creation_tokens = pf.cache_creation_tokens
         if not lm.is_vlm:
             _recheck_window_if_eviction_cache_lost(
                 lm, gen_kwargs, prompt, full_prompt_tokens, use_prompt_cache
@@ -4127,8 +4166,15 @@ async def _full_completion(
                         cache_creation_tokens=cache_creation_tokens,
                         full_prompt_tokens=full_prompt_tokens,
                         cache_id=cache_id,
+                        has_deferred_prefill=deferred_prefill is not None,
                     )
                     prompt = pf.prompt
+                    if pf.cache_dropped:
+                        deferred_prefill = None
+                    if pf.cache_read_tokens is not None:
+                        cache_read_tokens = pf.cache_read_tokens
+                    if pf.cache_creation_tokens is not None:
+                        cache_creation_tokens = pf.cache_creation_tokens
                     _recheck_window_if_eviction_cache_lost(
                         lm, gen_kwargs, prompt, full_prompt_tokens, use_prompt_cache
                     )

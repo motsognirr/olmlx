@@ -237,7 +237,13 @@ def calibrate_head(
     data_f32 = kv_data.astype(mx.float32)
     norms = mx.sqrt(mx.sum(data_f32**2, axis=-1, keepdims=True))
     data_norm = data_f32 / mx.maximum(norms, mx.array(1e-8))
-    rotated = data_norm @ eigenvectors.T
+    # ``eigendecompose`` returns eigenvectors as COLUMNS; store the basis with
+    # one eigenvector per ROW, which is what ``SpectralRotation.rotate``
+    # (``x @ V.T``) projects onto. Using the column matrix directly projected
+    # onto its rows, so the leading "semantic" coordinates weren't the
+    # high-variance directions (#761).
+    basis = eigenvectors.T
+    rotated = data_norm @ basis.T
 
     sem_data = rotated[:, :d_eff].reshape(-1)
     tail_data = rotated[:, d_eff:].reshape(-1)
@@ -248,7 +254,7 @@ def calibrate_head(
     )
 
     return {
-        "eigenvectors": eigenvectors,  # (head_dim, head_dim), columns = eigvecs
+        "eigenvectors": basis,  # (head_dim, head_dim), rows = eigvecs
         "d_eff": d_eff,
         "codebook_sem": codebook_sem,
         "codebook_tail": codebook_tail,
@@ -278,7 +284,9 @@ def save_calibration(calibration: CalibrationData, output_dir: Path) -> None:
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    config: dict[str, Any] = {"heads": {}}
+    # ``basis: rows`` marks calibrations whose eigenvectors are stored one per
+    # row (#761); older files stored columns, see ``load_calibration``.
+    config: dict[str, Any] = {"basis": "rows", "heads": {}}
     tensors: dict[str, np.ndarray] = {}
 
     for (layer, head, kind), data in calibration.items():
@@ -309,6 +317,17 @@ def load_calibration(calibration_dir: Path) -> CalibrationData:
     tensors = safetensors.numpy.load_file(
         str(calibration_dir / "calibration.safetensors")
     )
+    if config.get("basis") != "rows":
+        # Pre-#761 calibrations projected onto the eigenvector matrix's rows
+        # while storing eigenvectors as columns. Their codebooks were fit on
+        # that same projection, so they still round-trip consistently; they
+        # just don't concentrate variance in the semantic coordinates.
+        logger.warning(
+            "SpectralQuant calibration at %s predates the eigenbasis fix "
+            "(#761) and compresses worse than it should; re-calibrate with "
+            "'olmlx spectral prepare <model>' (add --avg-bits if not 4).",
+            calibration_dir,
+        )
 
     result: CalibrationData = {}
     for prefix, meta in config["heads"].items():

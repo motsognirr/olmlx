@@ -46,7 +46,13 @@ class SpectralQuantKVCache(_BaseCache):
         d_eff: int,
         bits_high: int,
         bits_low: int,
+        value_d_eff: int | None = None,
+        value_bits_high: int | None = None,
+        value_bits_low: int | None = None,
     ):
+        """``d_eff``/``bits_*`` are the key's calibration; ``value_*`` are the
+        value's (calibrated separately, so they generally differ — #761).
+        Each ``value_*`` defaults to the key's value when omitted."""
         self.rotation_key = rotation_key
         self.rotation_value = rotation_value
         self.codebook_sem_key = codebook_sem_key
@@ -56,6 +62,9 @@ class SpectralQuantKVCache(_BaseCache):
         self.d_eff = d_eff
         self.bits_high = bits_high
         self.bits_low = bits_low
+        self.value_d_eff = d_eff if value_d_eff is None else value_d_eff
+        self.value_bits_high = bits_high if value_bits_high is None else value_bits_high
+        self.value_bits_low = bits_low if value_bits_low is None else value_bits_low
 
         # Buffers for keys
         self._k_sem: mx.array | None = None
@@ -67,9 +76,12 @@ class SpectralQuantKVCache(_BaseCache):
         self._v_norms: mx.array | None = None
         self.offset = 0
 
-    def _packed_dims(self, head_dim: int) -> tuple[int, int]:
+    @staticmethod
+    def _packed_dims(
+        head_dim: int, d_eff: int, bits_high: int, bits_low: int
+    ) -> tuple[int, int]:
         """Compute packed dimensions for semantic and tail regimes."""
-        d_tail = head_dim - self.d_eff
+        d_tail = head_dim - d_eff
 
         def _packed(dim, bits):
             if bits == 8:
@@ -79,7 +91,7 @@ class SpectralQuantKVCache(_BaseCache):
             factor = 8 // bits
             return (dim + factor - 1) // factor
 
-        return _packed(self.d_eff, self.bits_high), _packed(d_tail, self.bits_low)
+        return _packed(d_eff, bits_high), _packed(d_tail, bits_low)
 
     def update_and_fetch(
         self, keys: mx.array, values: mx.array
@@ -104,18 +116,25 @@ class SpectralQuantKVCache(_BaseCache):
             self.rotation_value,
             self.codebook_sem_value,
             self.codebook_tail_value,
-            self.d_eff,
-            self.bits_high,
-            self.bits_low,
+            self.value_d_eff,
+            self.value_bits_high,
+            self.value_bits_low,
         )
 
-        sem_packed_dim, tail_packed_dim = self._packed_dims(head_dim)
+        k_sem_dim, k_tail_dim = self._packed_dims(
+            head_dim, self.d_eff, self.bits_high, self.bits_low
+        )
+        v_sem_dim, v_tail_dim = self._packed_dims(
+            head_dim, self.value_d_eff, self.value_bits_high, self.value_bits_low
+        )
 
         # Allocate or expand buffers
         if self._k_sem is None or (prev + num_steps) > self._k_sem.shape[2]:
             new_steps = (num_steps + self.step - 1) // self.step * self.step
-            sem_shape = (B, n_heads, new_steps, sem_packed_dim)
-            tail_shape = (B, n_heads, new_steps, tail_packed_dim)
+            k_sem_shape = (B, n_heads, new_steps, k_sem_dim)
+            k_tail_shape = (B, n_heads, new_steps, k_tail_dim)
+            v_sem_shape = (B, n_heads, new_steps, v_sem_dim)
+            v_tail_shape = (B, n_heads, new_steps, v_tail_dim)
             nrm_shape = (B, n_heads, new_steps, 1)
 
             if self._k_sem is not None:
@@ -134,29 +153,29 @@ class SpectralQuantKVCache(_BaseCache):
                     self._v_tail = self._v_tail[..., :prev, :]
                     self._v_norms = self._v_norms[..., :prev, :]
                 self._k_sem = mx.concatenate(
-                    [self._k_sem, mx.zeros(sem_shape, dtype=mx.uint8)], axis=2
+                    [self._k_sem, mx.zeros(k_sem_shape, dtype=mx.uint8)], axis=2
                 )
                 self._k_tail = mx.concatenate(
-                    [self._k_tail, mx.zeros(tail_shape, dtype=mx.uint8)], axis=2
+                    [self._k_tail, mx.zeros(k_tail_shape, dtype=mx.uint8)], axis=2
                 )
                 self._k_norms = mx.concatenate(
                     [self._k_norms, mx.zeros(nrm_shape, dtype=mx.float32)], axis=2
                 )
                 self._v_sem = mx.concatenate(
-                    [self._v_sem, mx.zeros(sem_shape, dtype=mx.uint8)], axis=2
+                    [self._v_sem, mx.zeros(v_sem_shape, dtype=mx.uint8)], axis=2
                 )
                 self._v_tail = mx.concatenate(
-                    [self._v_tail, mx.zeros(tail_shape, dtype=mx.uint8)], axis=2
+                    [self._v_tail, mx.zeros(v_tail_shape, dtype=mx.uint8)], axis=2
                 )
                 self._v_norms = mx.concatenate(
                     [self._v_norms, mx.zeros(nrm_shape, dtype=mx.float32)], axis=2
                 )
             else:
-                self._k_sem = mx.zeros(sem_shape, dtype=mx.uint8)
-                self._k_tail = mx.zeros(tail_shape, dtype=mx.uint8)
+                self._k_sem = mx.zeros(k_sem_shape, dtype=mx.uint8)
+                self._k_tail = mx.zeros(k_tail_shape, dtype=mx.uint8)
                 self._k_norms = mx.zeros(nrm_shape, dtype=mx.float32)
-                self._v_sem = mx.zeros(sem_shape, dtype=mx.uint8)
-                self._v_tail = mx.zeros(tail_shape, dtype=mx.uint8)
+                self._v_sem = mx.zeros(v_sem_shape, dtype=mx.uint8)
+                self._v_tail = mx.zeros(v_tail_shape, dtype=mx.uint8)
                 self._v_norms = mx.zeros(nrm_shape, dtype=mx.float32)
 
         # Store quantized data
@@ -206,9 +225,9 @@ class SpectralQuantKVCache(_BaseCache):
             self.rotation_value,
             self.codebook_sem_value,
             self.codebook_tail_value,
-            self.d_eff,
-            self.bits_high,
-            self.bits_low,
+            self.value_d_eff,
+            self.value_bits_high,
+            self.value_bits_low,
             dtype=input_dtype,
         )
         return k_full[..., : self.offset, :], v_full[..., : self.offset, :]
@@ -429,6 +448,9 @@ def make_spectral_cache(
             d_eff=key_cal["d_eff"],
             bits_high=key_cal["bits_high"],
             bits_low=key_cal["bits_low"],
+            value_d_eff=val_cal["d_eff"],
+            value_bits_high=val_cal["bits_high"],
+            value_bits_low=val_cal["bits_low"],
         )
         caches.append(cache)
         sq_count += 1

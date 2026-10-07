@@ -964,3 +964,60 @@ def test_drive_no_snapshot_when_only_final_segment_remains():
     assert model.calls == [[10, 11]]
     assert suffix == [12]
     assert len(store) == 0
+
+
+def test_drive_cancel_mid_chunk1_does_not_insert_partial_checkpoint(monkeypatch):
+    """#761 item 1: a cancel between chunk-1 sub-chunks must not store the
+    partially-filled cache under the full ``flat[:deepest_boundary]`` key.
+
+    Otherwise a retry warm-starts with ``already_covered == boundary`` while
+    the cache only holds a prefix, and the skipped context is never prefilled.
+    """
+    import olmlx.engine.inference as inf
+
+    monkeypatch.setattr(inf, "_PREFILL_CHUNK", 2)
+    cancel = threading.Event()
+
+    class _CancelAfterFirst(_DummyModel):
+        def __call__(self, tokens, cache=None):
+            out = super().__call__(tokens, cache=cache)
+            cancel.set()
+            return out
+
+    model = _CancelAfterFirst()
+    store = PromptCacheStore(max_slots=8)
+    sp = SegmentedPrompt(
+        segments=[
+            Segment(tokens=[1, 2, 3, 4, 5, 6], role="system"),
+            Segment(tokens=[7, 8], role="user"),
+        ]
+    )
+    cache = [KVCache()]
+    _drive_segmented_prefill(
+        model=model,
+        segmented=sp,
+        cache=cache,
+        insert_checkpoint=store.insert_checkpoint,
+        cancel_event=cancel,
+    )
+    # Only the first sub-chunk ran before the cancel was observed.
+    assert model.calls == [[1, 2]]
+    assert len(store) == 0
+
+
+def test_insert_checkpoint_refuses_cache_shorter_than_key():
+    """#761 item 1 guard: a checkpoint whose KV depth disagrees with its token
+    key is refused rather than served as covering the whole key."""
+    from olmlx.engine.prompt_cache.state import CachedPromptState
+
+    store = PromptCacheStore(max_slots=8)
+    layer = KVCache()
+    layer.update_and_fetch(mx.zeros((1, 1, 2, 4)), mx.zeros((1, 1, 2, 4)))
+    store.insert_checkpoint(
+        CachedPromptState(tokens=[1, 2, 3, 4], cache=[layer], is_checkpoint=True)
+    )
+    assert len(store) == 0
+    store.insert_checkpoint(
+        CachedPromptState(tokens=[1, 2], cache=[layer], is_checkpoint=True)
+    )
+    assert len(store) == 1

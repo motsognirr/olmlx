@@ -157,6 +157,46 @@ class TestSpeculativeDecoder:
         # offset inflated past the committed length.
         assert decoder._target_cache[0].offset == decoder._cache_seq_len
 
+    def test_tree_disabled_on_sliding_window_cache(self):
+        """#761 item 5: tree verification writes sibling branches into the
+        cache and rolls back via ``trim_prompt_cache``, which no-ops once a
+        ``RotatingKVCache`` window has filled — rejected nodes would stay
+        resident. Tree mode must fall back to linear on rotating caches,
+        as it already does on GDN hybrids."""
+        from mlx_lm.models.cache import RotatingKVCache
+
+        from olmlx.engine.speculative import SpeculativeDecoder
+
+        vocab_size, hidden_size = 32, 16
+        draft = MockModel(vocab_size, hidden_size)
+        target = MockModel(vocab_size, hidden_size)
+        target.make_cache = lambda: [
+            RotatingKVCache(max_size=8, keep=0) for _ in target.layers
+        ]
+        decoder = SpeculativeDecoder(
+            draft_model=draft,
+            target_model=target,
+            num_speculative_tokens=3,
+            tree_width=2,
+        )
+        assert decoder._use_tree is True
+        decoder.prefill(mx.array([[1, 2, 3]]))
+        assert decoder._use_tree is False
+
+    def test_tree_kept_on_plain_kv_cache(self):
+        from olmlx.engine.speculative import SpeculativeDecoder
+
+        draft = MockModel(32, 16)
+        target = MockModel(32, 16)
+        decoder = SpeculativeDecoder(
+            draft_model=draft,
+            target_model=target,
+            num_speculative_tokens=3,
+            tree_width=2,
+        )
+        decoder.prefill(mx.array([[1, 2, 3]]))
+        assert decoder._use_tree is True
+
     def test_reset_clears_state(self, shared_decoder):
         prompt = mx.array([[1, 2, 3]])
         shared_decoder.prefill(prompt)
