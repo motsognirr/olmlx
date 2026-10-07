@@ -90,6 +90,13 @@ class AgentContext:
     #: instead of overrunning the budget, which is otherwise only checked at
     #: iteration boundaries.
     time_remaining: Callable[[], float | None] | None = None
+    #: What this run has left of each budget, keyed like a run's ``config``
+    #: (``max_iterations`` / ``token_budget`` / ``wallclock_timeout``; None =
+    #: unlimited). Set by the orchestrator; a delegated child gets at most
+    #: this (#758), so a delegation tree can't exceed the root's budgets.
+    remaining_budget: Callable[[], dict[str, float | int | None]] | None = None
+    #: ``(iterations, tokens)`` a finished child used, charged to this run.
+    charge_child: Callable[[int, int], None] | None = None
 
 
 class Orchestrator:
@@ -144,6 +151,29 @@ class Orchestrator:
         wallclock = self.budgets.wallclock_timeout
         if wallclock is not None:
             self.context.time_remaining = lambda: wallclock - elapsed()
+
+        token_budget = self.budgets.token_budget
+
+        def remaining_budget() -> dict[str, float | int | None]:
+            # Called mid-iteration (from a delegate tool call), so the
+            # in-progress iteration is already spoken for.
+            return {
+                "max_iterations": self.budgets.max_iterations - iterations - 1,
+                "token_budget": None if token_budget is None else token_budget - tokens,
+                "wallclock_timeout": None
+                if wallclock is None
+                else wallclock - elapsed(),
+            }
+
+        def charge_child(child_iterations: int, child_tokens: int) -> None:
+            # A child's wallclock already elapsed on this run's clock; its
+            # iterations and tokens are charged explicitly.
+            nonlocal iterations, tokens
+            iterations += child_iterations
+            tokens += child_tokens
+
+        self.context.remaining_budget = remaining_budget
+        self.context.charge_child = charge_child
 
         try:
             while True:

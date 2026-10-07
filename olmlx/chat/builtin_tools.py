@@ -134,10 +134,12 @@ def _resolve_path(
 # -- Tool handler functions --
 
 
-async def _handle_read_file(args: dict) -> str | ToolError:
+async def _handle_read_file(
+    args: dict, confine_root: Path | None = None
+) -> str | ToolError:
     path = args.get("path", "")
     try:
-        safe_path = _resolve_path(path)
+        safe_path = _resolve_path(path, confine_root=confine_root)
     except ValueError as exc:
         return ToolError(message=str(exc), tool_name="read_file", is_user_error=True)
     offset = args.get("offset", 1)
@@ -259,18 +261,42 @@ async def _handle_edit_file(
     return await asyncio.to_thread(_edit)
 
 
-async def _handle_glob(args: dict) -> str:
+async def _handle_glob(args: dict, confine_root: Path | None = None) -> str | ToolError:
     pattern = args.get("pattern", "")
     path = args.get("path", ".")
 
-    # A model-issued ``**/*`` over a large tree (or ``/``) would block the
-    # whole event loop — in server/agent mode that freezes every endpoint,
-    # not just this chat. Offload like the other file handlers (#614).
-    matches = sorted(
-        await asyncio.to_thread(
+    if confine_root is not None:
+        # An absolute or ``..`` pattern ignores/escapes ``root_dir`` (#758).
+        if Path(pattern).is_absolute() or ".." in Path(pattern).parts:
+            return ToolError(
+                message=f"Pattern {pattern!r} must be relative to the workspace "
+                "and must not contain '..'",
+                tool_name="glob",
+                is_user_error=True,
+            )
+        try:
+            root_dir = _resolve_path(path, confine_root=confine_root)
+        except ValueError as exc:
+            return ToolError(message=str(exc), tool_name="glob", is_user_error=True)
+        real_root = confine_root.resolve()
+
+        def _confined_glob() -> list[str]:
+            # Drop matches reached through a symlink that leaves the workspace.
+            return [
+                m
+                for m in glob_module.glob(pattern, root_dir=root_dir, recursive=True)
+                if (root_dir / m).resolve().is_relative_to(real_root)
+            ]
+
+        found = await asyncio.to_thread(_confined_glob)
+    else:
+        # A model-issued ``**/*`` over a large tree (or ``/``) would block the
+        # whole event loop — in server/agent mode that freezes every endpoint,
+        # not just this chat. Offload like the other file handlers (#614).
+        found = await asyncio.to_thread(
             glob_module.glob, pattern, root_dir=path, recursive=True
         )
-    )
+    matches = sorted(found)
     if not matches:
         return "No matches found."
 
@@ -281,9 +307,14 @@ async def _handle_glob(args: dict) -> str:
     return "\n".join(matches)
 
 
-async def _handle_grep(args: dict) -> str | ToolError:
+async def _handle_grep(args: dict, confine_root: Path | None = None) -> str | ToolError:
     pattern = args.get("pattern", "")
     path = args.get("path", ".")
+    if confine_root is not None:
+        try:
+            path = str(_resolve_path(path, confine_root=confine_root))
+        except ValueError as exc:
+            return ToolError(message=str(exc), tool_name="grep", is_user_error=True)
 
     # Max lines to return from search to bound output at the source
     max_count = "1000"
@@ -317,7 +348,7 @@ async def _handle_grep(args: dict) -> str | ToolError:
     # Try rg first, fall back to grep
     try:
         stdout, stderr, rc = await _run_search(
-            ["rg", "-n", "--no-heading", "-m", max_count, pattern, path]
+            ["rg", "-n", "--no-heading", "-m", max_count, "-e", pattern, "--", path]
         )
         if rc == 0:
             output = stdout
@@ -333,7 +364,7 @@ async def _handle_grep(args: dict) -> str | ToolError:
         # rg not installed, fall back to grep
         try:
             stdout, stderr, rc = await _run_search(
-                ["grep", "-rn", "-m", max_count, pattern, path]
+                ["grep", "-rn", "-m", max_count, "-e", pattern, "--", path]
             )
             if rc == 0:
                 output = stdout
@@ -370,11 +401,13 @@ async def _handle_grep(args: dict) -> str | ToolError:
     return output
 
 
-async def _handle_read_directory(args: dict) -> str | ToolError:
+async def _handle_read_directory(
+    args: dict, confine_root: Path | None = None
+) -> str | ToolError:
     path = args.get("path", ".")
 
     try:
-        safe_path = _resolve_path(path)
+        safe_path = _resolve_path(path, confine_root=confine_root)
     except ValueError as exc:
         return ToolError(
             message=str(exc), tool_name="read_directory", is_user_error=True
@@ -1032,6 +1065,9 @@ _TODO_HANDLERS: dict[str, Callable] = {
     "TodoWrite": _handle_todo_write,
 }
 
+#: Read handlers that accept ``confine_root`` (``ChatConfig.read_root``).
+_READ_HANDLERS_WITH_ROOT = frozenset({"read_file", "read_directory", "glob", "grep"})
+
 _QUESTION_HANDLERS: dict[str, Callable] = {
     "question": _handle_question,
 }
@@ -1067,6 +1103,12 @@ class BuiltinToolManager:
         if name in ("write_file", "edit_file"):
             return await _SIMPLE_HANDLERS[name](
                 arguments, confine_root=self._config.write_root
+            )
+        # Reads are confined the same way when read_root is set (#758), so a
+        # headless agent can't read credentials outside its workspace.
+        if name in _READ_HANDLERS_WITH_ROOT:
+            return await _SIMPLE_HANDLERS[name](
+                arguments, confine_root=self._config.read_root
             )
         if name in _SIMPLE_HANDLERS:
             return await _SIMPLE_HANDLERS[name](arguments)

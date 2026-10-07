@@ -45,10 +45,27 @@ class DelegateRunner:
         # serialized by the global inference lock, not this one.
         self._admit = asyncio.Lock()
 
-    async def delegate(self, *, parent_id: str, goal: str) -> dict[str, Any]:
+    async def delegate(
+        self,
+        *,
+        parent_id: str,
+        goal: str,
+        budget: dict[str, float | int | None] | None = None,
+    ) -> dict[str, Any]:
+        """Run a child for *goal* and return its final run row.
+
+        ``budget`` is what the parent has left (``AgentContext.remaining_budget``);
+        it caps the child's budgets so delegation can't multiply them (#758).
+        """
         goal = (goal or "").strip()
         if not goal:
             raise DelegateError("delegate requires a non-empty goal")
+        limits = {k: v for k, v in (budget or {}).items() if v is not None}
+        for key, value in limits.items():
+            if value <= 0:
+                raise DelegateError(
+                    f"cannot delegate: the parent run's {key} budget is exhausted"
+                )
 
         async with self._admit:
             parent = await self._service.store.get_run(parent_id)
@@ -69,11 +86,19 @@ class DelegateRunner:
                     f"reached for run {parent_id}"
                 )
 
+            parent_config = parent.get("config") or {}
+            child_config = {
+                **parent_config,
+                **limits,
+                # The child's own goal is model-written; its safety judge also
+                # checks against the user's original goal (#758).
+                "root_goal": parent_config.get("root_goal") or parent["goal"],
+            }
             child = await self._service.store.create_run(
                 run_id=self._service._id_factory(),
                 goal=goal,
                 model=parent["model"],
-                config=parent.get("config") or {},
+                config=child_config,
                 parent_id=parent_id,
                 depth=child_depth,
             )

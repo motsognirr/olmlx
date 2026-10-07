@@ -64,6 +64,11 @@ class ChatConfig:
     #: sets this to bound web-content-driven writes; interactive chat leaves it
     #: unset (it gates writes via per-tool CONFIRM instead).
     write_root: Path | None = None
+    #: The read-side counterpart of ``write_root`` (issue #758): when set,
+    #: ``read_file``/``read_directory``/``glob``/``grep`` only see paths inside
+    #: this directory, so injected content can't have the agent read
+    #: ``~/.ssh`` and exfiltrate it. ``None`` (interactive chat) is unchanged.
+    read_root: Path | None = None
     mcp_connect_retries: int = 3
     tool_result_truncation: int = 2000
     max_consecutive_tool_failures: int = 3

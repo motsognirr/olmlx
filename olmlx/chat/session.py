@@ -623,7 +623,7 @@ class ChatSession:
             with _tracing.span("mcp.tool_call", **{"tool.name": tool_name}) as _sp:
                 if tool_name == "use_skill" and self.skills:
                     result = self.skills.handle_use_skill(tool_input)
-                elif self.builtin and tool_name in self.builtin.tool_names:
+                elif self.builtin is not None and self._is_builtin_call(tool_name):
                     result = await self.builtin.call_tool(tool_name, tool_input)
                 elif self.mcp is not None:
                     _sp.set_attribute("mcp.server", getattr(self.mcp, "name", "mcp"))
@@ -709,6 +709,20 @@ class ChatSession:
                 },
             }
 
+    def _is_builtin_call(self, name: str) -> bool:
+        """Whether a call to *name* runs the builtin tool.
+
+        ``_prepare_tools`` gives a same-named MCP tool precedence, so the model
+        saw the MCP schema; dispatch (and policy classification) must follow
+        it to MCP rather than silently running the builtin (#758).
+        """
+        if self.builtin is None or name not in self.builtin.tool_names:
+            return False
+        if self.mcp is None:
+            return True
+        mcp_tools = self.mcp.get_tools_for_chat() or []
+        return name not in {t["function"]["name"] for t in mcp_tools}
+
     def _prepare_tools(self) -> list[dict] | None:
         """Merge MCP, builtin, and skill tool definitions."""
         tools = None
@@ -754,9 +768,9 @@ class ChatSession:
         local_tools = []
         remote_tools = []
         for tu in tool_uses:
-            is_local = (tu["name"] == "use_skill" and self.skills) or (
-                self.builtin and tu["name"] in self.builtin.tool_names
-            )
+            is_local = (
+                tu["name"] == "use_skill" and self.skills
+            ) or self._is_builtin_call(tu["name"])
             if is_local and self.config.local_tool_safety:
                 remote_tools.append(tu)
             elif is_local:
