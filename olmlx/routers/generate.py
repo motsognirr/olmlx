@@ -9,7 +9,11 @@ from olmlx.config import settings
 from olmlx.engine.grammar import parse_response_format
 from olmlx.engine.inference import generate_completion
 from olmlx.engine.tool_parser import parse_model_output
-from olmlx.routers.common import format_error, resolve_think_flag
+from olmlx.routers.common import (
+    format_error,
+    load_or_unload_response,
+    resolve_think_flag,
+)
 from olmlx.routers.thinking_split import flush_split_thinking, split_chunk_streaming
 from olmlx.schemas.generate import GenerateRequest
 from olmlx.utils.streaming import safe_ndjson_stream
@@ -21,6 +25,12 @@ router = APIRouter()
 
 @router.post("/api/generate")
 async def generate(req: GenerateRequest, request: Request):
+    if not req.prompt:
+        if req.images:
+            raise ValueError("prompt cannot be empty")
+        return await load_or_unload_response(
+            request, req.model, req.keep_alive, chat=False
+        )
     manager = request.app.state.model_manager
     options = req.options.model_dump(exclude_none=True) if req.options else {}
 

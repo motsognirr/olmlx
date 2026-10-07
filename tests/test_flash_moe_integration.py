@@ -150,7 +150,7 @@ class TestModelManagerFlashMoe:
         from unittest.mock import MagicMock
 
         store = MagicMock()
-        store.local_path.return_value = model_dir
+        store.model_dir.return_value = store.local_path.return_value = model_dir
 
         mgr = ModelManager.__new__(ModelManager)
         mgr.store = store
@@ -164,7 +164,9 @@ class TestModelManagerFlashMoe:
         from unittest.mock import MagicMock
 
         store = MagicMock()
-        store.local_path.return_value = tmp_path / "nonexistent"
+        store.model_dir.return_value = store.local_path.return_value = (
+            tmp_path / "nonexistent"
+        )
 
         mgr = ModelManager.__new__(ModelManager)
         mgr.store = store

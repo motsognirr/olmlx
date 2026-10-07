@@ -637,7 +637,18 @@ curl http://localhost:11434/api/create -d '{
 }'
 ```
 
-Supported directives: `FROM` (required — base model), `SYSTEM` (system prompt), `PARAMETER` (inference parameters).
+Supported directives: `FROM` (required — base model), `SYSTEM` (system prompt; `"""..."""` may span lines), `PARAMETER` (inference parameters; repeat `PARAMETER stop` for several stop strings). Ollama's structured request shape works too:
+
+```bash
+curl http://localhost:11434/api/create -d '{
+  "model": "my-custom-model",
+  "from": "llama3.2:latest",
+  "system": "You are a pirate.",
+  "parameters": {"temperature": 0.7}
+}'
+```
+
+The new model is a `models.json` entry that shares the base's weights. Its `system` is the default system prompt: it applies when a chat has no system message, and on `/api/generate` when the request has no `system`. Its parameters become per-model `options`. A `FROM`-only Modelfile just creates an alias. Parameters without an olmlx equivalent (`num_ctx`, `mirostat`, ...) are ignored. `TEMPLATE`, `ADAPTER`, `MESSAGE`, `files` and `adapters` are rejected with a 400. Deleting a created model (or an alias) leaves the shared weights in place.
 
 ---
 

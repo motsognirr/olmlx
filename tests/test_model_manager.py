@@ -3257,8 +3257,11 @@ class TestFlashLoadFailureCleanup:
             fp.PredictorBank, "load", classmethod(lambda cls, path: object())
         )
 
+        loaded_paths: list[str] = []
+
         def _fake_load(path, *, lazy):
-            if path == "draft/x":
+            loaded_paths.append(path)
+            if path == "/store/draft_x":
                 return SimpleNamespace(args=SimpleNamespace(vocab_size=200)), object()
             return object(), object()
 
@@ -3305,7 +3308,11 @@ class TestFlashLoadFailureCleanup:
             flash_speculative_tokens=4,
         )
 
-        manager = ModelManager(MagicMock(), MagicMock())
+        store = MagicMock()
+        # #760: the draft goes through the olmlx model store, never a raw
+        # repo id that a library would fetch into the HF cache.
+        store.ensure_downloaded.return_value = "/store/draft_x"
+        manager = ModelManager(MagicMock(), store)
         with pytest.raises(ValueError, match="vocab_size"):
             manager._load_flash_model(
                 "hf/model",
@@ -3316,6 +3323,8 @@ class TestFlashLoadFailureCleanup:
             )
         assert closed["store"] == 1, "weight store must be closed on failed load"
         assert closed["clear_cache"] >= 1, "draft weights must be released to the pool"
+        store.ensure_downloaded.assert_called_once_with("draft/x")
+        assert "draft/x" not in loaded_paths
 
 
 class TestExpiryChecker:
@@ -4615,7 +4624,9 @@ class TestPerModelConfig:
         spectral_path.mkdir()
         (spectral_path / "spectral_config.json").write_text("{}")
         mock_store = MagicMock()
-        mock_store.local_path.return_value = tmp_path
+        mock_store.model_dir.return_value = mock_store.local_path.return_value = (
+            tmp_path
+        )
         manager.store = mock_store
 
         result = manager._find_spectral_dir("test/model", "spectral:4")
@@ -4634,7 +4645,9 @@ class TestPerModelConfig:
             _json.dumps({"meta": {"avg_bits": 4}})
         )
         mock_store = MagicMock()
-        mock_store.local_path.return_value = tmp_path
+        mock_store.model_dir.return_value = mock_store.local_path.return_value = (
+            tmp_path
+        )
         manager.store = mock_store
 
         result = manager._find_spectral_dir("test/model", "spectral:4")
@@ -4673,7 +4686,9 @@ class TestPerModelConfig:
         spectral_path = tmp_path / "spectral"
         spectral_path.mkdir()
         mock_store = MagicMock()
-        mock_store.local_path.return_value = tmp_path
+        mock_store.model_dir.return_value = mock_store.local_path.return_value = (
+            tmp_path
+        )
         manager.store = mock_store
 
         with pytest.raises(SpectralCalibrationMissingError) as exc_info:
@@ -4699,7 +4714,9 @@ class TestPerModelConfig:
         )
         manager = ModelManager(MagicMock(), MagicMock())
         mock_store = MagicMock()
-        mock_store.local_path.return_value = tmp_path
+        mock_store.model_dir.return_value = mock_store.local_path.return_value = (
+            tmp_path
+        )
         manager.store = mock_store
 
         with pytest.raises(SpectralCalibrationMissingError) as exc_info:
@@ -4746,7 +4763,9 @@ class TestPerModelConfig:
         spectral_path.mkdir()
         (spectral_path / "spectral_config.json").write_text("{}")
         mock_store = MagicMock()
-        mock_store.local_path.return_value = tmp_path
+        mock_store.model_dir.return_value = mock_store.local_path.return_value = (
+            tmp_path
+        )
         manager.store = mock_store
 
         with pytest.raises(ValueError, match="spectral:3"):
@@ -4768,7 +4787,9 @@ class TestPerModelConfig:
             _json.dumps({"meta": {"avg_bits": 4}})
         )
         mock_store = MagicMock()
-        mock_store.local_path.return_value = tmp_path
+        mock_store.model_dir.return_value = mock_store.local_path.return_value = (
+            tmp_path
+        )
         manager.store = mock_store
 
         with pytest.raises(SpectralCalibrationMissingError) as exc_info:
@@ -4790,7 +4811,9 @@ class TestPerModelConfig:
         spectral_path.mkdir()
         (spectral_path / "spectral_config.json").write_text("not valid json {{")
         mock_store = MagicMock()
-        mock_store.local_path.return_value = tmp_path
+        mock_store.model_dir.return_value = mock_store.local_path.return_value = (
+            tmp_path
+        )
         manager.store = mock_store
 
         with pytest.raises(SpectralCalibrationMissingError) as exc_info:
@@ -6208,7 +6231,9 @@ class TestDFlashLoading:
         registry = MagicMock()
         store = MagicMock()
         store.ensure_downloaded.return_value = Path("/tmp/test-dflash-draft")
-        store.local_path.return_value = Path("/tmp/test-target")
+        store.model_dir.return_value = store.local_path.return_value = Path(
+            "/tmp/test-target"
+        )
 
         manager = ModelManager(registry, store)
         monkeypatch.setattr(
@@ -6963,3 +6988,44 @@ class TestBuildSpeculativeDecoderBundledProbe:
         assert used_cfg.draft_model == str(bundled)
         # store.local_path must NOT have been called for absolute hf_path
         mock_local_path.assert_not_called()
+
+
+class TestManifestNameResolvedOnLoop:
+    """#760 item 8: the manifest backfill on the load worker must not iterate
+    the loop-affine registry dicts; the short name is resolved on the loop
+    and passed in."""
+
+    def test_manifest_name_for_prefers_registry_short_name(self, registry):
+        manager = ModelManager(registry, MagicMock())
+        assert manager._manifest_name_for("Qwen/Qwen3-8B-MLX") == "qwen3:latest"
+        assert manager._manifest_name_for("org/unlisted") == "org/unlisted:latest"
+
+    def test_load_model_does_not_iterate_registry(self, tmp_path, monkeypatch):
+        import olmlx.models.store as store_mod
+
+        local = tmp_path / "m"
+        local.mkdir()
+        (local / "config.json").write_text("{}")
+        store = MagicMock()
+        store.ensure_downloaded.return_value = local
+        registry = MagicMock()
+        registry.list_models.side_effect = AssertionError("iterated off-loop")
+        manager = ModelManager(registry, store)
+
+        seen = {}
+
+        def _derive(local_dir, name, hf_path):
+            seen["name"] = name
+            return MagicMock()
+
+        monkeypatch.setattr(store_mod, "_derive_manifest", _derive)
+
+        class _Stop(Exception):
+            pass
+
+        monkeypatch.setattr(
+            manager, "_is_flash_moe_enabled", MagicMock(side_effect=_Stop)
+        )
+        with pytest.raises(_Stop):
+            manager._load_model("org/model", manifest_name="mine:latest")
+        assert seen["name"] == "mine:latest"

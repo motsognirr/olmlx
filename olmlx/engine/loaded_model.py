@@ -47,6 +47,15 @@ class ShardCalibrationMissingError(SpectralCalibrationMissingError):
     """
 
 
+class ModelNotFoundError(ValueError):
+    """The requested model isn't in the registry (#760).
+
+    A ``ValueError`` subclass so legacy ``except ValueError`` callers keep
+    working; the app maps it to a 404 (Ollama/OpenAI ``model_not_found``/
+    Anthropic ``not_found_error``) instead of the generic ValueError 400.
+    """
+
+
 class ActiveRequestsError(RuntimeError):
     """Raised by ``ModelManager.unload`` when a model has in-flight requests.
 
@@ -219,6 +228,9 @@ class LoadedModel:
     # (gpt-oss / Harmony): "low"/"medium"/"high". ``generate_chat`` consults
     # this when the caller didn't pass ``reasoning_effort``.
     reasoning_effort: str | None = None
+    # Per-model default system prompt (Modelfile ``SYSTEM``, #760): used when
+    # the request carries no system message of its own.
+    default_system: str | None = None
     # Per-model override for the cross-request prompt cache toggle.
     # ``generate_chat`` honours this in place of ``settings.prompt_cache``
     # when set. None means defer to the global setting. Surfaced for

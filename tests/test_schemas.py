@@ -139,13 +139,10 @@ class TestGenerateSchemas:
         assert req.stream is True
         assert req.raw is False
 
-    def test_generate_request_requires_prompt(self):
-        with pytest.raises(ValidationError, match="prompt"):
-            GenerateRequest(model="test")
-
-    def test_generate_request_rejects_empty_prompt(self):
-        with pytest.raises(ValidationError, match="prompt"):
-            GenerateRequest(model="test", prompt="")
+    def test_generate_request_prompt_optional(self):
+        # Empty/missing prompt is Ollama's load/unload request (#760).
+        assert GenerateRequest(model="test").prompt == ""
+        assert GenerateRequest(model="test", prompt="").prompt == ""
 
     def test_generate_response(self):
         resp = GenerateResponse(
@@ -225,9 +222,10 @@ class TestChatSchemas:
         )
         assert resp.done is True
 
-    def test_chat_request_rejects_empty_messages(self):
-        with pytest.raises(ValidationError, match="messages"):
-            ChatRequest(model="test", messages=[])
+    def test_chat_request_messages_optional(self):
+        # Empty/missing messages is Ollama's load/unload request (#760).
+        assert ChatRequest(model="test").messages == []
+        assert ChatRequest(model="test", messages=[]).messages == []
 
     def test_message_rejects_unknown_role(self):
         with pytest.raises(ValidationError, match="role"):

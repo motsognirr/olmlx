@@ -13,6 +13,7 @@ from typing import TYPE_CHECKING
 import mlx.core as mx
 import mlx.nn as nn
 
+from olmlx.engine.spec_decoder_base import _logits
 from olmlx.engine.speculative import SpeculativeDecoder
 
 if TYPE_CHECKING:
@@ -69,12 +70,12 @@ class SpeculativeFlashDecoder(SpeculativeDecoder):
             inp = mx.array([[next_token]])
             if can_capture:
                 hidden = inner_model(inp, cache=self._draft_cache)
-                logits = lm_head(hidden)
+                logits = _logits(lm_head(hidden))
                 next_logits = logits[:, -1, :]
                 mx.eval(next_logits)
                 captured.append(hidden[:, -1, :])
             else:
-                logits = self._draft(inp, cache=self._draft_cache)
+                logits = _logits(self._draft(inp, cache=self._draft_cache))
                 next_logits = logits[:, -1, :]
                 mx.eval(next_logits)
 

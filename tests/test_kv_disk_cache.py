@@ -860,3 +860,52 @@ class TestRestoreMaterializeFailureKeepsFile:
         assert state is None
         assert path.exists()
         assert "a" not in store._entries
+
+
+class TestDiskSpillAtomicWrite:
+    """#760 item 9: the spill must never be visible at its final path half
+    written, or a concurrent reader would fail to parse it and unlink it."""
+
+    def test_save_writes_temp_then_renames(self, tmp_path):
+        store = PromptCacheStore(
+            max_slots=1, disk_path=tmp_path, model_name="test-model"
+        )
+        final = store._disk_file_path("a")
+        seen: dict = {}
+
+        def fake_save(path, cache, metadata):
+            seen["path"] = Path(path)
+            # Mid-write: the final path must not exist yet.
+            seen["final_existed"] = final.exists()
+            Path(path).write_bytes(b"partial")
+
+        with patch(
+            "olmlx.engine.prompt_cache.store.save_prompt_cache", side_effect=fake_save
+        ):
+            store._save_to_disk("a", _make_state(1))
+
+        assert seen["path"] != final
+        assert seen["final_existed"] is False
+        assert final.read_bytes() == b"partial"
+        assert not seen["path"].exists()
+        # The temp file isn't visible to the *.safetensors scans.
+        assert list(final.parent.glob("*.safetensors")) == [final]
+
+    def test_failed_save_leaves_no_temp_or_final(self, tmp_path):
+        store = PromptCacheStore(
+            max_slots=1, disk_path=tmp_path, model_name="test-model"
+        )
+        final = store._disk_file_path("a")
+
+        def fake_save(path, cache, metadata):
+            Path(path).write_bytes(b"partial")
+            raise OSError("disk full")
+
+        with patch(
+            "olmlx.engine.prompt_cache.store.save_prompt_cache", side_effect=fake_save
+        ):
+            store._save_to_disk("a", _make_state(1))
+
+        assert not final.exists()
+        leftovers = [p for p in tmp_path.rglob("*") if p.is_file()]
+        assert leftovers == []

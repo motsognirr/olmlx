@@ -57,56 +57,126 @@ async def copy_model(req: CopyRequest, request: Request):
     return Response(status_code=200)
 
 
+def _shares_weights(registry, name: str) -> bool:
+    """True when another registry entry serves the same weights as *name*
+    (an alias from ``/api/copy`` or a derived ``/api/create`` model), so
+    deleting *name* must leave the files in place for the others."""
+    from olmlx.models.store import _strip_ollama_tag
+
+    normalized = registry.normalize_name(name)
+    target = registry.resolve(name)
+    if target is None:
+        return False
+    hf = _strip_ollama_tag(target.hf_path)
+    return any(
+        other != normalized and _strip_ollama_tag(mc.hf_path) == hf
+        for other, mc in registry.list_models().items()
+    )
+
+
 @router.delete("/api/delete")
 async def delete_model(req: DeleteRequest, request: Request):
     store = request.app.state.model_store
     registry = request.app.state.registry
-    deleted = store.delete(req.model)
-    registry.remove(req.model)
-    if not deleted:
+    in_registry = (
+        registry.is_adapter(req.model)
+        or registry.normalize_name(req.model) in registry.list_models()
+    )
+    # Like Ollama, removing one name never deletes weights another name
+    # still uses (#760).
+    if in_registry and not registry.is_adapter(req.model):
+        shared = _shares_weights(registry, req.model)
+    else:
+        shared = False
+    deleted = False if shared else store.delete(req.model)
+    if not deleted and not in_registry:
+        # Decide the 404 before touching the registry (#760).
         return JSONResponse(
             {"error": f"model '{req.model}' not found"}, status_code=404
         )
+    if in_registry:
+        registry.remove(req.model)
     return Response(status_code=200)
 
 
 @router.post("/api/create")
 async def create_model(req: CreateRequest, request: Request):
-    """Parse a basic Modelfile and create a new model entry."""
+    """Create a model from a base: an alias, or — with ``SYSTEM`` and/or
+    ``PARAMETER`` — a registry entry carrying them as per-model defaults.
+
+    Accepts both a Modelfile and Ollama's structured request shape (#760).
+    """
+    from dataclasses import replace
+
+    from olmlx.utils.modelfile import (
+        Modelfile,
+        coerce_parameters,
+        parse_modelfile,
+    )
+
     registry = request.app.state.registry
 
-    if not req.modelfile:
-        return JSONResponse({"error": "modelfile is required"}, status_code=400)
+    try:
+        mf = parse_modelfile(req.modelfile) if req.modelfile else Modelfile()
+    except ValueError as e:
+        return JSONResponse({"error": str(e)}, status_code=400)
 
-    # Parse Modelfile
-    from_model = None
-    parameters = {}
+    unsupported = list(mf.unsupported)
+    for field_name in ("template", "files", "adapters", "messages"):
+        if getattr(req, field_name):
+            unsupported.append(field_name)
+    if unsupported:
+        return JSONResponse(
+            {
+                "error": "unsupported by olmlx /api/create: "
+                + ", ".join(dict.fromkeys(unsupported))
+                + " (only FROM, SYSTEM and PARAMETER are supported)"
+            },
+            status_code=400,
+        )
 
-    for line in req.modelfile.splitlines():
-        line = line.strip()
-        if line.upper().startswith("FROM "):
-            from_model = line[5:].strip()
-        elif line.upper().startswith("SYSTEM "):
-            system_prompt = line[7:].strip().strip('"')
-            parameters["system"] = system_prompt
-        elif line.upper().startswith("PARAMETER "):
-            parts = line[10:].strip().split(None, 1)
-            if len(parts) == 2:
-                parameters[parts[0]] = parts[1]
-
+    from_model = req.from_ or mf.from_model
     if not from_model:
-        return JSONResponse({"error": "FROM is required in Modelfile"}, status_code=400)
+        error = (
+            "FROM is required in Modelfile"
+            if req.modelfile
+            else "'from' or a modelfile with FROM is required"
+        )
+        return JSONResponse({"error": error}, status_code=400)
+    system = req.system if req.system is not None else mf.system
+    try:
+        params = coerce_parameters({**mf.parameters, **(req.parameters or {})})
+    except ValueError as e:
+        return JSONResponse({"error": str(e)}, status_code=400)
 
     # Resolve the base model
-    resolved = registry.resolve(from_model)
+    try:
+        resolved = registry.resolve(from_model)
+    except ValueError as e:
+        return JSONResponse({"error": str(e)}, status_code=400)
     if resolved is None:
         return JSONResponse(
             {"error": f"base model '{from_model}' not found"}, status_code=404
         )
 
-    # Create alias for the new model
     normalized = registry.normalize_name(req.model)
-    registry.add_alias(normalized, from_model)
+    try:
+        # Re-creating a name replaces it: drop the earlier alias/entry first,
+        # since resolve() prefers an alias and would shadow a new mapping.
+        # Skipped when the new name *is* the base (already resolved above).
+        if normalized != registry.normalize_name(from_model):
+            registry.remove(normalized)
+        if system is None and not params:
+            registry.add_alias(normalized, from_model)
+        else:
+            mc = replace(
+                resolved,
+                options={**resolved.options, **params},
+                system=system if system is not None else resolved.system,
+            )
+            registry.add_mapping(normalized, mc.hf_path, model_config=mc)
+    except ValueError as e:
+        return JSONResponse({"error": str(e)}, status_code=400)
 
     if req.stream:
 
@@ -131,8 +201,12 @@ async def push_model():
 async def warmup_model(req: WarmupRequest, request: Request):
     """Preload a model into VRAM to reduce first-request latency."""
     manager = request.app.state.model_manager
+    from olmlx.engine.model_manager import ModelNotFoundError
+
     try:
         await manager.ensure_loaded(req.model, keep_alive=req.keep_alive)
+    except ModelNotFoundError as e:
+        return JSONResponse({"error": str(e)}, status_code=404)
     except (ValueError, RuntimeError) as e:
         return JSONResponse(
             {"error": f"warmup failed: {e}"},

@@ -462,6 +462,11 @@ class ModelConfig:
     #: ``generate_chat`` when the caller didn't pass one; ignored by templates
     #: that don't support ``reasoning_effort``. ``None`` uses the template default.
     reasoning_effort: str | None = None
+    #: Per-model default system prompt (Ollama Modelfile ``SYSTEM``, #760).
+    #: Prepended by ``generate_chat`` when the conversation has no system
+    #: message, and used by ``/api/generate`` when the request has no
+    #: ``system``. ``None`` means no default.
+    system: str | None = None
     #: Per-model override for the cross-request prompt cache toggle. When set,
     #: fully overrides ``OLMLX_PROMPT_CACHE`` for this model — useful when a
     #: specific architecture surfaces a checkpoint-path bug while the rest of
@@ -686,6 +691,8 @@ class ModelConfig:
                 "'reasoning_effort' must be 'low', 'medium', 'high', or None, "
                 f"got {self.reasoning_effort!r}"
             )
+        if self.system is not None and not isinstance(self.system, str):
+            raise ValueError(f"'system' must be a string or None, got {self.system!r}")
         if self.prompt_cache is not None and not isinstance(self.prompt_cache, bool):
             raise ValueError(
                 f"'prompt_cache' must be a bool or None, got {self.prompt_cache!r}"
@@ -1112,6 +1119,7 @@ class ModelConfig:
             flash_speculative_tokens = entry.get("flash_speculative_tokens")
             enable_thinking_raw = entry.get("enable_thinking")
             reasoning_effort_raw = entry.get("reasoning_effort")
+            system_raw = entry.get("system")
             prompt_cache_raw = entry.get("prompt_cache")
             batching_raw = entry.get("batching")
             batch_completion_size_raw = entry.get("batch_completion_size")
@@ -1202,6 +1210,7 @@ class ModelConfig:
                 flash_speculative_tokens=flash_speculative_tokens,
                 enable_thinking=enable_thinking_raw,
                 reasoning_effort=reasoning_effort_raw,
+                system=system_raw,
                 prompt_cache=prompt_cache_raw,
                 batching=batching_raw,
                 batch_completion_size=batch_completion_size_raw,
@@ -1250,6 +1259,7 @@ class ModelConfig:
             and self.flash_speculative_tokens is None
             and self.enable_thinking is None
             and self.reasoning_effort is None
+            and self.system is None
             and self.prompt_cache is None
             and self.batching is None
             and self.batch_completion_size is None
@@ -1331,6 +1341,8 @@ class ModelConfig:
             result["enable_thinking"] = self.enable_thinking
         if self.reasoning_effort is not None:
             result["reasoning_effort"] = self.reasoning_effort
+        if self.system is not None:
+            result["system"] = self.system
         if self.prompt_cache is not None:
             result["prompt_cache"] = self.prompt_cache
         if self.batching is not None:

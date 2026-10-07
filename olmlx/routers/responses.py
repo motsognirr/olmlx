@@ -524,16 +524,18 @@ async def _stream_response(
         message_open = False
         reasoning_index: int | None = None
         message_index: int | None = None
+        # Thinking that arrives after the message opened (gpt-oss: commentary
+        # preamble, then analysis) can't join the already-streamed reasoning
+        # item or the message text; it becomes a trailing reasoning item (#760).
+        late_thinking = ""
+        late_reasoning_id = _make_reasoning_id()
 
-        def reasoning_item() -> dict:
-            content = (
-                [{"type": "reasoning_text", "text": thinking_text}]
-                if thinking_text
-                else []
-            )
+        def reasoning_item(item_id: str | None = None, text: str | None = None) -> dict:
+            text = thinking_text if text is None else text
+            content = [{"type": "reasoning_text", "text": text}] if text else []
             return {
                 "type": "reasoning",
-                "id": reasoning_id,
+                "id": item_id or reasoning_id,
                 "summary": [],
                 "content": content,
             }
@@ -573,10 +575,13 @@ async def _stream_response(
 
         def route(channel: str, fragment: str) -> list[str]:
             """SSE events for *fragment*, opening/closing items as needed."""
-            nonlocal thinking_text, visible_text
+            nonlocal thinking_text, visible_text, late_thinking
             nonlocal reasoning_open, message_open
             nonlocal reasoning_index, message_index
             if not fragment:
+                return []
+            if channel == "thinking" and message_open:
+                late_thinking += fragment
                 return []
             events: list[str] = []
             if channel == "thinking" and not message_open:
@@ -602,8 +607,8 @@ async def _stream_response(
                     )
                 )
                 return events
-            # Visible content (or stray thinking after the message opened): close
-            # the reasoning item, then stream the fragment as an output_text delta.
+            # Visible content: close the reasoning item, then stream the
+            # fragment as an output_text delta.
             events.extend(close_reasoning())
             if not message_open:
                 message_open = True
@@ -707,12 +712,41 @@ async def _stream_response(
                 "response.output_item.done",
                 {"output_index": message_index, "item": message_item("completed")},
             )
+        late_index = (message_index or 0) + 1
+        if late_thinking:
+            late_item = reasoning_item(late_reasoning_id, late_thinking)
+            yield ev(
+                "response.output_item.added",
+                {
+                    "output_index": late_index,
+                    "item": reasoning_item(late_reasoning_id, ""),
+                },
+            )
+            for name, key in (
+                ("response.reasoning_text.delta", "delta"),
+                ("response.reasoning_text.done", "text"),
+            ):
+                yield ev(
+                    name,
+                    {
+                        "item_id": late_reasoning_id,
+                        "output_index": late_index,
+                        "content_index": 0,
+                        key: late_thinking,
+                    },
+                )
+            yield ev(
+                "response.output_item.done",
+                {"output_index": late_index, "item": late_item},
+            )
 
         output_items: list[dict] = []
         if thinking_text:
             output_items.append(reasoning_item())
         if visible_text:
             output_items.append(message_item("completed"))
+        if late_thinking:
+            output_items.append(reasoning_item(late_reasoning_id, late_thinking))
 
         final_status = (
             "incomplete" if done_reason in ("timeout", "length") else "completed"

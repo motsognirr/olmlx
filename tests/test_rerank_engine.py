@@ -14,6 +14,7 @@ class _FakeTokenizer:
         import numpy as np
 
         self.seen_max_length = max_length
+        self.seen_truncation = truncation
         n = len(documents)
         ids = np.ones((n, 4), dtype=np.int64) * 5
         mask = np.ones((n, 4), dtype=np.int64)
@@ -106,3 +107,21 @@ def test_build_rerank_results_top_n_clamped():
         return_documents=False,
     )
     assert len(results) == 2
+
+
+def test_score_pairs_truncates_long_query_too():
+    # #760: "only_second" can't shorten a query that alone exceeds max_len
+    # (fast tokenizers raise, slow ones return it untruncated and overrun the
+    # position table). "longest_first" trims docs first, then the query.
+    tok = _FakeTokenizer()
+    _score_pairs(_FakeModel([0.0]), tok, "q", ["a"], max_tokens_per_doc=128)
+    assert tok.seen_truncation == "longest_first"
+
+
+def test_score_pairs_bounded_by_position_table():
+    # A tokenizer limit past the model's position table must not win.
+    model = _FakeModel([0.0])
+    model.max_input_tokens = 100
+    tok = _FakeTokenizer(model_max_length=512)
+    _score_pairs(model, tok, "q", ["a"], max_tokens_per_doc=4096)
+    assert tok.seen_max_length == 100

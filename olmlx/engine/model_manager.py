@@ -72,6 +72,7 @@ from olmlx.engine.loaded_model import (  # noqa: F401
     SpectralCalibrationMissingError,
     ShardCalibrationMissingError,
     ActiveRequestsError,
+    ModelNotFoundError,
     structural_copy,
     LoadedModel,
     _is_cross_encoder_config,
@@ -517,7 +518,7 @@ class ModelManager(SpeculativeLoaderMixin):
         """
         cfg: AdapterConfig | None = self.registry.resolve_adapter(normalized)
         if cfg is None:  # pragma: no cover - guarded by caller's is_adapter
-            raise ValueError(f"Adapter '{normalized}' not found in config")
+            raise ModelNotFoundError(f"Adapter '{normalized}' not found in config")
 
         # Fast path: already loaded — refresh expiry and return.
         async with self._lock:
@@ -588,6 +589,7 @@ class ModelManager(SpeculativeLoaderMixin):
                     sync_mode=base_lm.sync_mode,
                     enable_thinking=base_lm.enable_thinking,
                     reasoning_effort=base_lm.reasoning_effort,
+                    default_system=base_lm.default_system,
                     prompt_cache=base_lm.prompt_cache,
                     context_length=base_lm.context_length,
                     # The prompt cache is built from the model's layers, which
@@ -791,7 +793,7 @@ class ModelManager(SpeculativeLoaderMixin):
                         f"\nAdd it to {settings.models_config} or use a HuggingFace path "
                         f"like 'mlx-community/Qwen2.5-3B-Instruct-4bit'"
                     )
-                    raise ValueError(msg)
+                    raise ModelNotFoundError(msg)
 
                 hf_path = model_config.hf_path
 
@@ -1027,6 +1029,9 @@ class ModelManager(SpeculativeLoaderMixin):
                         flash_moe_config,
                         weight_quant_str,
                         image_config,
+                        # Registry dicts are loop-affine (#463): resolve the
+                        # manifest name here, not on the load worker (#760).
+                        self._manifest_name_for(hf_path),
                     )
                     timeout = settings.model_load_timeout
                     is_distributed = False
@@ -1169,7 +1174,7 @@ class ModelManager(SpeculativeLoaderMixin):
                     # pre-existing manifests that may lack the field.
                     _model_size = 0
                     if self.store is not None:
-                        _local_dir = self.store.local_path(hf_path)
+                        _local_dir = self.store.model_dir(hf_path)
                         if _local_dir.exists():
                             _manifest = await asyncio.to_thread(
                                 self.store.read_manifest, _local_dir
@@ -1228,6 +1233,7 @@ class ModelManager(SpeculativeLoaderMixin):
                         sync_mode=model_config.sync_mode,
                         enable_thinking=model_config.enable_thinking,
                         reasoning_effort=model_config.reasoning_effort,
+                        default_system=model_config.system,
                         prompt_cache=model_config.prompt_cache,
                         context_length=_context_length,
                         batching=model_config.batching,
@@ -1473,7 +1479,7 @@ class ModelManager(SpeculativeLoaderMixin):
         config = None
         # Check local store first
         if self.store is not None:
-            local_config = self.store.local_path(hf_path) / "config.json"
+            local_config = self.store.model_dir(hf_path) / "config.json"
             if local_config.exists():
                 try:
                     with open(local_config) as f:
@@ -1888,7 +1894,7 @@ class ModelManager(SpeculativeLoaderMixin):
         """Return the flash-prepared directory for a model, if it exists."""
         if self.store is None:
             return None
-        flash_path = self.store.local_path(hf_path) / "flash"
+        flash_path = self.store.model_dir(hf_path) / "flash"
         if flash_path.exists() and (flash_path / "flash_layout.json").exists():
             return flash_path
         return None
@@ -2121,7 +2127,7 @@ class ModelManager(SpeculativeLoaderMixin):
         if Path(hf_path).is_absolute():
             model_dir = Path(hf_path)
         elif self.store is not None:
-            model_dir = self.store.local_path(hf_path)
+            model_dir = self.store.model_dir(hf_path)
         config = None
         if model_dir is not None:
             try:
@@ -2181,7 +2187,7 @@ class ModelManager(SpeculativeLoaderMixin):
                 f"Invalid SpectralQuant bit width {kv_cache_quant!r}; expected 2 or 4"
             )
 
-        spectral_path = self.store.local_path(hf_path) / "spectral"
+        spectral_path = self.store.model_dir(hf_path) / "spectral"
         if spectral_path.exists() and (spectral_path / "spectral_config.json").exists():
             try:
                 config = json.loads(
@@ -2246,7 +2252,7 @@ class ModelManager(SpeculativeLoaderMixin):
             f"{kv_cache_quant!r}"
         )
         avg_bits = int(bits_str)
-        local_dir = self.store.local_path(hf_path)
+        local_dir = self.store.model_dir(hf_path)
         logger = logging.getLogger(__name__)
         logger.info(
             "Auto-calibrating spectral quant (%s-bit) for %s "
@@ -2298,7 +2304,7 @@ class ModelManager(SpeculativeLoaderMixin):
                 f"Invalid shard bit width {kv_cache_quant!r}; expected 2, 4 or 8"
             )
 
-        shard_path = self.store.local_path(hf_path) / "shard"
+        shard_path = self.store.model_dir(hf_path) / "shard"
         if shard_path.exists() and (shard_path / "shard_config.json").exists():
             try:
                 config = json.loads((shard_path / "shard_config.json").read_text())
@@ -2355,7 +2361,7 @@ class ModelManager(SpeculativeLoaderMixin):
             f"_auto_calibrate_shard called with non-shard quant: {kv_cache_quant!r}"
         )
         bits = int(bits_str)
-        local_dir = self.store.local_path(hf_path)
+        local_dir = self.store.model_dir(hf_path)
         logger = logging.getLogger(__name__)
         logger.info(
             "Auto-calibrating shard quant (%s-bit) for %s "
@@ -2503,8 +2509,13 @@ class ModelManager(SpeculativeLoaderMixin):
                     "Loading draft model %s for speculative decoding",
                     flash_config.flash_speculative_draft_model,
                 )
+                # Through the model store like every other draft (#760) — a
+                # raw repo id would be fetched into the HF cache.
                 draft_model, _draft_tokenizer = load_model_with_strict_fallback(
-                    flash_config.flash_speculative_draft_model, lazy=False
+                    self._resolve_draft_path(
+                        flash_config.flash_speculative_draft_model
+                    ),
+                    lazy=False,
                 )
 
                 # Verify vocab compatibility — a mismatch causes silent token ID errors
@@ -2563,7 +2574,7 @@ class ModelManager(SpeculativeLoaderMixin):
         """Return the flash-MoE directory for a model, if it exists."""
         if self.store is None:
             return None
-        flash_moe_path = self.store.local_path(hf_path) / "flash_moe"
+        flash_moe_path = self.store.model_dir(hf_path) / "flash_moe"
         if (
             flash_moe_path.exists()
             and (flash_moe_path / "flash_moe_layout.json").exists()
@@ -2674,7 +2685,7 @@ class ModelManager(SpeculativeLoaderMixin):
             if Path(hf_path).is_absolute():
                 _target_local = Path(hf_path)
             elif self.store is not None:
-                _target_local = self.store.local_path(hf_path)
+                _target_local = self.store.model_dir(hf_path)
             if _target_local is not None:
                 _bundled = _probe_bundled_draft_dir(_target_local, strategy)
                 if _bundled is not None:
@@ -2716,6 +2727,7 @@ class ModelManager(SpeculativeLoaderMixin):
         flash_moe_config: FlashMoeConfig | None = None,
         weight_quant_str: str | None = None,
         image_config: Any = None,
+        manifest_name: str | None = None,
     ) -> tuple[Any, Any, bool, TemplateCaps, Any]:
         """Load a model, using config.json inspection to choose the right library.
 
@@ -2791,13 +2803,12 @@ class ModelManager(SpeculativeLoaderMixin):
             if local_dir.exists() and not (local_dir / "manifest.json").exists():
                 from olmlx.models.store import _derive_manifest
 
-                # Find the Ollama short name for this hf_path, falling back
-                # to the hf_path itself if no registry entry maps to it.
-                manifest_name = self.registry.normalize_name(hf_path)
-                for short_name, mc in self.registry.list_models().items():
-                    if mc.hf_path == hf_path:
-                        manifest_name = short_name
-                        break
+                # The Ollama short name was resolved on the loop thread
+                # (``_manifest_name_for``); iterating the registry here could
+                # race a loop-side mutation (#760). Direct callers without one
+                # fall back to the hf_path itself.
+                if manifest_name is None:
+                    manifest_name = self.registry.normalize_name(hf_path)
 
                 manifest = _derive_manifest(
                     local_dir,
@@ -3134,6 +3145,14 @@ class ModelManager(SpeculativeLoaderMixin):
         quantize_model(target, cfg)
         mx.eval(target.parameters())
 
+    def _manifest_name_for(self, hf_path: str) -> str:
+        """The registry short name serving *hf_path*, for a backfilled
+        manifest; falls back to the hf_path itself. Loop thread only."""
+        for short_name, mc in self.registry.list_models().items():
+            if mc.hf_path == hf_path:
+                return short_name
+        return self.registry.normalize_name(hf_path)
+
     def _load_model_and_shard(
         self,
         hf_path: str,
@@ -3143,6 +3162,7 @@ class ModelManager(SpeculativeLoaderMixin):
         flash_moe_config: FlashMoeConfig | None = None,
         weight_quant_str: str | None = None,
         image_config: Any = None,
+        manifest_name: str | None = None,
     ) -> tuple[Any, Any, bool, TemplateCaps, bool, Any]:
         """Load a model and optionally shard it for distributed inference.
 
@@ -3167,6 +3187,7 @@ class ModelManager(SpeculativeLoaderMixin):
             flash_moe_config=flash_moe_config,
             weight_quant_str=weight_quant_str,
             image_config=image_config,
+            manifest_name=manifest_name,
         )
         is_distributed = False
 

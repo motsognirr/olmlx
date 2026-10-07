@@ -421,3 +421,33 @@ def test_resolved_flash_carries_speculative_and_prefetch(monkeypatch):
     assert rf.flash_speculative_draft_model == "d/m"
     assert rf.flash_speculative_tokens == 7
     assert rf.prefetch is True
+
+
+class _LmOutput:
+    """mlx-vlm-style ``LanguageModelOutput(logits=...)`` wrapper."""
+
+    def __init__(self, logits):
+        self.logits = logits
+
+
+class _VlmStyleDraft(MockModel):
+    def __call__(self, input_ids, cache=None):
+        return _LmOutput(super().__call__(input_ids, cache=cache))
+
+
+def test_draft_loop_unwraps_language_model_output():
+    """#760 item 11: an mlx-vlm draft returns ``LanguageModelOutput``; the
+    flash draft loop must unwrap ``.logits`` like every other decoder."""
+    from mlx_lm.models.cache import make_prompt_cache
+
+    vocab_size, hidden_size = 32, 16
+    draft = _VlmStyleDraft(vocab_size, hidden_size)
+    decoder = SpeculativeFlashDecoder(
+        draft_model=draft,
+        target_model=MockTargetModel(vocab_size, hidden_size),
+        num_speculative_tokens=3,
+    )
+    decoder._draft_cache = make_prompt_cache(draft)
+    tokens, captured = decoder._draft_generate_cached(1, 3)
+    assert len(tokens) == 3
+    assert captured == []

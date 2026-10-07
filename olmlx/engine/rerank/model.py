@@ -150,7 +150,21 @@ class XLMRobertaCrossEncoder(nn.Module):
         self.layers = [XLMRobertaLayer(config) for _ in range(config.num_hidden_layers)]
         self.classifier = XLMRobertaClassificationHead(config)
 
+    @property
+    def max_input_tokens(self) -> int:
+        """Longest sequence the position table can embed: positions run to
+        ``seq_len + pad_token_id`` (see ``roberta_position_ids``)."""
+        return self.config.max_position_embeddings - self.config.pad_token_id - 1
+
     def __call__(self, input_ids: mx.array, attention_mask: mx.array) -> mx.array:
+        # Past the table, MLX's gather reads out of bounds and the scores are
+        # silently wrong; refuse instead (#760).
+        seq_len = input_ids.shape[1]
+        if seq_len > self.max_input_tokens:
+            raise ValueError(
+                f"reranker input of {seq_len} tokens exceeds the model's "
+                f"{self.max_input_tokens}-token window; shorten the query"
+            )
         # additive mask: keep -> 0, pad -> _MASK_FILL, shaped [b, 1, 1, s]
         additive = (1.0 - attention_mask.astype(mx.float32))[
             :, None, None, :
