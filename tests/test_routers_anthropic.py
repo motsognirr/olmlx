@@ -680,6 +680,95 @@ class TestAnthropicEndpoint:
         assert "stop_sequence" in delta and delta["stop_sequence"] is None
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("with_tools", [True, False])
+    async def test_streaming_pings_flow_without_cache_info(
+        self, app_client, with_tools
+    ):
+        """#757: paths that never send ``cache_info`` (speculative,
+        distributed, prompt cache off, panels) must still get
+        ``message_start`` + keepalive pings during a long silent generation,
+        not zero body bytes until the first content token (#616)."""
+        gate = asyncio.Event()
+
+        async def mock_stream(*args, **kwargs):
+            async def gen():
+                # Withhold all output until the client has seen a ping.
+                await asyncio.wait_for(gate.wait(), timeout=5)
+                yield {"text": "late answer", "done": False}
+                yield {
+                    "text": "",
+                    "done": True,
+                    "done_reason": "stop",
+                    "stats": TimingStats(eval_count=2),
+                }
+
+            return gen()
+
+        body: dict = {
+            "model": "qwen3",
+            "messages": [{"role": "user", "content": "hi"}],
+            "max_tokens": 50,
+            "stream": True,
+        }
+        if with_tools:
+            body["tools"] = [
+                {
+                    "name": "search",
+                    "description": "Search",
+                    "input_schema": {"type": "object", "properties": {}},
+                }
+            ]
+        # Drive the ASGI app directly: httpx's ASGITransport buffers the whole
+        # body, which would hide *when* bytes reach the client.
+        app = app_client._transport.app
+        seen: list[str] = []
+        payload = json.dumps(body).encode()
+        request_sent = False
+
+        async def receive():
+            nonlocal request_sent
+            if not request_sent:
+                request_sent = True
+                return {"type": "http.request", "body": payload, "more_body": False}
+            await asyncio.Event().wait()  # never disconnects
+
+        async def send(message):
+            if message["type"] != "http.response.body":
+                return
+            for line in message.get("body", b"").decode().splitlines():
+                if line.startswith("event: "):
+                    seen.append(line[len("event: ") :])
+                elif line == ": ping" and not gate.is_set():
+                    # Keepalive bytes reach the client while generation is
+                    # silent, without committing message_start (its cache
+                    # stats aren't known yet) or any content.
+                    assert seen == [], seen
+                    gate.set()
+
+        scope = {
+            "type": "http",
+            "asgi": {"version": "3.0"},
+            "http_version": "1.1",
+            "method": "POST",
+            "scheme": "http",
+            "path": "/v1/messages",
+            "raw_path": b"/v1/messages",
+            "query_string": b"",
+            "root_path": "",
+            "headers": [(b"content-type", b"application/json"), (b"host", b"test")],
+            "client": ("127.0.0.1", 1234),
+            "server": ("test", 80),
+        }
+        with (
+            patch("olmlx.routers.anthropic.generate_chat", side_effect=mock_stream),
+            patch("olmlx.routers.anthropic.KEEPALIVE_PING_INTERVAL", 0.05),
+        ):
+            await asyncio.wait_for(app(scope, receive, send), timeout=10)
+        assert gate.is_set(), f"no keepalive reached the client: {seen}"
+        assert seen[0] == "message_start", seen
+        assert seen[-1] == "message_stop", seen
+
+    @pytest.mark.asyncio
     async def test_streaming_tools_buffered_stop_sequence_hit(self, app_client):
         # #711: the buffered-tools streaming path must agree with the
         # incremental path when a stop sequence ends a tool-less response.

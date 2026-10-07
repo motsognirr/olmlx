@@ -16,6 +16,7 @@ from collections import OrderedDict
 from pathlib import Path
 from typing import Any
 
+from olmlx.engine.prompt_cache.checkpoint import materialize_restored_cache
 from olmlx.engine.prompt_cache.metrics import CacheMetrics
 from olmlx.engine.prompt_cache.radix import PrefixCacheIndex
 from olmlx.engine.prompt_cache.state import CachedPromptState
@@ -273,6 +274,26 @@ class PromptCacheStore:
                     exc_info=True,
                 )
 
+    @staticmethod
+    def _materialize_restored(cache_id: str, cache: list[Any]) -> bool:
+        """Materialize a freshly loaded cache on this thread (#757).
+
+        Returns False on failure *without* raising, so the caller skips the
+        restore but keeps the file: a ``MemoryError`` or transient Metal
+        error here says nothing about file integrity, unlike the load /
+        metadata failures that trigger the corrupt-file unlink.
+        """
+        try:
+            materialize_restored_cache(cache)
+        except Exception:
+            logger.warning(
+                "Failed to materialize cache '%s' restored from disk; keeping the file",
+                cache_id,
+                exc_info=True,
+            )
+            return False
+        return True
+
     def _load_from_disk(self, cache_id: str) -> CachedPromptState | None:
         """Try to load a cache entry from disk. Returns None if not found."""
         with _tracing.span("cache.disk_read", cache_id=cache_id) as _sp:
@@ -286,6 +307,8 @@ class PromptCacheStore:
                 cache, metadata = load_prompt_cache(
                     str(file_path), return_metadata=True
                 )
+                if not self._materialize_restored(cache_id, cache):
+                    return None
                 tokens = json.loads(metadata.get("tokens", "[]"))
                 # Pre-PR entries lack cache_type / is_checkpoint metadata;
                 # fall through to the CachedPromptState defaults in that
@@ -613,6 +636,8 @@ class PromptCacheStore:
                 cache, metadata = load_prompt_cache(
                     str(file_path), return_metadata=True
                 )
+                if not self._materialize_restored(cache_id, cache):
+                    return None, None
                 tokens = json.loads(metadata.get("tokens", "[]"))
                 cache_type = metadata.get("cache_type", "assistant")
                 is_checkpoint = metadata.get("is_checkpoint", "0") == "1"

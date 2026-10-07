@@ -4343,6 +4343,7 @@ async def _full_completion_inner(
 
                 from olmlx.engine.speculative_stream import (
                     speculative_stream_generate,
+                    tokenizer_eos_ids,
                 )
 
                 if isinstance(prompt, str):
@@ -4354,7 +4355,7 @@ async def _full_completion_inner(
                     prompt_tokens = prompt
 
                 cancel = threading.Event()
-                eos_token_id = getattr(lm.text_tokenizer, "eos_token_id", None)
+                eos_ids = tokenizer_eos_ids(lm.text_tokenizer)
                 result = None
                 text_parts = []
                 for response in speculative_stream_generate(
@@ -4362,7 +4363,7 @@ async def _full_completion_inner(
                     prompt_tokens,
                     max_tokens=max_tokens,
                     cancel_event=cancel,
-                    eos_token_id=eos_token_id,
+                    eos_token_ids=eos_ids,
                     tokenizer=lm.text_tokenizer,
                 ):
                     text_parts.append(response.text)

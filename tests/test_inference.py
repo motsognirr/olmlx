@@ -521,66 +521,98 @@ class TestBuildGenerateKwargs:
         assert "sampler" not in result
 
 
-class TestFrequencyPenaltyProcessor:
-    """Unit tests for _make_frequency_penalty_processor."""
+def _drive_penalty(processor, prompt, generated, vocab=4, as_array=True, rows=1):
+    """Drive *processor* the way every generation path does (#757): one call
+    per sampled token, the history growing by the newest generated token.
+    The first call's history is the prompt — its last token (exclusive mlx-lm
+    path) or all of it (batched / mlx-vlm) — and must never be penalized."""
+    out = None
+    for n in range(len(generated) + 1):
+        history = list(prompt) + list(generated[:n])
+        tokens = mx.array(history) if as_array else history
+        out = processor(tokens, mx.full((rows, vocab), 10.0))
+    return out
 
-    def test_no_tokens_returns_unchanged(self):
-        processor = _make_frequency_penalty_processor(0.5)
-        logits = mx.array([1.0, 2.0, 3.0])
-        result = processor([], logits)
-        assert mx.allclose(result, logits).item()
 
-    def test_zero_penalty_returns_unchanged(self):
-        processor = _make_frequency_penalty_processor(0.0)
-        logits = mx.array([1.0, 2.0])
-        result = processor([0, 1, 0], logits)
-        assert mx.allclose(result, logits).item()
+class TestPenaltyProcessors:
+    """OpenAI frequency/presence penalties over the *generated* tokens."""
 
-    def test_penalty_applied_by_frequency(self):
-        """Token 0 appears twice → gets 2x penalty; token 1 appears once → gets 1x."""
-        processor = _make_frequency_penalty_processor(0.5)
-        logits = mx.array([10.0, 10.0, 10.0])
-        result = processor([0, 1, 0], logits)
-        expected = mx.array([9.0, 9.5, 10.0])
-        assert mx.allclose(result, expected).item()
+    def test_first_call_never_penalizes_prompt(self):
+        """The first call's history is prompt only; on the batched/VLM paths
+        that's the full prompt, so seeding from it would ban common prompt
+        tokens on a long prompt."""
+        for make in (
+            _make_frequency_penalty_processor,
+            _make_presence_penalty_processor,
+        ):
+            out = make(1.0)(mx.array([0, 0, 0, 1]), mx.full((1, 4), 10.0))
+            assert mx.allclose(out, mx.full((1, 4), 10.0)).item()
 
-    def test_multiple_tokens_same_penalty(self):
+    def test_prompt_tokens_not_counted_later(self):
         processor = _make_frequency_penalty_processor(1.0)
-        logits = mx.array([5.0, 5.0, 5.0, 5.0])
-        result = processor([0, 0, 0, 2], logits)
-        expected = mx.array([2.0, 5.0, 4.0, 5.0])
-        assert mx.allclose(result, expected).item()
+        out = _drive_penalty(processor, prompt=[0, 0, 0], generated=[1])
+        assert mx.allclose(out, mx.array([[10.0, 9.0, 10.0, 10.0]])).item()
 
+    def test_frequency_penalty_counts_generated(self):
+        processor = _make_frequency_penalty_processor(0.5)
+        out = _drive_penalty(processor, prompt=[3], generated=[0, 1, 0])
+        assert mx.allclose(out, mx.array([[9.0, 9.5, 10.0, 10.0]])).item()
 
-class TestPresencePenaltyProcessor:
-    """Unit tests for _make_presence_penalty_processor."""
-
-    def test_no_tokens_returns_unchanged(self):
+    def test_presence_penalty_once_per_seen_token(self):
         processor = _make_presence_penalty_processor(0.5)
-        logits = mx.array([1.0, 2.0, 3.0])
-        result = processor([], logits)
-        assert mx.allclose(result, logits).item()
+        out = _drive_penalty(processor, prompt=[3], generated=[0, 1, 0])
+        assert mx.allclose(out, mx.array([[9.5, 9.5, 10.0, 10.0]])).item()
+
+    def test_presence_penalty_persists_across_steps(self):
+        """Logits are fresh every call, so every seen token is re-penalized
+        on every step, not just the newly seen one."""
+        processor = _make_presence_penalty_processor(0.5)
+        out = _drive_penalty(processor, prompt=[3], generated=[0, 1, 2])
+        assert mx.allclose(out, mx.array([[9.5, 9.5, 9.5, 10.0]])).item()
+
+    def test_list_history(self):
+        processor = _make_frequency_penalty_processor(1.0)
+        out = _drive_penalty(processor, prompt=[3], generated=[0, 0], as_array=False)
+        assert mx.allclose(out, mx.array([[8.0, 10.0, 10.0, 10.0]])).item()
+
+    def test_one_dimensional_logits(self):
+        processor = _make_frequency_penalty_processor(1.0)
+        processor(mx.array([3]), mx.full((4,), 10.0))
+        out = processor(mx.array([3, 1]), mx.full((4,), 10.0))
+        assert mx.allclose(out, mx.array([10.0, 9.0, 10.0, 10.0])).item()
+
+    def test_empty_first_history_still_counts_next_token(self):
+        """A caller whose first call carries an empty history must not make
+        the next call (re)initialize instead of counting its token."""
+        processor = _make_frequency_penalty_processor(1.0)
+        processor(mx.array([], dtype=mx.int32), mx.full((1, 4), 10.0))
+        processor(mx.array([0]), mx.full((1, 4), 10.0))
+        out = processor(mx.array([0, 1]), mx.full((1, 4), 10.0))
+        assert mx.allclose(out, mx.array([[9.0, 9.0, 10.0, 10.0]])).item()
 
     def test_zero_penalty_returns_unchanged(self):
-        processor = _make_presence_penalty_processor(0.0)
-        logits = mx.array([1.0, 2.0])
-        result = processor([0, 1], logits)
-        assert mx.allclose(result, logits).item()
+        for make in (
+            _make_frequency_penalty_processor,
+            _make_presence_penalty_processor,
+        ):
+            out = _drive_penalty(make(0.0), prompt=[3], generated=[0, 1])
+            assert mx.allclose(out, mx.full((1, 4), 10.0)).item()
 
-    def test_penalty_applied_by_presence(self):
-        """Token 0 and 1 appear → penalized once each regardless of frequency."""
-        processor = _make_presence_penalty_processor(0.5)
-        logits = mx.array([10.0, 10.0, 10.0])
-        result = processor([0, 0, 1], logits)
-        expected = mx.array([9.5, 9.5, 10.0])
-        assert mx.allclose(result, expected).item()
+    def test_empty_history_returns_unchanged(self):
+        processor = _make_frequency_penalty_processor(1.0)
+        out = processor([], mx.full((1, 4), 10.0))
+        assert mx.allclose(out, mx.full((1, 4), 10.0)).item()
 
     def test_out_of_range_token_ignored(self):
-        processor = _make_presence_penalty_processor(0.5)
-        logits = mx.array([10.0, 10.0])
-        result = processor([0, 5], logits)
-        expected = mx.array([9.5, 10.0])
-        assert mx.allclose(result, expected).item()
+        processor = _make_frequency_penalty_processor(1.0)
+        out = _drive_penalty(processor, prompt=[3], generated=[9, 0])
+        assert mx.allclose(out, mx.array([[9.0, 10.0, 10.0, 10.0]])).item()
+
+    def test_preserves_logits_dtype(self):
+        processor = _make_frequency_penalty_processor(1.0)
+        processor(mx.array([3]), mx.full((1, 4), 10.0, dtype=mx.bfloat16))
+        out = processor(mx.array([3, 0]), mx.full((1, 4), 10.0, dtype=mx.bfloat16))
+        assert out.dtype == mx.bfloat16
 
 
 class TestStopSequenceHandling:

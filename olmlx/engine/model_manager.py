@@ -3129,6 +3129,8 @@ class ModelManager(SpeculativeLoaderMixin):
             cfg.group_size,
             hf_path,
         )
+        # quantize_model evals each HQQLinear's (underscore-keyed, so
+        # parameters()-invisible) buffers as it builds them (#757).
         quantize_model(target, cfg)
         mx.eval(target.parameters())
 

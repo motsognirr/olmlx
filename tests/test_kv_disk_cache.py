@@ -10,6 +10,17 @@ import pytest
 from olmlx.engine.model_manager import CachedPromptState, PromptCacheStore
 
 
+@pytest.fixture(autouse=True)
+def _no_restore_materialize():
+    """These tests exercise store bookkeeping with placeholder caches
+    (strings), which can't be ``mx.eval``'d. The real restore-time
+    materialization (#757) is gated by
+    ``test_thread_local_streams.py::TestDiskRestoredPromptCacheMaterialization``.
+    """
+    with patch("olmlx.engine.prompt_cache.store.materialize_restored_cache"):
+        yield
+
+
 def _make_state(token_id: int = 1) -> CachedPromptState:
     """Create a minimal CachedPromptState for testing."""
     return CachedPromptState(tokens=[token_id], cache=[f"cache_{token_id}"])
@@ -817,3 +828,35 @@ class TestAsyncDiskCache:
 
         # get returns None for missing
         assert store.get("missing") is None
+
+
+class TestRestoreMaterializeFailureKeepsFile:
+    """#757 review: a failure to materialize a restored cache (MemoryError,
+    transient Metal error) says nothing about file integrity, so it must not
+    trigger the corrupt-file unlink and lose a valid on-disk entry."""
+
+    def _spilled(self, tmp_path):
+        store = PromptCacheStore(max_slots=4, disk_path=tmp_path, model_name="m")
+        path = store._disk_file_path("a")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"x")
+        return store, path
+
+    @pytest.mark.parametrize("reader", ["_read_from_disk", "_load_from_disk"])
+    def test_materialize_failure_keeps_file(self, tmp_path, reader):
+        store, path = self._spilled(tmp_path)
+        with (
+            patch(
+                "olmlx.engine.prompt_cache.store.load_prompt_cache",
+                return_value=(["kv"], {"tokens": "[1]"}),
+            ),
+            patch(
+                "olmlx.engine.prompt_cache.store.materialize_restored_cache",
+                side_effect=MemoryError("metal"),
+            ),
+        ):
+            result = getattr(store, reader)("a")
+        state = result[0] if isinstance(result, tuple) else result
+        assert state is None
+        assert path.exists()
+        assert "a" not in store._entries

@@ -1068,3 +1068,62 @@ class TestResponsesMalformedToolSchemaRejected:
         )
         assert resp.status_code == 400
         assert "text/event-stream" not in resp.headers.get("content-type", "")
+
+
+def _sdk_accumulate(events: list[dict]):
+    """Feed parsed SSE events through the installed openai SDK's stream
+    accumulator, returning its final snapshot (what a client sees)."""
+    from openai import omit
+    from openai._models import construct_type
+    from openai.lib.streaming.responses._responses import ResponseStreamState
+    from openai.types.responses import ResponseStreamEvent
+
+    state = ResponseStreamState(input_tools=[], text_format=omit)
+    for e in events:
+        if e["data"] is None or "type" not in e["data"]:
+            continue
+        state.handle_event(construct_type(type_=ResponseStreamEvent, value=e["data"]))
+    return state._ResponseStreamState__current_snapshot
+
+
+class TestStreamSdkAccumulation:
+    """#757: ``response.output_item.added`` must carry an in-progress skeleton
+    (empty text / arguments). The SDK appends every following delta onto the
+    added item, so a finished item there doubles its content."""
+
+    @staticmethod
+    async def _stream(app_client, raw: str, tools: bool):
+        async def mock_stream(*args, **kwargs):
+            async def gen():
+                yield {"text": raw, "done": False}
+                yield {"text": "", "done": True, "stats": TimingStats()}
+
+            return gen()
+
+        body: dict = {"model": "qwen3", "input": "go", "stream": True}
+        if tools:
+            body["tools"] = [
+                {"type": "function", "name": "f", "parameters": {"type": "object"}}
+            ]
+        with patch("olmlx.routers.responses.generate_chat", side_effect=mock_stream):
+            resp = await app_client.post("/v1/responses", json=body)
+        return _sdk_accumulate(_parse_sse(resp.text))
+
+    @pytest.mark.asyncio
+    async def test_tools_mode_text_not_doubled(self, app_client):
+        snap = await self._stream(app_client, "hello", tools=True)
+        msgs = [o for o in snap.output if o.type == "message"]
+        assert [c.text for c in msgs[0].content] == ["hello"]
+
+    @pytest.mark.asyncio
+    async def test_tools_mode_arguments_not_doubled(self, app_client):
+        raw = '<tool_call>{"name": "f", "arguments": {"a": 1}}</tool_call>'
+        snap = await self._stream(app_client, raw, tools=True)
+        fc = next(o for o in snap.output if o.type == "function_call")
+        assert json.loads(fc.arguments) == {"a": 1}
+
+    @pytest.mark.asyncio
+    async def test_text_mode_single_content_part(self, app_client):
+        snap = await self._stream(app_client, "hello", tools=False)
+        msgs = [o for o in snap.output if o.type == "message"]
+        assert [c.text for c in msgs[0].content] == ["hello"]
