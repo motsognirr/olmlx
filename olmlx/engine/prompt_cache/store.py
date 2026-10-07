@@ -12,6 +12,7 @@ import logging
 import os
 import re
 import shutil
+import time
 import uuid
 from collections import OrderedDict
 from pathlib import Path
@@ -34,6 +35,10 @@ except ImportError:  # pragma: no cover
     load_prompt_cache = None  # type: ignore[assignment]
 
 logger = logging.getLogger(__name__)
+
+#: Age after which a spill temp file is a crash leftover, not a write in
+#: flight (a spill of even a very long context takes seconds).
+_STALE_TEMP_SPILL_SECONDS = 3600
 
 
 def _checkpoint_kv_depth(cache: Any) -> int | None:
@@ -441,6 +446,28 @@ class PromptCacheStore:
             f.stat().st_size for f in disk_dir.glob("*.safetensors")
         )
 
+    @staticmethod
+    def _purge_stale_temp_spills(disk_dir: Path) -> None:
+        """Remove spill temp files a crash left in ``.tmp/`` (#760).
+
+        ``_save_to_disk``'s ``finally`` removes its temp file on any
+        exception, but not if the process dies mid-write; such files are
+        invisible to the ``*.safetensors`` accounting and eviction above. Only
+        files older than ``_STALE_TEMP_SPILL_SECONDS`` are removed, so a write
+        in flight (from this or another store on the same model dir) is safe.
+        """
+        tmp_dir = disk_dir / ".tmp"
+        if not tmp_dir.is_dir():
+            return
+        cutoff = time.time() - _STALE_TEMP_SPILL_SECONDS
+        for f in tmp_dir.iterdir():
+            try:
+                if f.is_file() and f.stat().st_mtime < cutoff:
+                    f.unlink(missing_ok=True)
+                    logger.info("Disk cache cleanup: removed stale temp %s", f)
+            except OSError:
+                continue
+
     def _cleanup_disk(self) -> None:
         """Refresh bytes_on_disk and, if a size cap is set, remove
         oldest disk cache files until the total fits.
@@ -451,6 +478,7 @@ class PromptCacheStore:
         if not disk_dir.exists():
             self.metrics.bytes_on_disk = 0
             return
+        self._purge_stale_temp_spills(disk_dir)
         # Single stat pass: collect (path, size, mtime) to avoid double-stat
         file_info = []
         for f in disk_dir.glob("*.safetensors"):

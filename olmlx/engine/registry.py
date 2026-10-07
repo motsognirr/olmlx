@@ -2084,8 +2084,12 @@ class ModelRegistry:
             self._dirty_keys.add(alias)
             self._removed_keys.discard(alias)
         if dependents:
-            self._save_aliases()
+            # Mappings first: if the alias save then fails, aliases.json still
+            # names them alongside the new entries (redundant but resolvable).
+            # The reverse order could drop them from aliases.json before
+            # models.json gained them, orphaning the names after a restart.
             self._save_mappings()
+            self._save_aliases()
         return dependents
 
     def remove(self, name: str):

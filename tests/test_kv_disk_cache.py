@@ -909,3 +909,29 @@ class TestDiskSpillAtomicWrite:
         assert not final.exists()
         leftovers = [p for p in tmp_path.rglob("*") if p.is_file()]
         assert leftovers == []
+
+
+class TestStaleTempSpillPurge:
+    """#760 follow-up: crash-orphaned spill temps are purged by disk
+    cleanup; a fresh (in-flight) temp is left alone."""
+
+    def test_cleanup_removes_only_stale_temps(self, tmp_path):
+        import os
+        import time
+
+        store = PromptCacheStore(
+            max_slots=1, disk_path=tmp_path, model_name="test-model"
+        )
+        tmp_dir = store._disk_dir() / ".tmp"
+        tmp_dir.mkdir(parents=True)
+        stale = tmp_dir / "a.1.safetensors"
+        fresh = tmp_dir / "b.2.safetensors"
+        stale.write_bytes(b"x")
+        fresh.write_bytes(b"y")
+        old = time.time() - 2 * 3600
+        os.utime(stale, (old, old))
+
+        store._cleanup_disk()
+
+        assert not stale.exists()
+        assert fresh.exists()

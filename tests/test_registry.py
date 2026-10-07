@@ -2048,3 +2048,24 @@ class TestModelConfigSystem:
     def test_non_str_rejected(self):
         with pytest.raises(ValueError, match="system"):
             ModelConfig.from_entry({"hf_path": "org/model", "system": 3})
+
+
+class TestPromoteAliasesSaveOrder:
+    """#760 follow-up: promote_aliases_of persists models.json before
+    aliases.json, so a failed second write can't orphan the names."""
+
+    def test_mappings_saved_before_aliases(self, registry):
+        from unittest.mock import patch
+
+        registry.add_alias("a", "qwen3")
+        calls: list[str] = []
+        with (
+            patch.object(
+                registry, "_save_mappings", side_effect=lambda: calls.append("m")
+            ),
+            patch.object(
+                registry, "_save_aliases", side_effect=lambda: calls.append("a")
+            ),
+        ):
+            assert registry.promote_aliases_of("qwen3") == ["a:latest"]
+        assert calls == ["m", "a"]
