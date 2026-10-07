@@ -15,6 +15,7 @@ from fastapi.responses import PlainTextResponse, Response, StreamingResponse
 
 from olmlx.config import settings
 from olmlx.engine.inference import generate_speech, generate_transcription
+from olmlx.engine.loaded_model import ModelNotFoundError
 from olmlx.engine.tts import UnknownVoiceError, resolve_voice
 from olmlx.schemas.audio import (
     SpeechRequest,
@@ -206,6 +207,8 @@ async def create_speech(request: Request, body: SpeechRequest):
         try:
             async for chunk in _pcm_chunks():
                 parts.append(chunk)
+        except ModelNotFoundError:
+            raise  # app handler → 404 (#760)
         except ValueError as exc:  # non-TTS model etc.
             # A backend crash raises TTSGenerationError (a RuntimeError), so
             # it flows past this catch to app.py's 500 handler (#703).
@@ -227,6 +230,8 @@ async def create_speech(request: Request, body: SpeechRequest):
         first = await pcm_agen.__anext__()
     except StopAsyncIteration:
         first = b""
+    except ModelNotFoundError:
+        raise  # app handler → 404 (#760)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 

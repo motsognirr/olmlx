@@ -61,7 +61,7 @@ def _manager_with_store(tmp_path):
 
     mgr = ModelManager.__new__(ModelManager)
     store = MagicMock()
-    store.local_path.return_value = tmp_path
+    store.model_dir.return_value = store.local_path.return_value = tmp_path
     mgr.store = store
     return mgr
 

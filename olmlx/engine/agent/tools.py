@@ -405,6 +405,7 @@ class AgentToolManager(BuiltinToolManager):
         context: "AgentContext",
         skills: Any = None,
         image_tool: AgentImageTool | None = None,
+        offer_create_skill: bool = True,
     ):
         super().__init__(config)
         self._context = context
@@ -417,9 +418,10 @@ class AgentToolManager(BuiltinToolManager):
             _FINISH_DEF,
             _REMEMBER_DEF,
             _RECALL_DEF,
-            _CREATE_SKILL_DEF,
             _DELEGATE_DEF,
         ]
+        if offer_create_skill:
+            self._agent_defs.append(_CREATE_SKILL_DEF)
         if image_tool is not None:
             self._agent_defs.append(_GENERATE_IMAGE_DEF)
 
@@ -443,7 +445,7 @@ class AgentToolManager(BuiltinToolManager):
             return await self._handle_remember(arguments)
         if name == "recall":
             return await self._handle_recall(arguments)
-        if name == "create_skill":
+        if name == "create_skill" and _CREATE_SKILL_DEF in self._agent_defs:
             return await self._handle_create_skill(arguments)
         if name == "delegate":
             return await self._handle_delegate(arguments)
@@ -494,11 +496,39 @@ class AgentToolManager(BuiltinToolManager):
         return "\n".join(f"- {r}" for r in results)
 
     async def _handle_create_skill(self, arguments: dict) -> str | ToolError:
-        from olmlx.chat.skills import write_skill_file
+        from olmlx.chat.skills import validate_skill_name, write_skill_file
 
         name = str(arguments.get("name", "")).strip()
         description = str(arguments.get("description", "")).strip()
         body = str(arguments.get("body", ""))
+        try:
+            validate_skill_name(name)
+        except ValueError as exc:
+            return ToolError(
+                message=f"Invalid skill: {exc}",
+                tool_name="create_skill",
+                is_user_error=True,
+            )
+        # Only skills an agent run authored (recorded in the store) may be
+        # replaced; a same-named skill someone else wrote is never clobbered
+        # (#758).
+        skills_dir = (
+            self._skills.skills_dir
+            if self._skills is not None
+            else self._config.skills_dir
+        )
+        taken = (
+            self._skills is not None and self._skills.get_skill(name) is not None
+        ) or await asyncio.to_thread((skills_dir / f"{name}.md").exists)
+        if taken and await self._context.store.get_skill(name) is None:
+            return ToolError(
+                message=(
+                    f"A skill named {name!r} already exists and was not "
+                    "authored by an agent run; choose a different name."
+                ),
+                tool_name="create_skill",
+                is_user_error=True,
+            )
         try:
             if self._skills is not None:
                 # Route through the live SkillManager so the new skill is
@@ -513,7 +543,7 @@ class AgentToolManager(BuiltinToolManager):
             else:
                 path = await asyncio.to_thread(
                     write_skill_file,
-                    self._config.skills_dir,
+                    skills_dir,
                     name,
                     description,
                     body,
@@ -540,10 +570,25 @@ class AgentToolManager(BuiltinToolManager):
                 is_user_error=False,
             )
         goal = str(arguments.get("goal", "")).strip()
-        try:
-            result = await runner.delegate(parent_id=self._context.run_id, goal=goal)
-        except DelegateError as exc:
-            return ToolError(message=str(exc), tool_name="delegate", is_user_error=True)
+        remaining = self._context.remaining_budget
+        # One child at a time per parent, so each is granted what the
+        # previous one left (and its wallclock starts when it does).
+        async with self._context.delegate_lock:
+            try:
+                result = await runner.delegate(
+                    parent_id=self._context.run_id,
+                    goal=goal,
+                    budget=remaining() if remaining is not None else None,
+                )
+            except DelegateError as exc:
+                return ToolError(
+                    message=str(exc), tool_name="delegate", is_user_error=True
+                )
+            if self._context.charge_child is not None:
+                self._context.charge_child(
+                    int(result.get("iterations") or 0),
+                    int(result.get("tokens") or 0),
+                )
         status = result.get("status")
         if status == "finished":
             return f"Subagent finished. Result: {result.get('result') or '(none)'}"

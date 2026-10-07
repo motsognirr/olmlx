@@ -12,6 +12,7 @@ import logging
 import os
 import re
 import shutil
+import uuid
 from collections import OrderedDict
 from pathlib import Path
 from typing import Any
@@ -33,6 +34,23 @@ except ImportError:  # pragma: no cover
     load_prompt_cache = None  # type: ignore[assignment]
 
 logger = logging.getLogger(__name__)
+
+
+def _checkpoint_kv_depth(cache: Any) -> int | None:
+    """KV depth shared by every layer exposing an int ``offset``, else None.
+
+    Recurrent ``ArraysCache`` layers carry no offset; a hybrid's attention
+    layers do. Exact ``int`` so a MagicMock layer never reports a depth.
+    Layers that disagree make the depth unknown (None) rather than a
+    mismatch, so an exotic layout can't get every checkpoint refused.
+    """
+    if not isinstance(cache, (list, tuple)):
+        return None
+    offsets = {
+        layer.offset for layer in cache if type(getattr(layer, "offset", None)) is int
+    }
+    return offsets.pop() if len(offsets) == 1 else None
+
 
 # Layer classes the byte estimator failed to size (issue #465). Warned once
 # per class so bytes_in_ram undercounting is visible without log spam.
@@ -147,7 +165,11 @@ def _estimate_state_bytes(state: CachedPromptState) -> int:
                     total += nbytes
 
         if hasattr(layer, "__dict__"):
-            _walk(list(vars(layer).values()))
+            # Calibration constants that Shard/Spectral caches share by
+            # reference across entries (``_SHARED_CONSTANTS``, #634) aren't a
+            # per-entry cost: charging them overcharged every entry (#760).
+            shared = getattr(type(layer), "_SHARED_CONSTANTS", ())
+            _walk([v for k, v in vars(layer).items() if k not in shared])
         # ``_MISSING`` (not ``None``) so a present-but-empty ``.state``
         # still counts as a strategy match below. Note ``getattr`` with a
         # default also swallows a *property* that raises AttributeError —
@@ -258,7 +280,20 @@ class PromptCacheStore:
                     "cache_type": state.cache_type,
                     "is_checkpoint": "1" if state.is_checkpoint else "0",
                 }
-                save_prompt_cache(str(file_path), state.cache, metadata)
+                # Write to a temp file and rename into place, so a concurrent
+                # reader never sees a half-written spill at the final path —
+                # it would fail to parse it and unlink it (#760). The temp
+                # lives in a subdirectory (same filesystem, so os.replace is
+                # atomic) that the non-recursive ``*.safetensors`` scans skip;
+                # it keeps the suffix because mlx appends one otherwise.
+                tmp_dir = disk_dir / ".tmp"
+                tmp_dir.mkdir(exist_ok=True)
+                tmp_path = tmp_dir / f"{file_path.stem}.{uuid.uuid4().hex}.safetensors"
+                try:
+                    save_prompt_cache(str(tmp_path), state.cache, metadata)
+                    os.replace(tmp_path, file_path)
+                finally:
+                    tmp_path.unlink(missing_ok=True)
                 if file_path.exists():
                     _sp.set_attribute("bytes", file_path.stat().st_size)
                 logger.info(
@@ -911,7 +946,19 @@ class PromptCacheStore:
         """Add a checkpoint state, keyed by its tokens.
 
         Re-inserting with the same tokens replaces the prior entry.
+
+        Refuses (with a warning) a state whose KV depth disagrees with its
+        token key: a warm start trusts ``len(state.tokens)`` as the covered
+        depth, so a short cache would silently skip prefilling the rest (#761).
         """
+        depth = _checkpoint_kv_depth(state.cache)
+        if depth is not None and depth != len(state.tokens):
+            logger.warning(
+                "Refusing checkpoint: cache depth %d != %d key tokens",
+                depth,
+                len(state.tokens),
+            )
+            return
         cid = self._checkpoint_cache_id(state.tokens)
         evicted = self.set(cid, state)
         if evicted is not None:
@@ -948,6 +995,18 @@ class PromptCacheStore:
             # produce indefinite radix misses for an otherwise-recoverable
             # prefix.
             self._radix.remove(tokens[:depth], cid)
+            self.metrics.radix_misses += 1
+            return None
+        kv_depth = _checkpoint_kv_depth(state.cache)
+        if kv_depth is not None and kv_depth != depth:
+            # A short cache (e.g. a pre-#761 cancelled prefill restored from
+            # disk) would make the caller skip prefilling the gap. Drop it.
+            logger.warning(
+                "Dropping checkpoint: cache depth %d != %d key tokens",
+                kv_depth,
+                depth,
+            )
+            self.remove(cid)
             self.metrics.radix_misses += 1
             return None
         self._entries.move_to_end(cid)

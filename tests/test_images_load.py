@@ -97,7 +97,7 @@ class TestModelKindFromEntry:
 
         def fake_load(hf_path, *args):
             captured["hf_path"] = hf_path
-            captured["image_config"] = args[-1] if args else None
+            captured["image_config"] = args[5] if len(args) > 5 else None
             return (MagicMock(), None, False, TemplateCaps(), False, None)
 
         monkeypatch.setattr(mgr, "_load_model_and_shard", fake_load)

@@ -133,7 +133,7 @@ async def test_error_format_per_api(integration_ctx):
             "messages": [{"role": "user", "content": "Hi"}],
         },
     )
-    assert ollama_resp.status_code == 400
+    assert ollama_resp.status_code == 404  # unknown model (#760)
     ollama_body = ollama_resp.json()
     assert "error" in ollama_body
     assert isinstance(ollama_body["error"], str)
@@ -147,7 +147,7 @@ async def test_error_format_per_api(integration_ctx):
             "messages": [{"role": "user", "content": "Hi"}],
         },
     )
-    assert openai_resp.status_code == 400
+    assert openai_resp.status_code == 404  # unknown model (#760)
     openai_body = openai_resp.json()
     assert "error" in openai_body
     assert "message" in openai_body["error"]
@@ -164,7 +164,7 @@ async def test_error_format_per_api(integration_ctx):
             "messages": [{"role": "user", "content": "Hi"}],
         },
     )
-    assert anthropic_resp.status_code == 400
+    assert anthropic_resp.status_code == 404  # unknown model (#760)
     anthropic_body = anthropic_resp.json()
     assert anthropic_body["type"] == "error"
     assert "type" in anthropic_body["error"]

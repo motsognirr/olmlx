@@ -27,6 +27,8 @@ logger = logging.getLogger(__name__)
 _READ_FILE_MAX_BYTES = 10 * 1024 * 1024
 # Maximum results for glob
 _GLOB_MAX_RESULTS = 500
+#: Candidates a workspace-confined glob examines before giving up (#758).
+_GLOB_MAX_SCANNED = 50_000
 # Maximum output for grep
 _GREP_MAX_BYTES = 50_000
 # Default bash timeout
@@ -135,13 +137,43 @@ def _resolve_path(
     return resolved
 
 
+def _open_confined(path: Path, root: Path, *, directory: bool = False) -> int:
+    """Open an already-confined *path* without following any symlink.
+
+    ``_resolve_path(confine_root=...)`` checks a symlink-free path, but a
+    component could be swapped for a symlink before a plain ``open()`` (#758).
+    Walking the path from *root* with ``dir_fd`` + ``O_NOFOLLOW`` makes any
+    such swap fail the open instead of escaping the workspace. Same approach
+    as the agent's ``_write_new`` on the write side.
+    """
+    real_root = root.resolve()
+    parts = path.relative_to(real_root).parts
+    dir_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    fd = os.open(real_root, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        for i, part in enumerate(parts):
+            last = i == len(parts) - 1
+            flags = (
+                dir_flags if (directory or not last) else os.O_RDONLY | os.O_NOFOLLOW
+            )
+            next_fd = os.open(part, flags, dir_fd=fd)
+            os.close(fd)
+            fd = next_fd
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd
+
+
 # -- Tool handler functions --
 
 
-async def _handle_read_file(args: dict) -> str | ToolError:
+async def _handle_read_file(
+    args: dict, confine_root: Path | None = None
+) -> str | ToolError:
     path = args.get("path", "")
     try:
-        safe_path = _resolve_path(path)
+        safe_path = _resolve_path(path, confine_root=confine_root)
     except ValueError as exc:
         return ToolError(message=str(exc), tool_name="read_file", is_user_error=True)
     offset = args.get("offset", 1)
@@ -149,7 +181,11 @@ async def _handle_read_file(args: dict) -> str | ToolError:
     start = max(offset - 1, 0)
 
     def _read() -> list[str]:
-        with open(safe_path, errors="replace") as f:
+        if confine_root is not None:
+            f_ctx = os.fdopen(_open_confined(safe_path, confine_root), errors="replace")
+        else:
+            f_ctx = open(safe_path, errors="replace")
+        with f_ctx as f:
             # Check file size after opening to avoid TOCTOU
             f.seek(0, 2)
             size = f.tell()
@@ -263,18 +299,49 @@ async def _handle_edit_file(
     return await asyncio.to_thread(_edit)
 
 
-async def _handle_glob(args: dict) -> str:
+async def _handle_glob(args: dict, confine_root: Path | None = None) -> str | ToolError:
     pattern = args.get("pattern", "")
     path = args.get("path", ".")
 
-    # A model-issued ``**/*`` over a large tree (or ``/``) would block the
-    # whole event loop — in server/agent mode that freezes every endpoint,
-    # not just this chat. Offload like the other file handlers (#614).
-    matches = sorted(
-        await asyncio.to_thread(
+    if confine_root is not None:
+        # An absolute or ``..`` pattern ignores/escapes ``root_dir`` (#758).
+        if Path(pattern).is_absolute() or ".." in Path(pattern).parts:
+            return ToolError(
+                message=f"Pattern {pattern!r} must be relative to the workspace "
+                "and must not contain '..'",
+                tool_name="glob",
+                is_user_error=True,
+            )
+        try:
+            root_dir = _resolve_path(path, confine_root=confine_root)
+        except ValueError as exc:
+            return ToolError(message=str(exc), tool_name="glob", is_user_error=True)
+        real_root = confine_root.resolve()
+
+        def _confined_glob() -> list[str]:
+            # Drop matches reached through a symlink that leaves the workspace.
+            # ``**`` follows symlinked dirs, so a link to / could walk the whole
+            # disk: stop once the result cap is exceeded or after a bounded
+            # number of candidates, whichever comes first.
+            found: list[str] = []
+            for n, m in enumerate(
+                glob_module.iglob(pattern, root_dir=root_dir, recursive=True)
+            ):
+                if n >= _GLOB_MAX_SCANNED or len(found) > _GLOB_MAX_RESULTS:
+                    break
+                if (root_dir / m).resolve().is_relative_to(real_root):
+                    found.append(m)
+            return found
+
+        found = await asyncio.to_thread(_confined_glob)
+    else:
+        # A model-issued ``**/*`` over a large tree (or ``/``) would block the
+        # whole event loop — in server/agent mode that freezes every endpoint,
+        # not just this chat. Offload like the other file handlers (#614).
+        found = await asyncio.to_thread(
             glob_module.glob, pattern, root_dir=path, recursive=True
         )
-    )
+    matches = sorted(found)
     if not matches:
         return "No matches found."
 
@@ -285,9 +352,14 @@ async def _handle_glob(args: dict) -> str:
     return "\n".join(matches)
 
 
-async def _handle_grep(args: dict) -> str | ToolError:
+async def _handle_grep(args: dict, confine_root: Path | None = None) -> str | ToolError:
     pattern = args.get("pattern", "")
     path = args.get("path", ".")
+    if confine_root is not None:
+        try:
+            path = str(_resolve_path(path, confine_root=confine_root))
+        except ValueError as exc:
+            return ToolError(message=str(exc), tool_name="grep", is_user_error=True)
 
     # Max lines to return from search to bound output at the source
     max_count = "1000"
@@ -321,7 +393,7 @@ async def _handle_grep(args: dict) -> str | ToolError:
     # Try rg first, fall back to grep
     try:
         stdout, stderr, rc = await _run_search(
-            ["rg", "-n", "--no-heading", "-m", max_count, pattern, path]
+            ["rg", "-n", "--no-heading", "-m", max_count, "-e", pattern, "--", path]
         )
         if rc == 0:
             output = stdout
@@ -337,7 +409,7 @@ async def _handle_grep(args: dict) -> str | ToolError:
         # rg not installed, fall back to grep
         try:
             stdout, stderr, rc = await _run_search(
-                ["grep", "-rn", "-m", max_count, pattern, path]
+                ["grep", "-rn", "-m", max_count, "-e", pattern, "--", path]
             )
             if rc == 0:
                 output = stdout
@@ -374,11 +446,19 @@ async def _handle_grep(args: dict) -> str | ToolError:
     return output
 
 
-async def _handle_read_directory(args: dict) -> str | ToolError:
+def _dir_line(entry: "os.DirEntry[str] | Path") -> str:
+    if entry.is_dir():
+        return f"{entry.name}/"
+    return f"{entry.name} ({entry.stat().st_size} bytes)"
+
+
+async def _handle_read_directory(
+    args: dict, confine_root: Path | None = None
+) -> str | ToolError:
     path = args.get("path", ".")
 
     try:
-        safe_path = _resolve_path(path)
+        safe_path = _resolve_path(path, confine_root=confine_root)
     except ValueError as exc:
         return ToolError(
             message=str(exc), tool_name="read_directory", is_user_error=True
@@ -391,14 +471,16 @@ async def _handle_read_directory(args: dict) -> str | ToolError:
                 tool_name="read_directory",
                 is_user_error=True,
             )
-        lines = []
-        for entry in sorted(safe_path.iterdir()):
-            if entry.is_dir():
-                lines.append(f"{entry.name}/")
-            else:
-                size = entry.stat().st_size
-                lines.append(f"{entry.name} ({size} bytes)")
-        return lines
+        if confine_root is not None:
+            # List through a symlink-safe fd (#758), not the path.
+            fd = _open_confined(safe_path, confine_root, directory=True)
+            try:
+                with os.scandir(fd) as it:
+                    entries = sorted(it, key=lambda e: e.name)
+                    return [_dir_line(e) for e in entries]
+            finally:
+                os.close(fd)
+        return [_dir_line(e) for e in sorted(safe_path.iterdir())]
 
     try:
         entries = await asyncio.to_thread(_list_dir)
@@ -1062,6 +1144,9 @@ _TODO_HANDLERS: dict[str, Callable] = {
     "TodoWrite": _handle_todo_write,
 }
 
+#: Read handlers that accept ``confine_root`` (``ChatConfig.read_root``).
+_READ_HANDLERS_WITH_ROOT = frozenset({"read_file", "read_directory", "glob", "grep"})
+
 _QUESTION_HANDLERS: dict[str, Callable] = {
     "question": _handle_question,
 }
@@ -1101,6 +1186,12 @@ class BuiltinToolManager:
         if name in ("write_file", "edit_file"):
             return await _SIMPLE_HANDLERS[name](
                 arguments, confine_root=self._config.write_root
+            )
+        # Reads are confined the same way when read_root is set (#758), so a
+        # headless agent can't read credentials outside its workspace.
+        if name in _READ_HANDLERS_WITH_ROOT:
+            return await _SIMPLE_HANDLERS[name](
+                arguments, confine_root=self._config.read_root
             )
         if name in _SIMPLE_HANDLERS:
             return await _SIMPLE_HANDLERS[name](arguments)

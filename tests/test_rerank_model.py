@@ -343,3 +343,19 @@ def test_load_cross_encoder_rejects_multilabel(tmp_path):
     )
     with pytest.raises(ValueError, match="num_labels"):
         load_cross_encoder(str(tmp_path))
+
+
+def test_cross_encoder_rejects_input_past_position_table():
+    """#760 item 14: positions run to ``seq_len + pad_token_id``; past the
+    table, MLX's gather reads out of bounds and scores are silently wrong.
+    The forward must refuse instead (a clean ValueError → 400)."""
+    import pytest
+
+    cfg = _tiny_config()  # 32 positions, pad 1 → 30 usable
+    model = XLMRobertaCrossEncoder(cfg)
+    assert model.max_input_tokens == 30
+    ok = mx.array([[5] * 30])
+    mx.eval(model(ok, mx.ones_like(ok)))
+    too_long = mx.array([[5] * 31])
+    with pytest.raises(ValueError, match="31 tokens"):
+        model(too_long, mx.ones_like(too_long))

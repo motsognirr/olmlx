@@ -964,3 +964,138 @@ def test_drive_no_snapshot_when_only_final_segment_remains():
     assert model.calls == [[10, 11]]
     assert suffix == [12]
     assert len(store) == 0
+
+
+def test_drive_cancel_mid_chunk1_does_not_insert_partial_checkpoint(monkeypatch):
+    """#761 item 1: a cancel between chunk-1 sub-chunks must not store the
+    partially-filled cache under the full ``flat[:deepest_boundary]`` key.
+
+    Otherwise a retry warm-starts with ``already_covered == boundary`` while
+    the cache only holds a prefix, and the skipped context is never prefilled.
+    """
+    import olmlx.engine.inference as inf
+
+    monkeypatch.setattr(inf, "_PREFILL_CHUNK", 2)
+    cancel = threading.Event()
+
+    class _CancelAfterFirst(_DummyModel):
+        def __call__(self, tokens, cache=None):
+            out = super().__call__(tokens, cache=cache)
+            cancel.set()
+            return out
+
+    model = _CancelAfterFirst()
+    store = PromptCacheStore(max_slots=8)
+    sp = SegmentedPrompt(
+        segments=[
+            Segment(tokens=[1, 2, 3, 4, 5, 6], role="system"),
+            Segment(tokens=[7, 8], role="user"),
+        ]
+    )
+    cache = [KVCache()]
+    _drive_segmented_prefill(
+        model=model,
+        segmented=sp,
+        cache=cache,
+        insert_checkpoint=store.insert_checkpoint,
+        cancel_event=cancel,
+    )
+    # Only the first sub-chunk ran before the cancel was observed.
+    assert model.calls == [[1, 2]]
+    assert len(store) == 0
+
+
+def test_insert_checkpoint_refuses_cache_shorter_than_key():
+    """#761 item 1 guard: a checkpoint whose KV depth disagrees with its token
+    key is refused rather than served as covering the whole key."""
+    from olmlx.engine.prompt_cache.state import CachedPromptState
+
+    store = PromptCacheStore(max_slots=8)
+    layer = KVCache()
+    layer.update_and_fetch(mx.zeros((1, 1, 2, 4)), mx.zeros((1, 1, 2, 4)))
+    store.insert_checkpoint(
+        CachedPromptState(tokens=[1, 2, 3, 4], cache=[layer], is_checkpoint=True)
+    )
+    assert len(store) == 0
+    store.insert_checkpoint(
+        CachedPromptState(tokens=[1, 2], cache=[layer], is_checkpoint=True)
+    )
+    assert len(store) == 1
+
+
+def test_fetch_nearest_drops_checkpoint_shorter_than_key():
+    """#766 review: entries that bypass insert_checkpoint (disk restore, spills
+    from before the guard) must not be served as covering their whole key."""
+    from olmlx.engine.prompt_cache.state import CachedPromptState
+
+    store = PromptCacheStore(max_slots=8)
+    layer = KVCache()
+    layer.update_and_fetch(mx.zeros((1, 1, 2, 4)), mx.zeros((1, 1, 2, 4)))
+    cid = store._checkpoint_cache_id([1, 2, 3, 4])
+    store.set(
+        cid, CachedPromptState(tokens=[1, 2, 3, 4], cache=[layer], is_checkpoint=True)
+    )
+    assert store.fetch_nearest([1, 2, 3, 4, 5, 6]) is None
+    assert len(store) == 0
+
+
+def test_drive_pure_rotating_cancel_before_prefill_skips_snapshot():
+    cancel = threading.Event()
+    cancel.set()
+    model = _DummyModel()
+    store = PromptCacheStore(max_slots=8)
+    sp = SegmentedPrompt(
+        segments=[
+            Segment(tokens=[1, 2, 3], role="system"),
+            Segment(tokens=[4, 5], role="user"),
+        ]
+    )
+    _drive_segmented_prefill(
+        model=model,
+        segmented=sp,
+        cache=[RotatingKVCache(max_size=64, keep=0)],
+        insert_checkpoint=store.insert_checkpoint,
+        cancel_event=cancel,
+    )
+    assert model.calls == []
+    assert len(store) == 0
+
+
+def test_async_mlx_stream_skips_generation_after_cancelled_prefill(monkeypatch):
+    """#766 review: a cancel during the deferred prefill must not go on to
+    decode from a cache that covers only a prefix of the prompt."""
+    import olmlx.utils.streaming as streaming_mod
+
+    generated: list[int] = []
+
+    def fake_stream_generate(model, tokenizer, **kwargs):
+        generated.append(1)
+        yield from ()
+
+    monkeypatch.setattr("mlx_lm.stream_generate", fake_stream_generate)
+
+    def deferred(cancel_event):
+        cancel_event.set()  # client disconnected mid-prefill
+
+    async def _go():
+        stream = streaming_mod.async_mlx_stream(
+            object(), object(), [1], max_tokens=4, deferred_prefill=deferred
+        )
+        async for _tok in stream:
+            pass
+        await stream.drain_and_join()
+
+    asyncio.run(_go())
+    assert generated == []
+
+
+def test_checkpoint_kv_depth_unknown_when_layers_disagree():
+    """#766 review: a layout whose offset-bearing layers disagree (e.g. a
+    model-specific cache with a different offset meaning) must not make every
+    checkpoint insert be refused; the guard only applies to a clear depth."""
+    from olmlx.engine.prompt_cache.store import _checkpoint_kv_depth
+
+    a, b = SimpleNamespace(offset=4), SimpleNamespace(offset=2)
+    assert _checkpoint_kv_depth([a, a]) == 4
+    assert _checkpoint_kv_depth([a, b]) is None
+    assert _checkpoint_kv_depth([SimpleNamespace(), a]) == 4

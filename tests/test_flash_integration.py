@@ -84,7 +84,9 @@ class TestModelManagerFlashDetection:
     def test_flash_dir_returns_none_when_not_prepared(self, tmp_path):
         registry = MagicMock()
         store = MagicMock()
-        store.local_path.return_value = tmp_path / "model"
+        store.model_dir.return_value = store.local_path.return_value = (
+            tmp_path / "model"
+        )
         (tmp_path / "model").mkdir()
 
         manager = self.ModelManager(registry, store)
@@ -99,7 +101,7 @@ class TestModelManagerFlashDetection:
         flash_path.mkdir()
         (flash_path / "flash_layout.json").write_text("{}")
 
-        store.local_path.return_value = model_path
+        store.model_dir.return_value = store.local_path.return_value = model_path
         manager = self.ModelManager(registry, store)
         assert manager._flash_dir("some/model") == flash_path
 

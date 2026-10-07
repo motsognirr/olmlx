@@ -218,20 +218,35 @@ class TestResolveAndDownload:
         assert "error" in captured.err.lower()
         assert "not-a-model" in captured.err
 
-    def test_no_download_uses_local_path(self, monkeypatch, tmp_path):
+    def test_no_download_uses_model_dir(self, monkeypatch, tmp_path):
+        # model_dir, not local_path: an AWQ/GPTQ model is served (and
+        # flash-prepared) from its converted directory (#760).
         from olmlx.cli import _resolve_and_download
 
         mock_store = MagicMock()
         resolved = MagicMock()
         resolved.hf_path = "org/model"
         mock_store.registry.resolve.return_value = resolved
-        mock_store.local_path.return_value = tmp_path / "model"
+        mock_store.model_dir.return_value = tmp_path / "model"
         monkeypatch.setattr("olmlx.cli.models_cmd._create_store", lambda: mock_store)
 
         store, local_dir = _resolve_and_download("mymodel", download=False)
         assert local_dir == tmp_path / "model"
-        mock_store.local_path.assert_called_once_with("org/model")
+        mock_store.model_dir.assert_called_once_with("org/model")
         mock_store.ensure_downloaded.assert_not_called()
+
+    def test_tagged_hf_path_is_stripped(self, monkeypatch, tmp_path):
+        from olmlx.cli import _resolve_and_download
+
+        mock_store = MagicMock()
+        resolved = MagicMock()
+        resolved.hf_path = "org/model:latest"
+        mock_store.registry.resolve.return_value = resolved
+        mock_store.model_dir.return_value = tmp_path
+        monkeypatch.setattr("olmlx.cli.models_cmd._create_store", lambda: mock_store)
+
+        _resolve_and_download("mymodel", download=False)
+        mock_store.model_dir.assert_called_once_with("org/model")
 
     def test_models_config_error_propagates_to_cli_main(self, monkeypatch):
         from olmlx.cli import _resolve_and_download

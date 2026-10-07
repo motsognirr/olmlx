@@ -555,6 +555,72 @@ class TestCalibration:
         assert result["eigenvectors"].shape == (32, 32)
         assert 1 <= result["d_eff"] <= 32
 
+    def test_calibrated_rotation_puts_top_variance_first(self):
+        """#761 item 4: the runtime rotation built from the calibrated basis
+        must project onto the eigenvectors, so the leading (semantic)
+        coordinates carry the high-variance directions. Projecting onto the
+        eigenvector matrix's rows instead of its columns scrambles them."""
+        from olmlx.engine.spectralquant import SpectralRotation
+        from olmlx.engine.spectralquant_calibrate import calibrate_head
+
+        rng = np.random.RandomState(0)
+        D = 16
+        q, _ = np.linalg.qr(rng.randn(D, D))
+        scales = np.full(D, 0.1)
+        scales[0] = 10.0  # variance 100 along q[:, 0]
+        data = (rng.randn(4000, D) * scales) @ q.T
+        result = calibrate_head(mx.array(data.astype(np.float32)), avg_bits=4)
+        rotated = np.array(
+            SpectralRotation(result["eigenvectors"]).rotate(
+                mx.array(data.astype(np.float32))
+            )
+        )
+        var = rotated.var(axis=0)
+        assert var[0] > 90.0
+        assert var[0] == var.max()
+
+    def test_legacy_column_calibration_warns(self, tmp_path, caplog):
+        """Calibrations saved before #761 lack the ``basis`` marker; they load
+        unchanged (self-consistent with their codebooks) but warn."""
+        import json
+        import logging
+
+        from olmlx.engine.spectralquant_calibrate import (
+            load_calibration,
+            save_calibration,
+        )
+
+        cal = {
+            (0, 0, kind): {
+                "eigenvectors": mx.eye(4),
+                "d_eff": 2,
+                "codebook_sem": mx.array([0.0, 1.0]),
+                "codebook_tail": mx.array([0.0, 1.0]),
+                "bits_high": 1,
+                "bits_low": 1,
+            }
+            for kind in ("key", "value")
+        }
+        save_calibration(cal, tmp_path)
+        cfg_path = tmp_path / "spectral_config.json"
+        assert json.loads(cfg_path.read_text()).get("basis") == "rows"
+        with caplog.at_level(logging.WARNING):
+            load_calibration(tmp_path)
+        assert "re-run" not in caplog.text.lower()
+
+        cfg = json.loads(cfg_path.read_text())
+        del cfg["basis"]
+        cfg_path.write_text(json.dumps(cfg))
+        with caplog.at_level(logging.WARNING):
+            loaded = load_calibration(tmp_path)
+        assert "olmlx spectral prepare" in caplog.text
+        assert (0, 0, "key") in loaded
+        # Cache builds reload calibration per request; warn only once per dir.
+        caplog.clear()
+        with caplog.at_level(logging.WARNING):
+            load_calibration(tmp_path)
+        assert "olmlx spectral prepare" not in caplog.text
+
     def test_save_and_load_calibration(self, tmp_path):
         """Calibration data should survive save/load roundtrip."""
         from olmlx.engine.spectralquant_calibrate import (
@@ -869,6 +935,150 @@ class TestSpectralQuantKVCache:
 # ---------------------------------------------------------------------------
 # Config validation tests
 # ---------------------------------------------------------------------------
+
+
+class TestSpectralSeparateKVParams:
+    """#761 item 3: V must be quantized with V's own calibrated d_eff and bit
+    split, not K's. Calibration produces separate K/V values; using K's for V
+    mis-splits V and, when K's bits exceed V's codebook size, gathers out of
+    bounds (mlx silently returns 0)."""
+
+    @staticmethod
+    def _cal(rng, head_dim, d_eff, bits_high, bits_low):
+        from olmlx.engine.spectralquant import SpectralRotation, fit_codebook
+
+        q, _ = np.linalg.qr(rng.randn(head_dim, head_dim).astype(np.float32))
+        rot = SpectralRotation(mx.array(q))
+        data = mx.random.normal((500, head_dim))
+        data = data / mx.linalg.norm(data, axis=-1, keepdims=True)
+        rotated = rot.rotate(data)
+        return {
+            "eigenvectors": mx.array(q),
+            "rotation": rot,
+            "d_eff": d_eff,
+            "bits_high": bits_high,
+            "bits_low": bits_low,
+            "codebook_sem": fit_codebook(
+                rotated[..., :d_eff].reshape(-1), bits=bits_high
+            ),
+            "codebook_tail": fit_codebook(
+                rotated[..., d_eff:].reshape(-1), bits=bits_low
+            ),
+        }
+
+    def test_values_use_value_params(self):
+        from olmlx.engine.spectralquant import (
+            spectral_dequantize,
+            spectral_quantize,
+        )
+        from olmlx.engine.spectralquant_cache import SpectralQuantKVCache
+
+        rng = np.random.RandomState(0)
+        hd = 32
+        k = self._cal(rng, hd, 4, 4, 2)
+        v = self._cal(rng, hd, 12, 2, 1)
+        cache = SpectralQuantKVCache(
+            rotation_key=k["rotation"],
+            rotation_value=v["rotation"],
+            codebook_sem_key=k["codebook_sem"],
+            codebook_tail_key=k["codebook_tail"],
+            codebook_sem_value=v["codebook_sem"],
+            codebook_tail_value=v["codebook_tail"],
+            d_eff=4,
+            bits_high=4,
+            bits_low=2,
+            value_d_eff=12,
+            value_bits_high=2,
+            value_bits_low=1,
+        )
+        keys = mx.random.normal((1, 2, 5, hd))
+        values = mx.random.normal((1, 2, 5, hd))
+        k_out, v_out = cache.update_and_fetch(keys, values)
+
+        def _ref(x, c):
+            parts = spectral_quantize(
+                x,
+                c["rotation"],
+                c["codebook_sem"],
+                c["codebook_tail"],
+                c["d_eff"],
+                c["bits_high"],
+                c["bits_low"],
+            )
+            return spectral_dequantize(
+                *parts,
+                c["rotation"],
+                c["codebook_sem"],
+                c["codebook_tail"],
+                c["d_eff"],
+                c["bits_high"],
+                c["bits_low"],
+                dtype=x.dtype,
+            )
+
+        np.testing.assert_allclose(
+            np.array(v_out), np.array(_ref(values, v)), atol=1e-5
+        )
+        np.testing.assert_allclose(np.array(k_out), np.array(_ref(keys, k)), atol=1e-5)
+
+    def test_value_head_dim_differs_from_key(self):
+        """#766 review: V buffers must be sized from V's head_dim (MLA-style
+        models have k_head_dim != v_head_dim)."""
+        from olmlx.engine.spectralquant_cache import SpectralQuantKVCache
+
+        rng = np.random.RandomState(2)
+        k = self._cal(rng, 48, 4, 4, 2)
+        v = self._cal(rng, 32, 8, 2, 1)
+        cache = SpectralQuantKVCache(
+            rotation_key=k["rotation"],
+            rotation_value=v["rotation"],
+            codebook_sem_key=k["codebook_sem"],
+            codebook_tail_key=k["codebook_tail"],
+            codebook_sem_value=v["codebook_sem"],
+            codebook_tail_value=v["codebook_tail"],
+            d_eff=4,
+            bits_high=4,
+            bits_low=2,
+            value_d_eff=8,
+            value_bits_high=2,
+            value_bits_low=1,
+        )
+        k_out, v_out = cache.update_and_fetch(
+            mx.random.normal((1, 2, 3, 48)), mx.random.normal((1, 2, 3, 32))
+        )
+        k_out, v_out = cache.update_and_fetch(
+            mx.random.normal((1, 2, 1, 48)), mx.random.normal((1, 2, 1, 32))
+        )
+        assert k_out.shape == (1, 2, 4, 48)
+        assert v_out.shape == (1, 2, 4, 32)
+
+    def test_make_spectral_cache_passes_value_calibration(self, monkeypatch, tmp_path):
+        import olmlx.engine.spectralquant_calibrate as cal_mod
+        from olmlx.engine.spectralquant_cache import (
+            SpectralQuantKVCache,
+            make_spectral_cache,
+        )
+
+        rng = np.random.RandomState(1)
+        k = self._cal(rng, 32, 4, 4, 2)
+        v = self._cal(rng, 32, 12, 2, 1)
+        monkeypatch.setattr(
+            cal_mod,
+            "load_calibration",
+            lambda _d: {(0, 0, "key"): k, (0, 0, "value"): v},
+        )
+        monkeypatch.setattr(
+            "olmlx.engine.turboquant_cache._detect_head_dim", lambda _m: 32
+        )
+
+        class _M:
+            layers = [object()]
+
+        caches = make_spectral_cache(_M(), tmp_path)
+        c = caches[0]
+        assert isinstance(c, SpectralQuantKVCache)
+        assert (c.d_eff, c.bits_high, c.bits_low) == (4, 4, 2)
+        assert (c.value_d_eff, c.value_bits_high, c.value_bits_low) == (12, 2, 1)
 
 
 class TestSpectralConfig:

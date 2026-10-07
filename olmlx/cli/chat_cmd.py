@@ -2,6 +2,7 @@
 
 import asyncio
 import logging
+import shutil
 import sys
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -72,6 +73,30 @@ def _check_voice_deps() -> None:
             file=sys.stderr,
         )
         raise SystemExit(1)
+    # Whisper decodes the push-to-talk recording through ffmpeg; without it
+    # every voice turn fails at transcription (#760).
+    if shutil.which("ffmpeg") is None:
+        print(
+            "--voice needs ffmpeg on PATH for speech recognition. "
+            "Install with: brew install ffmpeg",
+            file=sys.stderr,
+        )
+        raise SystemExit(1)
+
+
+async def _listen_or_report(voice_io: Any, tui: Any) -> str | None:
+    """Record + transcribe one push-to-talk turn; ``None`` on failure.
+
+    A device/dependency failure (``RuntimeError``) or a transcription failure
+    (``ValueError`` from ``generate_transcription``, e.g. ffmpeg missing or a
+    bad decode) is shown in the session rather than escaping to the outer
+    handler, which would end ``olmlx chat`` (#760).
+    """
+    try:
+        return await voice_io.listen()
+    except (RuntimeError, ValueError) as exc:
+        tui.display_error(str(exc))
+        return None
 
 
 def cmd_chat(args):
@@ -268,11 +293,7 @@ def cmd_chat(args):
 
                 # Empty line in voice mode => push-to-talk.
                 if voice_io is not None and not user_input.strip():
-                    try:
-                        user_input = await voice_io.listen()
-                    except RuntimeError as exc:  # device/dep failure
-                        tui.display_error(str(exc))
-                        continue
+                    user_input = await _listen_or_report(voice_io, tui)
                     if not user_input:
                         continue
                     tui.console.print(f"[dim]heard:[/dim] {user_input}")

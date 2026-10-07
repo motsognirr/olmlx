@@ -143,7 +143,8 @@ class TestAgentSessionPolicy:
         assert ts.get_policy("generate_image") == ToolPolicy.AUTO
         # Safe tools stay ALLOW so the agent still runs autonomously.
         assert ts.get_policy("read_file") == ToolPolicy.ALLOW
-        assert ts.get_policy("web_fetch") == ToolPolicy.ALLOW
+        # web_fetch is judged (#758): it is the exfiltration channel.
+        assert ts.get_policy("web_fetch") == ToolPolicy.AUTO
         assert ts.get_policy("finish") == ToolPolicy.ALLOW
 
     def test_local_tool_safety_enabled(self, store, tmp_path):

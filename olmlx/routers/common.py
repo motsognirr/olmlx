@@ -190,3 +190,43 @@ def build_inference_options(
         opts["presence_penalty"] = presence_penalty
 
     return opts
+
+
+async def load_or_unload_response(
+    request: Any, model: str, keep_alive: int | str | None, *, chat: bool
+) -> Any:
+    """Answer Ollama's preload/unload request (#760).
+
+    An ``/api/generate`` with no prompt (or ``/api/chat`` with no messages)
+    loads the model and returns ``done_reason: "load"``; with ``keep_alive: 0``
+    it unloads instead (``done_reason: "unload"``). Open WebUI and the ollama
+    CLI preload this way. Returns a JSON body (never a stream), like Ollama.
+    """
+    from fastapi.responses import JSONResponse
+
+    from olmlx.engine.loaded_model import parse_keep_alive
+    from olmlx.engine.model_manager import ActiveRequestsError
+
+    manager = request.app.state.model_manager
+    registry = request.app.state.registry
+    if keep_alive is not None and parse_keep_alive(keep_alive) == 0.0:
+        try:
+            await manager.unload(model)  # not loaded → nothing to do
+        except ActiveRequestsError as e:
+            return JSONResponse({"error": str(e)}, status_code=409)
+        reason = "unload"
+    else:
+        # A panel has no single model to load; its members load on first use.
+        if not registry.is_panel(model):
+            await manager.ensure_loaded(model, keep_alive)
+        reason = "load"
+    body: dict[str, Any] = {
+        "model": model,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    }
+    if chat:
+        body["message"] = {"role": "assistant", "content": ""}
+    else:
+        body["response"] = ""
+    body.update(done=True, done_reason=reason)
+    return body

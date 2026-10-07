@@ -42,6 +42,12 @@ class InferenceRequest:
     gen_kwargs: dict[str, Any]
     action: str  # "generate" or "shutdown"
 
+    @property
+    def generation_prompt(self) -> str | list[int]:
+        """The prompt workers hand ``stream_generate``: the text when sent,
+        else the exact token ids (a token-id prompt from rank 0, #760)."""
+        return self.prompt_text if self.prompt_text else self.prompt_tokens
+
     def to_dict(self) -> dict:
         return {
             "prompt_tokens": self.prompt_tokens,

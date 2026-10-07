@@ -169,6 +169,23 @@ def _maybe_broadcast_distributed(
         distributed_barrier()
 
 
+def _distributed_prompt_payload(
+    lm, prompt: str | list[int], prompt_tokens: list[int] | None
+) -> tuple[list[int], str]:
+    """Return ``(prompt_tokens, prompt_text)`` for a distributed broadcast.
+
+    Workers generate from ``prompt_text`` (avoids a tokenizer round-trip
+    mismatch), but a ``list[int]`` prompt — ``/api/generate``'s context path
+    (#656) — is already exact token ids: send those with an empty text so the
+    workers feed ``stream_generate`` the same ids as rank 0 (#760).
+    """
+    if isinstance(prompt, list):
+        return list(prompt), ""
+    if prompt_tokens is None:
+        prompt_tokens = tokenize_for_cache(lm.text_tokenizer, prompt)
+    return prompt_tokens, prompt
+
+
 # Metal does not support concurrent command buffer submission across any
 # models — they all share the same Metal device and command queue.  A per-model
 # lock would still allow interleaved GPU work from different models, risking
@@ -1475,6 +1492,14 @@ async def generate_completion(
         # (otherwise the splitter would arm the orphan-</think> buffer for thinking
         # the model was told not to produce).
         effective_thinking = enable_thinking if enable_thinking is not None else False
+        # Per-model default system prompt (Modelfile SYSTEM, #760); a request
+        # ``system`` wins, and raw mode (no template) never gets one.
+        if (
+            system is None
+            and apply_chat_template
+            and isinstance(lm.default_system, str)
+        ):
+            system = lm.default_system
 
         if apply_chat_template and not lm.is_vlm:
             messages: list[dict] = []
@@ -1775,14 +1800,21 @@ def _drive_segmented_prefill(
         prefill_stream = mx.default_stream(mx.default_device())
     pure_rotating = _is_pure_rotating_cache(cache)
 
-    def _run(start: int, end: int) -> None:
+    def _run(start: int, end: int) -> bool:
+        """Prefill ``flat[start:end]``; return False iff a cancel cut it short.
+
+        A cancelled run leaves the cache holding only a prefix of the span, so
+        callers must not snapshot it under the full span's token key (#761).
+        """
         if end <= start:
-            return
+            return True
         with mx.stream(prefill_stream):
             if pure_rotating:
                 # Sliding-window models (gpt-oss, Step-3.5, Gemma 3): feed the
                 # span in ONE call, preserving the validated single-call
                 # behavior their windowed attention depends on.
+                if cancel_event is not None and cancel_event.is_set():
+                    return False
                 model(mx.array(flat[start:end], dtype=mx.int32)[None, :], cache=cache)
                 mx.eval(flatten_cache_state(cache))
                 mx.clear_cache()
@@ -1795,7 +1827,7 @@ def _drive_segmented_prefill(
                 pos = start
                 while pos < end:
                     if cancel_event is not None and cancel_event.is_set():
-                        return
+                        return False
                     stop = min(pos + _PREFILL_CHUNK, end)
                     model(
                         mx.array(flat[pos:stop], dtype=mx.int32)[None, :], cache=cache
@@ -1803,6 +1835,7 @@ def _drive_segmented_prefill(
                     mx.eval(flatten_cache_state(cache))
                     mx.clear_cache()
                     pos = stop
+        return True
 
     if pure_rotating:
         # Sliding-window models (gpt-oss, Step-3.5, Gemma 3) must be prefilled
@@ -1817,8 +1850,12 @@ def _drive_segmented_prefill(
             already_covered_tokens,
             final_prefill_end,
         )
-        _run(already_covered_tokens, final_prefill_end)
-        if final_prefill_end > already_covered_tokens and segmented.segments:
+        completed = _run(already_covered_tokens, final_prefill_end)
+        if (
+            completed
+            and final_prefill_end > already_covered_tokens
+            and segmented.segments
+        ):
             snap = snapshot_cache_for_persistence(cache, eager_eval=False)
             insert_checkpoint(
                 CachedPromptState(
@@ -1836,7 +1873,11 @@ def _drive_segmented_prefill(
         _run(already_covered_tokens, final_prefill_end)
     else:
         # Chunk 1: uncovered prefix up to the deepest interior boundary.
-        _run(already_covered_tokens, deepest_boundary)
+        # A cancel mid-chunk leaves only a prefix in the cache; snapshotting
+        # it under ``flat[:deepest_boundary]`` would make a retry skip the
+        # unfilled context (#761).
+        if not _run(already_covered_tokens, deepest_boundary):
+            return [flat[-1]]
         # Snapshot at the boundary.  eager_eval=False because ``_run``'s
         # inner ``mx.eval(flatten_cache_state(cache))`` just materialised
         # the state on the prefill stream; deepcopy alone is sufficient.
@@ -1849,9 +1890,8 @@ def _drive_segmented_prefill(
                 is_checkpoint=True,
             )
         )
-        # Chunk 2: boundary to the reserved trailing token.
-        if cancel_event is not None and cancel_event.is_set():
-            return [flat[-1]]
+        # Chunk 2: boundary to the reserved trailing token (``_run`` checks
+        # cancel_event before each forward).
         _run(deepest_boundary, final_prefill_end)
 
     return [flat[-1]]
@@ -2385,6 +2425,12 @@ class _PreflightResult:
 
     prompt: str | list[int] = ""
     memory_limit: int = 0
+    cache_read_tokens: int | None = None
+    cache_creation_tokens: int | None = None
+    # True when memory pressure popped ``prompt_cache``: the caller must then
+    # drop any ``deferred_prefill``/trim, which would only act on the
+    # orphaned cache (#761).
+    cache_dropped: bool = False
 
 
 async def _kv_cache_preflight_check(
@@ -2397,12 +2443,18 @@ async def _kv_cache_preflight_check(
     cache_creation_tokens: int,
     full_prompt_tokens: list[int] | None,
     cache_id: str,
+    has_deferred_prefill: bool = False,
 ) -> _PreflightResult:
     """Estimate KV cache memory and reject if it would exceed the limit.
 
     Evicts prompt caches under pressure and restores prompt if needed.
     Mutates gen_kwargs in place (may remove prompt_cache and input_ids).
     Raises MemoryError if the KV cache would exceed the memory limit.
+
+    ``has_deferred_prefill``: setup deferred the prefill (checkpoint path) or
+    trim (flat lazy-state path) to the worker, so the working cache does not
+    yet match ``full_prompt_tokens[:cache_read_tokens]`` and the prompt may be
+    a suffix even when ``cache_read_tokens == 0``.
     """
     result = _PreflightResult(prompt=prompt)
 
@@ -2452,8 +2504,11 @@ async def _kv_cache_preflight_check(
             # (which normally cleans up) isn't reached on the MemoryError
             # path.  Dropping the working reference still frees memory;
             # the eviction below runs regardless to flush other entries.
+            result.cache_dropped = had_cache
             if had_cache:
-                if not lm.supports_cache_persistence:
+                if not lm.supports_cache_persistence or has_deferred_prefill:
+                    # A deferred prefill/trim hasn't run yet, so the working
+                    # cache doesn't match its key — never re-store it (#761).
                     lm.prompt_cache_store.remove(cache_id)
                 elif full_prompt_tokens is not None:
                     await lm.prompt_cache_store.async_set(
@@ -2469,7 +2524,10 @@ async def _kv_cache_preflight_check(
             mx.clear_cache()
             # Re-estimate for the full generation window
             estimate_tokens = num_prefill_tokens
-            if had_cache and cache_read_tokens > 0:
+            # A checkpoint cold start hands back a one-token suffix with
+            # cache_read_tokens == 0 (the rest is in the deferred prefill), so
+            # the full prompt must come back for it too (#761).
+            if had_cache and (cache_read_tokens > 0 or has_deferred_prefill):
                 estimate_tokens = cache_read_tokens + num_prefill_tokens
                 if full_prompt_tokens is not None and not lm.is_vlm:
                     result.prompt = full_prompt_tokens
@@ -3456,7 +3514,8 @@ async def _stream_completion(
     generated_tokens: list[int] = []
     full_prompt_tokens: list[int] | None = None
     # Save original string prompt before cache setup may replace it with token IDs.
-    # prompt is always str at entry; cache setup may later reassign it to list[int].
+    # A str at entry except /api/generate's context path (#656), which passes
+    # list[int]; cache setup may later reassign a str to list[int].
     original_prompt = prompt
     # Pop stop sequences before cache setup / stream creation so they are not
     # forwarded to mlx-lm (which does not support them).
@@ -3511,9 +3570,16 @@ async def _stream_completion(
             cache_creation_tokens=cache_creation_tokens,
             full_prompt_tokens=full_prompt_tokens,
             cache_id=cache_id,
+            has_deferred_prefill=cs.deferred_prefill is not None,
         )
         prompt = pf.prompt
         memory_limit = pf.memory_limit
+        if pf.cache_dropped:
+            cs.deferred_prefill = None
+        if pf.cache_read_tokens is not None:
+            cache_read_tokens = pf.cache_read_tokens
+        if pf.cache_creation_tokens is not None:
+            cache_creation_tokens = pf.cache_creation_tokens
         if not lm.is_vlm:
             _recheck_window_if_eviction_cache_lost(
                 lm, gen_kwargs, prompt, full_prompt_tokens, use_prompt_cache
@@ -3548,19 +3614,15 @@ async def _stream_completion(
         # Strip prompt_cache and input_ids — these are local MLX objects
         # that cannot be serialized to JSON for the sideband protocol.
         if lm.is_distributed:
-            tokens = (
-                prompt_tokens
-                if prompt_tokens is not None
-                else tokenize_for_cache(lm.text_tokenizer, original_prompt)
+            tokens, text = _distributed_prompt_payload(
+                lm, original_prompt, prompt_tokens
             )
             broadcast_kwargs = {
                 k: v
                 for k, v in gen_kwargs.items()
                 if k not in ("prompt_cache", "input_ids")
             }
-            _maybe_broadcast_distributed(
-                lm, tokens, original_prompt, max_tokens, broadcast_kwargs
-            )
+            _maybe_broadcast_distributed(lm, tokens, text, max_tokens, broadcast_kwargs)
 
         if lm.is_speculative and not (images or audio_paths) and grammar_active:
             # Speculative decoders do not consume gen_kwargs["logits_processors"],
@@ -4127,8 +4189,15 @@ async def _full_completion(
                         cache_creation_tokens=cache_creation_tokens,
                         full_prompt_tokens=full_prompt_tokens,
                         cache_id=cache_id,
+                        has_deferred_prefill=deferred_prefill is not None,
                     )
                     prompt = pf.prompt
+                    if pf.cache_dropped:
+                        deferred_prefill = None
+                    if pf.cache_read_tokens is not None:
+                        cache_read_tokens = pf.cache_read_tokens
+                    if pf.cache_creation_tokens is not None:
+                        cache_creation_tokens = pf.cache_creation_tokens
                     _recheck_window_if_eviction_cache_lost(
                         lm, gen_kwargs, prompt, full_prompt_tokens, use_prompt_cache
                     )
@@ -4276,8 +4345,8 @@ async def _full_completion_inner(
         # computation at the same time (avoids all_sum timeout).
         # Must happen before _apply_seed which pops seed from gen_kwargs.
         if lm.is_distributed:
-            tokens = tokenize_for_cache(lm.text_tokenizer, prompt)
-            _maybe_broadcast_distributed(lm, tokens, prompt, max_tokens, gen_kwargs)
+            tokens, text = _distributed_prompt_payload(lm, prompt, None)
+            _maybe_broadcast_distributed(lm, tokens, text, max_tokens, gen_kwargs)
 
         _apply_seed(gen_kwargs, consume=not lm.is_vlm)
 
@@ -4725,6 +4794,14 @@ async def generate_chat(
         # caller didn't pass one. An explicit caller value still wins.
         if reasoning_effort is None and lm.reasoning_effort is not None:
             reasoning_effort = lm.reasoning_effort
+
+        # Per-model default system prompt (Modelfile SYSTEM, #760) applies
+        # when the conversation carries no system turn of its own. isinstance:
+        # a MagicMock lm must not inject a system message.
+        if isinstance(lm.default_system, str) and not any(
+            m.get("role") in ("system", "developer") for m in messages
+        ):
+            messages = [{"role": "system", "content": lm.default_system}, *messages]
 
         # Templates that raise on a non-leading system turn (Qwen3.5/3.6) get
         # every system/developer turn folded into the leading one; templates
@@ -5215,6 +5292,40 @@ async def generate_embeddings(
         lm.release_ref()
 
 
+# Doc tokens always left after a shortened query, plus slack for a decode →
+# re-encode round trip that comes back a token or two longer.
+_RERANK_MIN_DOC_TOKENS = 8
+
+
+def _fit_rerank_query(tokenizer: Any, query: str, max_len: int) -> str:
+    """Shorten *query* only when it alone can't fit in *max_len* (#760).
+
+    ``truncation="only_second"`` can't trim the query: on such a query fast
+    tokenizers raise and slow ones return it untruncated, overrunning the
+    position table. ``longest_first`` would avoid that but also trims every
+    long-but-fitting query, changing scores for ordinary requests. So trim
+    the query up front, here, and only when it's over the window.
+    """
+    if not hasattr(tokenizer, "encode") or not hasattr(tokenizer, "decode"):
+        return query
+    try:
+        specials = int(tokenizer.num_special_tokens_to_add(pair=True))
+    except Exception:  # noqa: BLE001 — conservative default for RoBERTa pairs
+        specials = 4
+    avail = max_len - specials
+    if avail < 2:
+        raise ValueError(
+            f"max_tokens_per_doc={max_len} leaves no room for the query and a "
+            "document; use a larger value"
+        )
+    # Reserve doc room, but never the whole window on a tiny max_len (#768).
+    budget = avail - min(_RERANK_MIN_DOC_TOKENS, avail // 2)
+    ids = tokenizer.encode(query, add_special_tokens=False)
+    if len(ids) <= budget:
+        return query
+    return tokenizer.decode(ids[:budget])
+
+
 def _score_pairs(
     model,
     tokenizer,
@@ -5232,6 +5343,13 @@ def _score_pairs(
     if model_max > 100_000:
         model_max = 512
     max_len = min(max_tokens_per_doc, model_max)
+    # Never past the model's position table (#760): beyond it the embedding
+    # gather reads out of bounds. ``isinstance``: fakes/mocks may lack it.
+    table = getattr(model, "max_input_tokens", None)
+    if isinstance(table, int) and table > 0:
+        max_len = min(max_len, table)
+
+    query = _fit_rerank_query(tokenizer, query, max_len)
 
     scores: list[float] = []
     for start in range(0, len(documents), batch_size):
@@ -5239,6 +5357,8 @@ def _score_pairs(
         enc = tokenizer(
             [query] * len(chunk),
             chunk,
+            # Docs absorb the truncation; an over-long query was already
+            # shortened by _fit_rerank_query above.
             truncation="only_second",
             max_length=max_len,
             padding=True,
@@ -5386,7 +5506,7 @@ async def generate_transcription(
         # Resolve the on-disk path used as path_or_hf_repo so the ModelHolder
         # cache key matches what we inject.
         if manager.store is not None:
-            load_path = str(manager.store.local_path(lm.hf_path))
+            load_path = str(manager.store.model_dir(lm.hf_path))
         else:
             load_path = lm.hf_path
 

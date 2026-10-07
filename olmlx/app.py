@@ -2,6 +2,7 @@ import logging
 import time
 import traceback
 import uuid
+import weakref
 from contextlib import asynccontextmanager
 
 from pathlib import Path
@@ -17,6 +18,7 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from olmlx.config import settings
 from olmlx.context import request_id_var, surface_var
 from olmlx.engine.inference import ContextLengthExceededError, ServerBusyError
+from olmlx.engine.loaded_model import ModelNotFoundError
 from olmlx.engine.model_manager import (
     ModelLoadTimeoutError,
     ModelManager,
@@ -317,7 +319,14 @@ class MetricsMiddleware(BaseHTTPMiddleware):
             finally:
                 _record()
 
-        response.body_iterator = _instrumented_body()
+        body = _instrumented_body()
+        # An async generator that never started doesn't run its ``finally``
+        # on close or collection: a response cancelled between ``call_next``
+        # and the first chunk would leave HTTP_IN_FLIGHT stuck high (#760).
+        # Record on collection too — ``_record`` is idempotent, so the normal
+        # path still counts the request exactly once.
+        weakref.finalize(body, _record).atexit = False
+        response.body_iterator = body
         return response
 
 
@@ -482,6 +491,22 @@ def create_app() -> FastAPI:
             "invalid_request_error",
             "invalid_request_error",
             "invalid_value",
+        )
+
+    @app.exception_handler(ModelNotFoundError)
+    async def model_not_found_handler(request: Request, exc: ModelNotFoundError):
+        # A ValueError subclass, but every provider reports an unknown model
+        # as 404 (Ollama, OpenAI ``model_not_found``, Anthropic
+        # ``not_found_error``) — #760.
+        msg = str(exc)
+        logger.warning("Model not found on %s: %s", request.url.path, msg)
+        return _make_error_response(
+            request.url.path,
+            404,
+            msg,
+            "not_found_error",
+            "invalid_request_error",
+            "model_not_found",
         )
 
     @app.exception_handler(ContextLengthExceededError)

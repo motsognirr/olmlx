@@ -528,6 +528,29 @@ class TestAnthropicEndpoint:
         assert resp.json()["stop_reason"] == "stop_sequence"
 
     @pytest.mark.asyncio
+    async def test_non_streaming_always_emits_stop_sequence_null(self, app_client):
+        # #760: Anthropic always sends ``stop_sequence`` (null when no stop
+        # string matched); exclude_none must not strip it.
+        stats = TimingStats(prompt_eval_count=5, eval_count=3)
+        with patch(
+            "olmlx.routers.anthropic.generate_chat", new_callable=AsyncMock
+        ) as mock_gen:
+            mock_gen.return_value = {"text": "hi", "done": True, "stats": stats}
+            resp = await app_client.post(
+                "/v1/messages",
+                json={
+                    "model": "qwen3",
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "max_tokens": 50,
+                },
+            )
+        assert resp.status_code == 200
+        data = resp.json()
+        assert "stop_sequence" in data and data["stop_sequence"] is None
+        # Content blocks still drop their unused None fields.
+        assert "input" not in data["content"][0]
+
+    @pytest.mark.asyncio
     async def test_stop_sequence_hit_sets_stop_sequence_field(self, app_client):
         # #711: the response must name the matched sequence in `stop_sequence`.
         stats = TimingStats(prompt_eval_count=5, eval_count=3)
@@ -2337,9 +2360,10 @@ class TestCountTokens:
                 "max_tokens": 100,
             },
         )
-        assert resp.status_code == 400
+        assert resp.status_code == 404  # #760: unknown model is not_found
         data = resp.json()
         assert data["type"] == "error"
+        assert data["error"]["type"] == "not_found_error"
 
     @pytest.mark.asyncio
     async def test_dict_return_type(self, app_client, mock_loaded_model):

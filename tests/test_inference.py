@@ -2725,6 +2725,63 @@ class TestGenerateChatEnableThinking:
         assert call_kwargs["enable_thinking"] is True
 
 
+class TestPerModelDefaultSystem:
+    """Modelfile ``SYSTEM`` (#760) reaches the prompt as a default system
+    message; a system turn / ``system`` from the request wins."""
+
+    async def _chat(self, mock_manager, messages):
+        lm = mock_manager._loaded["qwen3:latest"]
+        lm.tokenizer.apply_chat_template = MagicMock(return_value="formatted prompt")
+        with (
+            patch("olmlx.engine.inference.mx", MagicMock()),
+            patch("olmlx.engine.inference.settings.prompt_cache", False),
+            patch(
+                "olmlx.engine.inference.asyncio.to_thread", new_callable=AsyncMock
+            ) as mock_thread,
+        ):
+            mock_thread.return_value = "response"
+            await generate_chat(mock_manager, "qwen3", messages, stream=False)
+        return lm.tokenizer.apply_chat_template.call_args[0][0]
+
+    @pytest.mark.asyncio
+    async def test_chat_prepends_default_system(self, mock_manager):
+        mock_manager._loaded["qwen3:latest"].default_system = "Be terse."
+        msgs = await self._chat(mock_manager, [{"role": "user", "content": "hi"}])
+        assert msgs[0] == {"role": "system", "content": "Be terse."}
+        assert msgs[1]["role"] == "user"
+
+    @pytest.mark.asyncio
+    async def test_chat_request_system_wins(self, mock_manager):
+        mock_manager._loaded["qwen3:latest"].default_system = "Be terse."
+        msgs = await self._chat(
+            mock_manager,
+            [
+                {"role": "system", "content": "Mine."},
+                {"role": "user", "content": "hi"},
+            ],
+        )
+        assert [m["content"] for m in msgs if m["role"] == "system"] == ["Mine."]
+
+    @pytest.mark.asyncio
+    async def test_completion_uses_default_system(self, mock_manager):
+        lm = mock_manager._loaded["qwen3:latest"]
+        lm.default_system = "Be terse."
+        lm.tokenizer.apply_chat_template = MagicMock(return_value="formatted prompt")
+        with (
+            patch("olmlx.engine.inference.mx", MagicMock()),
+            patch("olmlx.engine.inference.settings.prompt_cache", False),
+            patch(
+                "olmlx.engine.inference.asyncio.to_thread", new_callable=AsyncMock
+            ) as mock_thread,
+        ):
+            mock_thread.return_value = "response"
+            await generate_completion(
+                mock_manager, "qwen3", "hi", stream=False, apply_chat_template=True
+            )
+        msgs = lm.tokenizer.apply_chat_template.call_args[0][0]
+        assert msgs[0] == {"role": "system", "content": "Be terse."}
+
+
 class TestGenerateChatPerModelPromptCache:
     """Per-model ``prompt_cache`` override (set in models.json) takes
     precedence over the global ``OLMLX_PROMPT_CACHE`` setting.
@@ -5388,6 +5445,101 @@ class TestKvCachePreflightCheckHelper:
         # was correctly classified, or a future code path that bypasses
         # _setup_prompt_cache reaches this branch).
         mock_lm.prompt_cache_store.remove.assert_called_once_with("test")
+
+    @staticmethod
+    def _pressure_then_fits():
+        """Patches: first estimate over the limit, re-estimate under it."""
+        return (
+            patch(
+                "olmlx.utils.memory.get_system_memory_bytes",
+                return_value=24 * 1024**3,
+            ),
+            patch(
+                "olmlx.utils.memory.get_metal_memory",
+                return_value=10 * 1024**3,
+            ),
+            patch(
+                "olmlx.engine.inference.estimate_kv_cache_bytes",
+                side_effect=[3 * 1024**3, 1 * 1024**3],
+            ),
+            patch("olmlx.engine.inference._safe_sync"),
+            patch("olmlx.engine.inference.mx"),
+        )
+
+    @pytest.mark.asyncio
+    async def test_cold_checkpoint_drop_restores_full_prompt(self, mock_lm):
+        """#761 item 2: a checkpoint cold start hands back a one-token suffix
+        with ``cache_read_tokens == 0`` and defers the prefill. When pressure
+        pops the cache, the full prompt must be restored (else decode starts
+        from one token on a fresh cache) and the deferred prefill flagged for
+        dropping (it would fill the orphaned cache)."""
+        from olmlx.engine.inference import _kv_cache_preflight_check
+
+        mock_lm.supports_cache_persistence = True
+        gen_kwargs = {"prompt_cache": MagicMock()}
+        p1, p2, p3, p4, p5 = self._pressure_then_fits()
+        with (
+            p1,
+            p2,
+            p3,
+            p4,
+            p5,
+            patch("olmlx.engine.inference.settings") as mock_settings,
+        ):
+            mock_settings.memory_limit_fraction = 0.5
+            result = await _kv_cache_preflight_check(
+                mock_lm,
+                [5],
+                100,
+                gen_kwargs,
+                cache_read_tokens=0,
+                cache_creation_tokens=5,
+                full_prompt_tokens=[1, 2, 3, 4, 5],
+                cache_id="test",
+                has_deferred_prefill=True,
+            )
+
+        assert "prompt_cache" not in gen_kwargs
+        assert result.prompt == [1, 2, 3, 4, 5]
+        assert result.cache_dropped is True
+        # The working cache is not yet filled to its key (the prefill/trim
+        # was deferred), so it must not be re-stored under that key.
+        mock_lm.prompt_cache_store.async_set.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_no_drop_flag_when_cache_kept(self, mock_lm):
+        from olmlx.engine.inference import _kv_cache_preflight_check
+
+        gen_kwargs = {"prompt_cache": MagicMock()}
+        with (
+            patch(
+                "olmlx.utils.memory.get_system_memory_bytes",
+                return_value=24 * 1024**3,
+            ),
+            patch(
+                "olmlx.utils.memory.get_metal_memory",
+                return_value=1 * 1024**3,
+            ),
+            patch("olmlx.engine.inference.settings") as mock_settings,
+            patch(
+                "olmlx.engine.inference.estimate_kv_cache_bytes",
+                return_value=1 * 1024**3,
+            ),
+        ):
+            mock_settings.memory_limit_fraction = 0.5
+            result = await _kv_cache_preflight_check(
+                mock_lm,
+                [5],
+                100,
+                gen_kwargs,
+                cache_read_tokens=0,
+                cache_creation_tokens=5,
+                full_prompt_tokens=[1, 2, 3, 4, 5],
+                cache_id="test",
+                has_deferred_prefill=True,
+            )
+        assert result.cache_dropped is False
+        assert result.prompt == [5]
 
 
 class TestStorePromptCacheAfterGeneration:
