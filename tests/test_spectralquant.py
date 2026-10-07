@@ -615,6 +615,11 @@ class TestCalibration:
             loaded = load_calibration(tmp_path)
         assert "olmlx spectral prepare" in caplog.text
         assert (0, 0, "key") in loaded
+        # Cache builds reload calibration per request; warn only once per dir.
+        caplog.clear()
+        with caplog.at_level(logging.WARNING):
+            load_calibration(tmp_path)
+        assert "olmlx spectral prepare" not in caplog.text
 
     def test_save_and_load_calibration(self, tmp_path):
         """Calibration data should survive save/load roundtrip."""
@@ -1015,6 +1020,37 @@ class TestSpectralSeparateKVParams:
             np.array(v_out), np.array(_ref(values, v)), atol=1e-5
         )
         np.testing.assert_allclose(np.array(k_out), np.array(_ref(keys, k)), atol=1e-5)
+
+    def test_value_head_dim_differs_from_key(self):
+        """#766 review: V buffers must be sized from V's head_dim (MLA-style
+        models have k_head_dim != v_head_dim)."""
+        from olmlx.engine.spectralquant_cache import SpectralQuantKVCache
+
+        rng = np.random.RandomState(2)
+        k = self._cal(rng, 48, 4, 4, 2)
+        v = self._cal(rng, 32, 8, 2, 1)
+        cache = SpectralQuantKVCache(
+            rotation_key=k["rotation"],
+            rotation_value=v["rotation"],
+            codebook_sem_key=k["codebook_sem"],
+            codebook_tail_key=k["codebook_tail"],
+            codebook_sem_value=v["codebook_sem"],
+            codebook_tail_value=v["codebook_tail"],
+            d_eff=4,
+            bits_high=4,
+            bits_low=2,
+            value_d_eff=8,
+            value_bits_high=2,
+            value_bits_low=1,
+        )
+        k_out, v_out = cache.update_and_fetch(
+            mx.random.normal((1, 2, 3, 48)), mx.random.normal((1, 2, 3, 32))
+        )
+        k_out, v_out = cache.update_and_fetch(
+            mx.random.normal((1, 2, 1, 48)), mx.random.normal((1, 2, 1, 32))
+        )
+        assert k_out.shape == (1, 2, 4, 48)
+        assert v_out.shape == (1, 2, 4, 32)
 
     def test_make_spectral_cache_passes_value_calibration(self, monkeypatch, tmp_path):
         import olmlx.engine.spectralquant_calibrate as cal_mod

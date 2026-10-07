@@ -183,6 +183,26 @@ class TestSpeculativeDecoder:
         decoder.prefill(mx.array([[1, 2, 3]]))
         assert decoder._use_tree is False
 
+    def test_tree_disabled_on_vlm_rotating_cache(self):
+        """mlx-vlm's RotatingKVCache doesn't subclass mlx-lm's; match by name."""
+        from olmlx.engine.speculative import SpeculativeDecoder
+
+        class RotatingKVCache:  # stand-in for mlx_vlm's unrelated class
+            pass
+
+        draft = MockModel(32, 16)
+        target = MockModel(32, 16)
+        decoder = SpeculativeDecoder(
+            draft_model=draft,
+            target_model=target,
+            num_speculative_tokens=3,
+            tree_width=2,
+        )
+        decoder._target_cache = [RotatingKVCache()]
+        decoder._draft_cache = []
+        decoder._disable_tree_on_rotating_cache()
+        assert decoder._use_tree is False
+
     def test_tree_kept_on_plain_kv_cache(self):
         from olmlx.engine.speculative import SpeculativeDecoder
 

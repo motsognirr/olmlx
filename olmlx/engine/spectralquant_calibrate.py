@@ -21,6 +21,9 @@ from olmlx.engine.spectralquant import allocate_bits, fit_codebook
 
 logger = logging.getLogger(__name__)
 
+#: Calibration dirs already warned about as pre-#761 (column) layouts.
+_LEGACY_WARNED: set[Path] = set()
+
 #: Default max tokens collected per head during calibration.  Also duplicated
 #: in ``model_manager.py`` (which avoids importing this module eagerly) —
 #: both copies must be kept in sync.
@@ -317,7 +320,9 @@ def load_calibration(calibration_dir: Path) -> CalibrationData:
     tensors = safetensors.numpy.load_file(
         str(calibration_dir / "calibration.safetensors")
     )
-    if config.get("basis") != "rows":
+    if config.get("basis") != "rows" and calibration_dir not in _LEGACY_WARNED:
+        # Cache builds reload calibration per request; warn once per dir.
+        _LEGACY_WARNED.add(calibration_dir)
         # Pre-#761 calibrations projected onto the eigenvector matrix's rows
         # while storing eigenvectors as columns. Their codebooks were fit on
         # that same projection, so they still round-trip consistently; they

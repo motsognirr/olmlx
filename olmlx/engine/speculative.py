@@ -22,13 +22,8 @@ import mlx.core as mx
 import mlx.nn as nn
 
 try:
-    from mlx_lm.models.cache import (
-        RotatingKVCache,
-        make_prompt_cache,
-        trim_prompt_cache,
-    )
+    from mlx_lm.models.cache import make_prompt_cache, trim_prompt_cache
 except ImportError:
-    RotatingKVCache = None  # type: ignore[assignment,misc]
     make_prompt_cache = None  # type: ignore[assignment]
     trim_prompt_cache = None  # type: ignore[assignment]
 
@@ -659,10 +654,11 @@ class SpeculativeDecoder(SpecDecoderBase):
         resident (gpt-oss, Gemma 3, Step-3.5). Linear speculation trims with
         the rotating-aware ``_trim_recent_cache`` (#605) and is correct there.
         """
-        if not self._use_tree or RotatingKVCache is None:
+        if not self._use_tree:
             return
         caches = (self._target_cache or []) + (self._draft_cache or [])
-        if any(isinstance(c, RotatingKVCache) for c in caches):
+        # By class name: mlx-vlm's RotatingKVCache doesn't subclass mlx-lm's.
+        if any(type(c).__name__ == "RotatingKVCache" for c in caches):
             logger.warning(
                 "Tree speculation (tree_width>=2) is not supported on "
                 "sliding-window (RotatingKVCache) models; falling back to "

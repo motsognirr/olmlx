@@ -1788,6 +1788,8 @@ def _drive_segmented_prefill(
                 # Sliding-window models (gpt-oss, Step-3.5, Gemma 3): feed the
                 # span in ONE call, preserving the validated single-call
                 # behavior their windowed attention depends on.
+                if cancel_event is not None and cancel_event.is_set():
+                    return False
                 model(mx.array(flat[start:end], dtype=mx.int32)[None, :], cache=cache)
                 mx.eval(flatten_cache_state(cache))
                 mx.clear_cache()
@@ -1863,9 +1865,8 @@ def _drive_segmented_prefill(
                 is_checkpoint=True,
             )
         )
-        # Chunk 2: boundary to the reserved trailing token.
-        if cancel_event is not None and cancel_event.is_set():
-            return [flat[-1]]
+        # Chunk 2: boundary to the reserved trailing token (``_run`` checks
+        # cancel_event before each forward).
         _run(deepest_boundary, final_prefill_end)
 
     return [flat[-1]]

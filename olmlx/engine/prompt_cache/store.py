@@ -978,6 +978,18 @@ class PromptCacheStore:
             self._radix.remove(tokens[:depth], cid)
             self.metrics.radix_misses += 1
             return None
+        kv_depth = _checkpoint_kv_depth(state.cache)
+        if kv_depth is not None and kv_depth != depth:
+            # A short cache (e.g. a pre-#761 cancelled prefill restored from
+            # disk) would make the caller skip prefilling the gap. Drop it.
+            logger.warning(
+                "Dropping checkpoint: cache depth %d != %d key tokens",
+                kv_depth,
+                depth,
+            )
+            self.remove(cid)
+            self.metrics.radix_misses += 1
+            return None
         self._entries.move_to_end(cid)
         self.metrics.radix_hits += 1
         suffix = tokens[depth:]

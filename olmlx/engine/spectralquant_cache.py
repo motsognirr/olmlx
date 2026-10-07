@@ -124,8 +124,12 @@ class SpectralQuantKVCache(_BaseCache):
         k_sem_dim, k_tail_dim = self._packed_dims(
             head_dim, self.d_eff, self.bits_high, self.bits_low
         )
+        # V's head size can differ from K's (MLA-style models).
         v_sem_dim, v_tail_dim = self._packed_dims(
-            head_dim, self.value_d_eff, self.value_bits_high, self.value_bits_low
+            values.shape[-1],
+            self.value_d_eff,
+            self.value_bits_high,
+            self.value_bits_low,
         )
 
         # Allocate or expand buffers

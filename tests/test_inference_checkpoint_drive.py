@@ -1021,3 +1021,41 @@ def test_insert_checkpoint_refuses_cache_shorter_than_key():
         CachedPromptState(tokens=[1, 2], cache=[layer], is_checkpoint=True)
     )
     assert len(store) == 1
+
+
+def test_fetch_nearest_drops_checkpoint_shorter_than_key():
+    """#766 review: entries that bypass insert_checkpoint (disk restore, spills
+    from before the guard) must not be served as covering their whole key."""
+    from olmlx.engine.prompt_cache.state import CachedPromptState
+
+    store = PromptCacheStore(max_slots=8)
+    layer = KVCache()
+    layer.update_and_fetch(mx.zeros((1, 1, 2, 4)), mx.zeros((1, 1, 2, 4)))
+    cid = store._checkpoint_cache_id([1, 2, 3, 4])
+    store.set(
+        cid, CachedPromptState(tokens=[1, 2, 3, 4], cache=[layer], is_checkpoint=True)
+    )
+    assert store.fetch_nearest([1, 2, 3, 4, 5, 6]) is None
+    assert len(store) == 0
+
+
+def test_drive_pure_rotating_cancel_before_prefill_skips_snapshot():
+    cancel = threading.Event()
+    cancel.set()
+    model = _DummyModel()
+    store = PromptCacheStore(max_slots=8)
+    sp = SegmentedPrompt(
+        segments=[
+            Segment(tokens=[1, 2, 3], role="system"),
+            Segment(tokens=[4, 5], role="user"),
+        ]
+    )
+    _drive_segmented_prefill(
+        model=model,
+        segmented=sp,
+        cache=[RotatingKVCache(max_size=64, keep=0)],
+        insert_checkpoint=store.insert_checkpoint,
+        cancel_event=cancel,
+    )
+    assert model.calls == []
+    assert len(store) == 0
