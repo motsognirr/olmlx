@@ -961,7 +961,7 @@ class TestStaleTempSpillPurge:
         fresh = tmp_dir / "b.cafebabe.safetensors"
         stale.write_bytes(b"x")
         fresh.write_bytes(b"y")
-        old = time.time() - 2 * 3600
+        old = time.time() - 25 * 3600
         os.utime(stale, (old, old))
         store._cleanup_disk()
         assert not stale.exists()
@@ -988,13 +988,22 @@ class TestStaleTempSpillPurge:
         (store._disk_dir() / "b.safetensors").write_bytes(b"y")
         assert store.clear_disk() == 2
 
-    def test_cleanup_sweeps_temps_once_per_store(self, tmp_path):
+    def test_cleanup_sweeps_temps_rate_limited(self, tmp_path):
         from unittest.mock import patch
 
+        import olmlx.engine.prompt_cache.store as store_mod
+
         store, _ = self._store(tmp_path)
-        with patch.object(
-            PromptCacheStore, "_purge_stale_temp_spills", return_value=0
-        ) as purge:
+        clock = [1000.0]
+        with (
+            patch.object(
+                PromptCacheStore, "_purge_stale_temp_spills", return_value=0
+            ) as purge,
+            patch.object(store_mod.time, "monotonic", lambda: clock[0]),
+        ):
             store._cleanup_disk()
-            store._cleanup_disk()
-        assert purge.call_count == 1
+            store._cleanup_disk()  # within the interval: no rescan
+            assert purge.call_count == 1
+            clock[0] += store_mod._TEMP_SWEEP_INTERVAL_SECONDS
+            store._cleanup_disk()  # a later crash's orphan gets reclaimed
+            assert purge.call_count == 2

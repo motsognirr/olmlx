@@ -36,9 +36,14 @@ except ImportError:  # pragma: no cover
 
 logger = logging.getLogger(__name__)
 
-#: Age after which a spill temp *without* a writer PID in its name (an older
-#: naming scheme) is treated as a crash leftover rather than a write in flight.
-_STALE_TEMP_SPILL_SECONDS = 3600
+#: Age after which a spill temp *without* a writer PID in its name (the
+#: brief pre-#769 naming scheme) is treated as a crash leftover. Generous, as
+#: it can't tell a slow write in flight from a leftover.
+_STALE_TEMP_SPILL_SECONDS = 24 * 3600
+
+#: Minimum interval between ``.tmp`` sweeps of one store, so a writer that
+#: crashes after a sweep is still reclaimed without a scan on every spill.
+_TEMP_SWEEP_INTERVAL_SECONDS = 600
 
 
 def _spill_temp_path(tmp_dir: Path, file_path: Path) -> Path:
@@ -264,7 +269,7 @@ class PromptCacheStore:
         self._disk_max_bytes = disk_max_bytes
         self._ram_budget_bytes = ram_budget_bytes
         self._evict_generation = 0  # bumped by async_evict_all_to_disk
-        self._temp_spills_swept = False  # see _cleanup_disk
+        self._last_temp_sweep: float | None = None  # see _cleanup_disk
         self._radix = PrefixCacheIndex()
         self.metrics = CacheMetrics()
 
@@ -488,7 +493,9 @@ class PromptCacheStore:
         leftover when that process is gone, however recent the crash, while
         temps of a live process (this one, or another server on the same
         dir) are never touched, so a write in flight is always safe (#769
-        review). Temps without a parseable PID fall back to an age check.
+        review). A recycled PID errs the same way: the orphan is kept, never
+        a live write deleted. Temps without a parseable PID fall back to a
+        generous age check.
         Returns the number of files removed.
         """
         tmp_dir = disk_dir / ".tmp"
@@ -528,12 +535,15 @@ class PromptCacheStore:
         if not disk_dir.exists():
             self.metrics.bytes_on_disk = 0
             return
-        # Crash leftovers come only from dead processes, which the PID check
-        # recognizes at any age, so one sweep per store is enough — not a
-        # .tmp scan on every spill, which can run on the event loop via the
-        # sync set() path (#769 review).
-        if not self._temp_spills_swept:
-            self._temp_spills_swept = True
+        # Rate-limited, not per spill: the sync set() path runs this on the
+        # event loop. Periodic rather than once, so a writer that crashes
+        # after a sweep is still reclaimed (#769 review).
+        now = time.monotonic()
+        if (
+            self._last_temp_sweep is None
+            or now - self._last_temp_sweep >= _TEMP_SWEEP_INTERVAL_SECONDS
+        ):
+            self._last_temp_sweep = now
             self._purge_stale_temp_spills(disk_dir)
         # Single stat pass: collect (path, size, mtime) to avoid double-stat
         file_info = []
