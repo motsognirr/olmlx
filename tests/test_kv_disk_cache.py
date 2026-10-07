@@ -935,7 +935,9 @@ class TestStaleTempSpillPurge:
 
     def test_dead_writer_temp_removed_even_if_fresh(self, tmp_path):
         store, tmp_dir = self._store(tmp_path)
-        orphan = tmp_dir / f"a-x.{self._dead_pid()}.abc.safetensors"
+        from olmlx.engine.prompt_cache.store import _host_token
+
+        orphan = tmp_dir / f"a-x.{self._dead_pid()}-{_host_token()}.abc.safetensors"
         orphan.write_bytes(b"x")
         store._cleanup_disk()
         assert not orphan.exists()
@@ -943,8 +945,10 @@ class TestStaleTempSpillPurge:
     def test_live_writer_temp_kept_even_by_clear_disk(self, tmp_path):
         import os
 
+        from olmlx.engine.prompt_cache.store import _host_token
+
         store, tmp_dir = self._store(tmp_path)
-        inflight = tmp_dir / f"a.b-x.{os.getpid()}.abc.safetensors"
+        inflight = tmp_dir / f"a.b-x.{os.getpid()}-{_host_token()}.abc.safetensors"
         inflight.write_bytes(b"x")
         old = 0
         os.utime(inflight, (old, old))  # age alone must not condemn it
@@ -984,7 +988,11 @@ class TestStaleTempSpillPurge:
 
     def test_clear_disk_counts_purged_temps(self, tmp_path):
         store, tmp_dir = self._store(tmp_path)
-        (tmp_dir / f"a.{self._dead_pid()}.abc.safetensors").write_bytes(b"x")
+        from olmlx.engine.prompt_cache.store import _host_token
+
+        (tmp_dir / f"a.{self._dead_pid()}-{_host_token()}.abc.safetensors").write_bytes(
+            b"x"
+        )
         (store._disk_dir() / "b.safetensors").write_bytes(b"y")
         assert store.clear_disk() == 2
 
@@ -1007,3 +1015,25 @@ class TestStaleTempSpillPurge:
             clock[0] += store_mod._TEMP_SWEEP_INTERVAL_SECONDS
             store._cleanup_disk()  # a later crash's orphan gets reclaimed
             assert purge.call_count == 2
+
+    def test_other_host_temp_falls_back_to_age(self, tmp_path):
+        # A dead-looking PID from another host (shared volume) isn't trusted:
+        # a fresh temp survives, so a co-tenant's live spill is never cut.
+        store, tmp_dir = self._store(tmp_path)
+        foreign = tmp_dir / f"a.{self._dead_pid()}-00000000.abc.safetensors"
+        foreign.write_bytes(b"x")
+        store._cleanup_disk()
+        assert foreign.exists()
+
+    def test_pid_parse_never_raises(self, tmp_path):
+        from olmlx.engine.prompt_cache.store import _host_token, _spill_temp_pid
+
+        h = _host_token()
+        for name in (
+            f"a.\u00b2-{h}.u.safetensors",
+            f"a.0-{h}.u.safetensors",
+            f"a.1-{h}.u.safetensors",
+            "a.b.c.d.e",
+            "x",
+        ):
+            assert _spill_temp_pid(tmp_path / name) is None

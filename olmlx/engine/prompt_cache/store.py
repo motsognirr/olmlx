@@ -12,6 +12,7 @@ import logging
 import os
 import re
 import shutil
+import socket
 import time
 import uuid
 from collections import OrderedDict
@@ -46,19 +47,38 @@ _STALE_TEMP_SPILL_SECONDS = 24 * 3600
 _TEMP_SWEEP_INTERVAL_SECONDS = 600
 
 
+def _host_token() -> str:
+    """Short, filename-safe tag for this host (and so PID namespace, in
+    practice: containers get their own hostnames)."""
+    return hashlib.sha1(socket.gethostname().encode("utf-8")).hexdigest()[:8]
+
+
 def _spill_temp_path(tmp_dir: Path, file_path: Path) -> Path:
-    """``<stem>.<pid>.<uuid>.safetensors``: the PID lets a later sweep tell a
-    dead writer's leftover from a live write (``_purge_stale_temp_spills``).
-    Keeps the suffix because mlx appends one otherwise."""
-    return tmp_dir / f"{file_path.stem}.{os.getpid()}.{uuid.uuid4().hex}.safetensors"
+    """``<stem>.<pid>-<host>.<uuid>.safetensors``: lets a later sweep tell a
+    dead local writer's leftover from a live write
+    (``_purge_stale_temp_spills``). Keeps the suffix because mlx appends one
+    otherwise."""
+    return tmp_dir / (
+        f"{file_path.stem}.{os.getpid()}-{_host_token()}.{uuid.uuid4().hex}.safetensors"
+    )
+
+
+_SPILL_WRITER_RE = re.compile(r"([0-9]+)-([0-9a-f]{8})", re.ASCII)
 
 
 def _spill_temp_pid(path: Path) -> int | None:
-    """The writer PID encoded by ``_spill_temp_path``, or ``None``."""
+    """The writer PID encoded by ``_spill_temp_path`` — only when the temp
+    was written on *this* host, since a PID from another host's (or
+    container's) process table can't be checked here. ``None`` otherwise."""
     parts = path.name.rsplit(".", 3)
-    if len(parts) != 4 or not parts[1].isdigit():
+    if len(parts) != 4:
         return None
-    return int(parts[1])
+    m = _SPILL_WRITER_RE.fullmatch(parts[1])
+    if m is None or m.group(2) != _host_token():
+        return None
+    pid = int(m.group(1))
+    # 0/1 would make os.kill probe a process group / init.
+    return pid if pid > 1 else None
 
 
 def _pid_alive(pid: int) -> bool:
@@ -489,13 +509,13 @@ class PromptCacheStore:
         exception, but not if the process dies mid-write; such files are
         invisible to the ``*.safetensors`` accounting and eviction above.
 
-        Each temp names its writer's PID (``_spill_temp_path``). A temp is a
-        leftover when that process is gone, however recent the crash, while
-        temps of a live process (this one, or another server on the same
-        dir) are never touched, so a write in flight is always safe (#769
-        review). A recycled PID errs the same way: the orphan is kept, never
-        a live write deleted. Temps without a parseable PID fall back to a
-        generous age check.
+        Each temp names its writer's PID and host (``_spill_temp_path``). A
+        temp written on this host is a leftover when that process is gone,
+        however recent the crash, while temps of a live local process (this
+        one, or another server here) are never touched (#769 review). A
+        recycled PID errs the same way: the orphan is kept, never a live
+        write deleted. Temps from another host (a shared volume), or without
+        a parseable writer, fall back to a generous age check.
         Returns the number of files removed.
         """
         tmp_dir = disk_dir / ".tmp"
