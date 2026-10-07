@@ -58,7 +58,7 @@ async def ps(request: Request):
             # read_manifest applies the #702 stale-estimator refresh (#741),
             # which may re-read config.json and rewrite the manifest.
             m = await asyncio.to_thread(
-                store.read_manifest, store.local_path(lm.hf_path)
+                store.read_manifest, store.model_dir(lm.hf_path)
             )
             if m is not None:
                 if size == 0:

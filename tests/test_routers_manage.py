@@ -510,3 +510,67 @@ class TestDeleteParity:
         mc = registry.resolve("helper")
         assert mc.system is None
         assert "helper:latest" not in registry._mappings
+
+
+class TestCreateDeleteReviewFollowups:
+    """PR #768 review: failed re-create keeps the old entry; aliases never
+    dangle when their target is removed or replaced."""
+
+    async def test_invalid_recreate_keeps_existing_entry(self, app_client, registry):
+        await app_client.post(
+            "/api/create",
+            json={"model": "helper", "from": "qwen3", "system": "Old", "stream": False},
+        )
+        resp = await app_client.post(
+            "/api/create",
+            json={
+                "model": "helper",
+                "modelfile": "FROM qwen3\nPARAMETER num_predict 0",
+                "stream": False,
+            },
+        )
+        assert resp.status_code == 400
+        assert registry.resolve("helper").system == "Old"
+
+    async def test_create_from_own_alias_rejected(self, app_client, registry):
+        # x → helper (alias); "create helper FROM x" would orphan x.
+        await app_client.post(
+            "/api/create",
+            json={"model": "helper", "from": "qwen3", "system": "S", "stream": False},
+        )
+        await app_client.post(
+            "/api/copy", json={"source": "helper", "destination": "x"}
+        )
+        resp = await app_client.post(
+            "/api/create", json={"model": "helper", "from": "x", "stream": False}
+        )
+        assert resp.status_code == 400
+        assert registry.resolve("x").system == "S"
+
+    async def test_delete_canonical_promotes_alias(self, app_client, registry):
+        await app_client.post(
+            "/api/create",
+            json={"model": "base2", "from": "qwen3", "system": "S", "stream": False},
+        )
+        await app_client.post("/api/copy", json={"source": "base2", "destination": "a"})
+        resp = await app_client.request(
+            "DELETE", "/api/delete", json={"model": "base2"}
+        )
+        assert resp.status_code == 200
+        assert registry.resolve("base2") is None
+        mc = registry.resolve("a")
+        assert mc.hf_path == "Qwen/Qwen3-8B-MLX"
+        assert mc.system == "S"
+
+    async def test_recreate_target_keeps_alias_resolvable(self, app_client, registry):
+        await app_client.post(
+            "/api/create",
+            json={"model": "base2", "from": "qwen3", "system": "S", "stream": False},
+        )
+        await app_client.post("/api/copy", json={"source": "base2", "destination": "a"})
+        resp = await app_client.post(
+            "/api/create", json={"model": "base2", "from": "llama3:8b", "stream": False}
+        )
+        assert resp.status_code == 200
+        assert registry.resolve("a").hf_path == "Qwen/Qwen3-8B-MLX"
+        assert registry.resolve("base2").hf_path == "mlx-community/Llama-3-8B-Instruct"

@@ -5245,6 +5245,33 @@ async def generate_embeddings(
         lm.release_ref()
 
 
+# Doc tokens always left after a shortened query, plus slack for a decode →
+# re-encode round trip that comes back a token or two longer.
+_RERANK_MIN_DOC_TOKENS = 8
+
+
+def _fit_rerank_query(tokenizer: Any, query: str, max_len: int) -> str:
+    """Shorten *query* only when it alone can't fit in *max_len* (#760).
+
+    ``truncation="only_second"`` can't trim the query: on such a query fast
+    tokenizers raise and slow ones return it untruncated, overrunning the
+    position table. ``longest_first`` would avoid that but also trims every
+    long-but-fitting query, changing scores for ordinary requests. So trim
+    the query up front, here, and only when it's over the window.
+    """
+    if not hasattr(tokenizer, "encode") or not hasattr(tokenizer, "decode"):
+        return query
+    try:
+        specials = int(tokenizer.num_special_tokens_to_add(pair=True))
+    except Exception:  # noqa: BLE001 — conservative default for RoBERTa pairs
+        specials = 4
+    budget = max_len - specials - _RERANK_MIN_DOC_TOKENS
+    ids = tokenizer.encode(query, add_special_tokens=False)
+    if budget <= 0 or len(ids) <= budget:
+        return query
+    return tokenizer.decode(ids[:budget])
+
+
 def _score_pairs(
     model,
     tokenizer,
@@ -5268,16 +5295,17 @@ def _score_pairs(
     if isinstance(table, int) and table > 0:
         max_len = min(max_len, table)
 
+    query = _fit_rerank_query(tokenizer, query, max_len)
+
     scores: list[float] = []
     for start in range(0, len(documents), batch_size):
         chunk = documents[start : start + batch_size]
         enc = tokenizer(
             [query] * len(chunk),
             chunk,
-            # "only_second" can't shorten a query that alone exceeds
-            # max_len (fast tokenizers raise; slow ones overrun the position
-            # table). longest_first trims docs first, then the query (#760).
-            truncation="longest_first",
+            # Docs absorb the truncation; an over-long query was already
+            # shortened by _fit_rerank_query above.
+            truncation="only_second",
             max_length=max_len,
             padding=True,
             return_tensors="np",
@@ -5424,7 +5452,7 @@ async def generate_transcription(
         # Resolve the on-disk path used as path_or_hf_repo so the ModelHolder
         # cache key matches what we inject.
         if manager.store is not None:
-            load_path = str(manager.store.local_path(lm.hf_path))
+            load_path = str(manager.store.model_dir(lm.hf_path))
         else:
             load_path = lm.hf_path
 

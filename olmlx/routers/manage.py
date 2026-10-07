@@ -95,6 +95,10 @@ async def delete_model(req: DeleteRequest, request: Request):
             {"error": f"model '{req.model}' not found"}, status_code=404
         )
     if in_registry:
+        if shared:
+            # Aliases of this entry still use the kept weights: make them
+            # standalone entries first, or they'd point at nothing (#760).
+            registry.promote_aliases_of(req.model)
         registry.remove(req.model)
     return Response(status_code=200)
 
@@ -160,20 +164,40 @@ async def create_model(req: CreateRequest, request: Request):
         )
 
     normalized = registry.normalize_name(req.model)
-    try:
-        # Re-creating a name replaces it: drop the earlier alias/entry first,
-        # since resolve() prefers an alias and would shadow a new mapping.
-        # Skipped when the new name *is* the base (already resolved above).
-        if normalized != registry.normalize_name(from_model):
-            registry.remove(normalized)
-        if system is None and not params:
-            registry.add_alias(normalized, from_model)
-        else:
+    same_name = normalized == registry.normalize_name(from_model)
+    if not same_name and normalized in registry.alias_chain(from_model):
+        # Replacing *normalized* would cut the base out from under itself.
+        return JSONResponse(
+            {
+                "error": f"cannot create '{req.model}' from '{from_model}': "
+                f"'{from_model}' is an alias of '{req.model}'"
+            },
+            status_code=400,
+        )
+    mc = None
+    if system is not None or params:
+        # Build (and so validate) the new entry before touching the registry:
+        # a rejected value must leave an existing model of this name intact.
+        try:
             mc = replace(
                 resolved,
                 options={**resolved.options, **params},
                 system=system if system is not None else resolved.system,
             )
+        except ValueError as e:
+            return JSONResponse({"error": str(e)}, status_code=400)
+    try:
+        # Re-creating a name replaces it: drop the earlier alias/entry first,
+        # since resolve() prefers an alias and would shadow a new mapping.
+        # Skipped when the new name *is* the base (already resolved above).
+        if not same_name:
+            # Aliases of the old entry keep what they pointed at (Ollama's
+            # copy semantics) instead of dangling or following the new one.
+            registry.promote_aliases_of(normalized)
+            registry.remove(normalized)
+        if mc is None:
+            registry.add_alias(normalized, from_model)
+        else:
             registry.add_mapping(normalized, mc.hf_path, model_config=mc)
     except ValueError as e:
         return JSONResponse({"error": str(e)}, status_code=400)

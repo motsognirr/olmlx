@@ -2049,6 +2049,45 @@ class ModelRegistry:
         self._dirty_keys -= dirty_snapshot
         self._removed_keys -= removed_snapshot
 
+    def alias_chain(self, name: str) -> list[str]:
+        """Names visited resolving *name* through aliases (normalized),
+        starting with *name* itself. Loop thread only."""
+        current = self.normalize_name(name)
+        chain = [current]
+        while current in self._aliases:
+            current = self._aliases[current]
+            if current in chain:
+                break
+            chain.append(current)
+        return chain
+
+    def promote_aliases_of(self, name: str) -> list[str]:
+        """Turn aliases of the mapping *name* into standalone entries with the
+        same config, so removing *name* doesn't leave them dangling (#760).
+
+        Returns the promoted alias names. Loop thread only.
+        """
+        assert_loop_thread("ModelRegistry.promote_aliases_of")
+        normalized = self.normalize_name(name)
+        mc = self._mappings.get(normalized)
+        if mc is None:
+            return []
+        dependents = [
+            alias
+            for alias in list(self._aliases)
+            if alias != normalized and normalized in self.alias_chain(alias)[1:]
+        ]
+        for alias in dependents:
+            del self._aliases[alias]
+            self._mappings[alias] = mc
+            self._raw_unrecognized.pop(alias, None)
+            self._dirty_keys.add(alias)
+            self._removed_keys.discard(alias)
+        if dependents:
+            self._save_aliases()
+            self._save_mappings()
+        return dependents
+
     def remove(self, name: str):
         """Remove a model alias, mapping, or adapter."""
         # Lock-free pop-then-save of _aliases/_mappings/_adapters; loop-only (#463).
