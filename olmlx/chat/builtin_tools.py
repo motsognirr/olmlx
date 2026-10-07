@@ -6,6 +6,7 @@ import glob as glob_module
 import http.client
 import ipaddress
 import logging
+import math
 import os
 import signal
 import socket
@@ -15,7 +16,7 @@ import urllib.request
 import urllib.error
 from html.parser import HTMLParser
 from pathlib import Path
-from typing import Callable
+from typing import Any, Callable
 
 from olmlx.chat.config import ChatConfig
 from olmlx.chat.errors import ToolError
@@ -30,6 +31,9 @@ _GLOB_MAX_RESULTS = 500
 _GREP_MAX_BYTES = 50_000
 # Default bash timeout
 _BASH_DEFAULT_TIMEOUT = 120
+# Upper bound on a model-supplied bash timeout (#759): an unbounded value
+# (``null``, ``1e9``, ``inf``) would let one tool call pin a turn forever.
+_BASH_MAX_TIMEOUT = 3600
 # Maximum output for bash
 _BASH_MAX_BYTES = 100_000
 # Maximum characters for web_fetch output
@@ -423,9 +427,24 @@ async def _handle_question(args: dict) -> str:
     return "__question__:" + json.dumps(payload)
 
 
+def _resolve_bash_timeout(value: Any) -> float:
+    """Return a finite, positive bash timeout (#759).
+
+    Model-supplied JSON may carry ``null``, a string, a bool or a
+    non-positive/NaN number — any of which would otherwise reach
+    ``wait_for`` (``None`` there means wait forever). Those fall back to the
+    default; an over-large value is clamped to ``_BASH_MAX_TIMEOUT``.
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return _BASH_DEFAULT_TIMEOUT
+    if math.isnan(value) or value <= 0:
+        return _BASH_DEFAULT_TIMEOUT
+    return min(value, _BASH_MAX_TIMEOUT)
+
+
 async def _handle_bash(args: dict) -> str | ToolError:
     command = args.get("command", "")
-    timeout = args.get("timeout", _BASH_DEFAULT_TIMEOUT)
+    timeout = _resolve_bash_timeout(args.get("timeout"))
 
     try:
         proc = await asyncio.create_subprocess_shell(
@@ -1057,7 +1076,7 @@ class BuiltinToolManager:
         # handlers keep their own internal bounds (grep/web 30s).
         if (
             name == "bash"
-            and "timeout" not in arguments
+            and arguments.get("timeout") is None
             and self._config.tool_timeout is not None
         ):
             arguments = {**arguments, "timeout": self._config.tool_timeout}

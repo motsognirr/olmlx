@@ -6963,3 +6963,222 @@ class TestBuildSpeculativeDecoderBundledProbe:
         assert used_cfg.draft_model == str(bundled)
         # store.local_path must NOT have been called for absolute hf_path
         mock_local_path.assert_not_called()
+
+
+class TestFailedLoadClosesResources:
+    """Issue #759 items 1 & 3: abandoned/failed loads must close the
+    speculative decoder (releases ``_GDN_PATCH_LOCK``) and the Flash weight
+    store (fds + I/O pool), and a cancelled untimed load must not orphan
+    its thread."""
+
+    GB = 1024 * 1024 * 1024
+
+    def _common_patches(self, metal_side_effect):
+        return (
+            patch(
+                "olmlx.utils.memory.get_metal_memory",
+                side_effect=metal_side_effect,
+            ),
+            patch(
+                "olmlx.utils.memory.get_system_memory_bytes",
+                return_value=64 * self.GB,
+            ),
+            patch(
+                "olmlx.utils.memory.is_memory_pressure_high",
+                return_value=False,
+            ),
+            patch("olmlx.engine.model_manager.gc.collect"),
+            patch("olmlx.engine.model_manager.mx.clear_cache"),
+            patch("olmlx.engine.model_manager.mx.synchronize"),
+        )
+
+    def _model_with_store(self):
+        model = MagicMock()
+        model.prefetcher = None
+        model._weight_store = MagicMock()
+        return model
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("timeout", [None, 10.0])
+    async def test_memory_error_closes_spec_decoder_and_weight_store(
+        self, registry, mock_store, monkeypatch, timeout
+    ):
+        monkeypatch.setattr(
+            "olmlx.engine.model_manager.settings.model_load_timeout", timeout
+        )
+        manager = ModelManager(registry, mock_store)
+        model = self._model_with_store()
+        tok = MagicMock()
+        tok.chat_template = None
+        decoder = MagicMock()
+        patches = self._common_patches([1 * self.GB, int(64 * self.GB * 0.9)])
+        with (
+            patch.object(
+                manager,
+                "_load_model",
+                return_value=(model, tok, False, TemplateCaps(), decoder),
+            ),
+            patches[0],
+            patches[1],
+            patches[2],
+            patches[3],
+            patches[4],
+            patches[5],
+        ):
+            with pytest.raises(MemoryError):
+                await manager.ensure_loaded("qwen3")
+        decoder.close.assert_called_once()
+        model._weight_store.close.assert_called_once()
+        assert "qwen3:latest" not in manager._loaded
+
+    @pytest.mark.asyncio
+    async def test_probe_failure_closes_registered_model(
+        self, registry, mock_store, monkeypatch
+    ):
+        manager = ModelManager(registry, mock_store)
+        model = self._model_with_store()
+        tok = MagicMock()
+        tok.chat_template = None
+        decoder = MagicMock()
+        patches = self._common_patches(lambda: 1 * self.GB)
+        with (
+            patch.object(
+                manager,
+                "_load_model",
+                return_value=(model, tok, False, TemplateCaps(), decoder),
+            ),
+            patch.object(
+                manager,
+                "_probe_cache_capabilities",
+                side_effect=RuntimeError("probe failed"),
+            ),
+            patches[0],
+            patches[1],
+            patches[2],
+            patches[3],
+            patches[4],
+            patches[5],
+        ):
+            with pytest.raises(RuntimeError, match="probe failed"):
+                await manager.ensure_loaded("qwen3")
+        decoder.close.assert_called_once()
+        model._weight_store.close.assert_called_once()
+        assert "qwen3:latest" not in manager._loaded
+
+    @pytest.mark.asyncio
+    async def test_timed_out_load_result_is_closed_when_thread_finishes(
+        self, registry, mock_store, monkeypatch
+    ):
+        monkeypatch.setattr(
+            "olmlx.engine.model_manager.settings.model_load_timeout", 0.05
+        )
+        manager = ModelManager(registry, mock_store)
+        model = self._model_with_store()
+        tok = MagicMock()
+        tok.chat_template = None
+        decoder = MagicMock()
+        release = threading.Event()
+
+        def slow_load(*a, **kw):
+            release.wait(5)
+            return (model, tok, False, TemplateCaps(), decoder)
+
+        patches = self._common_patches(lambda: 1 * self.GB)
+        with (
+            patch.object(manager, "_load_model", side_effect=slow_load),
+            patches[0],
+            patches[1],
+            patches[2],
+            patches[3],
+            patches[4],
+            patches[5],
+        ):
+            with pytest.raises(ModelLoadTimeoutError):
+                await manager.ensure_loaded("qwen3")
+            cleanup = manager._pending_cleanups["qwen3:latest"]
+            release.set()
+            await cleanup
+        decoder.close.assert_called_once()
+        model._weight_store.close.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_cancel_untimed_load_schedules_deferred_cleanup(
+        self, registry, mock_store, monkeypatch
+    ):
+        """With model_load_timeout=None (default), a cancelled load must
+        still be tracked so a retry waits for the orphaned thread, and the
+        orphan's result must be closed."""
+        monkeypatch.setattr(
+            "olmlx.engine.model_manager.settings.model_load_timeout", None
+        )
+        manager = ModelManager(registry, mock_store)
+        model = self._model_with_store()
+        tok = MagicMock()
+        tok.chat_template = None
+        decoder = MagicMock()
+        started = threading.Event()
+        release = threading.Event()
+
+        def slow_load(*a, **kw):
+            started.set()
+            release.wait(5)
+            return (model, tok, False, TemplateCaps(), decoder)
+
+        patches = self._common_patches(lambda: 1 * self.GB)
+        with (
+            patch.object(manager, "_load_model", side_effect=slow_load),
+            patches[0],
+            patches[1],
+            patches[2],
+            patches[3],
+            patches[4],
+            patches[5],
+        ):
+            task = asyncio.create_task(manager.ensure_loaded("qwen3"))
+            await asyncio.to_thread(started.wait, 5)
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            assert "qwen3:latest" in manager._pending_cleanups
+            assert "qwen3:latest" in manager._pending_load_tasks
+            cleanup = manager._pending_cleanups["qwen3:latest"]
+            release.set()
+            await cleanup
+        decoder.close.assert_called_once()
+        model._weight_store.close.assert_called_once()
+        assert "qwen3:latest" not in manager._pending_cleanups
+
+    @pytest.mark.asyncio
+    async def test_stop_closes_orphaned_load_result(
+        self, registry, mock_store, monkeypatch
+    ):
+        monkeypatch.setattr(
+            "olmlx.engine.model_manager.settings.model_load_timeout", 0.05
+        )
+        manager = ModelManager(registry, mock_store)
+        model = self._model_with_store()
+        tok = MagicMock()
+        tok.chat_template = None
+        decoder = MagicMock()
+        release = threading.Event()
+
+        def slow_load(*a, **kw):
+            release.wait(5)
+            return (model, tok, False, TemplateCaps(), decoder)
+
+        patches = self._common_patches(lambda: 1 * self.GB)
+        with (
+            patch.object(manager, "_load_model", side_effect=slow_load),
+            patches[0],
+            patches[1],
+            patches[2],
+            patches[3],
+            patches[4],
+            patches[5],
+        ):
+            with pytest.raises(ModelLoadTimeoutError):
+                await manager.ensure_loaded("qwen3")
+            threading.Timer(0.1, release.set).start()
+            await manager.stop()
+        decoder.close.assert_called_once()
+        model._weight_store.close.assert_called_once()

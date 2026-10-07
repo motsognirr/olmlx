@@ -110,7 +110,7 @@ class TestBuiltinErrorFormat:
     @pytest.mark.asyncio
     async def test_bash_timeout_returns_tool_error(self):
         mgr = BuiltinToolManager(ChatConfig(model_name="x"))
-        result = await mgr.call_tool("bash", {"command": "sleep 2", "timeout": 0})
+        result = await mgr.call_tool("bash", {"command": "sleep 2", "timeout": 0.01})
         assert isinstance(result, ToolError)
         assert result.tool_name == "bash"
         assert "timed out" in result.message.lower()

@@ -151,6 +151,13 @@ class TestAgentSessionPolicy:
         sess = _session(_service(store, tmp_path), store)
         assert sess.config.local_tool_safety is True
 
+    def test_tool_timeout_defaults_on(self, store, tmp_path):
+        # #759: a headless run must not inherit "no timeout" for bash/MCP.
+        sess = _session(_service(store, tmp_path), store)
+        assert sess.config.tool_timeout == 300.0
+        sess = _session(_service(store, tmp_path, agent_tool_timeout=5.0), store)
+        assert sess.config.tool_timeout == 5.0
+
     def test_deny_policy_override(self, store, tmp_path):
         svc = _service(
             store,

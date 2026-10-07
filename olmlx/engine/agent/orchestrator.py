@@ -70,7 +70,7 @@ class AgentContext:
     """Shared mutable state passed to agent tools and the orchestrator.
 
     ``cancel_event`` is the cooperative-cancel seam (checked at iteration
-    boundaries). ``memory`` / ``skills`` / ``delegate_runner`` are wired by the
+    boundaries, and raced against each in-flight turn). ``memory`` / ``skills`` / ``delegate_runner`` are wired by the
     later phases; Phase 1 leaves them ``None``.
     """
 
@@ -191,22 +191,44 @@ class Orchestrator:
                         await self.store.append_events(self.run_id, token_buffer)
                         token_buffer = []
 
-                async for event in self.session.send_message(prompt):
-                    etype = event.get("type")
-                    if etype in _TOKEN_EVENT_TYPES:
-                        token_buffer.append(event)
-                        tokens += 1
-                        if len(token_buffer) >= _TOKEN_FLUSH_BATCH:
-                            await _flush_tokens()
-                        continue
-                    await _flush_tokens()
-                    await self.store.append_event(self.run_id, event)
-                    if etype == "tool_call" and event.get("name") == "finish":
-                        finished = True
-                        args = event.get("arguments")
-                        if isinstance(args, dict):
-                            summary = str(args.get("summary", "")).strip()
+                async def _run_turn() -> None:
+                    nonlocal tokens, finished, summary
+                    async for event in self.session.send_message(prompt):
+                        etype = event.get("type")
+                        if etype in _TOKEN_EVENT_TYPES:
+                            token_buffer.append(event)
+                            tokens += 1
+                            if len(token_buffer) >= _TOKEN_FLUSH_BATCH:
+                                await _flush_tokens()
+                            continue
+                        await _flush_tokens()
+                        await self.store.append_event(self.run_id, event)
+                        if etype == "tool_call" and event.get("name") == "finish":
+                            finished = True
+                            args = event.get("arguments")
+                            if isinstance(args, dict):
+                                summary = str(args.get("summary", "")).strip()
+
+                # One turn can run up to ``agent_inner_max_turns`` tool calls
+                # (a hung ``bash``, a long generation), so the cancel event and
+                # the wallclock budget are raced against it instead of being
+                # checked only at the boundary (#759). On either, the turn is
+                # cancelled — which kills a running bash process group and
+                # aborts generation — and the run ends without checkpointing
+                # the partial turn (the last checkpoint stays consistent).
+                interrupted = await self._race_turn(
+                    _run_turn(),
+                    None if wallclock is None else wallclock - elapsed(),
+                )
                 await _flush_tokens()
+                if interrupted is not None:
+                    return await self._finalize(
+                        interrupted[0],
+                        iterations,
+                        tokens,
+                        elapsed(),
+                        reason=interrupted[1],
+                    )
 
                 iterations += 1
                 runtime = elapsed()
@@ -243,6 +265,39 @@ class Orchestrator:
                 "cancelled", iterations, tokens, elapsed(), reason="cancelled"
             )
             raise
+
+    async def _race_turn(
+        self, turn: Any, timeout: float | None
+    ) -> tuple[str, str] | None:
+        """Run *turn* until it finishes, the run is cancelled, or *timeout*
+        (seconds of wallclock budget left) expires.
+
+        Returns ``None`` when the turn completed (its exception, if any,
+        propagates), else the ``(status, reason)`` to finalize with. The turn
+        task is always torn down before returning, including when this
+        coroutine itself is cancelled.
+        """
+        turn_task = asyncio.ensure_future(turn)
+        cancel_task = asyncio.ensure_future(self.context.cancel_event.wait())
+        try:
+            await asyncio.wait(
+                {turn_task, cancel_task},
+                timeout=None if timeout is None else max(timeout, 0.0),
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if turn_task.done():
+                turn_task.result()
+                return None
+            if cancel_task.done():
+                return ("cancelled", "cancelled")
+            return ("failed", "wallclock_timeout")
+        finally:
+            for task in (turn_task, cancel_task):
+                if not task.done():
+                    task.cancel()
+            # Wait for the turn to unwind (bash kill, generation abort) so
+            # nothing from it runs after the run is finalized.
+            await asyncio.gather(turn_task, cancel_task, return_exceptions=True)
 
     def _check_boundary(
         self, iterations: int, tokens: int, runtime: float

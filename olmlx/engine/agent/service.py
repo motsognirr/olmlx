@@ -295,6 +295,7 @@ class AgentService:
             system_prompt=_AGENT_SYSTEM_PROMPT.format(goal=run["goal"]),
             max_turns=s.agent_inner_max_turns,
             skills_dir=s.agent_skills_dir,
+            tool_timeout=s.agent_tool_timeout,
             # The dangerous builtins (bash/write_file/edit_file) are local
             # tools, which bypass the safety policy unless this is set (#611).
             local_tool_safety=True,
