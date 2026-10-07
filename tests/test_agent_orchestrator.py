@@ -443,6 +443,22 @@ class TestMidIterationGuards:
         assert session.torn_down
         assert (await store.get_run("r1"))["status"] == "cancelled"
 
+    async def test_interrupt_checkpoints_tokens_with_pre_turn_messages(self, store):
+        """Resuming a cancelled run must keep the interrupted turn's tokens
+        (budget accounting) but not its half-finished messages."""
+        await store.create_run(run_id="r1", goal="G", model="m", config={})
+        ctx = _ctx(store)
+        session = HangingSession()
+        orch = Orchestrator(session=session, context=ctx, budgets=Budgets())
+        task = asyncio.create_task(orch.run())
+        await asyncio.wait_for(session.started.wait(), 5)
+        ctx.cancel_event.set()
+        result = await asyncio.wait_for(task, 5)
+        checkpoint = await store.latest_checkpoint("r1")
+        assert checkpoint is not None
+        assert checkpoint["tokens"] == result["tokens"] == 1
+        assert checkpoint["messages"] == [{"role": "system", "content": "sys"}]
+
     async def test_wallclock_interrupts_in_flight_turn(self, store):
         await store.create_run(run_id="r1", goal="G", model="m", config={})
         session = HangingSession()

@@ -427,6 +427,15 @@ async def _handle_question(args: dict) -> str:
     return "__question__:" + json.dumps(payload)
 
 
+def _is_valid_timeout(value: Any) -> bool:
+    return (
+        not isinstance(value, bool)
+        and isinstance(value, (int, float))
+        and not math.isnan(value)
+        and value > 0
+    )
+
+
 def _resolve_bash_timeout(value: Any) -> float:
     """Return a finite, positive bash timeout (#759).
 
@@ -435,9 +444,7 @@ def _resolve_bash_timeout(value: Any) -> float:
     ``wait_for`` (``None`` there means wait forever). Those fall back to the
     default; an over-large value is clamped to ``_BASH_MAX_TIMEOUT``.
     """
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
-        return _BASH_DEFAULT_TIMEOUT
-    if math.isnan(value) or value <= 0:
+    if not _is_valid_timeout(value):
         return _BASH_DEFAULT_TIMEOUT
     return min(value, _BASH_MAX_TIMEOUT)
 
@@ -1076,7 +1083,7 @@ class BuiltinToolManager:
         # handlers keep their own internal bounds (grep/web 30s).
         if (
             name == "bash"
-            and arguments.get("timeout") is None
+            and not _is_valid_timeout(arguments.get("timeout"))
             and self._config.tool_timeout is not None
         ):
             arguments = {**arguments, "timeout": self._config.tool_timeout}

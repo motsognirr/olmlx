@@ -174,6 +174,7 @@ class Orchestrator:
                 # stall signature ``"[]"`` every iteration and falsely killing
                 # long runs as "stall" once truncation kicks in (#622).
                 before_ids = {id(m) for m in self.session.messages}
+                messages_before = list(self.session.messages)
 
                 finished = False
                 summary = ""
@@ -222,6 +223,12 @@ class Orchestrator:
                 )
                 await _flush_tokens()
                 if interrupted is not None:
+                    # Checkpoint the pre-turn messages (the partial turn may
+                    # end mid tool call) with the turn's tokens, so a resume
+                    # keeps the token budget honest.
+                    await self.store.append_checkpoint(
+                        self.run_id, messages_before, iterations, tokens
+                    )
                     return await self._finalize(
                         interrupted[0],
                         iterations,

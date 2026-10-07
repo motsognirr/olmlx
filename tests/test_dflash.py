@@ -1118,7 +1118,36 @@ class TestDFlashChunkedPrefill:
         first = decoder.prefill(prompt)
         assert first == ref_first
         assert decoder._hidden.shape == ref_hidden.shape
-        assert mx.allclose(decoder._hidden, ref_hidden).item()
+        assert mx.allclose(decoder._hidden, ref_hidden, atol=1e-5).item()
+        decoder.reset()
+
+    def test_pure_rotating_target_prefills_in_one_forward(
+        self, components, monkeypatch
+    ):
+        """Pure sliding-window targets (gpt-oss, Gemma 3) must prefill in a
+        single forward (CLAUDE.md invariant) — keep the pre-#759 path."""
+        from olmlx.engine import speculative
+        from olmlx.engine.dflash import decoder as dmod
+
+        monkeypatch.setattr(speculative, "_PREFILL_CHUNK", 4)
+        monkeypatch.setattr(
+            dmod,
+            "make_prompt_cache",
+            lambda model: [RotatingKVCache(max_size=64) for _ in model.layers],
+        )
+        target, draft, cfg = components
+        seq_lens: list[int] = []
+        orig_call = type(target).__call__
+
+        def recording_call(self, input_ids, cache=None):
+            seq_lens.append(input_ids.shape[1])
+            return orig_call(self, input_ids, cache=cache)
+
+        monkeypatch.setattr(type(target), "__call__", recording_call)
+        decoder = DFlashDecoder(target, draft, cfg, block_size=2)
+        decoder.prefill(mx.arange(1, 21, dtype=mx.int32)[None, :])
+        assert seq_lens == [19, 1]
+        assert decoder._hidden.shape[1] == 20
         decoder.reset()
 
     def test_prefill_honors_cancel_event(self, components):

@@ -361,6 +361,21 @@ class TestBash:
         assert "timed out after 0.2s" in result.message
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("bad", ["abc", -1, 0, float("nan"), True])
+    async def test_bash_invalid_timeout_uses_config_default(self, tmp_path, bad):
+        """An invalid model-supplied timeout falls back to the operator's
+        configured tool_timeout, not the module default."""
+        config = ChatConfig(
+            model_name="test:latest",
+            plans_dir=tmp_path / "plans",
+            tool_timeout=0.2,
+        )
+        manager = BuiltinToolManager(config)
+        result = await manager.call_tool("bash", {"command": "sleep 5", "timeout": bad})
+        assert isinstance(result, ToolError)
+        assert "timed out after 0.2s" in result.message
+
+    @pytest.mark.asyncio
     @pytest.mark.parametrize("bad", [None, "abc", -1, 0, float("nan"), True])
     async def test_bash_invalid_timeout_falls_back_to_default(
         self, manager, monkeypatch, bad

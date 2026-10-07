@@ -121,6 +121,11 @@ class ModelManager(SpeculativeLoaderMixin):
         self._expiry_task: asyncio.Task | None = None
         self._pending_cleanups: dict[str, asyncio.Task] = {}
         self._pending_load_tasks: dict[str, asyncio.Task] = {}
+        # In-flight closes of abandoned load results (#759), keyed like
+        # ``_pending_load_tasks``. A deferred cleanup moves its entry from
+        # that dict to this one with no await in between, so ``stop()``
+        # always sees exactly one of them and waits for the close.
+        self._pending_result_closes: dict[str, asyncio.Future] = {}
         self._flush_lock = asyncio.Lock()
         self._flush_thread_lock = threading.Lock()
 
@@ -141,28 +146,37 @@ class ModelManager(SpeculativeLoaderMixin):
                 *self._pending_cleanups.values(), return_exceptions=True
             )
         self._pending_cleanups.clear()
-        # Drain orphaned load tasks so their exceptions are retrieved.
+        # Drain orphaned load tasks (so their exceptions are retrieved) and
+        # in-flight result closes. Snapshot first: the awaits below yield, and
+        # a concurrent ensure_loaded timing out would mutate the dicts.
         # The underlying threads can't be interrupted (Python limitation)
         # so use a bounded timeout to avoid blocking shutdown indefinitely.
-        if self._pending_load_tasks:
-            drained = True
+        pending_loads = list(self._pending_load_tasks.items())
+        pending_closes = list(self._pending_result_closes.values())
+        if pending_loads or pending_closes:
             try:
                 await asyncio.wait_for(
                     asyncio.gather(
-                        *self._pending_load_tasks.values(), return_exceptions=True
+                        *(task for _, task in pending_loads),
+                        *pending_closes,
+                        return_exceptions=True,
                     ),
                     timeout=5.0,
                 )
             except asyncio.TimeoutError:
-                drained = False
+                pass
+            # Drained only if every load thread and close actually finished.
+            drained = all(task.done() for _, task in pending_loads) and all(
+                fut.done() for fut in pending_closes
+            )
+            if not drained:
                 logger.warning(
-                    "Timed out waiting for %d orphaned load thread(s) to finish; "
-                    "they will be abandoned on process exit",
-                    len(self._pending_load_tasks),
+                    "Timed out waiting for orphaned load thread(s) / result "
+                    "close(s) to finish; they will be abandoned on process exit"
                 )
             # Close what finished orphaned loads own (#759) — their deferred
             # cleanup was cancelled above before it could.
-            for name, task in self._pending_load_tasks.items():
+            for name, task in pending_loads:
                 if not task.done() or task.cancelled() or task.exception():
                     continue
                 model, *_rest, spec_decoder = task.result()
@@ -177,6 +191,7 @@ class ModelManager(SpeculativeLoaderMixin):
             if drained:
                 await self._flush_metal()
         self._pending_load_tasks.clear()
+        self._pending_result_closes.clear()
         # Close all still-resident models before dropping them — otherwise
         # Flash prefetcher/weight-store executors (threads + per-layer fds),
         # batch schedulers, and the whisper ModelHolder strong reference leak
@@ -1392,18 +1407,29 @@ class ModelManager(SpeculativeLoaderMixin):
                 # decoder would otherwise hold ``_GDN_PATCH_LOCK`` forever).
                 model, *_rest, spec_decoder = result
                 del result, _rest
-                # The thread is done, so stop() no longer needs the task to
-                # drain it — and must not close this result a second time.
+                close_fut = asyncio.ensure_future(
+                    asyncio.to_thread(
+                        self._close_load_result, model_name, model, spec_decoder
+                    )
+                )
+                del model, spec_decoder
+                # Hand tracking from the load task to the close with no await
+                # in between: stop() must wait for this close (even if it
+                # cancels us mid-close) and must not close the result again.
+                self._pending_result_closes[model_name] = close_fut
+
+                def _untrack(fut: asyncio.Future) -> None:
+                    if not fut.cancelled():
+                        fut.exception()  # retrieved; already logged
+                    if self._pending_result_closes.get(model_name) is fut:
+                        self._pending_result_closes.pop(model_name, None)
+
+                close_fut.add_done_callback(_untrack)
                 self._pending_load_tasks.pop(model_name, None)
                 try:
-                    await asyncio.shield(
-                        asyncio.to_thread(
-                            self._close_load_result, model_name, model, spec_decoder
-                        )
-                    )
+                    await asyncio.shield(close_fut)
                 except ExceptionGroup:
                     pass  # already logged per-resource
-                del model, spec_decoder
             except asyncio.CancelledError:
                 # The background thread keeps running (Python can't
                 # interrupt native threads).  Don't call load_task.cancel()

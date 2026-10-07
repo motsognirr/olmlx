@@ -7182,3 +7182,61 @@ class TestFailedLoadClosesResources:
             await manager.stop()
         decoder.close.assert_called_once()
         model._weight_store.close.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_stop_waits_for_in_flight_result_close(
+        self, registry, mock_store, monkeypatch
+    ):
+        """If stop() cancels the deferred cleanup while it is closing a
+        finished load's result, stop() must still wait for that close (and
+        not flush Metal underneath it)."""
+        monkeypatch.setattr(
+            "olmlx.engine.model_manager.settings.model_load_timeout", 0.05
+        )
+        manager = ModelManager(registry, mock_store)
+        model = self._model_with_store()
+        tok = MagicMock()
+        tok.chat_template = None
+        release_load = threading.Event()
+        close_started = threading.Event()
+        release_close = threading.Event()
+        close_done = threading.Event()
+
+        def slow_load(*a, **kw):
+            release_load.wait(5)
+            return (model, tok, False, TemplateCaps(), MagicMock())
+
+        def slow_close(*a, **kw):
+            close_started.set()
+            release_close.wait(5)
+            close_done.set()
+
+        flushed_before_close: list[bool] = []
+
+        async def fake_flush():
+            # Only flushes overlapping the in-flight close count (the
+            # pre-load hygiene flush runs before the close starts).
+            flushed_before_close.append(
+                close_started.is_set() and not close_done.is_set()
+            )
+
+        patches = self._common_patches(lambda: 1 * self.GB)
+        with (
+            patch.object(manager, "_load_model", side_effect=slow_load),
+            patch.object(manager, "_close_load_result", side_effect=slow_close),
+            patch.object(manager, "_flush_metal", side_effect=fake_flush),
+            patches[0],
+            patches[1],
+            patches[2],
+            patches[3],
+            patches[4],
+            patches[5],
+        ):
+            with pytest.raises(ModelLoadTimeoutError):
+                await manager.ensure_loaded("qwen3")
+            release_load.set()
+            await asyncio.to_thread(close_started.wait, 5)
+            threading.Timer(0.2, release_close.set).start()
+            await manager.stop()
+            assert close_done.is_set()
+        assert not any(flushed_before_close)

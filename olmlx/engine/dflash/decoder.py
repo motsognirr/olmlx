@@ -51,7 +51,12 @@ from olmlx.engine.spec_decoder_base import (
     _trim_recent_cache as _trim_recent_cache,
     _unpatch_model as _unpatch_model,
 )
-from olmlx.engine.speculative import PrefillCancelled, _chunked_prefill, _eval_cache
+from olmlx.engine.speculative import (
+    PrefillCancelled,
+    _chunked_prefill,
+    _eval_cache,
+    _is_pure_rotating_cache,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -226,12 +231,20 @@ class DFlashDecoder(SpecDecoderBase):
                 self._hidden_capture[:] = [None] * len(self._hidden_capture)
                 return out
 
-            _chunked_prefill(
-                _capturing_target,
-                prefix,
-                self._target_cache,
-                cancel_event=cancel_event,
-            )
+            if _is_pure_rotating_cache(self._target_cache):
+                # Pure sliding-window targets (gpt-oss, Gemma 3) must prefill
+                # in a single forward — splitting corrupts windowed attention
+                # (CLAUDE.md "Pure-RotatingKVCache prefill is single-chunk").
+                if cancel_event is not None and cancel_event.is_set():
+                    raise PrefillCancelled()
+                _capturing_target(prefix, self._target_cache)
+            else:
+                _chunked_prefill(
+                    _capturing_target,
+                    prefix,
+                    self._target_cache,
+                    cancel_event=cancel_event,
+                )
             _eval_cache(self._target_cache)
             if self._capture is not None:
                 self._capture.use_buffer(self._capture_buffer)
