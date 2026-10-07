@@ -189,16 +189,21 @@ async def create_model(req: CreateRequest, request: Request):
     try:
         # Re-creating a name replaces it: drop the earlier alias/entry first,
         # since resolve() prefers an alias and would shadow a new mapping.
-        # Skipped when the new name *is* the base (already resolved above).
-        if not same_name:
-            # Aliases of the old entry keep what they pointed at (Ollama's
-            # copy semantics) instead of dangling or following the new one.
-            registry.promote_aliases_of(normalized)
-            registry.remove(normalized)
-        if mc is None:
-            registry.add_alias(normalized, from_model)
+        if same_name and mc is None:
+            pass  # "create x FROM x" with nothing to add: already is x
         else:
-            registry.add_mapping(normalized, mc.hf_path, model_config=mc)
+            if not same_name:
+                # Aliases of the old entry keep what they pointed at (Ollama's
+                # copy semantics) instead of dangling or following the new one.
+                registry.promote_aliases_of(normalized)
+            # Also when the new name *is* the base: the base's config was
+            # resolved above, and an alias left behind would shadow the new
+            # mapping (#768 review).
+            registry.remove(normalized)
+            if mc is None:
+                registry.add_alias(normalized, from_model)
+            else:
+                registry.add_mapping(normalized, mc.hf_path, model_config=mc)
     except ValueError as e:
         return JSONResponse({"error": str(e)}, status_code=400)
 

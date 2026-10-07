@@ -235,6 +235,19 @@ class TestResolveAndDownload:
         mock_store.model_dir.assert_called_once_with("org/model")
         mock_store.ensure_downloaded.assert_not_called()
 
+    def test_tagged_hf_path_is_stripped(self, monkeypatch, tmp_path):
+        from olmlx.cli import _resolve_and_download
+
+        mock_store = MagicMock()
+        resolved = MagicMock()
+        resolved.hf_path = "org/model:latest"
+        mock_store.registry.resolve.return_value = resolved
+        mock_store.model_dir.return_value = tmp_path
+        monkeypatch.setattr("olmlx.cli.models_cmd._create_store", lambda: mock_store)
+
+        _resolve_and_download("mymodel", download=False)
+        mock_store.model_dir.assert_called_once_with("org/model")
+
     def test_models_config_error_propagates_to_cli_main(self, monkeypatch):
         from olmlx.cli import _resolve_and_download
         from olmlx.engine.registry import ModelsConfigError

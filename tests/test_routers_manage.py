@@ -601,3 +601,26 @@ class TestCreateDeleteReviewFollowups:
         )
         assert resp.status_code == 200
         assert registry.resolve("helper").options == {"temperature": 0.2}
+
+    async def test_recreate_alias_from_itself_applies_system(
+        self, app_client, registry
+    ):
+        # #768 review: "create a FROM a" where a is an alias must not leave the
+        # alias shadowing the new entry.
+        await app_client.post("/api/copy", json={"source": "qwen3", "destination": "a"})
+        resp = await app_client.post(
+            "/api/create",
+            json={"model": "a", "from": "a", "system": "New", "stream": False},
+        )
+        assert resp.status_code == 200
+        mc = registry.resolve("a")
+        assert mc.system == "New"
+        assert mc.hf_path == "Qwen/Qwen3-8B-MLX"
+
+    async def test_recreate_self_without_changes_is_noop(self, app_client, registry):
+        before = registry.resolve("qwen3")
+        resp = await app_client.post(
+            "/api/create", json={"model": "qwen3", "from": "qwen3", "stream": False}
+        )
+        assert resp.status_code == 200
+        assert registry.resolve("qwen3") == before

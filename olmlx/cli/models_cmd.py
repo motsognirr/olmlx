@@ -44,11 +44,15 @@ def _resolve_and_download(model: str, *, download: bool = True):
     than collapsing it into a generic exit.
     """
     from olmlx.engine.registry import ModelsConfigError
+    from olmlx.models.store import _strip_ollama_tag
 
     try:
         store = _create_store()
         resolved = store.registry.resolve(model)
         hf_path = resolved.hf_path if resolved is not None else model
+        # Ollama-style tag off, as every other store consumer does — a tagged
+        # path would name a different (nonexistent) store directory.
+        hf_path = _strip_ollama_tag(hf_path)
         if download:
             local_dir = store.ensure_downloaded(hf_path)
         else:
