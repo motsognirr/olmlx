@@ -11,6 +11,7 @@
 7. An MCP tool that shadows a builtin's name dispatches to MCP and is policed.
 """
 
+import asyncio
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -516,3 +517,143 @@ class TestMcpShadowsBuiltin:
         allow, confirm, auto, deny = session._classify_tool_calls(uses)
         assert [tu["name"] for tu in deny] == ["write_file"]
         assert allow == []
+
+
+# --------------------------------------------------------------------------
+# PR #765 review follow-ups
+# --------------------------------------------------------------------------
+class TestLargeWriteJudgedOnElidedContent:
+    async def test_large_write_file_is_judged_not_denied(
+        self, store, tmp_path, monkeypatch
+    ):
+        svc = _service(store, tmp_path)
+        judge = svc._make_tool_safety_judge("m", "goal")
+        captured: list = []
+        monkeypatch.setattr(
+            "olmlx.engine.inference.generate_chat",
+            _capturing_generate_chat("ALLOW", captured),
+        )
+        content = "HEAD" + "x" * 60_000 + "TAIL"
+        args = {"path": "out/report.md", "content": content}
+        assert await judge("write_file", args, None) is True
+        prompt = captured[0][0]["content"]
+        assert "out/report.md" in prompt
+        assert "HEAD" in prompt and "TAIL" in prompt
+        assert "characters omitted" in prompt
+        assert len(prompt) < 20_000
+
+    async def test_large_edit_file_is_judged(self, store, tmp_path, monkeypatch):
+        svc = _service(store, tmp_path)
+        judge = svc._make_tool_safety_judge("m", "goal")
+        captured: list = []
+        monkeypatch.setattr(
+            "olmlx.engine.inference.generate_chat",
+            _capturing_generate_chat("ALLOW", captured),
+        )
+        args = {"path": "a.py", "old_text": "o" * 30_000, "new_text": "n" * 30_000}
+        assert await judge("edit_file", args, None) is True
+        assert len(captured) == 1
+
+    async def test_huge_path_still_denied(self, store, tmp_path, monkeypatch):
+        # Only bulk content is elided; other fields must be shown in full.
+        svc = _service(store, tmp_path)
+        judge = svc._make_tool_safety_judge("m", "goal")
+        captured: list = []
+        monkeypatch.setattr(
+            "olmlx.engine.inference.generate_chat",
+            _capturing_generate_chat("ALLOW", captured),
+        )
+        args = {"path": "p" * 40_000, "content": "x"}
+        assert await judge("write_file", args, None) is False
+        assert captured == []
+
+
+class TestConcurrentDelegatesShareBudget:
+    async def test_sibling_delegates_see_charged_budget(self, store, tmp_path):
+        svc = _service(
+            store, tmp_path, session_factory=lambda r, c, m: _FinishSession()
+        )
+        parent = await store.create_run(run_id="p", goal="g", model="m", config={})
+        ctx = svc._make_context(parent)
+        used = {"iterations": 0}
+        ctx.remaining_budget = lambda: {
+            "max_iterations": 10 - used["iterations"],
+            "token_budget": None,
+            "wallclock_timeout": None,
+        }
+
+        def charge(it, tok):
+            used["iterations"] += it
+
+        ctx.charge_child = charge
+        tools = AgentToolManager(ChatConfig(model_name="m"), ctx)
+        await asyncio.gather(
+            tools.call_tool("delegate", {"goal": "a"}),
+            tools.call_tool("delegate", {"goal": "b"}),
+        )
+        grants = sorted(
+            c["config"]["max_iterations"] for c in await store.list_children("p")
+        )
+        # The second child is granted what the first left, not the full 10.
+        assert grants == [9, 10]
+
+
+class TestAgentPlansConfined:
+    def test_plans_dir_inside_workspace_per_run(self, store, tmp_path):
+        svc = _service(store, tmp_path)
+        run = {"model": "m", "goal": "g"}
+        sess = svc._default_session(run, AgentContext(run_id="r1", store=store))
+        plans = sess.config.plans_dir
+        assert plans.is_relative_to(tmp_path / "ws")
+        assert "r1" in plans.parts
+
+
+class TestReviewFollowUps:
+    def _session(self, svc, store):
+        run = {"model": "m", "goal": "g"}
+        return svc._default_session(run, AgentContext(run_id="r1", store=store))
+
+    def test_web_search_judged_like_web_fetch(self, store, tmp_path):
+        sess = self._session(_service(store, tmp_path), store)
+        assert sess.tool_safety.get_policy("web_search") == ToolPolicy.AUTO
+
+    def test_create_skill_not_offered_under_deny(self, store, tmp_path):
+        svc = _service(store, tmp_path, agent_file_write_policy="deny")
+        sess = self._session(svc, store)
+        assert "create_skill" not in sess.builtin.tool_names
+        names = {d["function"]["name"] for d in sess.builtin.get_tool_definitions()}
+        assert "create_skill" not in names
+
+    async def test_judge_sees_non_ascii_unescaped(self, store, tmp_path, monkeypatch):
+        svc = _service(store, tmp_path)
+        judge = svc._make_tool_safety_judge("m", "goal")
+        captured: list = []
+        monkeypatch.setattr(
+            "olmlx.engine.inference.generate_chat",
+            _capturing_generate_chat("ALLOW", captured),
+        )
+        # 5k CJK chars: 15k+ chars once \\u-escaped, well under the cap raw.
+        assert await judge("bash", {"command": "echo " + "漢" * 5000}, None) is True
+        assert "漢" in captured[0][0]["content"]
+
+    async def test_read_file_refuses_symlink_swapped_after_check(
+        self, tmp_path, monkeypatch
+    ):
+        ws = tmp_path / "ws"
+        (ws / "sub").mkdir(parents=True)
+        secret = tmp_path / "secret"
+        secret.mkdir()
+        (secret / "key").write_text("PRIVATE")
+        checked = (ws / "sub" / "key").resolve()
+        # Swap the checked directory for a symlink out of the workspace
+        # between _resolve_path and open().
+        (ws / "sub").rmdir()
+        (ws / "sub").symlink_to(secret)
+        monkeypatch.setattr(
+            "olmlx.chat.builtin_tools._resolve_path",
+            lambda path, base_dir=None, confine_root=None: checked,
+        )
+        cfg = ChatConfig(model_name="m", plans_dir=tmp_path / "plans", read_root=ws)
+        res = await BuiltinToolManager(cfg).call_tool("read_file", {"path": "sub/key"})
+        assert isinstance(res, ToolError)
+        assert "PRIVATE" not in res.message

@@ -405,6 +405,7 @@ class AgentToolManager(BuiltinToolManager):
         context: "AgentContext",
         skills: Any = None,
         image_tool: AgentImageTool | None = None,
+        offer_create_skill: bool = True,
     ):
         super().__init__(config)
         self._context = context
@@ -417,9 +418,10 @@ class AgentToolManager(BuiltinToolManager):
             _FINISH_DEF,
             _REMEMBER_DEF,
             _RECALL_DEF,
-            _CREATE_SKILL_DEF,
             _DELEGATE_DEF,
         ]
+        if offer_create_skill:
+            self._agent_defs.append(_CREATE_SKILL_DEF)
         if image_tool is not None:
             self._agent_defs.append(_GENERATE_IMAGE_DEF)
 
@@ -443,7 +445,7 @@ class AgentToolManager(BuiltinToolManager):
             return await self._handle_remember(arguments)
         if name == "recall":
             return await self._handle_recall(arguments)
-        if name == "create_skill":
+        if name == "create_skill" and _CREATE_SKILL_DEF in self._agent_defs:
             return await self._handle_create_skill(arguments)
         if name == "delegate":
             return await self._handle_delegate(arguments)
@@ -511,8 +513,10 @@ class AgentToolManager(BuiltinToolManager):
         # replaced; a same-named skill someone else wrote is never clobbered
         # (#758).
         skills_dir = (
-            self._skills.skills_dir if self._skills is not None else None
-        ) or self._config.skills_dir
+            self._skills.skills_dir
+            if self._skills is not None
+            else self._config.skills_dir
+        )
         taken = (
             self._skills is not None and self._skills.get_skill(name) is not None
         ) or await asyncio.to_thread((skills_dir / f"{name}.md").exists)
@@ -539,7 +543,7 @@ class AgentToolManager(BuiltinToolManager):
             else:
                 path = await asyncio.to_thread(
                     write_skill_file,
-                    self._config.skills_dir,
+                    skills_dir,
                     name,
                     description,
                     body,
@@ -567,18 +571,24 @@ class AgentToolManager(BuiltinToolManager):
             )
         goal = str(arguments.get("goal", "")).strip()
         remaining = self._context.remaining_budget
-        try:
-            result = await runner.delegate(
-                parent_id=self._context.run_id,
-                goal=goal,
-                budget=remaining() if remaining is not None else None,
-            )
-        except DelegateError as exc:
-            return ToolError(message=str(exc), tool_name="delegate", is_user_error=True)
-        if self._context.charge_child is not None:
-            self._context.charge_child(
-                int(result.get("iterations") or 0), int(result.get("tokens") or 0)
-            )
+        # One child at a time per parent, so each is granted what the
+        # previous one left (and its wallclock starts when it does).
+        async with self._context.delegate_lock:
+            try:
+                result = await runner.delegate(
+                    parent_id=self._context.run_id,
+                    goal=goal,
+                    budget=remaining() if remaining is not None else None,
+                )
+            except DelegateError as exc:
+                return ToolError(
+                    message=str(exc), tool_name="delegate", is_user_error=True
+                )
+            if self._context.charge_child is not None:
+                self._context.charge_child(
+                    int(result.get("iterations") or 0),
+                    int(result.get("tokens") or 0),
+                )
         status = result.get("status")
         if status == "finished":
             return f"Subagent finished. Result: {result.get('result') or '(none)'}"

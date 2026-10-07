@@ -26,6 +26,8 @@ logger = logging.getLogger(__name__)
 _READ_FILE_MAX_BYTES = 10 * 1024 * 1024
 # Maximum results for glob
 _GLOB_MAX_RESULTS = 500
+#: Candidates a workspace-confined glob examines before giving up (#758).
+_GLOB_MAX_SCANNED = 50_000
 # Maximum output for grep
 _GREP_MAX_BYTES = 50_000
 # Default bash timeout
@@ -131,6 +133,34 @@ def _resolve_path(
     return resolved
 
 
+def _open_confined(path: Path, root: Path, *, directory: bool = False) -> int:
+    """Open an already-confined *path* without following any symlink.
+
+    ``_resolve_path(confine_root=...)`` checks a symlink-free path, but a
+    component could be swapped for a symlink before a plain ``open()`` (#758).
+    Walking the path from *root* with ``dir_fd`` + ``O_NOFOLLOW`` makes any
+    such swap fail the open instead of escaping the workspace. Same approach
+    as the agent's ``_write_new`` on the write side.
+    """
+    real_root = root.resolve()
+    parts = path.relative_to(real_root).parts
+    dir_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    fd = os.open(real_root, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        for i, part in enumerate(parts):
+            last = i == len(parts) - 1
+            flags = (
+                dir_flags if (directory or not last) else os.O_RDONLY | os.O_NOFOLLOW
+            )
+            next_fd = os.open(part, flags, dir_fd=fd)
+            os.close(fd)
+            fd = next_fd
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd
+
+
 # -- Tool handler functions --
 
 
@@ -147,7 +177,11 @@ async def _handle_read_file(
     start = max(offset - 1, 0)
 
     def _read() -> list[str]:
-        with open(safe_path, errors="replace") as f:
+        if confine_root is not None:
+            f_ctx = os.fdopen(_open_confined(safe_path, confine_root), errors="replace")
+        else:
+            f_ctx = open(safe_path, errors="replace")
+        with f_ctx as f:
             # Check file size after opening to avoid TOCTOU
             f.seek(0, 2)
             size = f.tell()
@@ -282,11 +316,18 @@ async def _handle_glob(args: dict, confine_root: Path | None = None) -> str | To
 
         def _confined_glob() -> list[str]:
             # Drop matches reached through a symlink that leaves the workspace.
-            return [
-                m
-                for m in glob_module.glob(pattern, root_dir=root_dir, recursive=True)
-                if (root_dir / m).resolve().is_relative_to(real_root)
-            ]
+            # ``**`` follows symlinked dirs, so a link to / could walk the whole
+            # disk: stop once the result cap is exceeded or after a bounded
+            # number of candidates, whichever comes first.
+            found: list[str] = []
+            for n, m in enumerate(
+                glob_module.iglob(pattern, root_dir=root_dir, recursive=True)
+            ):
+                if n >= _GLOB_MAX_SCANNED or len(found) > _GLOB_MAX_RESULTS:
+                    break
+                if (root_dir / m).resolve().is_relative_to(real_root):
+                    found.append(m)
+            return found
 
         found = await asyncio.to_thread(_confined_glob)
     else:
@@ -401,6 +442,12 @@ async def _handle_grep(args: dict, confine_root: Path | None = None) -> str | To
     return output
 
 
+def _dir_line(entry: "os.DirEntry[str] | Path") -> str:
+    if entry.is_dir():
+        return f"{entry.name}/"
+    return f"{entry.name} ({entry.stat().st_size} bytes)"
+
+
 async def _handle_read_directory(
     args: dict, confine_root: Path | None = None
 ) -> str | ToolError:
@@ -420,14 +467,16 @@ async def _handle_read_directory(
                 tool_name="read_directory",
                 is_user_error=True,
             )
-        lines = []
-        for entry in sorted(safe_path.iterdir()):
-            if entry.is_dir():
-                lines.append(f"{entry.name}/")
-            else:
-                size = entry.stat().st_size
-                lines.append(f"{entry.name} ({size} bytes)")
-        return lines
+        if confine_root is not None:
+            # List through a symlink-safe fd (#758), not the path.
+            fd = _open_confined(safe_path, confine_root, directory=True)
+            try:
+                with os.scandir(fd) as it:
+                    entries = sorted(it, key=lambda e: e.name)
+                    return [_dir_line(e) for e in entries]
+            finally:
+                os.close(fd)
+        return [_dir_line(e) for e in sorted(safe_path.iterdir())]
 
     try:
         entries = await asyncio.to_thread(_list_dir)

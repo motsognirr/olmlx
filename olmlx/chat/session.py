@@ -492,6 +492,9 @@ class ChatSession:
         self.builtin = builtin
         self.tool_safety = tool_safety
         self.messages: list[dict] = []
+        #: Builtin names an MCP tool shadowed in the last ``_prepare_tools``
+        #: (the schemas the model saw); None until tools are prepared.
+        self._mcp_shadowed: set[str] | None = None
 
         system_prompt = self._build_system_prompt()
         if system_prompt:
@@ -718,10 +721,15 @@ class ChatSession:
         """
         if self.builtin is None or name not in self.builtin.tool_names:
             return False
+        shadowed = self._mcp_shadowed
+        if shadowed is None:
+            shadowed = self._mcp_tool_names()
+        return name not in shadowed
+
+    def _mcp_tool_names(self) -> set[str]:
         if self.mcp is None:
-            return True
-        mcp_tools = self.mcp.get_tools_for_chat() or []
-        return name not in {t["function"]["name"] for t in mcp_tools}
+            return set()
+        return {t["function"]["name"] for t in self.mcp.get_tools_for_chat() or []}
 
     def _prepare_tools(self) -> list[dict] | None:
         """Merge MCP, builtin, and skill tool definitions."""
@@ -732,12 +740,14 @@ class ChatSession:
         # Merge built-in tool definitions, skipping collisions with MCP tools
         if self.builtin:
             builtin_defs = self.builtin.get_tool_definitions()
+            self._mcp_shadowed = set()
             if tools:
                 mcp_names = {t["function"]["name"] for t in tools}
                 filtered = []
                 for d in builtin_defs:
                     n = d["function"]["name"]
                     if n in mcp_names:
+                        self._mcp_shadowed.add(n)
                         logger.warning(
                             "Built-in tool %r skipped: MCP tool with same name takes precedence",
                             n,

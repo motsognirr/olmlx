@@ -15,6 +15,7 @@ the service can be constructed in ``create_app`` before the manager exists.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import uuid
 from dataclasses import dataclass
@@ -37,6 +38,44 @@ logger = logging.getLogger(__name__)
 #: Longest tool-call argument JSON the safety judge will review. Longer calls
 #: are denied rather than judged on a truncated view (#758).
 _JUDGE_MAX_ARGS_CHARS = 16_000
+#: File-content fields the judge may see elided in the middle when a call is
+#: too long to show in full. The content can only land inside the confined
+#: workspace, and running it later needs a separately judged ``bash`` call.
+_JUDGE_ELIDABLE_FIELDS: dict[str, tuple[str, ...]] = {
+    "write_file": ("content",),
+    "edit_file": ("old_text", "new_text"),
+}
+#: Characters kept from each end of an elided field.
+_JUDGE_ELIDE_KEEP = 3_000
+
+
+def _dump_args(arguments: dict) -> str:
+    # ensure_ascii=False: \uXXXX escapes would both inflate non-Latin text
+    # ~6x against the cap and hide it from the judge.
+    try:
+        return json.dumps(arguments, ensure_ascii=False)
+    except (TypeError, ValueError):
+        return str(arguments)
+
+
+def _judge_args_view(name: str, arguments: dict) -> str:
+    """The tool-call arguments as the safety judge sees them."""
+    full = _dump_args(arguments)
+    fields = _JUDGE_ELIDABLE_FIELDS.get(name, ())
+    if len(full) <= _JUDGE_MAX_ARGS_CHARS or not fields:
+        return full
+    view = dict(arguments)
+    for key in fields:
+        value = view.get(key)
+        if isinstance(value, str) and len(value) > 2 * _JUDGE_ELIDE_KEEP:
+            omitted = len(value) - 2 * _JUDGE_ELIDE_KEEP
+            view[key] = (
+                f"{value[:_JUDGE_ELIDE_KEEP]}\n[... {omitted} characters "
+                f"omitted from the middle ...]\n{value[-_JUDGE_ELIDE_KEEP:]}"
+            )
+    return _dump_args(view)
+
+
 #: Decoration a model may wrap its one-word verdict in ("`ALLOW`", "Allow.").
 _VERDICT_STRIP_CHARS = " \t\r\n.,!?:;\"'`*"
 
@@ -308,6 +347,9 @@ class AgentService:
             # Reads too (#758): an unjudged read-anywhere + web_fetch would let
             # injected content exfiltrate ~/.ssh and friends.
             read_root=workspace,
+            # Per-run plans inside the workspace (#758): the default
+            # ~/.olmlx/plans/plan.md is shared with ``olmlx chat``.
+            plans_dir=workspace / ".agent-plans" / context.run_id,
         )
         # Load the learned-skill library so skills authored by earlier runs are
         # offered to this one (the self-improving loop's read side).
@@ -316,7 +358,13 @@ class AgentService:
         # Pass the live SkillManager so a mid-run create_skill registers into
         # it and is immediately usable via use_skill (#636).
         builtin = AgentToolManager(
-            config, context, skills=skills, image_tool=self._make_image_tool()
+            config,
+            context,
+            skills=skills,
+            image_tool=self._make_image_tool(),
+            # Like generate_image: don't offer a tool every call of which
+            # would be denied.
+            offer_create_skill=s.agent_file_write_policy != "deny",
         )
         # Gate the mutating/exec builtins per policy; every other tool stays
         # ALLOW so the agent still runs autonomously. AUTO routes through an LLM
@@ -333,8 +381,10 @@ class AgentService:
                     "generate_image": ToolPolicy(s.agent_file_write_policy),
                     # A persistent write later runs replay as instructions (#758).
                     "create_skill": ToolPolicy(s.agent_file_write_policy),
-                    # The outbound channel for anything the agent has read.
+                    # The outbound channels for anything the agent has read:
+                    # a fetched URL or a search query can both carry data.
                     "web_fetch": ToolPolicy(s.agent_web_fetch_policy),
+                    "web_search": ToolPolicy(s.agent_web_fetch_policy),
                 },
             ),
             llm_judge=self._make_tool_safety_judge(
@@ -445,16 +495,13 @@ class AgentService:
         async def judge(
             name: str, arguments: dict, context: list[dict] | None = None
         ) -> bool:
-            import json
-
             from olmlx.engine.inference import generate_chat
 
-            try:
-                args_str = json.dumps(arguments)
-            except (TypeError, ValueError):
-                args_str = str(arguments)
-            # Never judge a truncated view (#758): padding would push the
-            # payload past the cut. Too long to show in full → deny.
+            args_str = _judge_args_view(name, arguments)
+            # Never judge a blindly truncated view (#758): padding would push
+            # the payload past the cut. Only file *content* (which lands
+            # inside the confined workspace) is elided, with an explicit
+            # marker; anything else too long to show in full is denied.
             if len(args_str) > _JUDGE_MAX_ARGS_CHARS:
                 logger.info(
                     "Tool-safety judge denied %r: arguments are %d chars (limit %d)",

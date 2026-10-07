@@ -97,6 +97,11 @@ class AgentContext:
     remaining_budget: Callable[[], dict[str, float | int | None]] | None = None
     #: ``(iterations, tokens)`` a finished child used, charged to this run.
     charge_child: Callable[[int, int], None] | None = None
+    #: Serializes this run's ``delegate`` calls (#758). Sibling calls in one
+    #: tool turn run concurrently, and each would otherwise be granted the
+    #: same remaining budget before any child is charged back. Children
+    #: generate one at a time on the inference lock anyway.
+    delegate_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
 
 class Orchestrator:
