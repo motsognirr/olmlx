@@ -535,9 +535,12 @@ class Settings(BaseSettings):
     # registry only exist when ``agent_enabled`` is true.
     agent_enabled: bool = False
     agent_db_path: Path = Path.home() / ".olmlx" / "agent.db"
-    #: Where learned skills (Phase 3) are written; shared with the chat skill
-    #: library by default so the agent's self-authored skills are reusable.
-    agent_skills_dir: Path = Path.home() / ".olmlx" / "skills"
+    #: Where learned skills (Phase 3) are written and loaded from. Separate
+    #: from the interactive chat skill library (``~/.olmlx/skills``) by default
+    #: (#758): a skill authored by a headless run that ingested untrusted web
+    #: content must not be loaded by ``olmlx chat``, where bash/write_file run
+    #: unconfirmed. Point both at one directory only if you trust that.
+    agent_skills_dir: Path = Path.home() / ".olmlx" / "agent-skills"
     #: Default model for agent runs when a create request omits ``model``.
     #: Empty string means the request must supply one (else HTTP 422).
     agent_model: str = ""
@@ -566,11 +569,16 @@ class Settings(BaseSettings):
     #: actions. ``auto`` (default) routes each such call through an LLM safety
     #: judge; ``allow`` trusts them unconditionally; ``deny`` blocks them.
     #: ``agent_shell_policy`` governs ``bash``; ``agent_file_write_policy``
-    #: governs ``write_file``, ``edit_file`` and ``generate_image``. All other tools stay allowed.
+    #: governs ``write_file``, ``edit_file``, ``generate_image`` and
+    #: ``create_skill``. ``agent_web_fetch_policy`` governs ``web_fetch``, the
+    #: channel that could carry workspace data out in a URL (#758). All other
+    #: tools stay allowed; reads are confined to ``agent_workspace_dir``.
     agent_shell_policy: Literal["allow", "auto", "deny"] = "auto"
     agent_file_write_policy: Literal["allow", "auto", "deny"] = "auto"
-    #: Confine agent file writes to this directory — absolute-path escapes are
-    #: rejected (``write_file``/``edit_file``). ``None`` confines to the
+    agent_web_fetch_policy: Literal["allow", "auto", "deny"] = "auto"
+    #: Confine agent file writes (``write_file``/``edit_file``) and reads
+    #: (``read_file``/``read_directory``/``glob``/``grep``, #758) to this
+    #: directory — absolute-path escapes are rejected. ``None`` confines to the
     #: server's working directory. Only bounds the agent; interactive chat is
     #: unaffected.
     agent_workspace_dir: Path | None = None
