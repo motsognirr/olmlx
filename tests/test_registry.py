@@ -2069,3 +2069,16 @@ class TestPromoteAliasesSaveOrder:
         ):
             assert registry.promote_aliases_of("qwen3") == ["a:latest"]
         assert calls == ["m", "a"]
+
+    def test_failed_alias_save_restores_aliases_and_raises(self, registry):
+        from unittest.mock import patch
+
+        registry.add_alias("a", "qwen3")
+        with (
+            patch.object(registry, "_save_mappings"),
+            patch.object(registry, "_save_aliases", side_effect=OSError("disk")),
+        ):
+            with pytest.raises(OSError):
+                registry.promote_aliases_of("qwen3")
+        # Memory matches the unchanged aliases.json: still an alias of qwen3.
+        assert registry._aliases["a:latest"] == "qwen3:latest"

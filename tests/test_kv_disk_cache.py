@@ -935,3 +935,29 @@ class TestStaleTempSpillPurge:
 
         assert not stale.exists()
         assert fresh.exists()
+
+    def test_purge_tolerates_unreadable_tmp_dir(self, tmp_path):
+        from unittest.mock import patch
+
+        store = PromptCacheStore(
+            max_slots=1, disk_path=tmp_path, model_name="test-model"
+        )
+        (store._disk_dir() / ".tmp").mkdir(parents=True)
+        with patch("pathlib.Path.iterdir", side_effect=PermissionError("denied")):
+            store._purge_stale_temp_spills(store._disk_dir())  # must not raise
+
+    def test_clear_disk_purges_stale_temps(self, tmp_path):
+        import os
+        import time
+
+        store = PromptCacheStore(
+            max_slots=1, disk_path=tmp_path, model_name="test-model"
+        )
+        tmp_dir = store._disk_dir() / ".tmp"
+        tmp_dir.mkdir(parents=True)
+        stale = tmp_dir / "a.1.safetensors"
+        stale.write_bytes(b"x")
+        old = time.time() - 2 * 3600
+        os.utime(stale, (old, old))
+        store.clear_disk()
+        assert not stale.exists()

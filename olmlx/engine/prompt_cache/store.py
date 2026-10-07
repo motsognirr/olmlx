@@ -457,10 +457,15 @@ class PromptCacheStore:
         in flight (from this or another store on the same model dir) is safe.
         """
         tmp_dir = disk_dir / ".tmp"
-        if not tmp_dir.is_dir():
-            return
         cutoff = time.time() - _STALE_TEMP_SPILL_SECONDS
-        for f in tmp_dir.iterdir():
+        try:
+            entries = list(tmp_dir.iterdir())
+        except OSError:
+            # Missing (the common case), vanished under a concurrent
+            # clear(), or unreadable: nothing to purge. Never raise — the
+            # caller runs after a *successful* spill (#769 review).
+            return
+        for f in entries:
             try:
                 if f.is_file() and f.stat().st_mtime < cutoff:
                     f.unlink(missing_ok=True)
@@ -647,6 +652,9 @@ class PromptCacheStore:
                 removed += 1
             except OSError:
                 logger.debug("Failed to remove stale disk cache %s", f, exc_info=True)
+        # Also reclaim crash-orphaned spill temps: a model that never spills
+        # again would otherwise keep them forever (#769 review).
+        self._purge_stale_temp_spills(disk_dir)
         # Recompute rather than zero so any files that survived an
         # unlink failure are still reflected in the metric.
         self._refresh_disk_bytes()

@@ -2077,6 +2077,7 @@ class ModelRegistry:
             for alias in list(self._aliases)
             if alias != normalized and normalized in self.alias_chain(alias)[1:]
         ]
+        previous = {alias: self._aliases[alias] for alias in dependents}
         for alias in dependents:
             del self._aliases[alias]
             self._mappings[alias] = mc
@@ -2084,12 +2085,19 @@ class ModelRegistry:
             self._dirty_keys.add(alias)
             self._removed_keys.discard(alias)
         if dependents:
-            # Mappings first: if the alias save then fails, aliases.json still
-            # names them alongside the new entries (redundant but resolvable).
-            # The reverse order could drop them from aliases.json before
-            # models.json gained them, orphaning the names after a restart.
+            # Mappings first: the reverse order could drop the names from
+            # aliases.json before models.json gained them, orphaning them
+            # after a restart.
             self._save_mappings()
-            self._save_aliases()
+            try:
+                self._save_aliases()
+            except Exception:
+                # aliases.json still holds the old aliases, which resolve()
+                # prefers over the new standalone entries. Restore them in
+                # memory too, so memory matches disk, and raise so the caller
+                # never goes on to remove *name* — the aliases still need it.
+                self._aliases.update(previous)
+                raise
         return dependents
 
     def remove(self, name: str):
