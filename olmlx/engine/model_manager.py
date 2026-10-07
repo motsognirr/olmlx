@@ -1410,7 +1410,10 @@ class ModelManager(SpeculativeLoaderMixin):
         async def _cleanup() -> None:
             cancelled = False
             try:
-                result = await load_task
+                # Shielded: cancelling this cleanup (stop() does) must not
+                # cancel the load task too — that would discard its result
+                # while the thread keeps running, leaving nothing to close.
+                result = await asyncio.shield(load_task)
                 # The load finished after its caller gave up: nothing will
                 # register it, so close what it owns (#759 — a speculative
                 # decoder would otherwise hold ``_GDN_PATCH_LOCK`` forever).

@@ -7203,8 +7203,14 @@ class TestFailedLoadClosesResources:
         ):
             with pytest.raises(ModelLoadTimeoutError):
                 await manager.ensure_loaded("qwen3")
+            load_task = manager._pending_load_tasks["qwen3:latest"]
+            # Let the deferred cleanup start and block on the load.
+            await asyncio.sleep(0.01)
             threading.Timer(0.1, release.set).start()
             await manager.stop()
+        # Cancelling the deferred cleanup must not cancel the load itself,
+        # or its result could never be closed.
+        assert not load_task.cancelled()
         decoder.close.assert_called_once()
         model._weight_store.close.assert_called_once()
 
