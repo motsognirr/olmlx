@@ -435,7 +435,7 @@ All settings can be overridden with `OLMLX_`-prefixed environment variables or a
 | `OLMLX_SPECULATIVE_DRAFT_MODEL` | `None` | HuggingFace path of the draft model (also `--speculative-draft-model`) |
 | `OLMLX_SPECULATIVE_TOKENS` | `4` | Candidate tokens generated per verification step (also `--speculative-tokens`) |
 | `OLMLX_SPECULATIVE_CACHE_SLOTS` | `2` | Cross-request KV snapshots kept per model so each agent turn prefills only the new suffix (`classic`/`pld` only). `0` disables (fresh prefill every turn). Each slot is a full target (+draft) KV snapshot — keep small. |
-| `OLMLX_KV_CACHE_QUANT` | `None` | KV cache quantization: `turboquant:4` (~3.9x), `turboquant:2` (~7.5x), `spectral:4` (~5.9x), `spectral:2`, `shard:{2,4,8}` (asymmetric K/V + sink/window), or `kvarn:k4v2` / `kvarn:{2,4}` (variance-normalized, per-K/V bits) (also `--kv-cache-quant`) |
+| `OLMLX_KV_CACHE_QUANT` | `None` | KV cache quantization: `turboquant:4` (~3.9x), `turboquant:2` (~7.5x), `spectral:4` (~5.9x), `spectral:2`, `spectral-qa:{2,4}` (attention-aware calibration), `shard:{2,4,8}` (asymmetric K/V + sink/window), or `kvarn:k4v2` / `kvarn:{2,4}` (variance-normalized, per-K/V bits) (also `--kv-cache-quant`) |
 
 ### Flash inference settings
 
@@ -678,11 +678,18 @@ OLMLX_KV_CACHE_QUANT=turboquant:2
 **SpectralQuant** improves on TurboQuant with data-driven eigenvector rotations and non-uniform bit allocation (~19% better compression, +2.6pp cosine similarity). Requires one-time calibration:
 
 ```bash
-# Calibrate the model (one-time, ~15 seconds)
+# Calibrate the model (one-time)
 olmlx spectral prepare <model>
 
 # Use spectral quant
 OLMLX_KV_CACHE_QUANT=spectral:4
+```
+
+**Attention-aware SpectralQuant** (`spectral-qa`, issue #749, after NOVA-KV) calibrates the key side to minimize error in the attention products q·k instead of key reconstruction error: calibration also captures each layer's query statistics, and the key basis and bit split are chosen to spend bits where queries look (falling back to the plain spectral calibration per layer when nothing beats it). Same runtime codec and memory footprint as `spectral`; it reads its own `spectral_qa/` calibration, so both can coexist for A/B runs (`olmlx bench` has `spectral-qa-{2,4}` scenarios). On Qwen3-0.6B / 4B it cuts held-out attention-logit error to ~0.35x at 2 bits and ~0.8–0.9x at 4 bits; on Qwen3-4B `spectral-qa:2` stays coherent where `spectral:2` does not.
+
+```bash
+olmlx spectral prepare <model> --objective attention --avg-bits 2
+OLMLX_KV_CACHE_QUANT=spectral-qa:2
 ```
 
 **Shard** (issue #377, ref [krish1905/shard](https://github.com/krish1905/shard)) treats K and V asymmetrically: keys are de-RoPE'd into a per-head PCA basis with rank truncation, values get a Hadamard rotation + product vector quantization, and the first 4 (sink) + last 64 (window) tokens stay uncompressed. The compressed middle is dequantized on read, so this is a memory-capacity win (longer context in the same RAM), not a speed win. Requires one-time calibration:

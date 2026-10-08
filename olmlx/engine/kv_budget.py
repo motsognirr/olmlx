@@ -66,8 +66,11 @@ def _parse_kv_cache_quant_kv(spec: str) -> tuple[str, int, int]:
     """Split an ``OLMLX_KV_CACHE_QUANT`` value like ``"spectral:4"`` or
     ``"kvarn:k4v2"`` (#748) into ``(method, key_bits, value_bits)``.
     Symmetric methods report the same width for K and V. Format is validated
-    at config load time."""
+    at config load time. ``spectral-qa`` (#749) differs from ``spectral``
+    only in calibration, so it reports the ``spectral`` codec."""
     method, bits_str = spec.split(":")
+    if method == "spectral-qa":
+        method = "spectral"
     if method == "kvarn":
         from olmlx.config import parse_kvarn_bits
 

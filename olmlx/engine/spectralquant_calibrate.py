@@ -8,16 +8,19 @@ compression.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
+import threading
 from pathlib import Path
 from typing import Any
 
 import mlx.core as mx
 import numpy as np
+from olmlx.config import SPECTRAL_CALIBRATIONS
 from olmlx.engine.turboquant_cache import _is_plain_kv_cache
 
-from olmlx.engine.spectralquant import allocate_bits, fit_codebook
+from olmlx.engine.spectralquant import _PACKABLE_BITS, allocate_bits, fit_codebook
 
 logger = logging.getLogger(__name__)
 
@@ -36,6 +39,20 @@ _SPECTRAL_DEFAULT_NUM_SAMPLES = 256
 #: K/V-collection buffers. Bump if calibration is too slow.
 _CALIBRATION_CACHE_BUDGET_EXPERTS = 8
 _CALIBRATION_IO_THREADS = 32
+
+#: Calibration objective (#749) -> the model-relative directory it writes.
+#: ``reconstruction`` minimizes ||k - k_hat||; ``attention`` (``spectral-qa``)
+#: minimizes the error in the attention products q·k. Derived from
+#: ``config.SPECTRAL_CALIBRATIONS``.
+SPECTRAL_DIR_BY_OBJECTIVE: dict[str, str] = dict(SPECTRAL_CALIBRATIONS.values())
+
+#: Attention-objective candidate selection fits each candidate's codebooks on
+#: the remaining keys and scores it on this held-out fraction.
+_QA_HOLDOUT_FRACTION = 0.25
+#: A candidate must beat the reconstruction baseline's held-out q·k error by
+#: this relative margin to replace it, so split noise and Lloyd-Max local
+#: optima can't trade a known-good calibration for an equivalent-or-worse one.
+_QA_SWITCH_MARGIN = 0.02
 
 
 def _resolve_config_holder(inner: Any, model: Any) -> Any:
@@ -223,6 +240,17 @@ def calibrate_head(
         Dict with keys: eigenvectors, d_eff, codebook_sem, codebook_tail,
         bits_high, bits_low.
     """
+    return _fit_pca_plan(*_pca_plan(kv_data, avg_bits))
+
+
+def _pca_plan(
+    kv_data: mx.array, avg_bits: int
+) -> tuple[mx.array, mx.array, int, int, int]:
+    """``calibrate_head``'s basis and bit split, without the codebooks.
+
+    Returns ``(data_norm, basis, d_eff, bits_high, bits_low)``; ``basis`` has
+    one eigenvector per row.
+    """
     head_dim = kv_data.shape[-1]
 
     # Step 1: Covariance and eigendecomposition
@@ -246,16 +274,16 @@ def calibrate_head(
     # onto its rows, so the leading "semantic" coordinates weren't the
     # high-variance directions (#761).
     basis = eigenvectors.T
-    rotated = data_norm @ basis.T
+    return data_norm, basis, d_eff, bits_high, bits_low
 
-    sem_data = rotated[:, :d_eff].reshape(-1)
-    tail_data = rotated[:, d_eff:].reshape(-1)
 
-    codebook_sem = fit_codebook(sem_data, bits=bits_high)
-    codebook_tail = (
-        fit_codebook(tail_data, bits=bits_low) if d_eff < head_dim else mx.array([0.0])
+def _fit_pca_plan(
+    data_norm: mx.array, basis: mx.array, d_eff: int, bits_high: int, bits_low: int
+) -> dict[str, Any]:
+    """Fit a ``_pca_plan``'s codebooks; returns ``calibrate_head``'s result."""
+    codebook_sem, codebook_tail = _fit_regime_codebooks(
+        data_norm @ basis.T, d_eff, bits_high, bits_low
     )
-
     return {
         "eigenvectors": basis,  # (head_dim, head_dim), rows = eigvecs
         "d_eff": d_eff,
@@ -264,6 +292,339 @@ def calibrate_head(
         "bits_high": bits_high,
         "bits_low": bits_low,
     }
+
+
+def allocate_bits_weighted(
+    importance: np.ndarray, avg_bits: int
+) -> tuple[int, int, int]:
+    """Pick ``(d_eff, bits_high, bits_low)`` minimizing weighted distortion.
+
+    ``importance`` is per-coordinate, sorted descending; coordinate ``i``'s
+    error contributes ``importance[i] * 4**-bits`` at high rate. The leading
+    ``d_eff`` coordinates get ``bits_high``, the rest ``bits_low``, and the
+    total never exceeds the ``len(importance) * avg_bits`` budget (unlike
+    ``allocate_bits``, which minimizes absolute slack and may overshoot).
+    Both widths come from ``_PACKABLE_BITS``. Falls back to uniform
+    ``avg_bits`` (always within budget), which also wins ties.
+    """
+    imp = np.asarray(importance, dtype=np.float64)
+    D = len(imp)
+    budget = D * avg_bits
+    prefix = np.concatenate([[0.0], np.cumsum(imp)])
+    total = prefix[-1]
+
+    best = (D, avg_bits, avg_bits)
+    best_cost = total * 4.0**-avg_bits
+    # Relative tolerance so float noise can't pick a non-uniform split that
+    # is no better than uniform.
+    tol = 1e-9 * max(total, 1e-30)
+    for b_high in sorted(_PACKABLE_BITS, reverse=True):
+        for b_low in sorted((b for b in _PACKABLE_BITS if b <= b_high), reverse=True):
+            for d in range(1, D + 1):
+                if d * b_high + (D - d) * b_low > budget:
+                    continue
+                cost = prefix[d] * 4.0**-b_high + (total - prefix[d]) * 4.0**-b_low
+                if cost < best_cost - tol:
+                    best_cost = cost
+                    best = (d, b_high, b_low)
+    return best
+
+
+def _sym_eig_rows(mat: np.ndarray) -> np.ndarray:
+    """Eigenvectors of a symmetric matrix as ROWS, descending eigenvalue."""
+    _vals, vecs = np.linalg.eigh((mat + mat.T) / 2.0)
+    return vecs[:, ::-1].T
+
+
+def _psd_sqrt(mat: np.ndarray) -> np.ndarray:
+    vals, vecs = np.linalg.eigh((mat + mat.T) / 2.0)
+    return (vecs * np.sqrt(np.maximum(vals, 0.0))) @ vecs.T
+
+
+def _nearest_centroid(values: np.ndarray, codebook: np.ndarray) -> np.ndarray:
+    """Snap each value to its nearest entry of a sorted 1-D codebook."""
+    if codebook.size == 1:
+        return np.full_like(values, codebook[0])
+    mids = (codebook[:-1] + codebook[1:]) / 2.0
+    return codebook[np.searchsorted(mids, values)]
+
+
+def _fit_regime_codebooks(
+    rotated: mx.array | np.ndarray,
+    d_eff: int,
+    bits_high: int,
+    bits_low: int,
+) -> tuple[mx.array, mx.array]:
+    """Fit the semantic/tail Lloyd-Max codebooks on rotated unit vectors.
+
+    A full-rank semantic regime (``d_eff == head_dim``) gets the ``[0.0]``
+    tail sentinel.
+    """
+
+    def _flat(x: mx.array | np.ndarray) -> mx.array:
+        x = x.reshape(-1)
+        return mx.array(x.astype(np.float32)) if isinstance(x, np.ndarray) else x
+
+    codebook_sem = fit_codebook(_flat(rotated[:, :d_eff]), bits=bits_high)
+    if d_eff < rotated.shape[1]:
+        codebook_tail = fit_codebook(_flat(rotated[:, d_eff:]), bits=bits_low)
+    else:
+        codebook_tail = mx.array([0.0])
+    return codebook_sem, codebook_tail
+
+
+def calibrate_head_qa(
+    kv_data: mx.array,
+    query_cov: np.ndarray,
+    avg_bits: int = 4,
+    seed: int = 0,
+) -> dict[str, Any]:
+    """Attention-aware (``spectral-qa``) key calibration (#749).
+
+    Minimizes the error in attention products, ``E[(q·(k - k_hat))^2] =
+    E[e^T C_q e]`` with ``C_q`` the uncentered query second moment, instead
+    of ``||k - k_hat||^2``. The runtime codec is unchanged, so the basis
+    stays orthonormal (the cache unrotates with ``V``, not ``V^-1``) — only
+    the basis, the coordinate order and the bit split differ.
+
+    The baseline is ``calibrate_head`` itself (key PCA), returned verbatim
+    unless a candidate beats it by ``_QA_SWITCH_MARGIN``. Other candidates:
+    key PCA re-ordered by query importance, query PCA, the eigenbasis of
+    ``C_q^1/2 M_k C_q^1/2`` and of the symmetrized ``C_q M_k``. In each,
+    coordinate ``i``'s importance is ``(u_i^T C_q u_i) * (u_i^T M_k u_i)``
+    (``M_k``: second moment of the unit-normalized keys, which is what the
+    codec quantizes), and ``allocate_bits_weighted`` picks the split.
+
+    Every candidate, baseline included, is scored the same way: converged
+    codebooks fit on the keys outside a held-out split, q·k error measured
+    on the held-out keys. (Scoring with cheaper, unconverged codebooks
+    understated the baseline and let worse bases win on real models.) The
+    winner's codebooks are refit on all the keys.
+
+    Returns the same fields as ``calibrate_head`` plus ``objective_basis``
+    (the winning candidate's name).
+    """
+    # Only the baseline's plan up front: its full-data codebooks are fit
+    # only if it wins.
+    plan = _pca_plan(kv_data, avg_bits)
+
+    def _baseline() -> dict[str, Any]:
+        result = _fit_pca_plan(*plan)
+        result["objective_basis"] = "key_pca"
+        return result
+
+    c_q = np.asarray(query_cov, dtype=np.float64)
+    if not np.isfinite(c_q).all() or np.trace(c_q) <= 0.0:
+        return _baseline()
+
+    keys = np.array(kv_data.astype(mx.float32), dtype=np.float64)
+    N, _D = keys.shape
+    norms = np.sqrt(np.sum(keys**2, axis=-1, keepdims=True))
+    unit = keys / np.maximum(norms, 1e-8)
+
+    rng = np.random.default_rng(seed)
+    perm = rng.permutation(N)
+    n_hold = int(N * _QA_HOLDOUT_FRACTION) if N >= 16 else 0
+    hold_idx, fit_idx = perm[:n_hold], perm[n_hold:]
+    if n_hold == 0:
+        hold_idx = fit_idx
+
+    m_k = unit[fit_idx].T @ unit[fit_idx] / len(fit_idx)
+    _data_norm, base_basis, base_d, base_bh, base_bl = plan
+    key_pca = np.array(base_basis, dtype=np.float64)
+
+    candidates: list[tuple[str, np.ndarray, int, int, int]] = [
+        ("key_pca", key_pca, base_d, base_bh, base_bl)
+    ]
+    w = _psd_sqrt(c_q)
+    for name, basis in (
+        ("key_pca_weighted", key_pca),
+        ("query_pca", _sym_eig_rows(c_q)),
+        ("whitened", _sym_eig_rows(w @ m_k @ w)),
+        ("product", _sym_eig_rows(c_q @ m_k + m_k @ c_q)),
+    ):
+        # diag(U C U^T) as BLAS matmuls (a 3-operand einsum is a scalar loop)
+        imp = np.sum((basis @ c_q) * basis, axis=1) * np.sum(
+            (basis @ m_k) * basis, axis=1
+        )
+        order = np.argsort(-imp, kind="stable")
+        d, bh, bl = allocate_bits_weighted(imp[order], avg_bits)
+        candidates.append((name, basis[order], d, bh, bl))
+
+    hold_unit, hold_keys, hold_norms = unit[hold_idx], keys[hold_idx], norms[hold_idx]
+    scores: list[float] = []
+    for name, basis, d, bh, bl in candidates:
+        cb_sem, cb_tail = _fit_regime_codebooks(unit[fit_idx] @ basis.T, d, bh, bl)
+        y = hold_unit @ basis.T
+        y_hat = np.concatenate(
+            [
+                _nearest_centroid(y[:, :d], np.array(cb_sem, dtype=np.float64)),
+                _nearest_centroid(y[:, d:], np.array(cb_tail, dtype=np.float64)),
+            ],
+            axis=-1,
+        )
+        err = hold_keys - hold_norms * (y_hat @ basis)
+        scores.append(float(np.mean(np.sum((err @ c_q) * err, axis=1))))
+        logger.debug(
+            "spectral-qa candidate %s: d_eff=%d bits=(%d,%d) qk_mse=%.4g",
+            name,
+            d,
+            bh,
+            bl,
+            scores[-1],
+        )
+
+    best = min(range(1, len(candidates)), key=scores.__getitem__)
+    if not scores[best] < (1.0 - _QA_SWITCH_MARGIN) * scores[0]:
+        return _baseline()
+
+    name, basis, d, bh, bl = candidates[best]
+    codebook_sem, codebook_tail = _fit_regime_codebooks(unit @ basis.T, d, bh, bl)
+    return {
+        "eigenvectors": mx.array(basis.astype(np.float32)),
+        "d_eff": d,
+        "codebook_sem": codebook_sem,
+        "codebook_tail": codebook_tail,
+        "bits_high": bh,
+        "bits_low": bl,
+        "objective_basis": name,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Query capture (attention objective)
+# ---------------------------------------------------------------------------
+
+# One process-wide wrapper around ``mx.fast.scaled_dot_product_attention``,
+# installed while any capture is active (refcounted, so overlapping captures
+# on different threads can't restore each other's patch out of order). Each
+# capture records only its own thread's calls, so an auto-calibration inside
+# the server never sees another model's generation traffic.
+_sdpa_lock = threading.Lock()
+_sdpa_tls = threading.local()
+_sdpa_refs = 0
+#: The real SDPA, saved on first install. Never reset: another thread may have
+#: fetched ``_recording_sdpa`` from ``mx.fast`` just before the last capture
+#: restored the original, and still call it afterwards.
+_sdpa_orig: Any = None
+
+
+def _recording_sdpa(*args: Any, **kwargs: Any) -> Any:
+    records = getattr(_sdpa_tls, "records", None)
+    if records is not None:
+        q = args[0] if args else kwargs.get("q")
+        k = args[1] if len(args) > 1 else kwargs.get("k")
+        if q is not None and k is not None:
+            records.append((q, k))
+    return _sdpa_orig(*args, **kwargs)
+
+
+@contextlib.contextmanager
+def _capture_sdpa_queries():
+    """Record ``(queries, keys)`` of this thread's SDPA calls.
+
+    Patches ``mx.fast.scaled_dot_product_attention``, which mlx-lm's (and
+    mlx-vlm's) attention helpers look up at call time. Yields the list the
+    records are appended to; always restores the original function.
+    """
+    global _sdpa_refs, _sdpa_orig
+    records: list[tuple[mx.array, mx.array]] = []
+    prev = getattr(_sdpa_tls, "records", None)
+    with _sdpa_lock:
+        if _sdpa_refs == 0:
+            current = mx.fast.scaled_dot_product_attention
+            if current is not _recording_sdpa:
+                _sdpa_orig = current
+            mx.fast.scaled_dot_product_attention = _recording_sdpa
+        _sdpa_refs += 1
+    _sdpa_tls.records = records
+    try:
+        yield records
+    finally:
+        _sdpa_tls.records = prev
+        with _sdpa_lock:
+            _sdpa_refs -= 1
+            if _sdpa_refs == 0:
+                mx.fast.scaled_dot_product_attention = _sdpa_orig
+
+
+def _match_layer(
+    layer_keys: list[tuple[int, mx.array]], k: mx.array, cursor: int
+) -> int | None:
+    """Index into ``layer_keys`` of the cache whose keys equal ``k``.
+
+    Tries the next layer in forward order first (the usual match, one sync);
+    otherwise compares every other same-shape cache in a single ``mx.eval``,
+    so a call that matches nothing (e.g. a sliding-window layer with the same
+    key shape) costs one sync rather than one per layer.
+    """
+    n = len(layer_keys)
+    cands = [
+        pos
+        for pos in (*range(cursor, n), *range(0, cursor))
+        if layer_keys[pos][1].shape == k.shape
+    ]
+    if not cands:
+        return None
+    if bool(mx.array_equal(layer_keys[cands[0]][1], k)):
+        return cands[0]
+    rest = cands[1:]
+    if not rest:
+        return None
+    equal = [mx.array_equal(layer_keys[pos][1], k) for pos in rest]
+    mx.eval(equal)
+    for pos, eq in zip(rest, equal):
+        if eq.item():
+            return pos
+    return None
+
+
+def _accumulate_query_stats(
+    records: list[tuple[mx.array, mx.array]],
+    prompt_cache: list,
+    num_layers: int,
+    query_stats: dict[int, dict[str, Any]],
+) -> None:
+    """Attribute captured SDPA queries to layers and add ``sum q q^T``.
+
+    A call belongs to the layer whose cached keys it attended over: matched
+    by shape, then exact equality. Calls run in forward order, so the next
+    layer after the last match is tried first (which also disambiguates
+    identical caches); any other matching layer is accepted too, which
+    covers KV-shared layers (their queries do attend over the owner's
+    keys). Unmatched calls (sliding-window layers, models that repeat KV
+    heads before SDPA, ...) are dropped.
+    """
+    layer_keys: list[tuple[int, mx.array]] = [
+        (i, prompt_cache[i].state[0])
+        for i in range(min(num_layers, len(prompt_cache)))
+        if _is_attention_cache(prompt_cache[i])
+    ]
+    if not layer_keys:
+        return
+    cursor = 0
+    for q, k in records:
+        try:
+            if getattr(q, "ndim", 0) != 4 or q.shape[-1] != k.shape[-1]:
+                continue
+            chosen = _match_layer(layer_keys, k, cursor)
+            if chosen is None:
+                continue
+            if chosen >= cursor:
+                cursor = chosen + 1
+            qf = q.reshape(-1, q.shape[-1]).astype(mx.float32)
+            second = np.array(qf.T @ qf, dtype=np.float64)
+        except Exception as exc:  # e.g. a tracer recorded under mx.compile
+            logger.debug("Skipping SDPA query record: %s", exc)
+            continue
+        layer = layer_keys[chosen][0]
+        st = query_stats.get(layer)
+        if st is None:
+            st = query_stats[layer] = {"sum": np.zeros_like(second), "count": 0}
+        if st["sum"].shape != second.shape:
+            continue
+        st["sum"] += second
+        st["count"] += qf.shape[0]
 
 
 # ---------------------------------------------------------------------------
@@ -299,6 +660,8 @@ def save_calibration(calibration: CalibrationData, output_dir: Path) -> None:
             "bits_high": data["bits_high"],
             "bits_low": data["bits_low"],
         }
+        if "objective_basis" in data:
+            config["heads"][prefix]["objective_basis"] = data["objective_basis"]
         tensors[f"{prefix}_eigvecs"] = np.array(data["eigenvectors"])
         tensors[f"{prefix}_codebook_sem"] = np.array(data["codebook_sem"])
         tensors[f"{prefix}_codebook_tail"] = np.array(data["codebook_tail"])
@@ -435,6 +798,7 @@ def _load_and_collect_kv(
     calibration_dataset: str | None,
     max_tokens_per_head: int,
     progress_callback: Any | None,
+    query_stats: dict[int, dict[str, Any]] | None = None,
 ) -> tuple[Any, Any, Any, int, int, int, dict]:
     """Fetch calibration texts, load the model, and collect K/V vectors.
 
@@ -444,6 +808,8 @@ def _load_and_collect_kv(
     dataset download never wastes a multi-GB load nor runs under an open
     Flash-MoE store. The store (if any) is open only for the collection
     forwards and is always closed.
+
+    ``query_stats`` is forwarded to ``collect_kv_vectors``.
 
     Returns ``(model, tokenizer, inner, head_dim, n_kv_heads, num_layers,
     kv_collectors)``.
@@ -488,6 +854,7 @@ def _load_and_collect_kv(
             texts=texts,
             max_tokens_per_head=max_tokens_per_head,
             progress_callback=progress_callback,
+            query_stats=query_stats,
         )
     finally:
         if store is not None:
@@ -509,6 +876,7 @@ def collect_kv_vectors(
     progress_callback: Any | None = None,
     progress_lo: float = 0.1,
     progress_hi: float = 0.5,
+    query_stats: dict[int, dict[str, Any]] | None = None,
 ) -> dict[int, dict[int, dict[str, list[mx.array]]]]:
     """Collect post-RoPE K/V vectors per (layer, head) from forward passes.
 
@@ -516,11 +884,12 @@ def collect_kv_vectors(
     (seq, head_dim) chunks.  Each chunk starts at position 0 of its sample
     (relevant for de-roping in the shard pipeline).  Raises if nothing was
     collected.
+
+    When ``query_stats`` is a dict, the forwards also capture each attention
+    layer's queries (see ``_capture_sdpa_queries``) and fill
+    ``query_stats[layer] = {"sum": sum q q^T, "count": n}`` (float64, all
+    query heads pooled) for the attention objective (#749).
     """
-    from mlx_lm.models.cache import make_prompt_cache
-
-    from olmlx.engine.flash.prepare import _encode_tokens
-
     # Heads are discovered per layer from the cache tensors (``n_kv_heads`` /
     # ``head_dim`` are the model-wide config values, which per-layer layouts
     # such as Gemma 4's full-attention layers don't follow), so each layer's
@@ -536,6 +905,59 @@ def collect_kv_vectors(
     # values *after* rotary positional embeddings — the actual distribution
     # that gets stored in the KV cache at inference time.
     cache_model = _resolve_cache_owner(inner, model)
+    with contextlib.ExitStack() as stack:
+        records = (
+            stack.enter_context(_capture_sdpa_queries())
+            if query_stats is not None
+            else None
+        )
+        first_exc = _collect_samples(
+            model,
+            tokenizer,
+            cache_model,
+            texts,
+            num_layers=num_layers,
+            max_tokens_per_head=max_tokens_per_head,
+            kv_collectors=kv_collectors,
+            tokens_collected=tokens_collected,
+            records=records,
+            query_stats=query_stats,
+            progress_callback=progress_callback,
+            progress_lo=progress_lo,
+            progress_hi=progress_hi,
+        )
+
+    # Guard: if no KV vectors were collected, fail early with a clear message
+    if sum(tokens_collected.values()) == 0:
+        raise _build_empty_collection_error(first_exc)
+
+    return kv_collectors
+
+
+def _collect_samples(
+    model: Any,
+    tokenizer: Any,
+    cache_model: Any,
+    texts: list[str],
+    *,
+    num_layers: int,
+    max_tokens_per_head: int,
+    kv_collectors: dict[int, dict[int, dict[str, list[mx.array]]]],
+    tokens_collected: dict[tuple[int, int, str], int],
+    records: list | None,
+    query_stats: dict[int, dict[str, Any]] | None,
+    progress_callback: Any | None,
+    progress_lo: float,
+    progress_hi: float,
+) -> Exception | None:
+    """The per-sample forward loop of ``collect_kv_vectors``.
+
+    Returns the first forward-pass exception (if any), for error chaining.
+    """
+    from mlx_lm.models.cache import make_prompt_cache
+
+    from olmlx.engine.flash.prepare import _encode_tokens
+
     first_exc: Exception | None = None
     for sample_idx, text in enumerate(texts):
         tokens = _encode_tokens(tokenizer, text)
@@ -560,8 +982,13 @@ def collect_kv_vectors(
                 first_exc = exc
             logger.debug("Skipping sample %d: %s", sample_idx, exc)
             del prompt_cache
+            if records is not None:
+                records.clear()
             continue
         mx.eval([c.state for c in prompt_cache if hasattr(c, "state")])
+        if records is not None and query_stats is not None:
+            _accumulate_query_stats(records, prompt_cache, num_layers, query_stats)
+            records.clear()
 
         # Extract K/V from each layer's cache
         advanced = False
@@ -619,11 +1046,7 @@ def collect_kv_vectors(
             )
             progress_callback(f"Collected {sample_idx + 1}/{len(texts)} samples", frac)
 
-    # Guard: if no KV vectors were collected, fail early with a clear message
-    if sum(tokens_collected.values()) == 0:
-        raise _build_empty_collection_error(first_exc)
-
-    return kv_collectors
+    return first_exc
 
 
 def calibrate_model(
@@ -634,6 +1057,7 @@ def calibrate_model(
     avg_bits: int = 4,
     max_tokens_per_head: int = _SPECTRAL_DEFAULT_MAX_TOKENS_PER_HEAD,
     progress_callback: Any | None = None,
+    objective: str = "reconstruction",
 ) -> Path:
     """Run spectral calibration on a model.
 
@@ -642,12 +1066,17 @@ def calibrate_model(
 
     Args:
         model_path: HF model path or local directory.
-        output_dir: Where to write calibration files. Defaults to model_dir/spectral.
+        output_dir: Where to write calibration files. Defaults to
+            model_dir/spectral (model_dir/spectral_qa for the attention
+            objective).
         num_samples: Number of calibration text samples.
         calibration_dataset: "c4", "synthetic", or None (defaults to c4).
         avg_bits: Target average bits per dimension.
         max_tokens_per_head: Max tokens to collect per head for covariance.
         progress_callback: Called with (description, fraction).
+        objective: "reconstruction" (key PCA, ``spectral:N``) or "attention"
+            (query-weighted keys, ``spectral-qa:N``, #749). Values are
+            calibrated the same way under both.
 
     Returns:
         Path to the spectral calibration directory.
@@ -655,8 +1084,17 @@ def calibrate_model(
     import gc
     import time
 
+    if objective not in SPECTRAL_DIR_BY_OBJECTIVE:
+        raise ValueError(
+            f"Unknown spectral calibration objective {objective!r}; "
+            f"expected one of {sorted(SPECTRAL_DIR_BY_OBJECTIVE)}"
+        )
+    query_stats: dict[int, dict[str, Any]] | None = (
+        {} if objective == "attention" else None
+    )
+
     if output_dir is None:
-        output_dir = Path(model_path) / "spectral"
+        output_dir = Path(model_path) / SPECTRAL_DIR_BY_OBJECTIVE[objective]
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -674,7 +1112,16 @@ def calibrate_model(
         calibration_dataset=calibration_dataset,
         max_tokens_per_head=max_tokens_per_head,
         progress_callback=progress_callback,
+        query_stats=query_stats,
     )
+
+    if query_stats is not None and not query_stats:
+        raise RuntimeError(
+            "Attention-objective calibration captured no queries: no "
+            "mx.fast.scaled_dot_product_attention call could be matched to an "
+            "attention layer's cached keys. This model's attention is not "
+            "supported by spectral-qa; use 'spectral' instead."
+        )
 
     if progress_callback:
         progress_callback("Running eigenspectral analysis", 0.5)
@@ -703,7 +1150,29 @@ def calibrate_model(
                 continue
 
             kv_data = mx.concatenate(all_chunks, axis=0)
-            result = calibrate_head(kv_data, avg_bits=avg_bits)
+            if query_stats is not None and kind == "key":
+                stats = query_stats.get(layer_idx)
+                if stats is not None and stats["count"] > 0:
+                    result = calibrate_head_qa(
+                        kv_data, stats["sum"] / stats["count"], avg_bits=avg_bits
+                    )
+                    logger.debug(
+                        "spectral-qa layer %d: basis=%s d_eff=%d bits=(%d,%d)",
+                        layer_idx,
+                        result["objective_basis"],
+                        result["d_eff"],
+                        result["bits_high"],
+                        result["bits_low"],
+                    )
+                else:
+                    logger.warning(
+                        "spectral-qa: no queries captured for layer %d; "
+                        "calibrating its keys by reconstruction error",
+                        layer_idx,
+                    )
+                    result = calibrate_head(kv_data, avg_bits=avg_bits)
+            else:
+                result = calibrate_head(kv_data, avg_bits=avg_bits)
             calibration[(layer_idx, 0, kind)] = result
 
             done += 1
@@ -728,6 +1197,7 @@ def calibrate_model(
         "n_kv_heads": n_kv_heads,
         "head_dim": head_dim,
         "avg_bits": avg_bits,
+        "objective": objective,
         "num_samples": num_samples,
         "max_tokens_per_head": max_tokens_per_head,
         "calibration_dataset": calibration_dataset or "c4",

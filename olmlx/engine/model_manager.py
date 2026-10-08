@@ -13,7 +13,7 @@ from typing import TYPE_CHECKING, Any
 import mlx.core as mx
 
 from olmlx.config import FlashMoeConfig, experimental as global_experimental
-from olmlx.config import resolve_experimental, settings
+from olmlx.config import SPECTRAL_CALIBRATIONS, resolve_experimental, settings
 from olmlx.engine.registry import (
     _FLASH_MOE_INCOMPATIBLE_STRATEGIES,
     AdapterConfig,
@@ -91,6 +91,16 @@ _STOP_DRAIN_TIMEOUT = 5.0
 #: eagerly) to avoid pulling those imports into lightweight CLI paths.
 _SPECTRAL_DEFAULT_MAX_TOKENS_PER_HEAD = 8192
 _SPECTRAL_DEFAULT_NUM_SAMPLES = 256
+
+
+def _spectral_prepare_cmd(hf_path: str, method: str, bits: int) -> str:
+    """The ``olmlx spectral prepare`` invocation that produces ``method:bits``."""
+    cmd = f"olmlx spectral prepare {hf_path}"
+    if bits != 4:  # 4 is calibrate_model's default avg_bits
+        cmd += f" --avg-bits {bits}"
+    if SPECTRAL_CALIBRATIONS[method][0] != "reconstruction":
+        cmd += f" --objective {SPECTRAL_CALIBRATIONS[method][0]}"
+    return cmd
 
 
 # Exceptions from mlx-lm.load() that indicate the model simply isn't
@@ -2280,8 +2290,16 @@ class ModelManager(SpeculativeLoaderMixin):
     def _find_spectral_dir(
         self, hf_path: str, kv_cache_quant: str | None
     ) -> Path | None:
-        """Return the spectral calibration directory if spectral quant is configured."""
-        if kv_cache_quant is None or not kv_cache_quant.startswith("spectral:"):
+        """Return the spectral calibration directory if spectral quant is configured.
+
+        Covers ``spectral:N`` (``<model>/spectral``) and ``spectral-qa:N``
+        (``<model>/spectral_qa``, attention objective, #749); each method
+        reads only its own directory so both can coexist for A/B runs.
+        """
+        if kv_cache_quant is None:
+            return None
+        method = kv_cache_quant.split(":", 1)[0]
+        if method not in SPECTRAL_CALIBRATIONS or ":" not in kv_cache_quant:
             return None
         if self.store is None:
             return None
@@ -2295,40 +2313,52 @@ class ModelManager(SpeculativeLoaderMixin):
         except (ValueError, IndexError):
             raise ValueError(
                 f"Invalid SpectralQuant config {kv_cache_quant!r}; "
-                f"expected spectral:2 or spectral:4"
+                f"expected {method}:2 or {method}:4"
             )
         if configured_bits not in (2, 4):
             raise ValueError(
                 f"Invalid SpectralQuant bit width {kv_cache_quant!r}; expected 2 or 4"
             )
 
-        spectral_path = self.store.model_dir(hf_path) / "spectral"
+        objective, dir_name = SPECTRAL_CALIBRATIONS[method]
+        recalibrate_cmd = _spectral_prepare_cmd(hf_path, method, configured_bits)
+        spectral_path = self.store.model_dir(hf_path) / dir_name
         if spectral_path.exists() and (spectral_path / "spectral_config.json").exists():
             try:
                 config = json.loads(
                     (spectral_path / "spectral_config.json").read_text()
                 )
             except (json.JSONDecodeError, OSError) as exc:
-                recalibrate_cmd = f"olmlx spectral prepare {hf_path}"
-                if configured_bits != 4:
-                    recalibrate_cmd += f" --avg-bits {configured_bits}"
                 raise SpectralCalibrationMissingError(
                     f"SpectralQuant configured ({kv_cache_quant}) but calibration "
                     f"file at {spectral_path}/spectral_config.json is unreadable "
                     f"({exc}). Re-run '{recalibrate_cmd}'."
                 )
-            cal_bits = config.get("meta", {}).get("avg_bits")
+            meta = config.get("meta", {})
+            cal_bits = meta.get("avg_bits")
             if cal_bits is not None and cal_bits != configured_bits:
-                calibrate_cmd = (
-                    f"olmlx spectral prepare {hf_path} --avg-bits {configured_bits}"
-                )
                 raise SpectralCalibrationMissingError(
                     f"SpectralQuant configured ({kv_cache_quant}) but calibration "
                     f"data at {spectral_path} was generated with "
-                    f"--avg-bits {cal_bits}. Run '{calibrate_cmd}' "
+                    f"--avg-bits {cal_bits}. Run '{recalibrate_cmd}' "
                     f"to re-calibrate at {configured_bits}-bit, "
-                    f"or set OLMLX_KV_CACHE_QUANT=spectral:{cal_bits} "
+                    f"or set OLMLX_KV_CACHE_QUANT={method}:{cal_bits} "
                     f"to use the existing calibration."
+                )
+            # Pre-#749 calibrations record no objective and are reconstruction,
+            # so only plain ``spectral`` may fall back; a ``spectral_qa`` dir
+            # with no recorded objective is of unknown origin.
+            cal_objective = meta.get("objective", "reconstruction")
+            if cal_objective != objective:
+                made_with = (
+                    f"was generated with --objective {cal_objective}"
+                    if "objective" in meta
+                    else "records no calibration objective"
+                )
+                raise SpectralCalibrationMissingError(
+                    f"SpectralQuant configured ({kv_cache_quant}) but calibration "
+                    f"data at {spectral_path} {made_with}. "
+                    f"Run '{recalibrate_cmd}'."
                 )
             return spectral_path
 
@@ -2337,13 +2367,9 @@ class ModelManager(SpeculativeLoaderMixin):
             return self._auto_calibrate_spectral(hf_path, kv_cache_quant)
 
         other_bits = 4 if configured_bits == 2 else 2
-
-        calibrate_cmd = f"olmlx spectral prepare {hf_path}"
-        if configured_bits != 4:  # 4 is calibrate_model's default avg_bits
-            calibrate_cmd += f" --avg-bits {configured_bits}"
         raise SpectralCalibrationMissingError(
             f"SpectralQuant configured ({kv_cache_quant}) but no calibration data "
-            f"found at {spectral_path}. Run '{calibrate_cmd}' "
+            f"found at {spectral_path}. Run '{recalibrate_cmd}' "
             f"to calibrate. Calibration collects KV vectors from "
             f"~{_SPECTRAL_DEFAULT_NUM_SAMPLES} text samples (C4 by default) "
             f"and computes per-layer eigendecompositions for non-uniform "
@@ -2362,31 +2388,36 @@ class ModelManager(SpeculativeLoaderMixin):
         from olmlx.engine.spectralquant_calibrate import calibrate_model
 
         method, bits_str = kv_cache_quant.split(":")
-        assert method == "spectral", (
+        assert method in SPECTRAL_CALIBRATIONS, (
             f"_auto_calibrate_spectral called with non-spectral quant: "
             f"{kv_cache_quant!r}"
         )
+        objective, dir_name = SPECTRAL_CALIBRATIONS[method]
         avg_bits = int(bits_str)
         local_dir = self.store.model_dir(hf_path)
+        prepare_cmd = _spectral_prepare_cmd(hf_path, method, avg_bits)
         logger = logging.getLogger(__name__)
         logger.info(
-            "Auto-calibrating spectral quant (%s-bit) for %s "
+            "Auto-calibrating %s quant (%s-bit) for %s "
             "(this may take several minutes)...",
+            method,
             avg_bits,
             hf_path,
         )
         try:
             output_dir = calibrate_model(
                 model_path=str(local_dir),
+                output_dir=local_dir / dir_name,
                 num_samples=64,
                 calibration_dataset="c4",
                 avg_bits=avg_bits,
                 max_tokens_per_head=2048,
+                objective=objective,
             )
         except Exception as exc:
             raise SpectralCalibrationMissingError(
                 f"Auto-calibration failed for {hf_path}: {exc}. "
-                f"Run 'olmlx spectral prepare {hf_path}' manually."
+                f"Run '{prepare_cmd}' manually."
             ) from exc
         spectral_path = Path(output_dir)
         if spectral_path.exists() and (spectral_path / "spectral_config.json").exists():
@@ -2394,7 +2425,7 @@ class ModelManager(SpeculativeLoaderMixin):
             return spectral_path
         raise SpectralCalibrationMissingError(
             f"Auto-calibration completed but spectral data not found at "
-            f"{spectral_path}. Run 'olmlx spectral prepare {hf_path}' manually."
+            f"{spectral_path}. Run '{prepare_cmd}' manually."
         )
 
     def _find_shard_dir(self, hf_path: str, kv_cache_quant: str | None) -> Path | None:

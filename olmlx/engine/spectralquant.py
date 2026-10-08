@@ -169,18 +169,33 @@ def fit_codebook(
     lo, hi = float(data_np.min()), float(data_np.max())
     centroids = np.linspace(lo, hi, n_levels).astype(np.float32)
 
-    for _ in range(max_iter):
-        # Assignment: find nearest centroid for each data point
-        # Do this in numpy to avoid large MLX materialization
-        dists = np.abs(data_np[:, None] - centroids[None, :])
-        assignments = dists.argmin(axis=1)
+    # In 1-D, each centroid's cell is the interval between the midpoints to
+    # its sorted neighbours, so once the data is sorted an iteration is K
+    # binary searches plus prefix-sum lookups — O(K log N) — instead of an
+    # (N, K) distance matrix and one masked pass per centroid (minutes per
+    # layer for 8-bit codebooks). ``side="right"`` puts a point exactly on a
+    # midpoint in the lower cell, matching ``argmin``'s first-index
+    # tie-break.
+    data_sorted = np.sort(data_np)
+    prefix = np.concatenate([[0.0], np.cumsum(data_sorted, dtype=np.float64)])
+    n = data_sorted.shape[0]
 
-        # Update: recompute each centroid as conditional mean
+    for _ in range(max_iter):
+        order = np.argsort(centroids, kind="stable")
+        sorted_c = centroids[order]
+        mids = (sorted_c[:-1] + sorted_c[1:]) / 2
+        bounds = np.concatenate(
+            [[0], np.searchsorted(data_sorted, mids, side="right"), [n]]
+        )
+
+        # Update: recompute each non-empty centroid as its conditional mean
+        counts = np.diff(bounds)
+        sums = prefix[bounds[1:]] - prefix[bounds[:-1]]
         new_centroids = centroids.copy()
-        for k in range(n_levels):
-            mask = assignments == k
-            if mask.any():
-                new_centroids[k] = data_np[mask].mean()
+        nonempty = counts > 0
+        new_centroids[order[nonempty]] = (sums[nonempty] / counts[nonempty]).astype(
+            np.float32
+        )
 
         # Check convergence
         max_change = np.max(np.abs(new_centroids - centroids))

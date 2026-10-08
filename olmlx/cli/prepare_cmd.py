@@ -42,6 +42,8 @@ def cmd_spectral_prepare(args):
     print(f"  Calibration dataset: {dataset_label}")
     print(f"  Calibration samples: {args.samples}")
     print(f"  Max tokens per head: {args.max_tokens}")
+    objective = getattr(args, "objective", "reconstruction")
+    print(f"  Objective: {objective}")
     print()
 
     from olmlx.engine.spectralquant_calibrate import calibrate_model
@@ -53,12 +55,18 @@ def cmd_spectral_prepare(args):
         avg_bits=args.avg_bits,
         max_tokens_per_head=args.max_tokens,
         progress_callback=_flash_progress,
+        objective=objective,
     )
 
+    from olmlx.config import SPECTRAL_CALIBRATIONS
+
+    method = next(
+        m for m, (obj, _d) in SPECTRAL_CALIBRATIONS.items() if obj == objective
+    )
     print("\nSpectral calibration complete!")
     print(f"  Output: {output_dir}")
     print("\nTo use spectral quant:")
-    print(f"  OLMLX_KV_CACHE_QUANT=spectral:{args.avg_bits} olmlx serve")
+    print(f"  OLMLX_KV_CACHE_QUANT={method}:{args.avg_bits} olmlx serve")
 
 
 def cmd_shard_prepare(args):
