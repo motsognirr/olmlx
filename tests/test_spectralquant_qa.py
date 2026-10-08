@@ -639,3 +639,24 @@ def test_fit_codebook_is_fast_at_8_bits():
     fit_codebook(data, bits=8)
     # The O(N*K) reference takes minutes here.
     assert time.perf_counter() - t < 10.0
+
+
+@pytest.mark.parametrize(
+    "data",
+    [
+        [0.0, 0.5, 1.0],  # 0.5 is exactly the initial midpoint
+        [0.0, 0.25, 0.5, 0.5, 0.75, 1.0],
+        [-1.0, -0.5, 0.0, 0.0, 0.5, 1.0],
+    ],
+)
+def test_fit_codebook_midpoint_ties_go_to_lower_centroid(data):
+    """A point exactly on a midpoint joins the lower cell, as ``argmin``'s
+    first-index tie-break does. (With bounds from ``searchsorted(data, mids,
+    side="right")`` the lower cell holds every point ``<= mid``; ``"left"``
+    would move ties up and diverge from the reference.)"""
+    from olmlx.engine.spectralquant import fit_codebook
+
+    data = np.array(data, dtype=np.float32)
+    for bits in (1, 2):
+        got = np.array(fit_codebook(mx.array(data), bits=bits))
+        np.testing.assert_allclose(got, _reference_lloyd(data, bits), atol=1e-7)
