@@ -29,17 +29,14 @@ from olmlx.engine.spectralquant import (
 # ---------------------------------------------------------------------------
 
 
-#: Rows per codec call in ``_runtime_roundtrip``. Large enough calls with a
-#: 256-level codebook exceed spectralquant's broadcast cap and switch to the
-#: 256-step unrolled argmin, which the CPU backend (CI runs MLX on CPU) JIT-
-#: compiles into one huge C++ kernel: ~10 s locally, and a native abort on
-#: the self-hosted CI runner. Small chunks stay on the vectorized path; the
-#: codec is per-vector, so the result is identical.
-_ROUNDTRIP_CHUNK = 1024
-
-
 def _runtime_roundtrip(keys: np.ndarray, cal: dict) -> np.ndarray:
-    """Quantize + dequantize through the real runtime spectral codec."""
+    """Quantize + dequantize through the real runtime spectral codec.
+
+    Callers run under ``metal_default_device``: the codec's compiled kernels
+    are a GPU path in production, and on the self-hosted CI runner the CPU
+    backend aborted the whole test process inside this roundtrip (no message
+    survives pytest's capture), while the same run passes locally.
+    """
     rot = SpectralRotation(cal["eigenvectors"])
     codec = (
         cal["codebook_sem"],
@@ -48,13 +45,9 @@ def _runtime_roundtrip(keys: np.ndarray, cal: dict) -> np.ndarray:
         cal["bits_high"],
         cal["bits_low"],
     )
-    out = []
-    for start in range(0, len(keys), _ROUNDTRIP_CHUNK):
-        chunk = keys[start : start + _ROUNDTRIP_CHUNK]
-        x = mx.array(chunk[None, None].astype(np.float32))  # (1, 1, n, D)
-        ps, pt, norms = spectral_quantize(x, rot, *codec)
-        out.append(np.array(spectral_dequantize(ps, pt, norms, rot, *codec)[0, 0]))
-    return np.concatenate(out)
+    x = mx.array(keys[None, None].astype(np.float32))  # (1, 1, N, D)
+    ps, pt, norms = spectral_quantize(x, rot, *codec)
+    return np.array(spectral_dequantize(ps, pt, norms, rot, *codec)[0, 0])
 
 
 def _qk_mse(keys: np.ndarray, recon: np.ndarray, queries: np.ndarray) -> float:
@@ -81,6 +74,7 @@ def _synthetic(D=16, n=6000, seed=0):
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.usefixtures("metal_default_device")
 @pytest.mark.parametrize("avg_bits", [2, 4])
 def test_qa_beats_key_pca_when_queries_look_at_low_variance_dims(avg_bits):
     keys, queries, c_q = _synthetic()
@@ -96,6 +90,7 @@ def test_qa_beats_key_pca_when_queries_look_at_low_variance_dims(avg_bits):
     assert qa_err < 0.6 * base_err, (qa_err, base_err, qa["objective_basis"])
 
 
+@pytest.mark.usefixtures("metal_default_device")
 def test_qa_not_worse_than_key_pca_with_isotropic_queries():
     rng = np.random.default_rng(1)
     D = 16
@@ -545,6 +540,7 @@ def _in_sample_qk(keys, c_q, cal):
     return float(np.mean(np.einsum("nd,de,ne->n", err, c_q, err)))
 
 
+@pytest.mark.usefixtures("metal_default_device")
 @pytest.mark.parametrize("seed", [0, 1, 2, 3])
 def test_qa_never_worse_than_spectral_on_calibration_data(seed):
     """Selection must compare candidates with converged codebooks, and the
