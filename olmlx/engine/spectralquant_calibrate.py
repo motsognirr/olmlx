@@ -17,6 +17,7 @@ from typing import Any
 
 import mlx.core as mx
 import numpy as np
+from olmlx.config import SPECTRAL_CALIBRATIONS
 from olmlx.engine.turboquant_cache import _is_plain_kv_cache
 
 from olmlx.engine.spectralquant import _PACKABLE_BITS, allocate_bits, fit_codebook
@@ -39,14 +40,11 @@ _SPECTRAL_DEFAULT_NUM_SAMPLES = 256
 _CALIBRATION_CACHE_BUDGET_EXPERTS = 8
 _CALIBRATION_IO_THREADS = 32
 
-#: Calibration objectives (#749) and the model-relative directory each writes.
+#: Calibration objective (#749) -> the model-relative directory it writes.
 #: ``reconstruction`` minimizes ||k - k_hat||; ``attention`` (``spectral-qa``)
-#: minimizes the error in the attention products q·k. Also duplicated in
-#: ``model_manager.py`` — keep in sync.
-SPECTRAL_DIR_BY_OBJECTIVE: dict[str, str] = {
-    "reconstruction": "spectral",
-    "attention": "spectral_qa",
-}
+#: minimizes the error in the attention products q·k. Derived from
+#: ``config.SPECTRAL_CALIBRATIONS``.
+SPECTRAL_DIR_BY_OBJECTIVE: dict[str, str] = dict(SPECTRAL_CALIBRATIONS.values())
 
 #: Attention-objective candidate selection fits each candidate's codebooks on
 #: the remaining keys and scores it on this held-out fraction.
@@ -242,6 +240,17 @@ def calibrate_head(
         Dict with keys: eigenvectors, d_eff, codebook_sem, codebook_tail,
         bits_high, bits_low.
     """
+    return _fit_pca_plan(*_pca_plan(kv_data, avg_bits))
+
+
+def _pca_plan(
+    kv_data: mx.array, avg_bits: int
+) -> tuple[mx.array, mx.array, int, int, int]:
+    """``calibrate_head``'s basis and bit split, without the codebooks.
+
+    Returns ``(data_norm, basis, d_eff, bits_high, bits_low)``; ``basis`` has
+    one eigenvector per row.
+    """
     head_dim = kv_data.shape[-1]
 
     # Step 1: Covariance and eigendecomposition
@@ -265,16 +274,16 @@ def calibrate_head(
     # onto its rows, so the leading "semantic" coordinates weren't the
     # high-variance directions (#761).
     basis = eigenvectors.T
-    rotated = data_norm @ basis.T
+    return data_norm, basis, d_eff, bits_high, bits_low
 
-    sem_data = rotated[:, :d_eff].reshape(-1)
-    tail_data = rotated[:, d_eff:].reshape(-1)
 
-    codebook_sem = fit_codebook(sem_data, bits=bits_high)
-    codebook_tail = (
-        fit_codebook(tail_data, bits=bits_low) if d_eff < head_dim else mx.array([0.0])
+def _fit_pca_plan(
+    data_norm: mx.array, basis: mx.array, d_eff: int, bits_high: int, bits_low: int
+) -> dict[str, Any]:
+    """Fit a ``_pca_plan``'s codebooks; returns ``calibrate_head``'s result."""
+    codebook_sem, codebook_tail = _fit_regime_codebooks(
+        data_norm @ basis.T, d_eff, bits_high, bits_low
     )
-
     return {
         "eigenvectors": basis,  # (head_dim, head_dim), rows = eigvecs
         "d_eff": d_eff,
@@ -341,18 +350,24 @@ def _nearest_centroid(values: np.ndarray, codebook: np.ndarray) -> np.ndarray:
 
 
 def _fit_regime_codebooks(
-    rotated: np.ndarray,
+    rotated: mx.array | np.ndarray,
     d_eff: int,
     bits_high: int,
     bits_low: int,
 ) -> tuple[mx.array, mx.array]:
-    """Fit the semantic/tail Lloyd-Max codebooks on rotated unit vectors."""
-    D = rotated.shape[1]
-    sem = mx.array(rotated[:, :d_eff].reshape(-1).astype(np.float32))
-    codebook_sem = fit_codebook(sem, bits=bits_high)
-    if d_eff < D:
-        tail = mx.array(rotated[:, d_eff:].reshape(-1).astype(np.float32))
-        codebook_tail = fit_codebook(tail, bits=bits_low)
+    """Fit the semantic/tail Lloyd-Max codebooks on rotated unit vectors.
+
+    A full-rank semantic regime (``d_eff == head_dim``) gets the ``[0.0]``
+    tail sentinel.
+    """
+
+    def _flat(x: mx.array | np.ndarray) -> mx.array:
+        x = x.reshape(-1)
+        return mx.array(x.astype(np.float32)) if isinstance(x, np.ndarray) else x
+
+    codebook_sem = fit_codebook(_flat(rotated[:, :d_eff]), bits=bits_high)
+    if d_eff < rotated.shape[1]:
+        codebook_tail = fit_codebook(_flat(rotated[:, d_eff:]), bits=bits_low)
     else:
         codebook_tail = mx.array([0.0])
     return codebook_sem, codebook_tail
@@ -389,11 +404,18 @@ def calibrate_head_qa(
     Returns the same fields as ``calibrate_head`` plus ``objective_basis``
     (the winning candidate's name).
     """
-    base = calibrate_head(kv_data, avg_bits=avg_bits)
-    base["objective_basis"] = "key_pca"
+    # Only the baseline's plan up front: its full-data codebooks are fit
+    # only if it wins.
+    plan = _pca_plan(kv_data, avg_bits)
+
+    def _baseline() -> dict[str, Any]:
+        result = _fit_pca_plan(*plan)
+        result["objective_basis"] = "key_pca"
+        return result
+
     c_q = np.asarray(query_cov, dtype=np.float64)
     if not np.isfinite(c_q).all() or np.trace(c_q) <= 0.0:
-        return base
+        return _baseline()
 
     keys = np.array(kv_data.astype(mx.float32), dtype=np.float64)
     N, _D = keys.shape
@@ -408,10 +430,11 @@ def calibrate_head_qa(
         hold_idx = fit_idx
 
     m_k = unit[fit_idx].T @ unit[fit_idx] / len(fit_idx)
-    key_pca = np.array(base["eigenvectors"], dtype=np.float64)
+    _data_norm, base_basis, base_d, base_bh, base_bl = plan
+    key_pca = np.array(base_basis, dtype=np.float64)
 
     candidates: list[tuple[str, np.ndarray, int, int, int]] = [
-        ("key_pca", key_pca, base["d_eff"], base["bits_high"], base["bits_low"])
+        ("key_pca", key_pca, base_d, base_bh, base_bl)
     ]
     w = _psd_sqrt(c_q)
     for name, basis in (
@@ -420,8 +443,9 @@ def calibrate_head_qa(
         ("whitened", _sym_eig_rows(w @ m_k @ w)),
         ("product", _sym_eig_rows(c_q @ m_k + m_k @ c_q)),
     ):
-        imp = np.einsum("id,de,ie->i", basis, c_q, basis) * np.einsum(
-            "id,de,ie->i", basis, m_k, basis
+        # diag(U C U^T) as BLAS matmuls (a 3-operand einsum is a scalar loop)
+        imp = np.sum((basis @ c_q) * basis, axis=1) * np.sum(
+            (basis @ m_k) * basis, axis=1
         )
         order = np.argsort(-imp, kind="stable")
         d, bh, bl = allocate_bits_weighted(imp[order], avg_bits)
@@ -440,7 +464,7 @@ def calibrate_head_qa(
             axis=-1,
         )
         err = hold_keys - hold_norms * (y_hat @ basis)
-        scores.append(float(np.mean(np.einsum("nd,de,ne->n", err, c_q, err))))
+        scores.append(float(np.mean(np.sum((err @ c_q) * err, axis=1))))
         logger.debug(
             "spectral-qa candidate %s: d_eff=%d bits=(%d,%d) qk_mse=%.4g",
             name,
@@ -452,7 +476,7 @@ def calibrate_head_qa(
 
     best = min(range(1, len(candidates)), key=scores.__getitem__)
     if not scores[best] < (1.0 - _QA_SWITCH_MARGIN) * scores[0]:
-        return base
+        return _baseline()
 
     name, basis, d, bh, bl = candidates[best]
     codebook_sem, codebook_tail = _fit_regime_codebooks(unit @ basis.T, d, bh, bl)
@@ -479,6 +503,9 @@ def calibrate_head_qa(
 _sdpa_lock = threading.Lock()
 _sdpa_tls = threading.local()
 _sdpa_refs = 0
+#: The real SDPA, saved on first install. Never reset: another thread may have
+#: fetched ``_recording_sdpa`` from ``mx.fast`` just before the last capture
+#: restored the original, and still call it afterwards.
 _sdpa_orig: Any = None
 
 
@@ -505,7 +532,9 @@ def _capture_sdpa_queries():
     prev = getattr(_sdpa_tls, "records", None)
     with _sdpa_lock:
         if _sdpa_refs == 0:
-            _sdpa_orig = mx.fast.scaled_dot_product_attention
+            current = mx.fast.scaled_dot_product_attention
+            if current is not _recording_sdpa:
+                _sdpa_orig = current
             mx.fast.scaled_dot_product_attention = _recording_sdpa
         _sdpa_refs += 1
     _sdpa_tls.records = records
@@ -517,7 +546,37 @@ def _capture_sdpa_queries():
             _sdpa_refs -= 1
             if _sdpa_refs == 0:
                 mx.fast.scaled_dot_product_attention = _sdpa_orig
-                _sdpa_orig = None
+
+
+def _match_layer(
+    layer_keys: list[tuple[int, mx.array]], k: mx.array, cursor: int
+) -> int | None:
+    """Index into ``layer_keys`` of the cache whose keys equal ``k``.
+
+    Tries the next layer in forward order first (the usual match, one sync);
+    otherwise compares every other same-shape cache in a single ``mx.eval``,
+    so a call that matches nothing (e.g. a sliding-window layer with the same
+    key shape) costs one sync rather than one per layer.
+    """
+    n = len(layer_keys)
+    cands = [
+        pos
+        for pos in (*range(cursor, n), *range(0, cursor))
+        if layer_keys[pos][1].shape == k.shape
+    ]
+    if not cands:
+        return None
+    if bool(mx.array_equal(layer_keys[cands[0]][1], k)):
+        return cands[0]
+    rest = cands[1:]
+    if not rest:
+        return None
+    equal = [mx.array_equal(layer_keys[pos][1], k) for pos in rest]
+    mx.eval(equal)
+    for pos, eq in zip(rest, equal):
+        if eq.item():
+            return pos
+    return None
 
 
 def _accumulate_query_stats(
@@ -544,17 +603,11 @@ def _accumulate_query_stats(
     if not layer_keys:
         return
     cursor = 0
-    n = len(layer_keys)
     for q, k in records:
         try:
             if getattr(q, "ndim", 0) != 4 or q.shape[-1] != k.shape[-1]:
                 continue
-            chosen = None
-            for pos in [*range(cursor, n), *range(0, cursor)]:
-                ck = layer_keys[pos][1]
-                if ck.shape == k.shape and bool(mx.array_equal(ck, k)):
-                    chosen = pos
-                    break
+            chosen = _match_layer(layer_keys, k, cursor)
             if chosen is None:
                 continue
             if chosen >= cursor:

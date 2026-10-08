@@ -357,6 +357,27 @@ class SpectralQuantKVCache(_BaseCache):
         return self._k_sem is None or self.offset == 0
 
 
+def _avg_bits_mismatch_message(meta: dict, avg_bits: int) -> str:
+    """Warning for a calibration made at a different ``avg_bits``, naming the
+    variant (``spectral`` / ``spectral-qa``) its ``objective`` belongs to."""
+    from olmlx.config import SPECTRAL_CALIBRATIONS
+
+    objective = meta.get("objective", "reconstruction")
+    method = next(
+        (m for m, (obj, _d) in SPECTRAL_CALIBRATIONS.items() if obj == objective),
+        "spectral",
+    )
+    cmd = f"olmlx spectral prepare --avg-bits {avg_bits}"
+    if objective != "reconstruction":
+        cmd += f" --objective {objective}"
+    cal_bits = meta.get("avg_bits")
+    return (
+        f"Calibration was run with avg_bits={cal_bits} but {method}:{avg_bits} "
+        f"was configured; using calibrated bit allocation ({cal_bits}-bit). "
+        f"Re-run '{cmd}' to match."
+    )
+
+
 def make_spectral_cache(
     model: Any,
     calibration_dir: Path,
@@ -389,15 +410,7 @@ def make_spectral_cache(
         meta = json.loads(config_path.read_text()).get("meta", {})
         cal_bits = meta.get("avg_bits")
         if cal_bits is not None and cal_bits != avg_bits:
-            logger.warning(
-                "Calibration was run with avg_bits=%d but spectral:%d was configured; "
-                "using calibrated bit allocation (%d-bit). Re-run "
-                "'olmlx spectral prepare' with --avg-bits %d to match.",
-                cal_bits,
-                avg_bits,
-                cal_bits,
-                avg_bits,
-            )
+            logger.warning(_avg_bits_mismatch_message(meta, avg_bits))
 
     num_layers = len(model.layers)
     head_dim = _detect_head_dim(model)

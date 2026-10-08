@@ -74,6 +74,17 @@ def parse_kvarn_bits(spec: str) -> tuple[int, int]:
     return int(m.group(1)), int(m.group(2))
 
 
+#: Spectral ``kv_cache_quant`` methods -> (calibration objective, calibration
+#: directory under the model dir). ``spectral-qa`` (#749) is the spectral codec
+#: calibrated on the attention (q·k) objective. Single source for
+#: ``olmlx spectral prepare``, the model manager and the bench; lives here
+#: because this module stays mlx-free.
+SPECTRAL_CALIBRATIONS: dict[str, tuple[str, str]] = {
+    "spectral": ("reconstruction", "spectral"),
+    "spectral-qa": ("attention", "spectral_qa"),
+}
+
+
 def validate_kv_cache_quant_format(v: str | None) -> str | None:
     """Validate that *v* is a valid ``kv_cache_quant`` value.
 

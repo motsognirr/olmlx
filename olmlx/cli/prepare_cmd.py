@@ -58,7 +58,11 @@ def cmd_spectral_prepare(args):
         objective=objective,
     )
 
-    method = "spectral-qa" if objective == "attention" else "spectral"
+    from olmlx.config import SPECTRAL_CALIBRATIONS
+
+    method = next(
+        m for m, (obj, _d) in SPECTRAL_CALIBRATIONS.items() if obj == objective
+    )
     print("\nSpectral calibration complete!")
     print(f"  Output: {output_dir}")
     print("\nTo use spectral quant:")

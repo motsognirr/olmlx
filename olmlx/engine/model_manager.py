@@ -13,7 +13,7 @@ from typing import TYPE_CHECKING, Any
 import mlx.core as mx
 
 from olmlx.config import FlashMoeConfig, experimental as global_experimental
-from olmlx.config import resolve_experimental, settings
+from olmlx.config import SPECTRAL_CALIBRATIONS, resolve_experimental, settings
 from olmlx.engine.registry import (
     _FLASH_MOE_INCOMPATIBLE_STRATEGIES,
     AdapterConfig,
@@ -92,22 +92,14 @@ _STOP_DRAIN_TIMEOUT = 5.0
 _SPECTRAL_DEFAULT_MAX_TOKENS_PER_HEAD = 8192
 _SPECTRAL_DEFAULT_NUM_SAMPLES = 256
 
-#: ``kv_cache_quant`` spectral method -> (calibration objective, model-relative
-#: calibration dir). Mirrors ``SPECTRAL_DIR_BY_OBJECTIVE`` in
-#: spectralquant_calibrate (duplicated for the same import-weight reason).
-_SPECTRAL_METHODS: dict[str, tuple[str, str]] = {
-    "spectral": ("reconstruction", "spectral"),
-    "spectral-qa": ("attention", "spectral_qa"),
-}
-
 
 def _spectral_prepare_cmd(hf_path: str, method: str, bits: int) -> str:
     """The ``olmlx spectral prepare`` invocation that produces ``method:bits``."""
     cmd = f"olmlx spectral prepare {hf_path}"
     if bits != 4:  # 4 is calibrate_model's default avg_bits
         cmd += f" --avg-bits {bits}"
-    if _SPECTRAL_METHODS[method][0] != "reconstruction":
-        cmd += f" --objective {_SPECTRAL_METHODS[method][0]}"
+    if SPECTRAL_CALIBRATIONS[method][0] != "reconstruction":
+        cmd += f" --objective {SPECTRAL_CALIBRATIONS[method][0]}"
     return cmd
 
 
@@ -2307,7 +2299,7 @@ class ModelManager(SpeculativeLoaderMixin):
         if kv_cache_quant is None:
             return None
         method = kv_cache_quant.split(":", 1)[0]
-        if method not in _SPECTRAL_METHODS or ":" not in kv_cache_quant:
+        if method not in SPECTRAL_CALIBRATIONS or ":" not in kv_cache_quant:
             return None
         if self.store is None:
             return None
@@ -2328,7 +2320,7 @@ class ModelManager(SpeculativeLoaderMixin):
                 f"Invalid SpectralQuant bit width {kv_cache_quant!r}; expected 2 or 4"
             )
 
-        objective, dir_name = _SPECTRAL_METHODS[method]
+        objective, dir_name = SPECTRAL_CALIBRATIONS[method]
         recalibrate_cmd = _spectral_prepare_cmd(hf_path, method, configured_bits)
         spectral_path = self.store.model_dir(hf_path) / dir_name
         if spectral_path.exists() and (spectral_path / "spectral_config.json").exists():
@@ -2389,11 +2381,11 @@ class ModelManager(SpeculativeLoaderMixin):
         from olmlx.engine.spectralquant_calibrate import calibrate_model
 
         method, bits_str = kv_cache_quant.split(":")
-        assert method in _SPECTRAL_METHODS, (
+        assert method in SPECTRAL_CALIBRATIONS, (
             f"_auto_calibrate_spectral called with non-spectral quant: "
             f"{kv_cache_quant!r}"
         )
-        objective, dir_name = _SPECTRAL_METHODS[method]
+        objective, dir_name = SPECTRAL_CALIBRATIONS[method]
         avg_bits = int(bits_str)
         local_dir = self.store.model_dir(hf_path)
         prepare_cmd = _spectral_prepare_cmd(hf_path, method, avg_bits)

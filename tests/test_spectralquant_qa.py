@@ -660,3 +660,58 @@ def test_fit_codebook_midpoint_ties_go_to_lower_centroid(data):
     for bits in (1, 2):
         got = np.array(fit_codebook(mx.array(data), bits=bits))
         np.testing.assert_allclose(got, _reference_lloyd(data, bits), atol=1e-7)
+
+
+# ---------------------------------------------------------------------------
+# PR #771 review follow-ups
+# ---------------------------------------------------------------------------
+
+
+def test_wrapper_grabbed_during_capture_still_works_after_it_ends():
+    """Another thread can fetch the wrapper from ``mx.fast`` just before the
+    last capture restores the original, and call it afterwards. That call
+    must reach the real SDPA, not a nulled ``_sdpa_orig``."""
+    q = mx.random.normal((1, 1, 4, 8))
+    with sc._capture_sdpa_queries():
+        grabbed = mx.fast.scaled_dot_product_attention
+    assert grabbed is not mx.fast.scaled_dot_product_attention
+    out = grabbed(q, q, q, scale=1.0)
+    want = mx.fast.scaled_dot_product_attention(q, q, q, scale=1.0)
+    np.testing.assert_allclose(np.array(out), np.array(want), atol=1e-6)
+
+
+def test_spectral_calibration_table_is_single_source():
+    from olmlx.config import SPECTRAL_CALIBRATIONS
+    from olmlx.engine import model_manager
+
+    assert SPECTRAL_CALIBRATIONS == {
+        "spectral": ("reconstruction", "spectral"),
+        "spectral-qa": ("attention", "spectral_qa"),
+    }
+    assert model_manager.SPECTRAL_CALIBRATIONS is SPECTRAL_CALIBRATIONS
+    assert sc.SPECTRAL_DIR_BY_OBJECTIVE == {
+        obj: d for obj, d in SPECTRAL_CALIBRATIONS.values()
+    }
+
+
+@pytest.mark.parametrize(
+    ("objective", "method", "flag"),
+    [
+        ("attention", "spectral-qa", "--objective attention"),
+        ("reconstruction", "spectral", None),
+        (None, "spectral", None),
+    ],
+)
+def test_avg_bits_mismatch_hint_names_the_right_variant(objective, method, flag):
+    from olmlx.engine.spectralquant_cache import _avg_bits_mismatch_message
+
+    meta = {"avg_bits": 4}
+    if objective is not None:
+        meta["objective"] = objective
+    msg = _avg_bits_mismatch_message(meta, 2)
+    assert f"{method}:2" in msg
+    assert "--avg-bits 2" in msg
+    if flag:
+        assert flag in msg
+    else:
+        assert "--objective" not in msg

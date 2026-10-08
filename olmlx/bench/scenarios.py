@@ -9,7 +9,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
 
-from olmlx.config import settings
+from olmlx.config import SPECTRAL_CALIBRATIONS, settings
 
 logger = logging.getLogger(__name__)
 
@@ -44,12 +44,12 @@ def _requires_spectral_dir(model_path: Path, dir_name: str) -> str | None:
 
 def _requires_spectral(model_path: Path) -> str | None:
     """Skip if model has no spectral calibration."""
-    return _requires_spectral_dir(model_path, "spectral")
+    return _requires_spectral_dir(model_path, SPECTRAL_CALIBRATIONS["spectral"][1])
 
 
 def _requires_spectral_qa(model_path: Path) -> str | None:
     """Skip if model has no attention-objective spectral calibration (#749)."""
-    return _requires_spectral_dir(model_path, "spectral_qa")
+    return _requires_spectral_dir(model_path, SPECTRAL_CALIBRATIONS["spectral-qa"][1])
 
 
 def _requires_moe(model_path: Path) -> str | None:
