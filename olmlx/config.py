@@ -87,6 +87,8 @@ def validate_kv_cache_quant_format(v: str | None) -> str | None:
     _VALID_BITS_BY_METHOD = {
         "turboquant": {"2", "4"},
         "spectral": {"2", "4"},
+        # Same codec as spectral, calibrated on the attention objective (#749).
+        "spectral-qa": {"2", "4"},
         "shard": {"2", "4", "8"},
     }
     parts = v.split(":", 1)
@@ -105,7 +107,8 @@ def validate_kv_cache_quant_format(v: str | None) -> str | None:
         raise ValueError(
             f"Invalid kv_cache_quant={v!r}. "
             f"Expected '<method>:<bits>' where method:bits is one of "
-            f"turboquant:{{2,4}}, spectral:{{2,4}}, shard:{{2,4,8}}, "
+            f"turboquant:{{2,4}}, spectral:{{2,4}}, spectral-qa:{{2,4}}, "
+            f"shard:{{2,4,8}}, "
             f"or kvarn:k{{2,4}}v{{2,4}} / kvarn:{{2,4}}."
         )
     return v
@@ -278,8 +281,10 @@ class Settings(BaseSettings):
     anthropic_models: dict[str, str] = {}
 
     # KV cache quantization (TurboQuant, SpectralQuant, or Shard).
-    # Format: "<method>:<bits>" where method ∈ {turboquant, spectral, shard};
-    # bits ∈ {2, 4} for turboquant/spectral, {2, 4, 8} for shard. Per-model
+    # Format: "<method>:<bits>" where method ∈ {turboquant, spectral,
+    # spectral-qa, shard}; bits ∈ {2, 4} for turboquant/spectral/spectral-qa,
+    # {2, 4, 8} for shard. ``spectral-qa`` is spectral calibrated on the
+    # attention (q·k) objective (#749). Per-model
     # overrides live on ``ModelConfig`` in ``olmlx.engine.registry``.
     kv_cache_quant: str | None = None
 
@@ -597,11 +602,14 @@ class Settings(BaseSettings):
     def validate_auto_calibrate(self) -> "Settings":
         if self.kv_cache_auto_calibrate and (
             self.kv_cache_quant is None
-            or not self.kv_cache_quant.startswith(("spectral:", "shard:"))
+            or not self.kv_cache_quant.startswith(
+                ("spectral:", "spectral-qa:", "shard:")
+            )
         ):
             raise ValueError(
                 "OLMLX_KV_CACHE_AUTO_CALIBRATE=true requires "
-                "OLMLX_KV_CACHE_QUANT=spectral:<bits> or shard:<bits>"
+                "OLMLX_KV_CACHE_QUANT=spectral:<bits>, spectral-qa:<bits> "
+                "or shard:<bits>"
             )
         return self
 

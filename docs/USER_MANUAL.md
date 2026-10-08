@@ -1458,7 +1458,7 @@ All settings are configured via `OLMLX_`-prefixed environment variables. You can
 
 | Variable | Type | Default | Description |
 |---|---|---|---|
-| `OLMLX_KV_CACHE_QUANT` | string/None | `None` | KV cache quantization method. Format: `<method>:<bits>`: `turboquant:{2,4}`, `spectral:{2,4}`, `shard:{2,4,8}`, or `kvarn:k{2,4}v{2,4}` / `kvarn:{2,4}` (see [KVarN](#kvarn-variance-normalized-kv-quantization)) |
+| `OLMLX_KV_CACHE_QUANT` | string/None | `None` | KV cache quantization method. Format: `<method>:<bits>`: `turboquant:{2,4}`, `spectral:{2,4}`, `spectral-qa:{2,4}` (spectral with attention-aware calibration: `olmlx spectral prepare <model> --objective attention`), `shard:{2,4,8}`, or `kvarn:k{2,4}v{2,4}` / `kvarn:{2,4}` (see [KVarN](#kvarn-variance-normalized-kv-quantization)) |
 
 ### Flash-MoE Settings
 

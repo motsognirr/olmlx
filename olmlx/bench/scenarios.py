@@ -31,9 +31,8 @@ def _requires_flash(model_path: Path) -> str | None:
     return None
 
 
-def _requires_spectral(model_path: Path) -> str | None:
-    """Skip if model has no spectral calibration."""
-    spectral_dir = model_path / "spectral"
+def _requires_spectral_dir(model_path: Path, dir_name: str) -> str | None:
+    spectral_dir = model_path / dir_name
     if (
         not spectral_dir.exists()
         or not (spectral_dir / "spectral_config.json").exists()
@@ -41,6 +40,16 @@ def _requires_spectral(model_path: Path) -> str | None:
     ):
         return f"No spectral calibration found at {spectral_dir}"
     return None
+
+
+def _requires_spectral(model_path: Path) -> str | None:
+    """Skip if model has no spectral calibration."""
+    return _requires_spectral_dir(model_path, "spectral")
+
+
+def _requires_spectral_qa(model_path: Path) -> str | None:
+    """Skip if model has no attention-objective spectral calibration (#749)."""
+    return _requires_spectral_dir(model_path, "spectral_qa")
 
 
 def _requires_moe(model_path: Path) -> str | None:
@@ -244,6 +253,18 @@ SCENARIOS: list[Scenario] = [
         description="SpectralQuant 2-bit KV cache quantization",
         env_overrides={"OLMLX_KV_CACHE_QUANT": "spectral:2"},
         should_skip=_requires_spectral,
+    ),
+    Scenario(
+        name="spectral-qa-4",
+        description="SpectralQuant 4-bit, attention-aware (q·k) calibration",
+        env_overrides={"OLMLX_KV_CACHE_QUANT": "spectral-qa:4"},
+        should_skip=_requires_spectral_qa,
+    ),
+    Scenario(
+        name="spectral-qa-2",
+        description="SpectralQuant 2-bit, attention-aware (q·k) calibration",
+        env_overrides={"OLMLX_KV_CACHE_QUANT": "spectral-qa:2"},
+        should_skip=_requires_spectral_qa,
     ),
     Scenario(
         name="cache+tq4",

@@ -95,7 +95,7 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help=(
             "KV cache quantization method and bits "
-            "(e.g. turboquant:4, spectral:2, shard:4, kvarn:k4v2)"
+            "(e.g. turboquant:4, spectral:2, spectral-qa:2, shard:4, kvarn:k4v2)"
         ),
     )
     serve_p.add_argument(
@@ -674,6 +674,17 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=8192,
         help="Max tokens to collect per head (default: 8192)",
+    )
+    spectral_prepare_p.add_argument(
+        "--objective",
+        choices=["reconstruction", "attention"],
+        default="reconstruction",
+        help=(
+            "Key calibration objective: 'reconstruction' (key PCA, used by "
+            "spectral:N, writes <model>/spectral) or 'attention' (weights keys "
+            "by query statistics to minimize q·k error, used by spectral-qa:N, "
+            "writes <model>/spectral_qa). Default: reconstruction"
+        ),
     )
 
     # Shard quant calibration (#377)
