@@ -2345,13 +2345,20 @@ class ModelManager(SpeculativeLoaderMixin):
                     f"or set OLMLX_KV_CACHE_QUANT={method}:{cal_bits} "
                     f"to use the existing calibration."
                 )
-            # Pre-#749 calibrations carry no objective and are reconstruction.
+            # Pre-#749 calibrations record no objective and are reconstruction,
+            # so only plain ``spectral`` may fall back; a ``spectral_qa`` dir
+            # with no recorded objective is of unknown origin.
             cal_objective = meta.get("objective", "reconstruction")
-            if "meta" in config and cal_objective != objective:
+            if cal_objective != objective:
+                made_with = (
+                    f"was generated with --objective {cal_objective}"
+                    if "objective" in meta
+                    else "records no calibration objective"
+                )
                 raise SpectralCalibrationMissingError(
                     f"SpectralQuant configured ({kv_cache_quant}) but calibration "
-                    f"data at {spectral_path} was generated with "
-                    f"--objective {cal_objective}. Run '{recalibrate_cmd}'."
+                    f"data at {spectral_path} {made_with}. "
+                    f"Run '{recalibrate_cmd}'."
                 )
             return spectral_path
 

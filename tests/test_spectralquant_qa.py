@@ -716,3 +716,27 @@ def test_avg_bits_mismatch_hint_names_the_right_variant(objective, method, flag)
         assert flag in msg
     else:
         assert "--objective" not in msg
+
+
+@pytest.mark.parametrize("config", [{}, {"meta": {"avg_bits": 2}}])
+def test_find_spectral_dir_spectral_qa_requires_attention_objective(tmp_path, config):
+    """A ``spectral_qa`` dir without ``meta.objective`` is of unknown origin
+    (e.g. a copied reconstruction calibration) and must not be served as
+    attention-aware; only plain ``spectral`` gets the pre-#749 fallback."""
+    from olmlx.engine.model_manager import SpectralCalibrationMissingError
+
+    d = tmp_path / "spectral_qa"
+    d.mkdir()
+    (d / "spectral_config.json").write_text(json.dumps(config))
+    manager = _manager_with_store(tmp_path)
+    with pytest.raises(SpectralCalibrationMissingError, match="--objective attention"):
+        manager._find_spectral_dir("m", "spectral-qa:2")
+
+
+@pytest.mark.parametrize("config", [{}, {"meta": {"avg_bits": 2}}])
+def test_find_spectral_dir_spectral_accepts_legacy_without_objective(tmp_path, config):
+    d = tmp_path / "spectral"
+    d.mkdir()
+    (d / "spectral_config.json").write_text(json.dumps(config))
+    manager = _manager_with_store(tmp_path)
+    assert manager._find_spectral_dir("m", "spectral:2") == d
