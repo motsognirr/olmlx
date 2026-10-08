@@ -367,7 +367,7 @@ def _avg_bits_mismatch_message(meta: dict, avg_bits: int) -> str:
         (m for m, (obj, _d) in SPECTRAL_CALIBRATIONS.items() if obj == objective),
         "spectral",
     )
-    cmd = f"olmlx spectral prepare --avg-bits {avg_bits}"
+    cmd = f"olmlx spectral prepare <model> --avg-bits {avg_bits}"
     if objective != "reconstruction":
         cmd += f" --objective {objective}"
     cal_bits = meta.get("avg_bits")

@@ -710,7 +710,8 @@ def test_avg_bits_mismatch_hint_names_the_right_variant(objective, method, flag)
         meta["objective"] = objective
     msg = _avg_bits_mismatch_message(meta, 2)
     assert f"{method}:2" in msg
-    assert "--avg-bits 2" in msg
+    # ``spectral prepare`` requires the model positional.
+    assert "olmlx spectral prepare <model> --avg-bits 2" in msg
     if flag:
         assert flag in msg
     else:
