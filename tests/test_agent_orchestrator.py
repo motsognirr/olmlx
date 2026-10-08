@@ -1,5 +1,7 @@
 """Tests for olmlx.engine.agent.orchestrator — the goal-pursuit loop."""
 
+import asyncio
+import time
 from typing import Any
 
 import pytest
@@ -402,6 +404,87 @@ class TestCancellation:
         orch = Orchestrator(session=session, context=ctx, budgets=Budgets())
         result = await orch.run()
         assert result["status"] == "cancelled"
+        assert (await store.get_run("r1"))["status"] == "cancelled"
+
+
+class HangingSession(FakeSession):
+    """A turn that never returns — e.g. a ``bash`` call stuck in ``sleep``."""
+
+    def __init__(self):
+        super().__init__([])
+        self.started = asyncio.Event()
+        self.torn_down = False
+
+    async def send_message(self, user_text: str):
+        self.prompts.append(user_text)
+        yield {"type": "token", "text": "x"}
+        self.started.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            self.torn_down = True
+        yield {"type": "done"}  # pragma: no cover
+
+
+class TestMidIterationGuards:
+    """#759: cancel and the wallclock budget must take effect while a turn is
+    in flight, not only at iteration boundaries."""
+
+    async def test_cancel_interrupts_in_flight_turn(self, store):
+        await store.create_run(run_id="r1", goal="G", model="m", config={})
+        ctx = _ctx(store)
+        session = HangingSession()
+        orch = Orchestrator(session=session, context=ctx, budgets=Budgets())
+        task = asyncio.create_task(orch.run())
+        await asyncio.wait_for(session.started.wait(), 5)
+        ctx.cancel_event.set()
+        result = await asyncio.wait_for(task, 5)
+        assert result["status"] == "cancelled"
+        assert session.torn_down
+        assert (await store.get_run("r1"))["status"] == "cancelled"
+
+    async def test_interrupt_checkpoints_tokens_with_pre_turn_messages(self, store):
+        """Resuming a cancelled run must keep the interrupted turn's tokens
+        (budget accounting) but not its half-finished messages."""
+        await store.create_run(run_id="r1", goal="G", model="m", config={})
+        ctx = _ctx(store)
+        session = HangingSession()
+        orch = Orchestrator(session=session, context=ctx, budgets=Budgets())
+        task = asyncio.create_task(orch.run())
+        await asyncio.wait_for(session.started.wait(), 5)
+        ctx.cancel_event.set()
+        result = await asyncio.wait_for(task, 5)
+        checkpoint = await store.latest_checkpoint("r1")
+        assert checkpoint is not None
+        assert checkpoint["tokens"] == result["tokens"] == 1
+        assert checkpoint["messages"] == [{"role": "system", "content": "sys"}]
+
+    async def test_wallclock_interrupts_in_flight_turn(self, store):
+        await store.create_run(run_id="r1", goal="G", model="m", config={})
+        session = HangingSession()
+        orch = Orchestrator(
+            session=session,
+            context=_ctx(store),
+            budgets=Budgets(wallclock_timeout=0.2),
+            clock=time.monotonic,
+        )
+        result = await asyncio.wait_for(orch.run(), 5)
+        assert result["status"] == "failed"
+        assert result["reason"] == "wallclock_timeout"
+        assert session.torn_down
+        run = await store.get_run("r1")
+        assert run["error"] == "wallclock_timeout"
+
+    async def test_task_cancel_tears_down_turn(self, store):
+        await store.create_run(run_id="r1", goal="G", model="m", config={})
+        session = HangingSession()
+        orch = Orchestrator(session=session, context=_ctx(store), budgets=Budgets())
+        task = asyncio.create_task(orch.run())
+        await asyncio.wait_for(session.started.wait(), 5)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert session.torn_down
         assert (await store.get_run("r1"))["status"] == "cancelled"
 
 

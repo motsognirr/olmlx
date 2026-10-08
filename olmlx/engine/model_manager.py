@@ -81,6 +81,11 @@ from olmlx.engine.loaded_model import (  # noqa: F401
 
 logger = logging.getLogger(__name__)
 
+#: Upper bound on how long ``stop()`` waits for orphaned load threads and
+#: in-flight result closes before abandoning them (Python can't interrupt
+#: native threads).
+_STOP_DRAIN_TIMEOUT = 5.0
+
 #: Default max tokens collected per head during SpectralQuant calibration.
 #: Duplicated from spectralquant_calibrate (which imports numpy/mlx_lm
 #: eagerly) to avoid pulling those imports into lightweight CLI paths.
@@ -122,6 +127,11 @@ class ModelManager(SpeculativeLoaderMixin):
         self._expiry_task: asyncio.Task | None = None
         self._pending_cleanups: dict[str, asyncio.Task] = {}
         self._pending_load_tasks: dict[str, asyncio.Task] = {}
+        # In-flight closes of abandoned load results (#759), keyed like
+        # ``_pending_load_tasks``. A deferred cleanup moves its entry from
+        # that dict to this one with no await in between, so ``stop()``
+        # always sees exactly one of them and waits for the close.
+        self._pending_result_closes: dict[str, asyncio.Future] = {}
         self._flush_lock = asyncio.Lock()
         self._flush_thread_lock = threading.Lock()
 
@@ -142,30 +152,50 @@ class ModelManager(SpeculativeLoaderMixin):
                 *self._pending_cleanups.values(), return_exceptions=True
             )
         self._pending_cleanups.clear()
-        # Drain orphaned load tasks so their exceptions are retrieved.
+        # Drain orphaned load tasks (so their exceptions are retrieved) and
+        # in-flight result closes. Snapshot first: the awaits below yield, and
+        # a concurrent ensure_loaded timing out would mutate the dicts.
         # The underlying threads can't be interrupted (Python limitation)
         # so use a bounded timeout to avoid blocking shutdown indefinitely.
-        if self._pending_load_tasks:
-            drained = True
-            try:
-                await asyncio.wait_for(
-                    asyncio.gather(
-                        *self._pending_load_tasks.values(), return_exceptions=True
-                    ),
-                    timeout=5.0,
-                )
-            except asyncio.TimeoutError:
-                drained = False
+        pending_loads = list(self._pending_load_tasks.items())
+        pending_closes = list(self._pending_result_closes.values())
+        if pending_loads or pending_closes:
+            # ``asyncio.wait`` (not ``wait_for(gather(...))``) so a timeout
+            # leaves the tasks running: cancelling a ``to_thread`` task marks
+            # it done while its thread still allocates, which would both read
+            # as "drained" (flushing Metal under the live thread) and discard
+            # a load result that still needs closing.
+            _done, not_done = await asyncio.wait(
+                [task for _, task in pending_loads] + pending_closes,
+                timeout=_STOP_DRAIN_TIMEOUT,
+            )
+            for fut in _done:
+                if not fut.cancelled():
+                    fut.exception()  # retrieve so it isn't logged as unhandled
+            drained = not not_done
+            if not drained:
                 logger.warning(
-                    "Timed out waiting for %d orphaned load thread(s) to finish; "
-                    "they will be abandoned on process exit",
-                    len(self._pending_load_tasks),
+                    "Timed out waiting for orphaned load thread(s) / result "
+                    "close(s) to finish; they will be abandoned on process exit"
                 )
+            # Close what finished orphaned loads own (#759) — their deferred
+            # cleanup was cancelled above before it could.
+            for name, task in pending_loads:
+                if not task.done() or task.cancelled() or task.exception():
+                    continue
+                model, *_rest, spec_decoder = task.result()
+                try:
+                    await asyncio.to_thread(
+                        self._close_load_result, name, model, spec_decoder
+                    )
+                except ExceptionGroup:
+                    pass  # already logged per-resource
             # Only flush when all threads finished — if the drain timed out,
             # threads are still allocating and mx.clear_cache() is unsafe.
             if drained:
                 await self._flush_metal()
         self._pending_load_tasks.clear()
+        self._pending_result_closes.clear()
         # Close all still-resident models before dropping them — otherwise
         # Flash prefetcher/weight-store executors (threads + per-layer fds),
         # batch schedulers, and the whisper ModelHolder strong reference leak
@@ -181,6 +211,43 @@ class ModelManager(SpeculativeLoaderMixin):
         return parse_keep_alive(
             keep_alive if keep_alive is not None else settings.default_keep_alive
         )
+
+    @staticmethod
+    def _close_load_result(name: str, model: Any, speculative_decoder: Any) -> None:
+        """Release resources owned by a load result that never got registered.
+
+        A load abandoned after ``_load_model_and_shard`` returned (post-load
+        ``MemoryError``, a timed-out/cancelled load whose thread finishes
+        later) has no ``LoadedModel`` for ``_close_loaded_model`` to close,
+        but the result still owns the same leak-prone resources (#759): a
+        speculative decoder holding ``_GDN_PATCH_LOCK`` (its ``__del__``
+        never fires — the class patch closure keeps it alive, so the next
+        hybrid speculative load would block forever in ``acquire()``), and a
+        Flash weight store with per-layer fds and an I/O pool. Same order and
+        error contract as ``_close_loaded_model``.
+        """
+        errors: list[BaseException] = []
+        if getattr(model, "prefetcher", None) is not None:
+            try:
+                model.prefetcher.close()
+            except Exception as exc:
+                logger.exception("Error closing prefetcher for %s", name)
+                errors.append(exc)
+        weight_store = getattr(model, "_weight_store", None)
+        if weight_store is not None:
+            try:
+                weight_store.close()
+            except Exception as exc:
+                logger.exception("Error closing weight store for %s", name)
+                errors.append(exc)
+        if speculative_decoder is not None:
+            try:
+                speculative_decoder.close()
+            except Exception as exc:
+                logger.exception("Error closing speculative decoder for %s", name)
+                errors.append(exc)
+        if errors:
+            raise ExceptionGroup(f"Errors closing abandoned load of {name}", errors)
 
     @staticmethod
     def _close_loaded_model(lm: "LoadedModel") -> None:
@@ -1017,7 +1084,7 @@ class ModelManager(SpeculativeLoaderMixin):
 
                 # Initialize before try so the except handler can always
                 # clean up, whether _load_model or the post-load check fails.
-                model = tokenizer = None
+                model = tokenizer = _spec_decoder = None
                 load_task = lm = None
                 try:
                     coro = asyncio.to_thread(
@@ -1035,37 +1102,14 @@ class ModelManager(SpeculativeLoaderMixin):
                     )
                     timeout = settings.model_load_timeout
                     is_distributed = False
-                    if timeout is not None:
-                        load_task = asyncio.create_task(coro)
-                        try:
-                            (
-                                model,
-                                tokenizer,
-                                is_vlm,
-                                caps,
-                                is_distributed,
-                                _spec_decoder,
-                            ) = await asyncio.wait_for(
-                                asyncio.shield(load_task), timeout=timeout
-                            )
-                        except (asyncio.TimeoutError, asyncio.CancelledError) as exc:
-                            # The background thread continues running — Python
-                            # cannot interrupt native threads.  Schedule GPU
-                            # cleanup for when it finishes to prevent Metal
-                            # memory leaks from orphaned model weights.
-                            # This handles both explicit timeouts AND external
-                            # cancellations (e.g. client disconnect), since
-                            # asyncio.shield protects load_task from being
-                            # cancelled but CancelledError still propagates
-                            # to the caller.
-                            self._schedule_deferred_cleanup(load_task, normalized)
-                            if isinstance(exc, asyncio.TimeoutError):
-                                raise ModelLoadTimeoutError(
-                                    f"Loading model '{normalized}' timed out after {timeout}s. "
-                                    f"Increase OLMLX_MODEL_LOAD_TIMEOUT or unset it to disable."
-                                )
-                            raise
-                    else:
+                    # Always run the load as a shielded task, even with no
+                    # timeout (the default): a cancelled ``await coro`` would
+                    # orphan the worker thread with no deferred-cleanup entry,
+                    # so a retry would start a second concurrent load and the
+                    # orphan's result would never be closed (#759).
+                    # ``wait_for(timeout=None)`` just awaits.
+                    load_task = asyncio.create_task(coro)
+                    try:
                         (
                             model,
                             tokenizer,
@@ -1073,7 +1117,26 @@ class ModelManager(SpeculativeLoaderMixin):
                             caps,
                             is_distributed,
                             _spec_decoder,
-                        ) = await coro
+                        ) = await asyncio.wait_for(
+                            asyncio.shield(load_task), timeout=timeout
+                        )
+                    except (asyncio.TimeoutError, asyncio.CancelledError) as exc:
+                        # The background thread continues running — Python
+                        # cannot interrupt native threads.  Schedule GPU
+                        # cleanup for when it finishes to prevent Metal
+                        # memory leaks from orphaned model weights.
+                        # This handles both explicit timeouts AND external
+                        # cancellations (e.g. client disconnect), since
+                        # asyncio.shield protects load_task from being
+                        # cancelled but CancelledError still propagates
+                        # to the caller.
+                        self._schedule_deferred_cleanup(load_task, normalized)
+                        if isinstance(exc, asyncio.TimeoutError):
+                            raise ModelLoadTimeoutError(
+                                f"Loading model '{normalized}' timed out after {timeout}s. "
+                                f"Increase OLMLX_MODEL_LOAD_TIMEOUT or unset it to disable."
+                            )
+                        raise
 
                     # Check if the model fits safely in memory.  On Apple Silicon
                     # the GPU shares system RAM — if total Metal memory exceeds the
@@ -1277,9 +1340,18 @@ class ModelManager(SpeculativeLoaderMixin):
                     # ``_loaded`` — eviction/expiry will clean it up when
                     # refs drop to zero.  Otherwise ``pop(normalized, None)``
                     # handles both the was-only and already-registered cases.
+                    # Close what the abandoned load owns (#759): a
+                    # speculative decoder holds ``_GDN_PATCH_LOCK`` until
+                    # ``close()`` and Flash weight stores hold fds + an I/O
+                    # pool, so dropping references alone would leak them and
+                    # hang the next hybrid speculative load.  Shielded so a
+                    # second cancel can't abort the close mid-way (it still
+                    # propagates; the close thread finishes on its own).
+                    close_fn = close_args = None
                     if lm is not None:
                         if lm.active_refs == 0:
                             self._loaded.pop(normalized, None)
+                            close_fn, close_args = self._close_loaded_model, (lm,)
                             del lm
                         else:
                             logger.warning(
@@ -1289,10 +1361,22 @@ class ModelManager(SpeculativeLoaderMixin):
                                 normalized,
                                 lm.active_refs,
                             )
+                    elif model is not None:
+                        close_fn = self._close_load_result
+                        close_args = (normalized, model, _spec_decoder)
+                    if close_fn is not None:
+                        try:
+                            await asyncio.shield(
+                                asyncio.to_thread(close_fn, *close_args)
+                            )
+                        except ExceptionGroup:
+                            pass  # already logged per-resource
+                        close_fn = close_args = None
                     # When _load_model fails, model/tokenizer are still None —
                     # only bother deleting if they hold actual GPU resources.
                     if model is not None:
                         del model, tokenizer
+                    _spec_decoder = None
                     # Release load_task's stored result tuple so the model
                     # weights can actually be freed by gc.collect below.
                     if load_task is not None:
@@ -1326,7 +1410,38 @@ class ModelManager(SpeculativeLoaderMixin):
         async def _cleanup() -> None:
             cancelled = False
             try:
-                await load_task
+                # Shielded: cancelling this cleanup (stop() does) must not
+                # cancel the load task too — that would discard its result
+                # while the thread keeps running, leaving nothing to close.
+                result = await asyncio.shield(load_task)
+                # The load finished after its caller gave up: nothing will
+                # register it, so close what it owns (#759 — a speculative
+                # decoder would otherwise hold ``_GDN_PATCH_LOCK`` forever).
+                model, *_rest, spec_decoder = result
+                del result, _rest
+                close_fut = asyncio.ensure_future(
+                    asyncio.to_thread(
+                        self._close_load_result, model_name, model, spec_decoder
+                    )
+                )
+                del model, spec_decoder
+                # Hand tracking from the load task to the close with no await
+                # in between: stop() must wait for this close (even if it
+                # cancels us mid-close) and must not close the result again.
+                self._pending_result_closes[model_name] = close_fut
+
+                def _untrack(fut: asyncio.Future) -> None:
+                    if not fut.cancelled():
+                        fut.exception()  # retrieved; already logged
+                    if self._pending_result_closes.get(model_name) is fut:
+                        self._pending_result_closes.pop(model_name, None)
+
+                close_fut.add_done_callback(_untrack)
+                self._pending_load_tasks.pop(model_name, None)
+                try:
+                    await asyncio.shield(close_fut)
+                except ExceptionGroup:
+                    pass  # already logged per-resource
             except asyncio.CancelledError:
                 # The background thread keeps running (Python can't
                 # interrupt native threads).  Don't call load_task.cancel()

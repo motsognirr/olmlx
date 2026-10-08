@@ -6990,6 +6990,334 @@ class TestBuildSpeculativeDecoderBundledProbe:
         mock_local_path.assert_not_called()
 
 
+class TestFailedLoadClosesResources:
+    """Issue #759 items 1 & 3: abandoned/failed loads must close the
+    speculative decoder (releases ``_GDN_PATCH_LOCK``) and the Flash weight
+    store (fds + I/O pool), and a cancelled untimed load must not orphan
+    its thread."""
+
+    GB = 1024 * 1024 * 1024
+
+    def _common_patches(self, metal_side_effect):
+        return (
+            patch(
+                "olmlx.utils.memory.get_metal_memory",
+                side_effect=metal_side_effect,
+            ),
+            patch(
+                "olmlx.utils.memory.get_system_memory_bytes",
+                return_value=64 * self.GB,
+            ),
+            patch(
+                "olmlx.utils.memory.is_memory_pressure_high",
+                return_value=False,
+            ),
+            patch("olmlx.engine.model_manager.gc.collect"),
+            patch("olmlx.engine.model_manager.mx.clear_cache"),
+            patch("olmlx.engine.model_manager.mx.synchronize"),
+        )
+
+    def _model_with_store(self):
+        model = MagicMock()
+        model.prefetcher = None
+        model._weight_store = MagicMock()
+        return model
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("timeout", [None, 10.0])
+    async def test_memory_error_closes_spec_decoder_and_weight_store(
+        self, registry, mock_store, monkeypatch, timeout
+    ):
+        monkeypatch.setattr(
+            "olmlx.engine.model_manager.settings.model_load_timeout", timeout
+        )
+        manager = ModelManager(registry, mock_store)
+        model = self._model_with_store()
+        tok = MagicMock()
+        tok.chat_template = None
+        decoder = MagicMock()
+        patches = self._common_patches([1 * self.GB, int(64 * self.GB * 0.9)])
+        with (
+            patch.object(
+                manager,
+                "_load_model",
+                return_value=(model, tok, False, TemplateCaps(), decoder),
+            ),
+            patches[0],
+            patches[1],
+            patches[2],
+            patches[3],
+            patches[4],
+            patches[5],
+        ):
+            with pytest.raises(MemoryError):
+                await manager.ensure_loaded("qwen3")
+        decoder.close.assert_called_once()
+        model._weight_store.close.assert_called_once()
+        assert "qwen3:latest" not in manager._loaded
+
+    @pytest.mark.asyncio
+    async def test_probe_failure_closes_registered_model(
+        self, registry, mock_store, monkeypatch
+    ):
+        manager = ModelManager(registry, mock_store)
+        model = self._model_with_store()
+        tok = MagicMock()
+        tok.chat_template = None
+        decoder = MagicMock()
+        patches = self._common_patches(lambda: 1 * self.GB)
+        with (
+            patch.object(
+                manager,
+                "_load_model",
+                return_value=(model, tok, False, TemplateCaps(), decoder),
+            ),
+            patch.object(
+                manager,
+                "_probe_cache_capabilities",
+                side_effect=RuntimeError("probe failed"),
+            ),
+            patches[0],
+            patches[1],
+            patches[2],
+            patches[3],
+            patches[4],
+            patches[5],
+        ):
+            with pytest.raises(RuntimeError, match="probe failed"):
+                await manager.ensure_loaded("qwen3")
+        decoder.close.assert_called_once()
+        model._weight_store.close.assert_called_once()
+        assert "qwen3:latest" not in manager._loaded
+
+    @pytest.mark.asyncio
+    async def test_timed_out_load_result_is_closed_when_thread_finishes(
+        self, registry, mock_store, monkeypatch
+    ):
+        monkeypatch.setattr(
+            "olmlx.engine.model_manager.settings.model_load_timeout", 0.05
+        )
+        manager = ModelManager(registry, mock_store)
+        model = self._model_with_store()
+        tok = MagicMock()
+        tok.chat_template = None
+        decoder = MagicMock()
+        release = threading.Event()
+
+        def slow_load(*a, **kw):
+            release.wait(5)
+            return (model, tok, False, TemplateCaps(), decoder)
+
+        patches = self._common_patches(lambda: 1 * self.GB)
+        with (
+            patch.object(manager, "_load_model", side_effect=slow_load),
+            patches[0],
+            patches[1],
+            patches[2],
+            patches[3],
+            patches[4],
+            patches[5],
+        ):
+            with pytest.raises(ModelLoadTimeoutError):
+                await manager.ensure_loaded("qwen3")
+            cleanup = manager._pending_cleanups["qwen3:latest"]
+            release.set()
+            await cleanup
+        decoder.close.assert_called_once()
+        model._weight_store.close.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_cancel_untimed_load_schedules_deferred_cleanup(
+        self, registry, mock_store, monkeypatch
+    ):
+        """With model_load_timeout=None (default), a cancelled load must
+        still be tracked so a retry waits for the orphaned thread, and the
+        orphan's result must be closed."""
+        monkeypatch.setattr(
+            "olmlx.engine.model_manager.settings.model_load_timeout", None
+        )
+        manager = ModelManager(registry, mock_store)
+        model = self._model_with_store()
+        tok = MagicMock()
+        tok.chat_template = None
+        decoder = MagicMock()
+        started = threading.Event()
+        release = threading.Event()
+
+        def slow_load(*a, **kw):
+            started.set()
+            release.wait(5)
+            return (model, tok, False, TemplateCaps(), decoder)
+
+        patches = self._common_patches(lambda: 1 * self.GB)
+        with (
+            patch.object(manager, "_load_model", side_effect=slow_load),
+            patches[0],
+            patches[1],
+            patches[2],
+            patches[3],
+            patches[4],
+            patches[5],
+        ):
+            task = asyncio.create_task(manager.ensure_loaded("qwen3"))
+            await asyncio.to_thread(started.wait, 5)
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            assert "qwen3:latest" in manager._pending_cleanups
+            assert "qwen3:latest" in manager._pending_load_tasks
+            cleanup = manager._pending_cleanups["qwen3:latest"]
+            release.set()
+            await cleanup
+        decoder.close.assert_called_once()
+        model._weight_store.close.assert_called_once()
+        assert "qwen3:latest" not in manager._pending_cleanups
+
+    @pytest.mark.asyncio
+    async def test_stop_closes_orphaned_load_result(
+        self, registry, mock_store, monkeypatch
+    ):
+        monkeypatch.setattr(
+            "olmlx.engine.model_manager.settings.model_load_timeout", 0.05
+        )
+        manager = ModelManager(registry, mock_store)
+        model = self._model_with_store()
+        tok = MagicMock()
+        tok.chat_template = None
+        decoder = MagicMock()
+        release = threading.Event()
+
+        def slow_load(*a, **kw):
+            release.wait(5)
+            return (model, tok, False, TemplateCaps(), decoder)
+
+        patches = self._common_patches(lambda: 1 * self.GB)
+        with (
+            patch.object(manager, "_load_model", side_effect=slow_load),
+            patches[0],
+            patches[1],
+            patches[2],
+            patches[3],
+            patches[4],
+            patches[5],
+        ):
+            with pytest.raises(ModelLoadTimeoutError):
+                await manager.ensure_loaded("qwen3")
+            load_task = manager._pending_load_tasks["qwen3:latest"]
+            # Let the deferred cleanup start and block on the load.
+            await asyncio.sleep(0.01)
+            threading.Timer(0.1, release.set).start()
+            await manager.stop()
+        # Cancelling the deferred cleanup must not cancel the load itself,
+        # or its result could never be closed.
+        assert not load_task.cancelled()
+        decoder.close.assert_called_once()
+        model._weight_store.close.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_stop_waits_for_in_flight_result_close(
+        self, registry, mock_store, monkeypatch
+    ):
+        """If stop() cancels the deferred cleanup while it is closing a
+        finished load's result, stop() must still wait for that close (and
+        not flush Metal underneath it)."""
+        monkeypatch.setattr(
+            "olmlx.engine.model_manager.settings.model_load_timeout", 0.05
+        )
+        manager = ModelManager(registry, mock_store)
+        model = self._model_with_store()
+        tok = MagicMock()
+        tok.chat_template = None
+        release_load = threading.Event()
+        close_started = threading.Event()
+        release_close = threading.Event()
+        close_done = threading.Event()
+
+        def slow_load(*a, **kw):
+            release_load.wait(5)
+            return (model, tok, False, TemplateCaps(), MagicMock())
+
+        def slow_close(*a, **kw):
+            close_started.set()
+            release_close.wait(5)
+            close_done.set()
+
+        flushed_before_close: list[bool] = []
+
+        async def fake_flush():
+            # Only flushes overlapping the in-flight close count (the
+            # pre-load hygiene flush runs before the close starts).
+            flushed_before_close.append(
+                close_started.is_set() and not close_done.is_set()
+            )
+
+        patches = self._common_patches(lambda: 1 * self.GB)
+        with (
+            patch.object(manager, "_load_model", side_effect=slow_load),
+            patch.object(manager, "_close_load_result", side_effect=slow_close),
+            patch.object(manager, "_flush_metal", side_effect=fake_flush),
+            patches[0],
+            patches[1],
+            patches[2],
+            patches[3],
+            patches[4],
+            patches[5],
+        ):
+            with pytest.raises(ModelLoadTimeoutError):
+                await manager.ensure_loaded("qwen3")
+            release_load.set()
+            await asyncio.to_thread(close_started.wait, 5)
+            threading.Timer(0.2, release_close.set).start()
+            await manager.stop()
+            assert close_done.is_set()
+        assert not any(flushed_before_close)
+
+    @pytest.mark.asyncio
+    async def test_stop_drain_timeout_does_not_flush_or_cancel_load(
+        self, registry, mock_store, monkeypatch
+    ):
+        """If the stop() drain times out, the still-running load must not be
+        cancelled (its result must stay closable) and Metal must not be
+        flushed underneath the live thread."""
+        monkeypatch.setattr(
+            "olmlx.engine.model_manager.settings.model_load_timeout", 0.05
+        )
+        monkeypatch.setattr("olmlx.engine.model_manager._STOP_DRAIN_TIMEOUT", 0.1)
+        manager = ModelManager(registry, mock_store)
+        tok = MagicMock()
+        tok.chat_template = None
+        release = threading.Event()
+
+        def slow_load(*a, **kw):
+            release.wait(5)
+            return (self._model_with_store(), tok, False, TemplateCaps(), None)
+
+        flushes: list[bool] = []
+
+        async def fake_flush():
+            flushes.append(not release.is_set())
+
+        patches = self._common_patches(lambda: 1 * self.GB)
+        with (
+            patch.object(manager, "_load_model", side_effect=slow_load),
+            patches[0],
+            patches[1],
+            patches[2],
+            patches[3],
+            patches[4],
+            patches[5],
+        ):
+            with pytest.raises(ModelLoadTimeoutError):
+                await manager.ensure_loaded("qwen3")
+            load_task = manager._pending_load_tasks["qwen3:latest"]
+            with patch.object(manager, "_flush_metal", side_effect=fake_flush):
+                await manager.stop()
+            assert not load_task.cancelled()
+            assert not any(flushes)
+            release.set()
+            await load_task
+
+
 class TestManifestNameResolvedOnLoop:
     """#760 item 8: the manifest backfill on the load worker must not iterate
     the loop-affine registry dicts; the short name is resolved on the loop

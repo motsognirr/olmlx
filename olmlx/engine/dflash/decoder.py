@@ -51,7 +51,12 @@ from olmlx.engine.spec_decoder_base import (
     _trim_recent_cache as _trim_recent_cache,
     _unpatch_model as _unpatch_model,
 )
-from olmlx.engine.speculative import _eval_cache
+from olmlx.engine.speculative import (
+    PrefillCancelled,
+    _chunked_prefill,
+    _eval_cache,
+    _is_pure_rotating_cache,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -141,11 +146,10 @@ class DFlashDecoder(SpecDecoderBase):
 
         Returns the first generated token (target greedy argmax).
 
-        ``segmented`` and ``cancel_event`` are accepted for the canonical
-        ``SpecDecoderBase`` signature but not honored: DFlash has no
-        snapshot store, prefills the target in a single forward (no
-        sub-chunk loop to check between), and is an experimental strategy
-        off the default path.
+        ``segmented`` is accepted for the canonical ``SpecDecoderBase``
+        signature but not honored (DFlash has no snapshot store).
+        ``cancel_event`` is honored at each pass-1 sub-chunk boundary and
+        before pass 2, raising :class:`PrefillCancelled` (#759).
         """
         target_layer_ids = list(self._config.target_layer_ids)
         # Build the target cache before patching: ``make_prompt_cache``
@@ -185,7 +189,8 @@ class DFlashDecoder(SpecDecoderBase):
         # last position's hidden state.
         #
         # DFlash's draft conditions on self._hidden[1, N, …] (all prompt hiddens),
-        # so we concatenate captured_prefix + captured_last along the time axis.
+        # so the per-chunk prefix captures + the last position are concatenated
+        # along the time axis.
         _err_msg = (
             "Target forward did not populate all configured "
             "target_layer_ids — check that the layer indices exist on "
@@ -205,39 +210,71 @@ class DFlashDecoder(SpecDecoderBase):
             prefix, last = prompt[:, :-1], prompt[:, -1:]
             if self._capture is not None:
                 self._capture.use_buffer(None)
-            self._target(prefix, cache=self._target_cache)  # output discarded
-            captured_prefix = list(self._hidden_capture)
-            if any(h is None for h in captured_prefix):
-                raise RuntimeError(_err_msg)
-            # Force pass-1 hiddens before dropping slot references, so
-            # correctness does not depend on _eval_cache transitively
-            # materialising the same graph.
-            mx.eval(*captured_prefix)
-            # Reset capture slots so the pass-2 None-check is independent.
-            self._hidden_capture[:] = [None] * len(self._hidden_capture)
+            # Pass 1 is sub-chunked via ``_chunked_prefill`` (#759, mirroring
+            # MTP / EAGLE / classic / PLD, #628): a single forward over a
+            # long prefix exceeds Metal's single-buffer limit on 38k–69k-token
+            # agentic prompts, and can't observe ``cancel_event``. The draft
+            # conditions on every prompt position's hidden, so each
+            # sub-chunk's captures are concatenated across layers, eval'd
+            # (bounding the live graph to one sub-chunk) and kept.
+            prefix_hiddens: list[mx.array] = []
+
+            def _capturing_target(tokens: mx.array, cache: Any) -> Any:
+                out = self._target(tokens, cache=cache)  # output discarded
+                chunk = list(self._hidden_capture)
+                if any(h is None for h in chunk):
+                    raise RuntimeError(_err_msg)
+                hidden = mx.concatenate(chunk, axis=-1)
+                mx.eval(hidden)
+                prefix_hiddens.append(hidden)
+                # Reset capture slots so each None-check is independent.
+                self._hidden_capture[:] = [None] * len(self._hidden_capture)
+                return out
+
+            if _is_pure_rotating_cache(self._target_cache):
+                # Pure sliding-window targets (gpt-oss, Gemma 3) must prefill
+                # in a single forward — splitting corrupts windowed attention
+                # (CLAUDE.md "Pure-RotatingKVCache prefill is single-chunk").
+                if cancel_event is not None and cancel_event.is_set():
+                    raise PrefillCancelled()
+                _capturing_target(prefix, self._target_cache)
+            else:
+                _chunked_prefill(
+                    _capturing_target,
+                    prefix,
+                    self._target_cache,
+                    cancel_event=cancel_event,
+                )
             _eval_cache(self._target_cache)
             if self._capture is not None:
                 self._capture.use_buffer(self._capture_buffer)
+            # Cancel may have fired on the final prefix sub-chunk; skip the
+            # tail forward too so post-cancel work stays bounded.
+            if cancel_event is not None and cancel_event.is_set():
+                raise PrefillCancelled()
             target_out = self._target(last, cache=self._target_cache)
             captured_last = list(self._hidden_capture)
             if any(h is None for h in captured_last):
                 raise RuntimeError(_err_msg)
-            captured = [
-                mx.concatenate([p, q], axis=1)
-                for p, q in zip(captured_prefix, captured_last)
-            ]
+            hidden = mx.concatenate(
+                prefix_hiddens + [mx.concatenate(captured_last, axis=-1)], axis=1
+            )
+            del prefix_hiddens
         else:
             # Single-token prompt: no long prefix to suppress, so the buffer
             # must be active for this forward so step()'s rollback has the
             # captured GDN state (mirrors MTP's single-token branch).
             if self._capture is not None:
                 self._capture.use_buffer(self._capture_buffer)
+            if cancel_event is not None and cancel_event.is_set():
+                raise PrefillCancelled()
             target_out = self._target(prompt, cache=self._target_cache)
             captured = list(self._hidden_capture)
             if any(h is None for h in captured):
                 raise RuntimeError(_err_msg)
+            hidden = mx.concatenate(captured, axis=-1)
         logits = _logits(target_out)
-        self._hidden = mx.concatenate(captured, axis=-1)
+        self._hidden = hidden
         last_logit = logits[:, -1, :]
         mx.eval(last_logit, self._hidden)
 

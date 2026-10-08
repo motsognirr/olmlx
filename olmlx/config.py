@@ -556,6 +556,10 @@ class Settings(BaseSettings):
     #: Per-iteration max ReAct turns inside the wrapped ``ChatSession`` — kept
     #: small so ``finish`` / budgets are checked often at the outer loop.
     agent_inner_max_turns: Annotated[int, Field(gt=0)] = 8
+    #: Default per-call timeout (seconds) for the agent's ``bash`` and MCP
+    #: tools when the model doesn't pass one (#759). Headless runs have no
+    #: human to Ctrl+C a hung command.
+    agent_tool_timeout: Annotated[float, Field(gt=0)] = 300.0
     #: Cross-session memory (Phase 2) bounds.
     agent_memory_max_entries: Annotated[int, Field(gt=0)] = 1000
     agent_memory_recall_k: Annotated[int, Field(gt=0)] = 5

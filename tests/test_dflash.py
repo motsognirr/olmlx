@@ -1069,6 +1069,124 @@ class TestDFlashDecoder:
 # ---------------------------------------------------------------------------
 
 
+class TestDFlashChunkedPrefill:
+    """#759: pass-1 must sub-chunk the prefix via ``_chunked_prefill`` and
+    honour ``cancel_event`` (the MTP/EAGLE/classic/PLD invariant, #628/#360).
+    A single forward over a 38k–69k-token prompt OOMs Metal and can't be
+    interrupted by a disconnect."""
+
+    @pytest.fixture()
+    def components(self):
+        vocab_size, hidden_size = 32, 16
+        target = _Target(vocab_size, hidden_size, num_layers=4)
+        cfg = _make_draft_config(vocab_size, hidden_size, [1, 3])
+        draft = DFlashDraftModel(cfg)
+        return target, draft, cfg
+
+    def test_prefill_subchunks_long_prefix(self, components, monkeypatch):
+        from olmlx.engine import speculative
+
+        monkeypatch.setattr(speculative, "_PREFILL_CHUNK", 4)
+        target, draft, cfg = components
+        seq_lens: list[int] = []
+        orig_call = type(target).__call__
+
+        def recording_call(self, input_ids, cache=None):
+            seq_lens.append(input_ids.shape[1])
+            return orig_call(self, input_ids, cache=cache)
+
+        monkeypatch.setattr(type(target), "__call__", recording_call)
+        decoder = DFlashDecoder(target, draft, cfg, block_size=2)
+        decoder.prefill(mx.arange(1, 21, dtype=mx.int32)[None, :])
+        assert max(seq_lens) <= 4, f"un-chunked prefix forward: {seq_lens}"
+        assert seq_lens[-1] == 1
+        # Every prompt position's hidden is still captured for the draft.
+        assert decoder._hidden.shape[1] == 20
+
+    def test_chunked_prefill_matches_single_forward(self, components, monkeypatch):
+        from olmlx.engine import speculative
+
+        target, draft, cfg = components
+        prompt = mx.arange(1, 21, dtype=mx.int32)[None, :]
+        decoder = DFlashDecoder(target, draft, cfg, block_size=2)
+        ref_first = decoder.prefill(prompt)
+        ref_hidden = mx.array(decoder._hidden)
+        decoder.reset()
+
+        monkeypatch.setattr(speculative, "_PREFILL_CHUNK", 3)
+        decoder = DFlashDecoder(target, draft, cfg, block_size=2)
+        first = decoder.prefill(prompt)
+        assert first == ref_first
+        assert decoder._hidden.shape == ref_hidden.shape
+        assert mx.allclose(decoder._hidden, ref_hidden, atol=1e-5).item()
+        decoder.reset()
+
+    def test_pure_rotating_target_prefills_in_one_forward(
+        self, components, monkeypatch
+    ):
+        """Pure sliding-window targets (gpt-oss, Gemma 3) must prefill in a
+        single forward (CLAUDE.md invariant) — keep the pre-#759 path."""
+        from olmlx.engine import speculative
+        from olmlx.engine.dflash import decoder as dmod
+
+        monkeypatch.setattr(speculative, "_PREFILL_CHUNK", 4)
+        monkeypatch.setattr(
+            dmod,
+            "make_prompt_cache",
+            lambda model: [RotatingKVCache(max_size=64) for _ in model.layers],
+        )
+        target, draft, cfg = components
+        seq_lens: list[int] = []
+        orig_call = type(target).__call__
+
+        def recording_call(self, input_ids, cache=None):
+            seq_lens.append(input_ids.shape[1])
+            return orig_call(self, input_ids, cache=cache)
+
+        monkeypatch.setattr(type(target), "__call__", recording_call)
+        decoder = DFlashDecoder(target, draft, cfg, block_size=2)
+        decoder.prefill(mx.arange(1, 21, dtype=mx.int32)[None, :])
+        assert seq_lens == [19, 1]
+        assert decoder._hidden.shape[1] == 20
+        decoder.reset()
+
+    def test_prefill_honors_cancel_event(self, components):
+        from olmlx.engine.speculative import PrefillCancelled
+
+        target, draft, cfg = components
+        decoder = DFlashDecoder(target, draft, cfg, block_size=2)
+        cancel = threading.Event()
+        cancel.set()
+        with pytest.raises(PrefillCancelled):
+            decoder.prefill(
+                mx.arange(1, 21, dtype=mx.int32)[None, :], cancel_event=cancel
+            )
+        assert decoder._target_cache is None
+
+    def test_cancel_mid_prefill_stops_at_chunk_boundary(self, components, monkeypatch):
+        from olmlx.engine import speculative
+        from olmlx.engine.speculative import PrefillCancelled
+
+        monkeypatch.setattr(speculative, "_PREFILL_CHUNK", 4)
+        target, draft, cfg = components
+        cancel = threading.Event()
+        calls: list[int] = []
+        orig_call = type(target).__call__
+
+        def cancelling_call(self, input_ids, cache=None):
+            calls.append(input_ids.shape[1])
+            cancel.set()  # disconnect arrives during the first sub-chunk
+            return orig_call(self, input_ids, cache=cache)
+
+        monkeypatch.setattr(type(target), "__call__", cancelling_call)
+        decoder = DFlashDecoder(target, draft, cfg, block_size=2)
+        with pytest.raises(PrefillCancelled):
+            decoder.prefill(
+                mx.arange(1, 21, dtype=mx.int32)[None, :], cancel_event=cancel
+            )
+        assert calls == [4]
+
+
 class TestDflashLegacyMigrationError:
     def test_experimental_dflash_raises(self):
         from olmlx.engine.registry import ModelConfig

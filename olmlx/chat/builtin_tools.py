@@ -6,6 +6,7 @@ import glob as glob_module
 import http.client
 import ipaddress
 import logging
+import math
 import os
 import signal
 import socket
@@ -15,7 +16,7 @@ import urllib.request
 import urllib.error
 from html.parser import HTMLParser
 from pathlib import Path
-from typing import Callable
+from typing import Any, Callable
 
 from olmlx.chat.config import ChatConfig
 from olmlx.chat.errors import ToolError
@@ -32,6 +33,9 @@ _GLOB_MAX_SCANNED = 50_000
 _GREP_MAX_BYTES = 50_000
 # Default bash timeout
 _BASH_DEFAULT_TIMEOUT = 120
+# Upper bound on a model-supplied bash timeout (#759): an unbounded value
+# (``null``, ``1e9``, ``inf``) would let one tool call pin a turn forever.
+_BASH_MAX_TIMEOUT = 3600
 # Maximum output for bash
 _BASH_MAX_BYTES = 100_000
 # Maximum characters for web_fetch output
@@ -505,9 +509,35 @@ async def _handle_question(args: dict) -> str:
     return "__question__:" + json.dumps(payload)
 
 
+def _is_valid_timeout(value: Any) -> bool:
+    # ``isnan`` only on floats: a huge JSON integer can't convert to float
+    # and would raise ``OverflowError``.
+    return (
+        not isinstance(value, bool)
+        and isinstance(value, (int, float))
+        and not (isinstance(value, float) and math.isnan(value))
+        and value > 0
+    )
+
+
+def _resolve_bash_timeout(value: Any) -> float:
+    """Return a finite, positive bash timeout (#759).
+
+    Model-supplied JSON may carry ``null``, a string, a bool or a
+    non-positive/NaN number — any of which would otherwise reach
+    ``wait_for`` (``None`` there means wait forever). Those fall back to the
+    default. Clamping a model-supplied value to ``_BASH_MAX_TIMEOUT`` happens
+    in ``BuiltinToolManager.call_tool``, so an operator-configured
+    ``tool_timeout`` is never capped.
+    """
+    if not _is_valid_timeout(value):
+        return _BASH_DEFAULT_TIMEOUT
+    return value
+
+
 async def _handle_bash(args: dict) -> str | ToolError:
     command = args.get("command", "")
-    timeout = args.get("timeout", _BASH_DEFAULT_TIMEOUT)
+    timeout = _resolve_bash_timeout(args.get("timeout"))
 
     try:
         proc = await asyncio.create_subprocess_shell(
@@ -1140,12 +1170,16 @@ class BuiltinToolManager:
         # tool_timeout is the default bash bound; the model's explicit
         # timeout arg stays the more specific override. Other builtin
         # handlers keep their own internal bounds (grep/web 30s).
-        if (
-            name == "bash"
-            and "timeout" not in arguments
-            and self._config.tool_timeout is not None
-        ):
-            arguments = {**arguments, "timeout": self._config.tool_timeout}
+        # A valid model-supplied timeout is capped at _BASH_MAX_TIMEOUT (an
+        # unbounded value would pin the turn); the operator's configured
+        # tool_timeout is trusted as-is (#759).
+        if name == "bash":
+            model_timeout = arguments.get("timeout")
+            if _is_valid_timeout(model_timeout):
+                if model_timeout > _BASH_MAX_TIMEOUT:
+                    arguments = {**arguments, "timeout": _BASH_MAX_TIMEOUT}
+            elif self._config.tool_timeout is not None:
+                arguments = {**arguments, "timeout": self._config.tool_timeout}
         # write_file/edit_file honor the configured workspace sandbox (#611):
         # when write_root is set, absolute-path writes that escape it are
         # rejected. write_root is None for interactive chat (unchanged).
