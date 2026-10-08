@@ -12,6 +12,9 @@ import logging
 import os
 import re
 import shutil
+import socket
+import threading
+import time
 import uuid
 from collections import OrderedDict
 from pathlib import Path
@@ -34,6 +37,66 @@ except ImportError:  # pragma: no cover
     load_prompt_cache = None  # type: ignore[assignment]
 
 logger = logging.getLogger(__name__)
+
+#: Age after which a spill temp *without* a writer PID in its name (the
+#: brief pre-#769 naming scheme) is treated as a crash leftover. Generous, as
+#: it can't tell a slow write in flight from a leftover.
+_STALE_TEMP_SPILL_SECONDS = 24 * 3600
+
+#: Minimum interval between ``.tmp`` sweeps of one store, so a writer that
+#: crashes after a sweep is still reclaimed without a scan on every spill.
+_TEMP_SWEEP_INTERVAL_SECONDS = 600
+
+
+def _host_token() -> str:
+    """Short, filename-safe tag for this host (and so PID namespace, in
+    practice: containers get their own hostnames)."""
+    return hashlib.sha1(socket.gethostname().encode("utf-8")).hexdigest()[:8]
+
+
+def _spill_temp_path(tmp_dir: Path, file_path: Path) -> Path:
+    """``<stem>.<pid>-<host>.<uuid>.safetensors``: lets a later sweep tell a
+    dead local writer's leftover from a live write
+    (``_purge_stale_temp_spills``). Keeps the suffix because mlx appends one
+    otherwise."""
+    return tmp_dir / (
+        f"{file_path.stem}.{os.getpid()}-{_host_token()}.{uuid.uuid4().hex}.safetensors"
+    )
+
+
+# At most 10 digits: covers pid_t, and keeps int() clear of CPython's
+# int/str digit limit (a ValueError, not the OSError the sweep tolerates).
+_SPILL_WRITER_RE = re.compile(r"([0-9]{1,10})-([0-9a-f]{8})", re.ASCII)
+
+
+def _spill_temp_pid(path: Path) -> int | None:
+    """The writer PID encoded by ``_spill_temp_path`` — only when the temp
+    was written on *this* host, since a PID from another host's (or
+    container's) process table can't be checked here. ``None`` otherwise."""
+    parts = path.name.rsplit(".", 3)
+    if len(parts) != 4:
+        return None
+    m = _SPILL_WRITER_RE.fullmatch(parts[1])
+    if m is None or m.group(2) != _host_token():
+        return None
+    pid = int(m.group(1))
+    # 0/1 would make os.kill probe a process group / init; past pid_t it
+    # would raise OverflowError instead of answering.
+    return pid if 1 < pid <= 2**31 - 1 else None
+
+
+def _pid_alive(pid: int) -> bool:
+    if pid == os.getpid():
+        return True
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True  # exists, owned by someone else
+    except OSError:
+        return False
+    return True
 
 
 def _checkpoint_kv_depth(cache: Any) -> int | None:
@@ -230,6 +293,8 @@ class PromptCacheStore:
         self._disk_max_bytes = disk_max_bytes
         self._ram_budget_bytes = ram_budget_bytes
         self._evict_generation = 0  # bumped by async_evict_all_to_disk
+        self._last_temp_sweep: float | None = None  # see _cleanup_disk
+        self._temp_sweep_lock = threading.Lock()
         self._radix = PrefixCacheIndex()
         self.metrics = CacheMetrics()
 
@@ -288,7 +353,7 @@ class PromptCacheStore:
                 # it keeps the suffix because mlx appends one otherwise.
                 tmp_dir = disk_dir / ".tmp"
                 tmp_dir.mkdir(exist_ok=True)
-                tmp_path = tmp_dir / f"{file_path.stem}.{uuid.uuid4().hex}.safetensors"
+                tmp_path = _spill_temp_path(tmp_dir, file_path)
                 try:
                     save_prompt_cache(str(tmp_path), state.cache, metadata)
                     os.replace(tmp_path, file_path)
@@ -441,6 +506,50 @@ class PromptCacheStore:
             f.stat().st_size for f in disk_dir.glob("*.safetensors")
         )
 
+    @staticmethod
+    def _purge_stale_temp_spills(disk_dir: Path) -> int:
+        """Remove spill temp files a crash left in ``.tmp/`` (#760).
+
+        ``_save_to_disk``'s ``finally`` removes its temp file on any
+        exception, but not if the process dies mid-write; such files are
+        invisible to the ``*.safetensors`` accounting and eviction above.
+
+        Each temp names its writer's PID and host (``_spill_temp_path``). A
+        temp written on this host is a leftover when that process is gone,
+        however recent the crash, while temps of a live local process (this
+        one, or another server here) are kept until the generous age bound
+        no real spill reaches (#769 review), which also caps how long a
+        recycled PID can keep an orphan. Temps from another host (a shared
+        volume), or without a parseable writer, use that age bound alone.
+        Returns the number of files removed.
+        """
+        tmp_dir = disk_dir / ".tmp"
+        try:
+            entries = list(tmp_dir.iterdir())
+        except OSError:
+            # Missing (the common case), vanished under a concurrent
+            # clear(), or unreadable: nothing to purge. Never raise — the
+            # caller runs after a *successful* spill (#769 review).
+            return 0
+        cutoff = time.time() - _STALE_TEMP_SPILL_SECONDS
+        removed = 0
+        for f in entries:
+            try:
+                if not f.is_file():
+                    continue
+                pid = _spill_temp_pid(f)
+                # A live local writer keeps its temp, unless the temp is past
+                # the age no real spill reaches: then the "live" PID was
+                # recycled by an unrelated process, so reclaim it anyway.
+                if (pid is None or _pid_alive(pid)) and f.stat().st_mtime > cutoff:
+                    continue
+                f.unlink(missing_ok=True)
+                removed += 1
+                logger.info("Disk cache cleanup: removed orphaned temp %s", f)
+            except OSError:
+                continue
+        return removed
+
     def _cleanup_disk(self) -> None:
         """Refresh bytes_on_disk and, if a size cap is set, remove
         oldest disk cache files until the total fits.
@@ -451,6 +560,21 @@ class PromptCacheStore:
         if not disk_dir.exists():
             self.metrics.bytes_on_disk = 0
             return
+        # Rate-limited, not per spill: the sync set() path runs this on the
+        # event loop. Periodic rather than once, so a writer that crashes
+        # after a sweep is still reclaimed (#769 review).
+        # Reached from the loop and from to_thread workers: claim the sweep
+        # under a lock so concurrent spills don't both scan.
+        now = time.monotonic()
+        with self._temp_sweep_lock:
+            due = (
+                self._last_temp_sweep is None
+                or now - self._last_temp_sweep >= _TEMP_SWEEP_INTERVAL_SECONDS
+            )
+            if due:
+                self._last_temp_sweep = now
+        if due:
+            self._purge_stale_temp_spills(disk_dir)
         # Single stat pass: collect (path, size, mtime) to avoid double-stat
         file_info = []
         for f in disk_dir.glob("*.safetensors"):
@@ -619,6 +743,10 @@ class PromptCacheStore:
                 removed += 1
             except OSError:
                 logger.debug("Failed to remove stale disk cache %s", f, exc_info=True)
+        # Also reclaim crash-orphaned spill temps (dead writers only, so a
+        # spill still in flight survives): these models never spill, so
+        # nothing later would reclaim them (#769 review).
+        removed += self._purge_stale_temp_spills(disk_dir)
         # Recompute rather than zero so any files that survived an
         # unlink failure are still reflected in the metric.
         self._refresh_disk_bytes()

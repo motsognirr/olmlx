@@ -909,3 +909,147 @@ class TestDiskSpillAtomicWrite:
         assert not final.exists()
         leftovers = [p for p in tmp_path.rglob("*") if p.is_file()]
         assert leftovers == []
+
+
+class TestStaleTempSpillPurge:
+    """#760 follow-up / #769 review: crash-orphaned spill temps are purged;
+    a temp whose writer is alive (a write in flight) never is."""
+
+    @staticmethod
+    def _store(tmp_path):
+        store = PromptCacheStore(
+            max_slots=1, disk_path=tmp_path, model_name="test-model"
+        )
+        tmp_dir = store._disk_dir() / ".tmp"
+        tmp_dir.mkdir(parents=True)
+        return store, tmp_dir
+
+    @staticmethod
+    def _dead_pid():
+        import subprocess
+        import sys
+
+        proc = subprocess.Popen([sys.executable, "-c", "pass"])
+        proc.wait()
+        return proc.pid
+
+    def test_dead_writer_temp_removed_even_if_fresh(self, tmp_path):
+        store, tmp_dir = self._store(tmp_path)
+        from olmlx.engine.prompt_cache.store import _host_token
+
+        orphan = tmp_dir / f"a-x.{self._dead_pid()}-{_host_token()}.abc.safetensors"
+        orphan.write_bytes(b"x")
+        store._cleanup_disk()
+        assert not orphan.exists()
+
+    def test_live_writer_temp_kept_even_by_clear_disk(self, tmp_path):
+        import os
+
+        from olmlx.engine.prompt_cache.store import _host_token
+
+        store, tmp_dir = self._store(tmp_path)
+        inflight = tmp_dir / f"a.b-x.{os.getpid()}-{_host_token()}.abc.safetensors"
+        inflight.write_bytes(b"x")  # fresh, as a write in flight is
+        store._cleanup_disk()
+        store.clear_disk()
+        assert inflight.exists()
+
+    def test_legacy_name_falls_back_to_age(self, tmp_path):
+        import os
+        import time
+
+        store, tmp_dir = self._store(tmp_path)
+        stale = tmp_dir / "a.deadbeef.safetensors"
+        fresh = tmp_dir / "b.cafebabe.safetensors"
+        stale.write_bytes(b"x")
+        fresh.write_bytes(b"y")
+        old = time.time() - 25 * 3600
+        os.utime(stale, (old, old))
+        store._cleanup_disk()
+        assert not stale.exists()
+        assert fresh.exists()
+
+    def test_spill_temp_name_carries_pid(self, tmp_path):
+        import os
+
+        from olmlx.engine.prompt_cache.store import _spill_temp_path, _spill_temp_pid
+
+        p = _spill_temp_path(tmp_path, tmp_path / "x.y-123.safetensors")
+        assert _spill_temp_pid(p) == os.getpid()
+
+    def test_purge_tolerates_unreadable_tmp_dir(self, tmp_path):
+        from unittest.mock import patch
+
+        store, _ = self._store(tmp_path)
+        with patch("pathlib.Path.iterdir", side_effect=PermissionError("denied")):
+            assert store._purge_stale_temp_spills(store._disk_dir()) == 0
+
+    def test_clear_disk_counts_purged_temps(self, tmp_path):
+        store, tmp_dir = self._store(tmp_path)
+        from olmlx.engine.prompt_cache.store import _host_token
+
+        (tmp_dir / f"a.{self._dead_pid()}-{_host_token()}.abc.safetensors").write_bytes(
+            b"x"
+        )
+        (store._disk_dir() / "b.safetensors").write_bytes(b"y")
+        assert store.clear_disk() == 2
+
+    def test_cleanup_sweeps_temps_rate_limited(self, tmp_path):
+        from unittest.mock import patch
+
+        import olmlx.engine.prompt_cache.store as store_mod
+
+        store, _ = self._store(tmp_path)
+        clock = [1000.0]
+        with (
+            patch.object(
+                PromptCacheStore, "_purge_stale_temp_spills", return_value=0
+            ) as purge,
+            patch.object(store_mod.time, "monotonic", lambda: clock[0]),
+        ):
+            store._cleanup_disk()
+            store._cleanup_disk()  # within the interval: no rescan
+            assert purge.call_count == 1
+            clock[0] += store_mod._TEMP_SWEEP_INTERVAL_SECONDS
+            store._cleanup_disk()  # a later crash's orphan gets reclaimed
+            assert purge.call_count == 2
+
+    def test_other_host_temp_falls_back_to_age(self, tmp_path):
+        # A dead-looking PID from another host (shared volume) isn't trusted:
+        # a fresh temp survives, so a co-tenant's live spill is never cut.
+        store, tmp_dir = self._store(tmp_path)
+        foreign = tmp_dir / f"a.{self._dead_pid()}-00000000.abc.safetensors"
+        foreign.write_bytes(b"x")
+        store._cleanup_disk()
+        assert foreign.exists()
+
+    def test_pid_parse_never_raises(self, tmp_path):
+        from olmlx.engine.prompt_cache.store import _host_token, _spill_temp_pid
+
+        h = _host_token()
+        for name in (
+            f"a.\u00b2-{h}.u.safetensors",
+            f"a.0-{h}.u.safetensors",
+            f"a.1-{h}.u.safetensors",
+            f"a.{10**20}-{h}.u.safetensors",
+            f"a.{'9' * 5000}-{h}.u.safetensors",
+            "a.b.c.d.e",
+            "x",
+        ):
+            assert _spill_temp_pid(tmp_path / name) is None
+
+    def test_recycled_pid_orphan_reclaimed_after_age_bound(self, tmp_path):
+        import os
+        import time
+
+        from olmlx.engine.prompt_cache.store import _host_token
+
+        store, tmp_dir = self._store(tmp_path)
+        # Our own (live) PID stands in for a recycled one; past the age
+        # bound no real spill is still writing, so it goes.
+        orphan = tmp_dir / f"a.{os.getpid()}-{_host_token()}.u.safetensors"
+        orphan.write_bytes(b"x")
+        old = time.time() - 25 * 3600
+        os.utime(orphan, (old, old))
+        store._cleanup_disk()
+        assert not orphan.exists()

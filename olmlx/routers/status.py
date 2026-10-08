@@ -57,8 +57,9 @@ async def ps(request: Request):
         if store is not None:
             # read_manifest applies the #702 stale-estimator refresh (#741),
             # which may re-read config.json and rewrite the manifest.
+            # model_dir() stats the converted dir — keep it off the loop too.
             m = await asyncio.to_thread(
-                store.read_manifest, store.model_dir(lm.hf_path)
+                lambda hf_path=lm.hf_path: store.read_manifest(store.model_dir(hf_path))
             )
             if m is not None:
                 if size == 0:

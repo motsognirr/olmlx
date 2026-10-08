@@ -2048,3 +2048,50 @@ class TestModelConfigSystem:
     def test_non_str_rejected(self):
         with pytest.raises(ValueError, match="system"):
             ModelConfig.from_entry({"hf_path": "org/model", "system": 3})
+
+
+class TestPromoteAliasesSaveOrder:
+    """#760 follow-up: promote_aliases_of persists models.json before
+    aliases.json, so a failed second write can't orphan the names."""
+
+    def test_mappings_saved_before_aliases(self, registry):
+        from unittest.mock import patch
+
+        registry.add_alias("a", "qwen3")
+        calls: list[str] = []
+        with (
+            patch.object(
+                registry, "_save_mappings", side_effect=lambda: calls.append("m")
+            ),
+            patch.object(
+                registry, "_save_aliases", side_effect=lambda: calls.append("a")
+            ),
+        ):
+            assert registry.promote_aliases_of("qwen3") == ["a:latest"]
+        assert calls == ["m", "a"]
+
+    def test_failed_alias_save_restores_aliases_and_raises(self, registry):
+        from unittest.mock import patch
+
+        registry.add_alias("a", "qwen3")
+        with (
+            patch.object(registry, "_save_mappings"),
+            patch.object(registry, "_save_aliases", side_effect=OSError("disk")),
+        ):
+            with pytest.raises(OSError):
+                registry.promote_aliases_of("qwen3")
+        # Memory matches the unchanged aliases.json: still an alias of qwen3.
+        assert registry._aliases["a:latest"] == "qwen3:latest"
+
+    def test_failed_mappings_save_undoes_promotion(self, registry):
+        from unittest.mock import patch
+
+        registry.add_alias("a", "qwen3")
+        with patch.object(registry, "_save_mappings", side_effect=OSError("disk")):
+            with pytest.raises(OSError):
+                registry.promote_aliases_of("qwen3")
+        assert registry._aliases["a:latest"] == "qwen3:latest"
+        assert "a:latest" not in registry._mappings
+        assert "a:latest" not in registry._dirty_keys
+        # A retry still finds the alias to promote.
+        assert registry.promote_aliases_of("qwen3") == ["a:latest"]
