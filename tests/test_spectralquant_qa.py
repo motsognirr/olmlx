@@ -29,31 +29,32 @@ from olmlx.engine.spectralquant import (
 # ---------------------------------------------------------------------------
 
 
+#: Rows per codec call in ``_runtime_roundtrip``. Large enough calls with a
+#: 256-level codebook exceed spectralquant's broadcast cap and switch to the
+#: 256-step unrolled argmin, which the CPU backend (CI runs MLX on CPU) JIT-
+#: compiles into one huge C++ kernel: ~10 s locally, and a native abort on
+#: the self-hosted CI runner. Small chunks stay on the vectorized path; the
+#: codec is per-vector, so the result is identical.
+_ROUNDTRIP_CHUNK = 1024
+
+
 def _runtime_roundtrip(keys: np.ndarray, cal: dict) -> np.ndarray:
     """Quantize + dequantize through the real runtime spectral codec."""
-    x = mx.array(keys[None, None].astype(np.float32))  # (1, 1, N, D)
     rot = SpectralRotation(cal["eigenvectors"])
-    ps, pt, norms = spectral_quantize(
-        x,
-        rot,
+    codec = (
         cal["codebook_sem"],
         cal["codebook_tail"],
         cal["d_eff"],
         cal["bits_high"],
         cal["bits_low"],
     )
-    out = spectral_dequantize(
-        ps,
-        pt,
-        norms,
-        rot,
-        cal["codebook_sem"],
-        cal["codebook_tail"],
-        cal["d_eff"],
-        cal["bits_high"],
-        cal["bits_low"],
-    )
-    return np.array(out[0, 0])
+    out = []
+    for start in range(0, len(keys), _ROUNDTRIP_CHUNK):
+        chunk = keys[start : start + _ROUNDTRIP_CHUNK]
+        x = mx.array(chunk[None, None].astype(np.float32))  # (1, 1, n, D)
+        ps, pt, norms = spectral_quantize(x, rot, *codec)
+        out.append(np.array(spectral_dequantize(ps, pt, norms, rot, *codec)[0, 0]))
+    return np.concatenate(out)
 
 
 def _qk_mse(keys: np.ndarray, recon: np.ndarray, queries: np.ndarray) -> float:
