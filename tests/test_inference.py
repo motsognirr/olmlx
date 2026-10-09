@@ -5136,6 +5136,42 @@ class TestEstimateKvCacheBytesCacheLayout:
         expected = int(7 * 2 * 8 * 128 * 1000 * 2 * _inf_mod.MEMORY_SAFETY_FACTOR)
         assert estimate_kv_cache_bytes(model, 1000) == expected
 
+    def test_unmapped_mixed_layout_never_charges_below_fp16(self):
+        """When a short layout can't be mapped onto layers, which of them the
+        factory quantizes is unknown. With mixed entry types an unmapped layer
+        must not be charged below fp16 (shard's ratio is < 1)."""
+        model = self._model(flags="none")
+        result = estimate_kv_cache_bytes(model, 40000, kv_cache_quant="shard:4")
+        assert result == self._expected(40000, quant=False, owned=self.N_LAYERS)
+
+    def test_unmapped_all_plain_layout_keeps_quant_ratio(self):
+        """Nemotron-NAS: the compacted layout can't be mapped, but every entry
+        is a plain ``KVCache``, so every cache is quantized."""
+        from mlx_lm.models.cache import KVCache
+
+        args = MagicMock(spec=[])
+        args.num_hidden_layers = 4
+        args.num_attention_heads = 8
+        args.hidden_size = 1024
+        model = MagicMock(spec=["args", "model", "make_cache"])
+        model.args = args
+        model.model = MagicMock()
+        layers = []
+        for i in range(4):
+            layer = MagicMock()
+            if i == 1:
+                layer.self_attn = None
+            else:
+                layer.self_attn = MagicMock()
+                layer.self_attn.n_kv_heads = 8
+            layers.append(layer)
+        model.model.layers = layers
+        model.make_cache = MagicMock(side_effect=lambda: [KVCache() for _ in range(3)])
+        fp16 = estimate_kv_cache_bytes(model, 1000)
+        shard = estimate_kv_cache_bytes(model, 1000, kv_cache_quant="shard:4")
+        assert fp16 == int(3 * 2 * 8 * 128 * 1000 * 2 * _inf_mod.MEMORY_SAFETY_FACTOR)
+        assert shard < fp16
+
     def test_args_fallback_follows_layout(self):
         """When per-layer introspection fails (no int ``n_kv_heads``), the
         args-based fallback charges one entry per cache in the layout —

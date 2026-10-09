@@ -239,6 +239,13 @@ def estimate_kv_cache_bytes(
     # Pure-rotating models (gpt-oss, Gemma 3) prefill the whole prompt in ONE
     # call, so their rotating layers briefly hold every prompt token.
     single_chunk_prefill = layout is not None and _is_pure_rotating_cache(layout)
+    # Whether a layer with no layout entry is quantized: without a layout
+    # mlx-lm builds a plain ``KVCache`` per layer (yes); with an all-plain
+    # layout every cache is (yes); with a mixed layout that couldn't be mapped
+    # onto the layers it's unknown, so never charge such a layer below fp16.
+    unmapped_quantized: bool | None = (
+        True if layout is None or all(_is_plain_kv_cache(e) for e in layout) else None
+    )
 
     def _layer_bytes(
         kv_heads: int, layer_head_dim: int, entry: Any, window: int | None
@@ -254,15 +261,13 @@ def estimate_kv_cache_bytes(
             tokens = num_tokens
         else:
             tokens = min(num_tokens, window + PREFILL_CHUNK_TOKENS)
-        quantized = entry is None or _is_plain_kv_cache(entry)
-        return (
-            2
-            * kv_heads
-            * layer_head_dim
-            * tokens
-            * bytes_per_element
-            * (_quant_ratio(layer_head_dim) if quantized else 1.0)
-        )
+        if entry is not None:
+            ratio = _quant_ratio(layer_head_dim) if _is_plain_kv_cache(entry) else 1.0
+        elif unmapped_quantized:
+            ratio = _quant_ratio(layer_head_dim)
+        else:
+            ratio = max(_quant_ratio(layer_head_dim), 1.0)
+        return 2 * kv_heads * layer_head_dim * tokens * bytes_per_element * ratio
 
     # Try layer introspection for NAS/variable-attention/hybrid models.
     # ``args_owner`` was set above to the component whose args we resolved
