@@ -438,7 +438,7 @@ def make_shard_cache(
     the default cache with a warning.
     """
     from olmlx.engine.shardquant_calibrate import load_shard_calibration
-    from olmlx.engine.turboquant_cache import _is_plain_kv_cache
+    from olmlx.engine.turboquant_cache import _is_plain_kv_cache, default_cache_layout
 
     if calibration_dir is None:
         # Reachable when ModelManager has no store (_find_shard_dir returns
@@ -478,11 +478,8 @@ def make_shard_cache(
         )
 
     num_layers = len(model.layers)
-    if hasattr(model, "make_cache"):
-        default_caches = model.make_cache()
-        if not isinstance(default_caches, list):
-            default_caches = [None] * num_layers
-    else:
+    default_caches = default_cache_layout(model)
+    if default_caches is None:
         default_caches = [None] * num_layers
 
     caches = []

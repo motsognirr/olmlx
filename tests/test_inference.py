@@ -37,6 +37,7 @@ from olmlx.engine.inference import (
 from olmlx.engine.template_caps import TemplateCaps
 from olmlx.engine.model_manager import LoadedModel
 from olmlx.engine.inference import _derive_timing_stats
+from olmlx.engine.kv_budget import PREFILL_CHUNK_TOKENS
 from olmlx.utils.streaming import CancellableStream, StreamToken
 from olmlx.utils.timing import TimingStats
 
@@ -4664,12 +4665,11 @@ class TestEstimateKvCacheBytes:
         model.model.layers = layers
 
         num_tokens = 33181
-        # Expected per-layer:
-        #   sliding: 2 * 16 * 256 * min(33181, 1024) * 2 = 16,777,216 bytes
-        #   full:    2 * 4 * 512 * 33181 * 2 = 271,773,696 bytes
-        #   sum: 50 * 16,777,216 + 10 * 271,773,696 = 838,860,800 + 2,717,736,960
-        #      = 3,556,597,760 bytes raw (≈3.31 GB)
-        sliding_per_layer = 2 * 16 * 256 * 1024 * 2
+        # Expected per-layer (a rotating cache peaks at window + one prefill
+        # chunk while prefilling, #762):
+        #   sliding: 2 * 16 * 256 * min(33181, 1024 + 2048) * 2
+        #   full:    2 * 4 * 512 * 33181 * 2
+        sliding_per_layer = 2 * 16 * 256 * (1024 + PREFILL_CHUNK_TOKENS) * 2
         full_per_layer = 2 * 4 * 512 * num_tokens * 2
         expected_raw = 50 * sliding_per_layer + 10 * full_per_layer
 
@@ -4678,7 +4678,7 @@ class TestEstimateKvCacheBytes:
 
         # Sanity check: result should fit in 16 GB.  The naive uniform-layer
         # formula (60 * 2 * 16 * 256 * 33181 * 2 * 1.3) ≈ 38 GB would not.
-        assert result < 16 * 1024**3, f"Expected ~4.3 GB, got {result / 1024**3:.1f} GB"
+        assert result < 16 * 1024**3, f"Expected ~6.8 GB, got {result / 1024**3:.1f} GB"
 
     def test_per_layer_sliding_window_override(self):
         """Per-layer self_attn.sliding_window_size takes precedence over args.sliding_window.
@@ -4712,9 +4712,10 @@ class TestEstimateKvCacheBytes:
         model.model = MagicMock()
         model.model.layers = layers
 
-        # 8000 tokens, but per-layer window is 512 (not 4096)
+        # 8000 tokens, but per-layer window is 512 (not 4096), plus one
+        # prefill chunk of headroom.
         result = estimate_kv_cache_bytes(model, 8000)
-        expected_raw = 4 * 2 * 8 * 128 * 512 * 2
+        expected_raw = 4 * 2 * 8 * 128 * (512 + PREFILL_CHUNK_TOKENS) * 2
         assert result == int(expected_raw * _inf_mod.MEMORY_SAFETY_FACTOR)
 
     def test_sliding_window_cap_short_prompt(self):
@@ -4863,6 +4864,440 @@ class TestEstimateKvCacheBytes:
         naive = int(naive_raw * _inf_mod.MEMORY_SAFETY_FACTOR)
         assert naive > 10 * 1024**3  # confirm the old estimate was wrong
         assert result < naive / 3  # introspection should be at least 3x lower
+
+
+class TestEstimateKvCacheBytesCacheLayout:
+    """#762: the estimate follows the model's actual cache layout
+    (``make_cache()``), not just ``layers``.
+
+    Gemma 4 E2B-shaped fixture: 35 layers, the last 20 KV-shared (no cache of
+    their own), every 5th layer full attention (n_kv=1, head_dim=512), the
+    rest sliding (n_kv=1, head_dim=256, window 512).
+    """
+
+    N_LAYERS = 35
+    N_SHARED = 20
+    WINDOW = 512
+
+    @staticmethod
+    def _is_full(i: int) -> bool:
+        return i % 5 == 4
+
+    @staticmethod
+    def _tq4_ratio(head_dim: int) -> float:
+        # Mirrors kv_budget._quant_ratio for turboquant:4: packed + f32 norm
+        # + fp16 side buffer, per K and V entry, relative to fp16.
+        fp16 = head_dim * 2
+        entry = head_dim // 2 + 4 + fp16
+        return (2 * entry) / (2 * fp16)
+
+    def _layer(self, i: int, *, flags: str):
+        layer = MagicMock()
+        attn = MagicMock()
+        attn.n_kv_heads = 1
+        attn.head_dim = 512 if self._is_full(i) else 256
+        attn.is_sliding = not self._is_full(i)
+        shared = i >= self.N_LAYERS - self.N_SHARED
+        if flags == "mlx_lm":
+            attn.has_kv = not shared
+        elif flags == "mlx_vlm":
+            attn.is_kv_shared_layer = shared
+        layer.self_attn = attn
+        return layer
+
+    def _layout(self, *, kv_cls=None, rot_cls=None):
+        from mlx_lm.models.cache import KVCache, RotatingKVCache
+
+        kv_cls = kv_cls or KVCache
+        rot_cls = rot_cls or RotatingKVCache
+        return [
+            kv_cls() if self._is_full(i) else rot_cls(max_size=self.WINDOW, keep=0)
+            for i in range(self.N_LAYERS - self.N_SHARED)
+        ]
+
+    def _model(self, *, flags: str = "mlx_lm", layout=None, make_cache=True):
+        args = MagicMock(spec=[])
+        args.num_hidden_layers = self.N_LAYERS
+        args.num_attention_heads = 8
+        args.num_key_value_heads = 1
+        args.hidden_size = 1536
+        args.head_dim = 256
+        args.sliding_window = self.WINDOW
+        attrs = ["args", "model"] + (["make_cache"] if make_cache else [])
+        model = MagicMock(spec=attrs)
+        model.args = args
+        model.model = MagicMock()
+        model.model.layers = [self._layer(i, flags=flags) for i in range(self.N_LAYERS)]
+        if make_cache:
+            built = layout if layout is not None else self._layout()
+            model.make_cache = MagicMock(side_effect=lambda: list(built))
+        return model
+
+    def _expected(
+        self,
+        num_tokens: int,
+        *,
+        quant: bool,
+        owned=None,
+        layers=None,
+        single_chunk: bool = True,
+    ) -> int:
+        """Gemma 4's layout (Rotating + KVCache, no ``ArraysCache``) is
+        prefilled in ONE ``model()`` call, and a ``RotatingKVCache`` keeps
+        that whole first chunk, so its sliding layers peak at the full prompt
+        (``single_chunk``). Without a layout the estimate can't tell, and
+        charges window + one prefill chunk."""
+        owned = self.N_LAYERS - self.N_SHARED if owned is None else owned
+        sliding_tokens = (
+            num_tokens
+            if single_chunk
+            else min(num_tokens, self.WINDOW + PREFILL_CHUNK_TOKENS)
+        )
+        raw = 0.0
+        for i in range(owned) if layers is None else layers:
+            if self._is_full(i):
+                raw += (
+                    2 * 512 * num_tokens * 2 * (self._tq4_ratio(512) if quant else 1.0)
+                )
+            else:
+                raw += 2 * 256 * sliding_tokens * 2
+        return int(raw * _inf_mod.MEMORY_SAFETY_FACTOR)
+
+    def test_kv_shared_layers_not_charged_mlx_lm_flags(self):
+        """mlx-lm Gemma 4: ``self_attn.has_kv`` is False on KV-shared layers."""
+        model = self._model(flags="mlx_lm")
+        assert estimate_kv_cache_bytes(model, 40000) == self._expected(
+            40000, quant=False
+        )
+
+    def test_kv_shared_layers_not_charged_mlx_vlm_flags(self):
+        """mlx-vlm Gemma 4: ``self_attn.is_kv_shared_layer`` is True on
+        KV-shared layers."""
+        model = self._model(flags="mlx_vlm")
+        assert estimate_kv_cache_bytes(model, 40000) == self._expected(
+            40000, quant=False
+        )
+
+    def test_short_layout_without_shared_flags_is_ignored(self):
+        """A layout shorter than ``layers`` is only trusted when every layer
+        past its end is flagged KV-shared. Otherwise the positional mapping
+        can't be verified (a ``make_cache`` that skips non-attention layers
+        would misalign it), so the layout is ignored and every attention
+        layer is charged — over-, never under-counting."""
+        model = self._model(flags="none")
+        assert estimate_kv_cache_bytes(model, 40000) == self._expected(
+            40000, quant=False, owned=self.N_LAYERS
+        )
+
+    def test_short_layout_with_partially_flagged_tail_is_ignored(self):
+        model = self._model(flags="mlx_lm")
+        # One tail layer loses its flag: the tail is no longer provably shared.
+        del model.model.layers[-1].self_attn.has_kv
+        model.model.layers[-1].self_attn.has_kv = None
+        result = estimate_kv_cache_bytes(model, 40000)
+        # Flagged layers are still skipped; the unflagged one is charged, and
+        # the layout no longer caps/excludes anything by position.
+        charged = [*range(self.N_LAYERS - self.N_SHARED), self.N_LAYERS - 1]
+        assert result == self._expected(40000, quant=False, layers=charged)
+
+    def test_kv_shared_flag_honoured_without_make_cache(self):
+        model = self._model(flags="mlx_lm", make_cache=False)
+        assert estimate_kv_cache_bytes(model, 40000) == self._expected(
+            40000, quant=False, single_chunk=False
+        )
+
+    def test_sliding_cap_includes_prefill_chunk_without_layout(self):
+        """mlx-lm's ``RotatingKVCache`` keeps ``max_size - 1 + S`` tokens
+        while prefilling a chunk of S, so a chunked prefill peaks at window +
+        one chunk, not at the window."""
+        model = self._model(make_cache=False)
+        n = self.WINDOW + PREFILL_CHUNK_TOKENS + 100  # the cap bites
+        assert estimate_kv_cache_bytes(model, n) == self._expected(
+            n, quant=False, single_chunk=False
+        )
+
+    def test_rotating_entry_in_hybrid_layout_is_chunk_capped(self):
+        """With an ``ArraysCache`` in the layout the prefill is chunked, so a
+        rotating entry is capped at its ``max_size`` + one chunk — even when
+        ``self_attn`` doesn't report ``is_sliding`` (the layout is
+        authoritative) — and stays fp16 under ``kv_cache_quant``."""
+        from mlx_lm.models.cache import ArraysCache, KVCache, RotatingKVCache
+
+        args = MagicMock(spec=[])
+        args.num_hidden_layers = 3
+        args.num_attention_heads = 8
+        args.num_key_value_heads = 2
+        args.hidden_size = 1024
+        args.head_dim = 128
+        model = MagicMock(spec=["args", "model", "make_cache"])
+        model.args = args
+        model.model = MagicMock()
+        linear = MagicMock()
+        linear.self_attn = None  # GatedDeltaNet layer
+        layers = [linear]
+        for _ in range(2):
+            layer = MagicMock()
+            layer.self_attn = MagicMock(spec=["n_kv_heads", "head_dim"])
+            layer.self_attn.n_kv_heads = 2
+            layer.self_attn.head_dim = 128
+            layers.append(layer)
+        model.model.layers = layers
+        model.make_cache = MagicMock(
+            side_effect=lambda: [
+                ArraysCache(size=2),
+                RotatingKVCache(max_size=512),
+                KVCache(),
+            ]
+        )
+        n = 40000
+        ratio = self._tq4_ratio(128)
+        raw = (
+            2 * 2 * 128 * (512 + PREFILL_CHUNK_TOKENS) * 2 + 2 * 2 * 128 * n * 2 * ratio
+        )
+        result = estimate_kv_cache_bytes(model, n, kv_cache_quant="turboquant:4")
+        assert result == int(raw * _inf_mod.MEMORY_SAFETY_FACTOR)
+
+    def test_pure_rotating_layout_charges_full_prompt(self):
+        """gpt-oss: a pure-rotating layout (no ``ArraysCache``) prefills the
+        whole prompt in one call, and ``RotatingKVCache`` keeps that whole
+        first chunk — the sliding layers hold every prompt token."""
+        from mlx_lm.models.cache import RotatingKVCache
+
+        args = MagicMock(spec=[])
+        args.num_hidden_layers = 4
+        args.num_attention_heads = 8
+        args.num_key_value_heads = 2
+        args.hidden_size = 1024
+        args.head_dim = 64
+        model = MagicMock(spec=["args", "model", "make_cache"])
+        model.args = args
+        model.model = MagicMock()
+        layers = []
+        for _ in range(4):
+            layer = MagicMock()
+            # gpt-oss's attention exposes neither is_sliding nor a window.
+            layer.self_attn = MagicMock(spec=["num_key_value_heads", "head_dim"])
+            layer.self_attn.num_key_value_heads = 2
+            layer.self_attn.head_dim = 64
+            layers.append(layer)
+        model.model.layers = layers
+        model.make_cache = MagicMock(
+            side_effect=lambda: [RotatingKVCache(max_size=128) for _ in range(4)]
+        )
+        n = 100_000
+        expected = int(4 * 2 * 2 * 64 * n * 2 * _inf_mod.MEMORY_SAFETY_FACTOR)
+        assert estimate_kv_cache_bytes(model, n) == expected
+
+    def test_plain_entry_overrides_is_sliding(self):
+        """The layout is authoritative both ways: an unbounded plain
+        ``KVCache`` entry on a layer reporting ``is_sliding=True`` (mlx-vlm
+        inkling) holds every token, so no window cap applies."""
+        from mlx_lm.models.cache import KVCache
+
+        model = self._model(
+            layout=[KVCache() for _ in range(self.N_LAYERS - self.N_SHARED)]
+        )
+        owned = self.N_LAYERS - self.N_SHARED
+        raw = sum(
+            2 * (512 if self._is_full(i) else 256) * 40000 * 2 for i in range(owned)
+        )
+        assert estimate_kv_cache_bytes(model, 40000) == int(
+            raw * _inf_mod.MEMORY_SAFETY_FACTOR
+        )
+
+    def test_nemotron_nas_compacted_layout_charges_every_attention_layer(self):
+        """Nemotron-NAS ``make_cache`` skips no-op layers, so the layout is
+        shorter than ``layers`` and misaligned with it. The trailing real
+        attention layers must still be charged."""
+        from mlx_lm.models.cache import KVCache
+
+        args = MagicMock(spec=[])
+        args.num_hidden_layers = 10
+        args.num_attention_heads = 8
+        args.hidden_size = 1024
+        model = MagicMock(spec=["args", "model", "make_cache"])
+        model.args = args
+        model.model = MagicMock()
+        layers = []
+        for i in range(10):
+            layer = MagicMock()
+            if i in (1, 4, 6):
+                layer.self_attn = None  # no-op attention
+            else:
+                layer.self_attn = MagicMock()
+                layer.self_attn.n_kv_heads = 8
+            layers.append(layer)
+        model.model.layers = layers
+        model.make_cache = MagicMock(
+            side_effect=lambda: [
+                KVCache() for layer in layers if layer.self_attn is not None
+            ]
+        )
+        expected = int(7 * 2 * 8 * 128 * 1000 * 2 * _inf_mod.MEMORY_SAFETY_FACTOR)
+        assert estimate_kv_cache_bytes(model, 1000) == expected
+
+    def test_unmapped_mixed_layout_never_charges_below_fp16(self):
+        """When a short layout can't be mapped onto layers, which of them the
+        factory quantizes is unknown. With mixed entry types an unmapped layer
+        must not be charged below fp16 (shard's ratio is < 1)."""
+        model = self._model(flags="none")
+        result = estimate_kv_cache_bytes(model, 40000, kv_cache_quant="shard:4")
+        assert result == self._expected(40000, quant=False, owned=self.N_LAYERS)
+
+    def test_unmapped_all_plain_layout_keeps_quant_ratio(self):
+        """Nemotron-NAS: the compacted layout can't be mapped, but every entry
+        is a plain ``KVCache``, so every cache is quantized."""
+        from mlx_lm.models.cache import KVCache
+
+        args = MagicMock(spec=[])
+        args.num_hidden_layers = 4
+        args.num_attention_heads = 8
+        args.hidden_size = 1024
+        model = MagicMock(spec=["args", "model", "make_cache"])
+        model.args = args
+        model.model = MagicMock()
+        layers = []
+        for i in range(4):
+            layer = MagicMock()
+            if i == 1:
+                layer.self_attn = None
+            else:
+                layer.self_attn = MagicMock()
+                layer.self_attn.n_kv_heads = 8
+            layers.append(layer)
+        model.model.layers = layers
+        model.make_cache = MagicMock(side_effect=lambda: [KVCache() for _ in range(3)])
+        fp16 = estimate_kv_cache_bytes(model, 1000)
+        shard = estimate_kv_cache_bytes(model, 1000, kv_cache_quant="shard:4")
+        assert fp16 == int(3 * 2 * 8 * 128 * 1000 * 2 * _inf_mod.MEMORY_SAFETY_FACTOR)
+        assert shard < fp16
+
+    def test_args_fallback_charges_largest_declared_dims(self):
+        """With no per-layer dims, the fallback charges every entry the
+        largest head dim / KV-head count the config declares, so it can't
+        undercount Gemma 4's 512-dim full-attention layers."""
+        model = self._model(flags="mlx_lm")
+        model.args.global_head_dim = 512
+        model.args.num_global_key_value_heads = 2
+        for layer in model.model.layers:
+            layer.self_attn.n_kv_heads = None  # breaks introspection
+        n = 40000
+        owned = self.N_LAYERS - self.N_SHARED
+        raw = owned * 2 * 2 * 512 * n * 2  # single-chunk: rotating hold all n
+        assert estimate_kv_cache_bytes(model, n) == int(
+            raw * _inf_mod.MEMORY_SAFETY_FACTOR
+        )
+
+    def test_empty_layout_is_ignored(self):
+        """An empty ``make_cache()`` result must not zero the estimate (that
+        would disable the preflight); it counts as no layout."""
+        model = self._model(flags="mlx_lm", layout=[])
+        for layer in model.model.layers:
+            layer.self_attn.n_kv_heads = None  # force the args fallback
+        n = 1000
+        raw = self.N_LAYERS * 2 * 1 * 256 * n * 2
+        assert estimate_kv_cache_bytes(model, n) == int(
+            raw * _inf_mod.MEMORY_SAFETY_FACTOR
+        )
+
+    def test_no_quant_skips_entry_type_checks(self):
+        """Without ``kv_cache_quant`` the entry types don't change the charge,
+        so the estimate must not call ``_is_plain_kv_cache`` (it can import
+        mlx-vlm on the event loop / warn on text-only deployments)."""
+        model = self._model()
+        with patch(
+            "olmlx.engine.turboquant_cache._is_plain_kv_cache",
+            side_effect=AssertionError("called without kv_cache_quant"),
+        ):
+            estimate_kv_cache_bytes(model, 40000)
+
+    def test_args_fallback_follows_layout(self):
+        """When per-layer introspection fails (no int ``n_kv_heads``), the
+        args-based fallback charges one entry per cache in the layout —
+        KV-shared layers own none, rotating entries are capped, and only
+        plain entries get the quant ratio."""
+        model = self._model(flags="mlx_lm")
+        for layer in model.model.layers:
+            layer.self_attn.n_kv_heads = None  # breaks introspection
+        n = 40000
+        owned = self.N_LAYERS - self.N_SHARED
+        raw = 0.0
+        for i in range(owned):
+            # args: n_kv=1, head_dim=256 for every entry; the rotating ones
+            # hold the whole single-call prefill.
+            if self._is_full(i):
+                raw += 2 * 256 * n * 2 * self._tq4_ratio(256)
+            else:
+                raw += 2 * 256 * n * 2
+        result = estimate_kv_cache_bytes(model, n, kv_cache_quant="turboquant:4")
+        assert result == int(raw * _inf_mod.MEMORY_SAFETY_FACTOR)
+
+    def test_quant_ratio_only_on_plain_kv_entries(self):
+        """Sliding layers keep a fp16 ``RotatingKVCache`` under
+        ``kv_cache_quant``; only the full-attention ``KVCache`` entries the
+        factory replaces get the quant ratio."""
+        model = self._model()
+        result = estimate_kv_cache_bytes(model, 40000, kv_cache_quant="turboquant:4")
+        assert result == self._expected(40000, quant=True)
+
+    def test_mlx_vlm_layout(self):
+        """mlx-vlm cache classes: its plain ``KVCache`` is quantized (exact
+        type, like the factories), its ``RotatingKVCache`` caps the window."""
+        from mlx_vlm.models.cache import KVCache as VlmKVCache
+        from mlx_vlm.models.cache import RotatingKVCache as VlmRotating
+
+        model = self._model(
+            flags="mlx_vlm",
+            layout=self._layout(kv_cls=VlmKVCache, rot_cls=VlmRotating),
+        )
+        result = estimate_kv_cache_bytes(model, 40000, kv_cache_quant="turboquant:4")
+        assert result == self._expected(40000, quant=True)
+
+    def test_non_plain_kv_subclass_stays_fp16(self):
+        """An mlx-vlm ``KVCache`` subclass (Qwen3.8's ``QSAKVCache``) carries
+        model state, so the factories leave it unquantized; the estimate
+        must charge it at fp16."""
+        from mlx_vlm.models.cache import KVCache as VlmKVCache
+
+        class _QSALike(VlmKVCache):
+            pass
+
+        args = MagicMock(spec=[])
+        args.num_hidden_layers = 4
+        args.num_attention_heads = 8
+        args.num_key_value_heads = 2
+        args.hidden_size = 1024
+        args.head_dim = 128
+        model = MagicMock(spec=["args", "model", "make_cache"])
+        model.args = args
+        model.model = MagicMock()
+        layers = []
+        for _ in range(4):
+            layer = MagicMock()
+            layer.self_attn = MagicMock()
+            layer.self_attn.n_kv_heads = 2
+            layer.self_attn.head_dim = 128
+            layer.self_attn.is_sliding = False
+            layers.append(layer)
+        model.model.layers = layers
+        model.make_cache = MagicMock(side_effect=lambda: [_QSALike() for _ in range(4)])
+
+        fp16 = estimate_kv_cache_bytes(model, 10000)
+        quant = estimate_kv_cache_bytes(model, 10000, kv_cache_quant="shard:4")
+        assert quant == fp16
+
+    def test_make_cache_failure_falls_back_to_layers(self):
+        """A ``make_cache()`` that raises or returns a non-list is ignored —
+        the estimate falls back to per-layer introspection."""
+        model = self._model(flags="mlx_lm")
+        model.make_cache = MagicMock(side_effect=RuntimeError("boom"))
+        assert estimate_kv_cache_bytes(model, 40000) == self._expected(
+            40000, quant=False, single_chunk=False
+        )
+        model.make_cache = MagicMock(return_value=MagicMock())
+        assert estimate_kv_cache_bytes(model, 40000) == self._expected(
+            40000, quant=False, single_chunk=False
+        )
 
 
 class TestKvCachePreflightCheck:

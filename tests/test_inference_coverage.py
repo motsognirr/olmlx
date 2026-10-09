@@ -24,6 +24,7 @@ from unittest.mock import MagicMock
 import pytest
 
 import olmlx.engine.inference as _inf_mod
+from olmlx.engine.kv_budget import PREFILL_CHUNK_TOKENS
 from olmlx.engine.inference import (
     _add_native_tool_hint,
     _build_generate_kwargs,
@@ -176,18 +177,20 @@ class TestEstimateKvCacheBytes:
             args=_uniform_args(sliding_window=win),
             model=SimpleNamespace(layers=[SimpleNamespace(self_attn=attn)]),
         )
-        capped = estimate_kv_cache_bytes(model, 1000)
-        # Past the window more tokens don't grow the estimate.
-        assert estimate_kv_cache_bytes(model, 100) == capped
-        # Below the window the estimate scales with token count.
-        assert estimate_kv_cache_bytes(model, win - 1) < capped
+        # A rotating cache peaks at window + one prefill chunk (#762).
+        cap = win + PREFILL_CHUNK_TOKENS
+        capped = estimate_kv_cache_bytes(model, cap * 4)
+        # Past the cap more tokens don't grow the estimate.
+        assert estimate_kv_cache_bytes(model, cap + 1) == capped
+        # Below the cap the estimate scales with token count.
+        assert estimate_kv_cache_bytes(model, cap - 1) < capped
         # An identical non-sliding layer scales fully with the prompt.
         attn_full = SimpleNamespace(n_kv_heads=2, head_dim=64)
         model_full = SimpleNamespace(
             args=_uniform_args(),
             model=SimpleNamespace(layers=[SimpleNamespace(self_attn=attn_full)]),
         )
-        assert estimate_kv_cache_bytes(model_full, 1000) > capped
+        assert estimate_kv_cache_bytes(model_full, cap * 4) > capped
 
     def test_introspection_falls_back_when_kv_heads_unknown(self):
         # self_attn present but no recognised kv-head attribute → args fallback.
@@ -748,3 +751,49 @@ class TestFullCompletionFinishReason:
         )
         assert result["text"] == "aa "
         assert result["finish_reason"] == "stop"
+
+
+def test_inference_imports_without_mlx_lm():
+    """``kv_budget`` / ``inference`` guard their mlx-lm imports so the
+    module still imports (degraded) when mlx-lm is unavailable. Cache-type
+    predicates they need must not pull it in unconditionally (#762 review)."""
+    import subprocess
+    import sys
+
+    code = (
+        "import sys\n"
+        "for m in ('mlx_lm', 'mlx_lm.models', 'mlx_lm.models.cache',"
+        " 'mlx_lm.utils', 'mlx_lm.sample_utils', 'mlx_lm.generate'):\n"
+        "    sys.modules[m] = None\n"
+        "import olmlx.engine.inference\n"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", code], capture_output=True, text=True, timeout=120
+    )
+    assert result.returncode == 0, result.stderr[-2000:]
+
+
+def test_estimate_works_without_mlx_lm():
+    """The estimator itself (not just the import) must degrade without
+    mlx-lm: the cache-layout helpers live in ``turboquant_cache``, which
+    imports mlx-lm unconditionally, so it falls back to the layout-free
+    estimate instead of raising (#762 review)."""
+    import subprocess
+    import sys
+
+    code = (
+        "import sys\n"
+        "for m in ('mlx_lm', 'mlx_lm.models', 'mlx_lm.models.cache',"
+        " 'mlx_lm.utils', 'mlx_lm.sample_utils', 'mlx_lm.generate'):\n"
+        "    sys.modules[m] = None\n"
+        "from types import SimpleNamespace\n"
+        "from olmlx.engine.kv_budget import estimate_kv_cache_bytes\n"
+        "args = SimpleNamespace(num_hidden_layers=2, num_attention_heads=4,"
+        " num_key_value_heads=2, hidden_size=256)\n"
+        "model = SimpleNamespace(args=args, make_cache=lambda: [])\n"
+        "assert estimate_kv_cache_bytes(model, 10) == int(2*2*2*64*10*2*1.3)\n"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", code], capture_output=True, text=True, timeout=120
+    )
+    assert result.returncode == 0, result.stderr[-2000:]

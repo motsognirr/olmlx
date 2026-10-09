@@ -585,6 +585,19 @@ def _is_plain_kv_cache(cache: Any) -> bool:
     return isinstance(cache, KVCache) or type(cache) is _vlm_kv_cache_cls()
 
 
+def default_cache_layout(model: Any) -> list | None:
+    """The model's own per-layer cache list (``model.make_cache()``), or
+    ``None`` when it has none — mlx-lm then builds one plain ``KVCache`` per
+    layer. Single source for the KV-quant factories and the KV budget
+    estimate, so the estimate charges exactly the layout the factories
+    quantize (#762). A non-list result (e.g. a MagicMock) counts as none.
+    """
+    if not hasattr(model, "make_cache"):
+        return None
+    layout = model.make_cache()
+    return layout if isinstance(layout, list) else None
+
+
 @functools.cache
 def _vlm_kv_cache_cls() -> type | None:
     # Resolved once, lazily: importing mlx_vlm at module import would pull its
@@ -626,11 +639,8 @@ def build_kv_quant_caches(
 
     # Get default cache layout from model if available (hybrid models
     # return different cache types per layer, e.g. ArraysCache for SSM)
-    if hasattr(model, "make_cache"):
-        default_caches = model.make_cache()
-        if not isinstance(default_caches, list):
-            default_caches = [None] * num_layers
-    else:
+    default_caches = default_cache_layout(model)
+    if default_caches is None:
         default_caches = [None] * num_layers
 
     caches = []

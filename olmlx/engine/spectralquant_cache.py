@@ -399,7 +399,11 @@ def make_spectral_cache(
     import json
 
     from olmlx.engine.spectralquant_calibrate import load_calibration
-    from olmlx.engine.turboquant_cache import _detect_head_dim, _is_plain_kv_cache
+    from olmlx.engine.turboquant_cache import (
+        _detect_head_dim,
+        _is_plain_kv_cache,
+        default_cache_layout,
+    )
 
     calibration_dir = Path(calibration_dir)
     calibration = load_calibration(calibration_dir)
@@ -416,11 +420,8 @@ def make_spectral_cache(
     head_dim = _detect_head_dim(model)
 
     # Get default cache layout (hybrid model support)
-    if hasattr(model, "make_cache"):
-        default_caches = model.make_cache()
-        if not isinstance(default_caches, list):
-            default_caches = [None] * num_layers
-    else:
+    default_caches = default_cache_layout(model)
+    if default_caches is None:
         default_caches = [None] * num_layers
 
     caches = []
