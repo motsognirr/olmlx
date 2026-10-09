@@ -771,3 +771,29 @@ def test_inference_imports_without_mlx_lm():
         [sys.executable, "-c", code], capture_output=True, text=True, timeout=120
     )
     assert result.returncode == 0, result.stderr[-2000:]
+
+
+def test_estimate_works_without_mlx_lm():
+    """The estimator itself (not just the import) must degrade without
+    mlx-lm: the cache-layout helpers live in ``turboquant_cache``, which
+    imports mlx-lm unconditionally, so it falls back to the layout-free
+    estimate instead of raising (#762 review)."""
+    import subprocess
+    import sys
+
+    code = (
+        "import sys\n"
+        "for m in ('mlx_lm', 'mlx_lm.models', 'mlx_lm.models.cache',"
+        " 'mlx_lm.utils', 'mlx_lm.sample_utils', 'mlx_lm.generate'):\n"
+        "    sys.modules[m] = None\n"
+        "from types import SimpleNamespace\n"
+        "from olmlx.engine.kv_budget import estimate_kv_cache_bytes\n"
+        "args = SimpleNamespace(num_hidden_layers=2, num_attention_heads=4,"
+        " num_key_value_heads=2, hidden_size=256)\n"
+        "model = SimpleNamespace(args=args, make_cache=lambda: [])\n"
+        "assert estimate_kv_cache_bytes(model, 10) == int(2*2*2*64*10*2*1.3)\n"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", code], capture_output=True, text=True, timeout=120
+    )
+    assert result.returncode == 0, result.stderr[-2000:]

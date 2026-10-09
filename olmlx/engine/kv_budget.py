@@ -229,9 +229,14 @@ def estimate_kv_cache_bytes(
     # rotating entry is bounded by its own size, not by what ``self_attn``
     # reports. Lazy import: ``turboquant_cache`` imports mlx-lm
     # unconditionally, and this module degrades without it.
-    from olmlx.engine.turboquant_cache import _is_plain_kv_cache
-
-    layout = _default_cache_layout(args_owner)
+    try:
+        from olmlx.engine.turboquant_cache import _is_plain_kv_cache
+    except ImportError:
+        # No mlx-lm: estimate without a layout, as before #762.
+        layout = None
+        _is_plain_kv_cache = None  # type: ignore[assignment]
+    else:
+        layout = _default_cache_layout(args_owner)
     # Pure-rotating models (gpt-oss, Gemma 3) prefill the whole prompt in ONE
     # call, so their rotating layers briefly hold every prompt token.
     single_chunk_prefill = layout is not None and _is_pure_rotating_cache(layout)
