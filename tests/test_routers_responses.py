@@ -1203,6 +1203,12 @@ class TestMessageRoles:
         with pytest.raises(ValueError, match="role"):
             ResponsesRequest(model="qwen3", input=[{"role": role, "content": "hi"}])
 
+    def test_message_item_missing_role_names_role(self):
+        # A type=message item without a role used to fail as "unsupported
+        # input item type: 'message'", hiding the real defect.
+        with pytest.raises(ValueError, match="missing 'role'"):
+            _build_input_messages([{"type": "message", "content": "hi"}])
+
     def test_non_message_items_untouched(self):
         req = ResponsesRequest(
             model="qwen3",
