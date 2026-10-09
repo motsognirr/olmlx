@@ -1206,8 +1206,21 @@ class TestMessageRoles:
     def test_message_item_missing_role_names_role(self):
         # A type=message item without a role used to fail as "unsupported
         # input item type: 'message'", hiding the real defect.
+        # It is rejected by the schema, like an unknown role, so both reach
+        # the client as the same 400.
         with pytest.raises(ValueError, match="missing 'role'"):
-            _build_input_messages([{"type": "message", "content": "hi"}])
+            ResponsesRequest(
+                model="qwen3", input=[{"type": "message", "content": "hi"}]
+            )
+
+    @pytest.mark.asyncio
+    async def test_message_item_missing_role_returns_400(self, app_client):
+        resp = await app_client.post(
+            "/v1/responses",
+            json={"model": "qwen3", "input": [{"type": "message", "content": "hi"}]},
+        )
+        assert resp.status_code == 400, resp.text
+        assert "missing 'role'" in resp.json()["error"]["message"]
 
     def test_non_message_items_untouched(self):
         req = ResponsesRequest(

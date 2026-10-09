@@ -100,8 +100,6 @@ def _build_input_messages(input_data: str | list[dict]) -> list[dict]:
         role = item.get("role")
         if itype in (None, "message") and role is not None:
             messages.append(_message_item_to_engine(item))
-        elif itype == "message":
-            raise ValueError("message input item missing 'role'")
         elif itype == "function_call":
             name = item.get("name")
             if not name:
