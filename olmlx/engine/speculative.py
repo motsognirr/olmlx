@@ -33,6 +33,7 @@ from olmlx.engine.gdn_rollback import (
     find_gdn_class,
 )
 from olmlx.engine.prompt_cache.checkpoint import snapshot_cache_for_persistence
+from olmlx.engine.turboquant_cache import _is_pure_rotating_cache
 from olmlx.engine.spec_decoder_base import (
     SpecDecoderBase,
     # Canonical home moved to spec_decoder_base (#467); re-exported here
@@ -227,15 +228,6 @@ def _cache_has_lazy_state(cache: list) -> bool:
     (``ArraysCache``) that must be ``mx.eval``-materialized before a snapshot
     crosses the request/worker-thread boundary (#284 hazard family)."""
     return any(type(layer).__name__ in _LAZY_STATE_CACHE_NAMES for layer in cache)
-
-
-def _is_pure_rotating_cache(cache: list) -> bool:
-    """True iff the cache is a sliding-window layout (``RotatingKVCache``) with
-    no ``ArraysCache`` layers. These (gpt-oss, Step-3.5, Gemma 3) are fragile
-    under interior-boundary prefill splits, so speculative cache reuse skips
-    them and keeps the legacy fresh-prefill path."""
-    names = {type(layer).__name__ for layer in cache}
-    return "RotatingKVCache" in names and "ArraysCache" not in names
 
 
 def _spec_reuse_decision(

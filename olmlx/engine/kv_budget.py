@@ -49,7 +49,13 @@ from olmlx.engine.chat_templating import (
     _message_boundary_token_ids as _message_boundary_token_ids,
     _NATIVE_TOOL_HINT as _NATIVE_TOOL_HINT,
 )
-from olmlx.engine.turboquant_cache import _is_plain_kv_cache
+
+
+PREFILL_CHUNK_TOKENS = 2048
+"""Tokens per prefill ``model()`` call: mlx-lm ``generate_step``'s
+``prefill_step_size`` default, also used by the checkpoint path's segmented
+drive. A ``RotatingKVCache`` holds up to ``max_size - 1 + chunk`` tokens while
+prefilling, so the KV estimate charges its window plus one chunk (#762)."""
 
 
 MEMORY_SAFETY_FACTOR = 1.3
@@ -217,6 +223,47 @@ def estimate_kv_cache_bytes(
             return (layer_head_dim // (8 // key_bits) + 4) / fp16_per_entry
         return 1.0
 
+    # The cache layout the factories actually build (#762): only plain
+    # ``KVCache`` entries get quantized — rotating (sliding) entries and
+    # model-specific subclasses (Qwen3.8's ``QSAKVCache``) stay fp16 — and a
+    # rotating entry is bounded by its own size, not by what ``self_attn``
+    # reports. Lazy import: ``turboquant_cache`` imports mlx-lm
+    # unconditionally, and this module degrades without it.
+    from olmlx.engine.turboquant_cache import (
+        _is_plain_kv_cache,
+        _is_pure_rotating_cache,
+        _is_rotating_cache,
+    )
+
+    layout = _default_cache_layout(args_owner)
+    # Pure-rotating models (gpt-oss, Gemma 3) prefill the whole prompt in ONE
+    # call, so their rotating layers briefly hold every prompt token.
+    single_chunk_prefill = layout is not None and _is_pure_rotating_cache(layout)
+
+    def _layer_bytes(
+        kv_heads: int, layer_head_dim: int, entry: Any, window: int | None
+    ) -> float:
+        """Peak bytes for one layer's cache. ``window`` is the sliding cap
+        derived from ``self_attn``; a layout ``entry`` overrides it."""
+        if entry is not None:
+            window = None
+            if _is_rotating_cache(entry):
+                size = getattr(entry, "max_size", None)
+                window = size if isinstance(size, int) and size > 0 else None
+        if window is None or single_chunk_prefill:
+            tokens = num_tokens
+        else:
+            tokens = min(num_tokens, window + PREFILL_CHUNK_TOKENS)
+        quantized = entry is None or _is_plain_kv_cache(entry)
+        return (
+            2
+            * kv_heads
+            * layer_head_dim
+            * tokens
+            * bytes_per_element
+            * (_quant_ratio(layer_head_dim) if quantized else 1.0)
+        )
+
     # Try layer introspection for NAS/variable-attention/hybrid models.
     # ``args_owner`` was set above to the component whose args we resolved
     # (model.language_model for VLMs/wrappers, else model) so we introspect
@@ -229,39 +276,29 @@ def estimate_kv_cache_bytes(
         # n_kv_heads/head_dim and a hard cap on cache depth, while others
         # use full attention with their own dimensions.
         sliding_window = getattr(args, "sliding_window", None)
-        # The cache layout the factories actually build (#762): entry ``i``
-        # belongs to layer ``i``, a layer past the end owns no cache (Gemma
-        # 4's KV-shared tail), and only plain ``KVCache`` entries get
-        # quantized — rotating (sliding) entries and model-specific
-        # subclasses (Qwen3.8's ``QSAKVCache``) stay fp16.
-        layout = _default_cache_layout(args_owner)
-        if layout is not None and len(layout) != len(layers):
-            # The positional mapping is only verifiable for a layout that is
-            # exactly one entry per layer, or a prefix whose missing tail is
-            # explicitly flagged KV-shared. Anything else (a ``make_cache``
-            # that skips non-attention layers) could misalign and undercount,
-            # letting the preflight admit an OOM — so ignore it.
-            if len(layout) > len(layers) or not all(
+        # Entry ``i`` belongs to layer ``i``. That mapping is only verifiable
+        # for a layout with exactly one entry per layer, or a prefix whose
+        # missing tail is explicitly flagged KV-shared (Gemma 4). Anything
+        # else — Nemotron-NAS's ``make_cache`` skips its no-op layers — could
+        # misalign and undercount, letting the preflight admit an OOM, so the
+        # per-layer walk ignores it.
+        layer_layout = layout
+        if layer_layout is not None and len(layer_layout) != len(layers):
+            if len(layer_layout) > len(layers) or not all(
                 _is_kv_shared_attn(getattr(layer, "self_attn", None))
-                for layer in layers[len(layout) :]
+                for layer in layers[len(layer_layout) :]
             ):
-                layout = None
-        raw_total = 0
+                layer_layout = None
+        raw_total = 0.0
         found_attn_layer = False
         introspection_complete = True
         for i, layer in enumerate(layers):
             self_attn = getattr(layer, "self_attn", None)
             if self_attn is None:
                 continue  # no-op attention layer — no KV cache
-            # KV-shared layers (Gemma 4) read an earlier layer's cache and own
-            # none.
             if _is_kv_shared_attn(self_attn):
-                continue
-            entry = None
-            if layout is not None:
-                if i >= len(layout):
-                    continue
-                entry = layout[i]
+                continue  # reads an earlier layer's cache, owns none
+            entry = layer_layout[i] if layer_layout is not None else None
             layer_kv_heads = getattr(self_attn, "n_kv_heads", None)
             if not isinstance(layer_kv_heads, int):
                 # Try alternate attribute name (e.g. Qwen3-Next uses
@@ -280,12 +317,12 @@ def estimate_kv_cache_bytes(
             layer_head_dim = (
                 attn_head_dim if isinstance(attn_head_dim, int) else head_dim
             )
-            # Sliding-window attention: cap effective tokens at the window
-            # size.  Use `is True` to avoid being fooled by truthy MagicMocks
-            # in tests; production code sets a literal bool.  Prefer a
-            # per-layer window if exposed (defensive — Gemma 4 today shares
-            # a single window across all sliding layers via args, but a
-            # future model could expose heterogeneous windows).
+            # Without a layout entry, sliding-window attention is read off
+            # ``self_attn``.  Use `is True` to avoid being fooled by truthy
+            # MagicMocks in tests; production code sets a literal bool.
+            # Prefer a per-layer window if exposed (defensive — Gemma 4 today
+            # shares a single window across all sliding layers via args, but
+            # a future model could expose heterogeneous windows).
             is_sliding = getattr(self_attn, "is_sliding", None) is True
             layer_sw: int | None = None
             for attr in ("sliding_window_size", "sliding_window"):
@@ -295,13 +332,7 @@ def estimate_kv_cache_bytes(
                     break
             if layer_sw is None and isinstance(sliding_window, int):
                 layer_sw = sliding_window
-            rotating_size = _rotating_max_size(entry)
-            if rotating_size is not None:
-                # The layout is authoritative: a rotating entry is capped at
-                # its own size whatever ``self_attn`` reports.
-                is_sliding = True
-                layer_sw = rotating_size
-            if is_sliding and layer_sw is None:
+            if is_sliding and layer_sw is None and entry is None:
                 # A sliding-window layer with no resolvable window size
                 # falls through to a full-prompt estimate (safe overestimate
                 # — won't cause OOM, just a spurious 503 on long prompts).
@@ -312,22 +343,11 @@ def estimate_kv_cache_bytes(
                     "KV estimation (safe overestimate)",
                     getattr(self_attn, "layer_idx", -1),
                 )
-            effective_tokens = (
-                min(num_tokens, layer_sw)
-                if is_sliding and layer_sw is not None
-                else num_tokens
-            )
-            raw_total += (
-                2
-                * layer_kv_heads
-                * layer_head_dim
-                * effective_tokens
-                * bytes_per_element
-                * (
-                    _quant_ratio(layer_head_dim)
-                    if entry is None or _is_plain_kv_cache(entry)
-                    else 1.0
-                )
+            raw_total += _layer_bytes(
+                layer_kv_heads,
+                layer_head_dim,
+                entry,
+                layer_sw if is_sliding else None,
             )
         # Only trust introspection when every encountered layer reported its
         # KV heads.  found_attn_layer == False likely means the attention
@@ -336,31 +356,34 @@ def estimate_kv_cache_bytes(
         if introspection_complete and found_attn_layer:
             return int(raw_total * MEMORY_SAFETY_FACTOR)
 
-    # Fallback: uniform estimate from args
-    num_layers = args.num_hidden_layers
+    # Fallback: uniform per-layer dims from args.
     num_kv_heads = getattr(args, "num_key_value_heads", num_heads)
+    if layout is not None:
+        # One charge per cache the model actually builds — KV-shared layers
+        # own none, and only plain entries are quantized. The dims are
+        # uniform here, so the entry-to-layer alignment doesn't matter.
+        raw = sum(_layer_bytes(num_kv_heads, head_dim, entry, None) for entry in layout)
+        return int(raw * MEMORY_SAFETY_FACTOR)
+    num_layers = args.num_hidden_layers
     raw = num_layers * 2 * num_kv_heads * head_dim * num_tokens * bytes_per_element
     return int(raw * _quant_ratio(head_dim) * MEMORY_SAFETY_FACTOR)
 
 
 def _default_cache_layout(model: Any) -> list | None:
-    """The model's default per-layer cache list (``model.make_cache()``),
-    the layout every KV-quant factory starts from — or ``None`` when the
-    model has none (mlx-lm then builds one plain ``KVCache`` per layer).
+    """``turboquant_cache.default_cache_layout`` — the layout every KV-quant
+    factory starts from — or ``None`` when it's unavailable.
 
-    Building it is cheap: the caches are empty until the first forward.
-    A failing or non-list ``make_cache`` (e.g. a MagicMock) yields ``None``
-    so the estimate falls back to per-layer introspection.
+    Building it is cheap (~2 µs on Gemma 4 E2B): the caches are empty until
+    the first forward. Unlike the factories, a failing ``make_cache`` only
+    degrades the estimate to per-layer introspection; it never fails it.
     """
-    make_cache = getattr(model, "make_cache", None)
-    if not callable(make_cache):
-        return None
+    from olmlx.engine.turboquant_cache import default_cache_layout
+
     try:
-        layout = make_cache()
+        return default_cache_layout(model)
     except Exception:
         logger.debug("make_cache() failed; estimating from layers", exc_info=True)
         return None
-    return layout if isinstance(layout, list) else None
 
 
 def _is_kv_shared_attn(self_attn: Any) -> bool:
@@ -372,19 +395,6 @@ def _is_kv_shared_attn(self_attn: Any) -> bool:
         getattr(self_attn, "has_kv", None) is False
         or getattr(self_attn, "is_kv_shared_layer", None) is True
     )
-
-
-def _rotating_max_size(entry: Any) -> int | None:
-    """``max_size`` of a rotating (sliding-window) cache entry, else ``None``.
-
-    Matched by class name so mlx-vlm's ``RotatingKVCache`` (which doesn't
-    subclass mlx-lm's) counts too."""
-    if entry is None or not any(
-        cls.__name__ == "RotatingKVCache" for cls in type(entry).__mro__
-    ):
-        return None
-    size = getattr(entry, "max_size", None)
-    return size if isinstance(size, int) and size > 0 else None
 
 
 def tokenize_for_cache(tokenizer: Any, prompt_text: str) -> list[int]:

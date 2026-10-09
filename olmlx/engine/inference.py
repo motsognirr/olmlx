@@ -115,11 +115,13 @@ from olmlx.engine.generation_options import (  # noqa: F401
 )
 from olmlx.engine.kv_budget import (  # noqa: F401
     MEMORY_SAFETY_FACTOR,
+    PREFILL_CHUNK_TOKENS,
     _parse_kv_cache_quant_kv,
     build_context_input_tokens,
     estimate_kv_cache_bytes,
     tokenize_for_cache,
 )
+from olmlx.engine.turboquant_cache import _is_pure_rotating_cache
 
 
 def _strategy_label(lm: "LoadedModel") -> str:
@@ -1692,8 +1694,9 @@ class _CacheSetupResult:
 # on non-pure-rotating (GatedDeltaNet/ArraysCache) caches. Matches mlx-lm's
 # ``generate_step`` ``prefill_step_size`` default so the checkpoint path bounds
 # activation memory the same way mlx-lm's native prefill does (avoids the
-# 70k-token single-forward OOM).
-_PREFILL_CHUNK = 2048
+# 70k-token single-forward OOM). Shared with the KV budget estimate, which
+# charges rotating caches one chunk of headroom.
+_PREFILL_CHUNK = PREFILL_CHUNK_TOKENS
 
 
 def _drive_segmented_prefill(
@@ -1931,22 +1934,6 @@ def _cache_list_contains_lazy_state(cache: list[Any]) -> bool:
         for layer in cache
         for cls in type(layer).__mro__
     )
-
-
-def _is_pure_rotating_cache(cache: list[Any]) -> bool:
-    """True iff the cache is a sliding-window layout (has ``RotatingKVCache``)
-    with no ``ArraysCache`` (GatedDeltaNet/SSM) layers.
-
-    These models — gpt-oss, Step-3.5, Gemma 3 — must be prefilled in a SINGLE
-    ``model(...)`` call.  The two-chunk checkpoint drive (which exists only to
-    bound GatedDeltaNet recurrent-state drift on ``ArraysCache`` models)
-    corrupts sliding-window attention here: splitting the prefill at an
-    interior message boundary makes the model generate coherent-but-unrelated
-    output and skip tool calls.  Mixed Rotating+Arrays layouts (Qwen3-Next)
-    return False — they keep the two-chunk drive for the SSM part.
-    """
-    names = {type(layer).__name__ for layer in cache}
-    return "RotatingKVCache" in names and "ArraysCache" not in names
 
 
 async def _setup_via_checkpoint_path(
