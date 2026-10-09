@@ -11,7 +11,6 @@ from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from olmlx.config import settings
-from olmlx.engine.chat_templating import _merge_system_turns
 from olmlx.engine.grammar import parse_response_format
 from olmlx.engine.inference import (
     INIT_ORPHAN_DETECT_LIMIT,
@@ -21,6 +20,7 @@ from olmlx.engine.inference import (
 )
 from olmlx.engine.panel import panel_generate_chat
 from olmlx.routers.common import (
+    _merge_leading_system_messages,
     build_inference_options,
     collect_content_parts,
     resolve_openai_think,
@@ -382,28 +382,6 @@ def _normalize_multimodal_messages(messages: list[dict]) -> list[dict]:
         if audio:
             m["audio"] = (m.get("audio") or []) + audio
     return messages
-
-
-def _merge_leading_system_messages(messages: list[dict]) -> list[dict]:
-    """Fold the leading run of system messages into a single system message.
-
-    ``developer`` is normalized to ``system`` by the schema (#710), so a client
-    sending ``system`` + ``developer`` produces two leading system turns.
-    Strict chat templates (Qwen3.5/3.6) raise "System message must be at the
-    beginning." on the second one. Only the leading run is folded here; a
-    mid-conversation system turn keeps its position, and ``generate_chat``
-    folds it to the front only for templates that reject it
-    (``TemplateCaps.rejects_positional_system``, #740). Runs after
-    ``_normalize_multimodal_messages``, so content is a string or absent.
-    Metadata rules are shared with the engine fold via
-    ``_merge_system_turns``.
-    """
-    run = 0
-    while run < len(messages) and messages[run].get("role") == "system":
-        run += 1
-    if run < 2:
-        return messages
-    return [_merge_system_turns(messages[:run]), *messages[run:]]
 
 
 @router.post(

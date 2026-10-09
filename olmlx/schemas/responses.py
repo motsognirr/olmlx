@@ -5,6 +5,7 @@ from typing import Any
 from pydantic import BaseModel, Field, field_validator
 
 from olmlx.schemas.common import ModelName
+from olmlx.schemas.openai import normalize_message_role
 
 
 class ResponsesRequest(BaseModel):
@@ -40,6 +41,17 @@ class ResponsesRequest(BaseModel):
                 raise ValueError("input string cannot be empty")
         elif not v:
             raise ValueError("input list cannot be empty")
+        else:
+            # Message items get the chat-completions role contract (#739):
+            # "developer" -> "system", unknown roles -> 400. Otherwise a role
+            # no chat template renders would be silently dropped.
+            v = [
+                {**item, "role": normalize_message_role(item["role"])}
+                if item.get("type") in (None, "message")
+                and item.get("role") is not None
+                else item
+                for item in v
+            ]
         return v
 
     @field_validator("max_output_tokens")

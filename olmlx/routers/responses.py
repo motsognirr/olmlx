@@ -19,6 +19,7 @@ from olmlx.routers.streaming_common import (
     validate_declared_tools,
 )
 from olmlx.routers.common import (
+    _merge_leading_system_messages,
     build_inference_options,
     resolve_openai_think,
     resolve_tool_choice,
@@ -840,6 +841,9 @@ async def create_response(req: ResponsesRequest, request: Request):
             {"role": "system", "content": req.instructions},
             *conversation,
         ]
+    # instructions + a leading developer/system item would be two leading
+    # system turns, which strict templates (Qwen3.5/3.6) reject (#739).
+    engine_messages = _merge_leading_system_messages(engine_messages)
 
     options = build_inference_options(
         temperature=req.temperature, top_p=req.top_p, seed=req.seed
