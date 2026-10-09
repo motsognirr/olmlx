@@ -1174,3 +1174,131 @@ class TestStreamSdkAccumulation:
         snap = await self._stream(app_client, "hello", tools=False)
         msgs = [o for o in snap.output if o.type == "message"]
         assert [c.text for c in msgs[0].content] == ["hello"]
+
+
+class TestMessageRoles:
+    """#739: roles get the same alias map / allow-list as /v1/chat/completions."""
+
+    def test_developer_role_maps_to_system(self):
+        req = ResponsesRequest(
+            model="qwen3",
+            input=[
+                {"role": "developer", "content": "be terse"},
+                {"role": "user", "content": "hi"},
+            ],
+        )
+        msgs = _build_input_messages(req.input)
+        assert msgs[0] == {"role": "system", "content": "be terse"}
+
+    def test_unknown_role_rejected_by_schema(self):
+        with pytest.raises(ValueError, match="role"):
+            ResponsesRequest(
+                model="qwen3", input=[{"role": "bogus_role", "content": "hi"}]
+            )
+
+    @pytest.mark.parametrize("role", [["user"], {"x": 1}, 5])
+    def test_non_string_role_rejected(self, role):
+        # An unhashable role must be a validation error (400), not a TypeError
+        # escaping the validator as a 500.
+        with pytest.raises(ValueError, match="role"):
+            ResponsesRequest(model="qwen3", input=[{"role": role, "content": "hi"}])
+
+    def test_message_item_missing_role_names_role(self):
+        # A type=message item without a role used to fail as "unsupported
+        # input item type: 'message'", hiding the real defect.
+        # It is rejected by the schema, like an unknown role, so both reach
+        # the client as the same 400.
+        with pytest.raises(ValueError, match="missing 'role'"):
+            ResponsesRequest(
+                model="qwen3", input=[{"type": "message", "content": "hi"}]
+            )
+
+    @pytest.mark.asyncio
+    async def test_message_item_missing_role_returns_400(self, app_client):
+        resp = await app_client.post(
+            "/v1/responses",
+            json={"model": "qwen3", "input": [{"type": "message", "content": "hi"}]},
+        )
+        assert resp.status_code == 400, resp.text
+        assert "missing 'role'" in resp.json()["error"]["message"]
+
+    def test_non_message_items_untouched(self):
+        req = ResponsesRequest(
+            model="qwen3",
+            input=[
+                {"type": "function_call_output", "call_id": "c1", "output": "x"},
+            ],
+        )
+        assert req.input[0] == {
+            "type": "function_call_output",
+            "call_id": "c1",
+            "output": "x",
+        }
+
+    @pytest.mark.asyncio
+    async def test_developer_reaches_engine_as_system(self, app_client):
+        mock_result = {"text": "ok", "done": True, "stats": TimingStats()}
+        with patch(
+            "olmlx.routers.responses.generate_chat", new_callable=AsyncMock
+        ) as mock_gen:
+            mock_gen.return_value = mock_result
+            resp = await app_client.post(
+                "/v1/responses",
+                json={
+                    "model": "qwen3",
+                    "input": [
+                        {"role": "developer", "content": "be terse"},
+                        {"role": "user", "content": "hi"},
+                    ],
+                },
+            )
+        assert resp.status_code == 200, resp.text
+        sent = mock_gen.call_args.args[2]
+        assert sent == [
+            {"role": "system", "content": "be terse"},
+            {"role": "user", "content": "hi"},
+        ]
+
+    @pytest.mark.asyncio
+    async def test_unknown_role_returns_400(self, app_client):
+        with patch(
+            "olmlx.routers.responses.generate_chat", new_callable=AsyncMock
+        ) as mock_gen:
+            resp = await app_client.post(
+                "/v1/responses",
+                json={
+                    "model": "qwen3",
+                    "input": [{"role": "bogus_role", "content": "hi"}],
+                },
+            )
+        assert resp.status_code == 400, resp.text
+        assert "role" in resp.json()["error"]["message"]
+        mock_gen.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_instructions_and_developer_fold_into_one_system(self, app_client):
+        # instructions is prepended as a system turn; a developer item right
+        # after it would make two leading system turns, which strict templates
+        # (Qwen3.5/3.6) reject. They must reach the engine as one.
+        mock_result = {"text": "ok", "done": True, "stats": TimingStats()}
+        with patch(
+            "olmlx.routers.responses.generate_chat", new_callable=AsyncMock
+        ) as mock_gen:
+            mock_gen.return_value = mock_result
+            resp = await app_client.post(
+                "/v1/responses",
+                json={
+                    "model": "qwen3",
+                    "instructions": "you are helpful",
+                    "input": [
+                        {"role": "developer", "content": "be terse"},
+                        {"role": "user", "content": "hi"},
+                    ],
+                },
+            )
+        assert resp.status_code == 200, resp.text
+        sent = mock_gen.call_args.args[2]
+        assert sent == [
+            {"role": "system", "content": "you are helpful\n\nbe terse"},
+            {"role": "user", "content": "hi"},
+        ]

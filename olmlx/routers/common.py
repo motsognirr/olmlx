@@ -5,6 +5,7 @@ from collections.abc import Iterable
 from datetime import datetime, timezone
 from typing import Any
 
+from olmlx.engine.chat_templating import _merge_system_turns
 from olmlx.utils.audio_input import normalize_audio_block
 from olmlx.utils.images import normalize_image_block
 
@@ -230,3 +231,26 @@ async def load_or_unload_response(
         body["response"] = ""
     body.update(done=True, done_reason=reason)
     return body
+
+
+def _merge_leading_system_messages(messages: list[dict]) -> list[dict]:
+    """Fold the leading run of system messages into a single system message.
+
+    ``developer`` is normalized to ``system`` by the schema (#710), so a client
+    sending ``system`` + ``developer`` produces two leading system turns (on
+    ``/v1/responses``, ``instructions`` + a ``developer`` item does too, #739).
+    Strict chat templates (Qwen3.5/3.6) raise "System message must be at the
+    beginning." on the second one. Only the leading run is folded here; a
+    mid-conversation system turn keeps its position, and ``generate_chat``
+    folds it to the front only for templates that reject it
+    (``TemplateCaps.rejects_positional_system``, #740). Callers run it after
+    content normalization, so content is a string or absent.
+    Metadata rules are shared with the engine fold via
+    ``_merge_system_turns``.
+    """
+    run = 0
+    while run < len(messages) and messages[run].get("role") == "system":
+        run += 1
+    if run < 2:
+        return messages
+    return [_merge_system_turns(messages[:run]), *messages[run:]]

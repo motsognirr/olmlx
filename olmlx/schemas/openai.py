@@ -27,6 +27,20 @@ _VALID_ROLES = frozenset({"system", "user", "assistant", "tool"})
 _ROLE_ALIASES = {"developer": "system"}
 
 
+def normalize_message_role(v: str) -> str:
+    """Map ``developer`` to ``system`` and reject roles no template renders.
+
+    Shared by ``/v1/chat/completions`` and ``/v1/responses`` (#739).
+    """
+    if not isinstance(v, str):
+        raise ValueError(f"role must be a string, got {type(v).__name__}")
+    v = _ROLE_ALIASES.get(v, v)
+    if v not in _VALID_ROLES:
+        accepted = sorted(_VALID_ROLES | _ROLE_ALIASES.keys())
+        raise ValueError(f"role must be one of {accepted}, got {v!r}")
+    return v
+
+
 class OpenAIChatMessage(BaseModel):
     role: str
     content: str | list[dict[str, Any]] | None = None
@@ -37,11 +51,7 @@ class OpenAIChatMessage(BaseModel):
     @field_validator("role")
     @classmethod
     def validate_role(cls, v: str) -> str:
-        v = _ROLE_ALIASES.get(v, v)
-        if v not in _VALID_ROLES:
-            accepted = sorted(_VALID_ROLES | _ROLE_ALIASES.keys())
-            raise ValueError(f"role must be one of {accepted}, got {v!r}")
-        return v
+        return normalize_message_role(v)
 
     @model_validator(mode="after")
     def _content_required(self) -> "OpenAIChatMessage":
