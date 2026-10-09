@@ -585,31 +585,6 @@ def _is_plain_kv_cache(cache: Any) -> bool:
     return isinstance(cache, KVCache) or type(cache) is _vlm_kv_cache_cls()
 
 
-def _is_rotating_cache(cache: Any) -> bool:
-    """True for a sliding-window ``RotatingKVCache`` layer cache.
-
-    Matched by class name along the MRO so mlx-vlm's ``RotatingKVCache``
-    (which doesn't subclass mlx-lm's) counts too."""
-    return any(cls.__name__ == "RotatingKVCache" for cls in type(cache).__mro__)
-
-
-def _is_pure_rotating_cache(cache: list) -> bool:
-    """True iff the cache is a sliding-window layout (has a
-    ``RotatingKVCache``) with no ``ArraysCache`` (GatedDeltaNet/SSM) layers.
-
-    These models — gpt-oss, Step-3.5, Gemma 3 — must be prefilled in a SINGLE
-    ``model(...)`` call: splitting at an interior message boundary corrupts
-    sliding-window attention (coherent-but-unrelated output, skipped tool
-    calls). Speculative cache reuse skips them for the same reason, and the
-    KV budget estimate charges their rotating layers the whole prompt (a
-    single-call prefill holds it all). Mixed Rotating+Arrays layouts
-    (Qwen3-Next) return False.
-    """
-    return any(_is_rotating_cache(layer) for layer in cache) and not any(
-        type(layer).__name__ == "ArraysCache" for layer in cache
-    )
-
-
 def default_cache_layout(model: Any) -> list | None:
     """The model's own per-layer cache list (``model.make_cache()``), or
     ``None`` when it has none — mlx-lm then builds one plain ``KVCache`` per

@@ -33,7 +33,7 @@ from olmlx.engine.gdn_rollback import (
     find_gdn_class,
 )
 from olmlx.engine.prompt_cache.checkpoint import snapshot_cache_for_persistence
-from olmlx.engine.turboquant_cache import _is_pure_rotating_cache
+from olmlx.engine.kv_budget import _is_pure_rotating_cache
 from olmlx.engine.spec_decoder_base import (
     SpecDecoderBase,
     # Canonical home moved to spec_decoder_base (#467); re-exported here

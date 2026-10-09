@@ -121,7 +121,7 @@ from olmlx.engine.kv_budget import (  # noqa: F401
     estimate_kv_cache_bytes,
     tokenize_for_cache,
 )
-from olmlx.engine.turboquant_cache import _is_pure_rotating_cache
+from olmlx.engine.kv_budget import _is_pure_rotating_cache
 
 
 def _strategy_label(lm: "LoadedModel") -> str:

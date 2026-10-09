@@ -5172,6 +5172,22 @@ class TestEstimateKvCacheBytesCacheLayout:
         assert fp16 == int(3 * 2 * 8 * 128 * 1000 * 2 * _inf_mod.MEMORY_SAFETY_FACTOR)
         assert shard < fp16
 
+    def test_args_fallback_charges_largest_declared_dims(self):
+        """With no per-layer dims, the fallback charges every entry the
+        largest head dim / KV-head count the config declares, so it can't
+        undercount Gemma 4's 512-dim full-attention layers."""
+        model = self._model(flags="mlx_lm")
+        model.args.global_head_dim = 512
+        model.args.num_global_key_value_heads = 2
+        for layer in model.model.layers:
+            layer.self_attn.n_kv_heads = None  # breaks introspection
+        n = 40000
+        owned = self.N_LAYERS - self.N_SHARED
+        raw = owned * 2 * 2 * 512 * n * 2  # single-chunk: rotating hold all n
+        assert estimate_kv_cache_bytes(model, n) == int(
+            raw * _inf_mod.MEMORY_SAFETY_FACTOR
+        )
+
     def test_args_fallback_follows_layout(self):
         """When per-layer introspection fails (no int ``n_kv_heads``), the
         args-based fallback charges one entry per cache in the layout —

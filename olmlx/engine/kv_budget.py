@@ -229,11 +229,7 @@ def estimate_kv_cache_bytes(
     # rotating entry is bounded by its own size, not by what ``self_attn``
     # reports. Lazy import: ``turboquant_cache`` imports mlx-lm
     # unconditionally, and this module degrades without it.
-    from olmlx.engine.turboquant_cache import (
-        _is_plain_kv_cache,
-        _is_pure_rotating_cache,
-        _is_rotating_cache,
-    )
+    from olmlx.engine.turboquant_cache import _is_plain_kv_cache
 
     layout = _default_cache_layout(args_owner)
     # Pure-rotating models (gpt-oss, Gemma 3) prefill the whole prompt in ONE
@@ -365,13 +361,29 @@ def estimate_kv_cache_bytes(
     num_kv_heads = getattr(args, "num_key_value_heads", num_heads)
     if layout is not None:
         # One charge per cache the model actually builds — KV-shared layers
-        # own none, and only plain entries are quantized. The dims are
-        # uniform here, so the entry-to-layer alignment doesn't matter.
-        raw = sum(_layer_bytes(num_kv_heads, head_dim, entry, None) for entry in layout)
+        # own none, and only plain entries are quantized. With no per-layer
+        # dims, charge every entry the largest the config declares (Gemma 4's
+        # full-attention layers use ``global_head_dim``/
+        # ``num_global_key_value_heads``), so dropping the shared layers can't
+        # turn the old overcount into an undercount. The dims are uniform, so
+        # the entry-to-layer alignment doesn't matter.
+        fb_kv_heads = _max_int(
+            num_kv_heads, getattr(args, "num_global_key_value_heads", None)
+        )
+        fb_head_dim = _max_int(head_dim, getattr(args, "global_head_dim", None))
+        raw = sum(
+            _layer_bytes(fb_kv_heads, fb_head_dim, entry, None) for entry in layout
+        )
         return int(raw * MEMORY_SAFETY_FACTOR)
     num_layers = args.num_hidden_layers
     raw = num_layers * 2 * num_kv_heads * head_dim * num_tokens * bytes_per_element
     return int(raw * _quant_ratio(head_dim) * MEMORY_SAFETY_FACTOR)
+
+
+def _max_int(base: int, other: Any) -> int:
+    """``max(base, other)``, ignoring a non-int ``other`` (unset config
+    fields are ``None``; test MagicMocks are not ints)."""
+    return max(base, other) if isinstance(other, int) else base
 
 
 def _default_cache_layout(model: Any) -> list | None:
@@ -389,6 +401,35 @@ def _default_cache_layout(model: Any) -> list | None:
     except Exception:
         logger.debug("make_cache() failed; estimating from layers", exc_info=True)
         return None
+
+
+def _has_cache_class(cache: Any, name: str) -> bool:
+    """Whether ``cache``'s class or any base is named ``name``. By name so
+    mlx-vlm's cache classes (which don't subclass mlx-lm's) match too."""
+    return any(cls.__name__ == name for cls in type(cache).__mro__)
+
+
+def _is_rotating_cache(cache: Any) -> bool:
+    """True for a sliding-window ``RotatingKVCache`` layer cache."""
+    return _has_cache_class(cache, "RotatingKVCache")
+
+
+def _is_pure_rotating_cache(cache: list) -> bool:
+    """True iff the cache is a sliding-window layout (has a
+    ``RotatingKVCache``) with no ``ArraysCache`` (GatedDeltaNet/SSM) layers.
+
+    These models — gpt-oss, Step-3.5, Gemma 3/4 — must be prefilled in a
+    SINGLE ``model(...)`` call: splitting at an interior message boundary
+    corrupts sliding-window attention (coherent-but-unrelated output, skipped
+    tool calls). Speculative cache reuse skips them for the same reason, and
+    the KV budget estimate charges their rotating layers the whole prompt
+    (a single-call prefill holds it all). Mixed Rotating+Arrays layouts
+    (Qwen3-Next) return False. Pure Python, so ``inference``/``speculative``
+    can import it without mlx-lm.
+    """
+    return any(_is_rotating_cache(layer) for layer in cache) and not any(
+        _has_cache_class(layer, "ArraysCache") for layer in cache
+    )
 
 
 def _is_kv_shared_attn(self_attn: Any) -> bool:

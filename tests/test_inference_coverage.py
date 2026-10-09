@@ -751,3 +751,23 @@ class TestFullCompletionFinishReason:
         )
         assert result["text"] == "aa "
         assert result["finish_reason"] == "stop"
+
+
+def test_inference_imports_without_mlx_lm():
+    """``kv_budget`` / ``inference`` guard their mlx-lm imports so the
+    module still imports (degraded) when mlx-lm is unavailable. Cache-type
+    predicates they need must not pull it in unconditionally (#762 review)."""
+    import subprocess
+    import sys
+
+    code = (
+        "import sys\n"
+        "for m in ('mlx_lm', 'mlx_lm.models', 'mlx_lm.models.cache',"
+        " 'mlx_lm.utils', 'mlx_lm.sample_utils', 'mlx_lm.generate'):\n"
+        "    sys.modules[m] = None\n"
+        "import olmlx.engine.inference\n"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", code], capture_output=True, text=True, timeout=120
+    )
+    assert result.returncode == 0, result.stderr[-2000:]
