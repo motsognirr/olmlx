@@ -235,6 +235,17 @@ def estimate_kv_cache_bytes(
         # quantized — rotating (sliding) entries and model-specific
         # subclasses (Qwen3.8's ``QSAKVCache``) stay fp16.
         layout = _default_cache_layout(args_owner)
+        if layout is not None and len(layout) != len(layers):
+            # The positional mapping is only verifiable for a layout that is
+            # exactly one entry per layer, or a prefix whose missing tail is
+            # explicitly flagged KV-shared. Anything else (a ``make_cache``
+            # that skips non-attention layers) could misalign and undercount,
+            # letting the preflight admit an OOM — so ignore it.
+            if len(layout) > len(layers) or not all(
+                _is_kv_shared_attn(getattr(layer, "self_attn", None))
+                for layer in layers[len(layout) :]
+            ):
+                layout = None
         raw_total = 0
         found_attn_layer = False
         introspection_complete = True
@@ -243,12 +254,8 @@ def estimate_kv_cache_bytes(
             if self_attn is None:
                 continue  # no-op attention layer — no KV cache
             # KV-shared layers (Gemma 4) read an earlier layer's cache and own
-            # none. mlx-lm marks them ``has_kv=False``, mlx-vlm
-            # ``is_kv_shared_layer=True``. Identity checks: MagicMock layers.
-            if (
-                getattr(self_attn, "has_kv", None) is False
-                or getattr(self_attn, "is_kv_shared_layer", None) is True
-            ):
+            # none.
+            if _is_kv_shared_attn(self_attn):
                 continue
             entry = None
             if layout is not None:
@@ -354,6 +361,17 @@ def _default_cache_layout(model: Any) -> list | None:
         logger.debug("make_cache() failed; estimating from layers", exc_info=True)
         return None
     return layout if isinstance(layout, list) else None
+
+
+def _is_kv_shared_attn(self_attn: Any) -> bool:
+    """A KV-shared attention module (Gemma 4) reads an earlier layer's cache
+    and owns none. mlx-lm marks it ``has_kv=False``, mlx-vlm
+    ``is_kv_shared_layer=True``. Identity checks so MagicMock layers aren't
+    mistaken for shared ones."""
+    return (
+        getattr(self_attn, "has_kv", None) is False
+        or getattr(self_attn, "is_kv_shared_layer", None) is True
+    )
 
 
 def _rotating_max_size(entry: Any) -> int | None:

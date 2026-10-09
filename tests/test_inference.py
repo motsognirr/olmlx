@@ -4932,10 +4932,12 @@ class TestEstimateKvCacheBytesCacheLayout:
             model.make_cache = MagicMock(side_effect=lambda: list(built))
         return model
 
-    def _expected(self, num_tokens: int, *, quant: bool, owned=None) -> int:
+    def _expected(
+        self, num_tokens: int, *, quant: bool, owned=None, layers=None
+    ) -> int:
         owned = self.N_LAYERS - self.N_SHARED if owned is None else owned
         raw = 0.0
-        for i in range(owned):
+        for i in range(owned) if layers is None else layers:
             if self._is_full(i):
                 raw += (
                     2 * 512 * num_tokens * 2 * (self._tq4_ratio(512) if quant else 1.0)
@@ -4959,13 +4961,27 @@ class TestEstimateKvCacheBytesCacheLayout:
             40000, quant=False
         )
 
-    def test_kv_shared_layers_not_charged_from_layout_length(self):
-        """No per-layer flag at all: layers past the end of the
-        ``make_cache()`` layout own no cache."""
+    def test_short_layout_without_shared_flags_is_ignored(self):
+        """A layout shorter than ``layers`` is only trusted when every layer
+        past its end is flagged KV-shared. Otherwise the positional mapping
+        can't be verified (a ``make_cache`` that skips non-attention layers
+        would misalign it), so the layout is ignored and every attention
+        layer is charged — over-, never under-counting."""
         model = self._model(flags="none")
         assert estimate_kv_cache_bytes(model, 40000) == self._expected(
-            40000, quant=False
+            40000, quant=False, owned=self.N_LAYERS
         )
+
+    def test_short_layout_with_partially_flagged_tail_is_ignored(self):
+        model = self._model(flags="mlx_lm")
+        # One tail layer loses its flag: the tail is no longer provably shared.
+        del model.model.layers[-1].self_attn.has_kv
+        model.model.layers[-1].self_attn.has_kv = None
+        result = estimate_kv_cache_bytes(model, 40000)
+        # Flagged layers are still skipped; the unflagged one is charged, and
+        # the layout no longer caps/excludes anything by position.
+        charged = [*range(self.N_LAYERS - self.N_SHARED), self.N_LAYERS - 1]
+        assert result == self._expected(40000, quant=False, layers=charged)
 
     def test_kv_shared_flag_honoured_without_make_cache(self):
         model = self._model(flags="mlx_lm", make_cache=False)
