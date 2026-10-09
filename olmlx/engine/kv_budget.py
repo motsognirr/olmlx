@@ -49,6 +49,7 @@ from olmlx.engine.chat_templating import (
     _message_boundary_token_ids as _message_boundary_token_ids,
     _NATIVE_TOOL_HINT as _NATIVE_TOOL_HINT,
 )
+from olmlx.engine.turboquant_cache import _is_plain_kv_cache
 
 
 MEMORY_SAFETY_FACTOR = 1.3
@@ -228,13 +229,32 @@ def estimate_kv_cache_bytes(
         # n_kv_heads/head_dim and a hard cap on cache depth, while others
         # use full attention with their own dimensions.
         sliding_window = getattr(args, "sliding_window", None)
+        # The cache layout the factories actually build (#762): entry ``i``
+        # belongs to layer ``i``, a layer past the end owns no cache (Gemma
+        # 4's KV-shared tail), and only plain ``KVCache`` entries get
+        # quantized — rotating (sliding) entries and model-specific
+        # subclasses (Qwen3.8's ``QSAKVCache``) stay fp16.
+        layout = _default_cache_layout(args_owner)
         raw_total = 0
         found_attn_layer = False
         introspection_complete = True
-        for layer in layers:
+        for i, layer in enumerate(layers):
             self_attn = getattr(layer, "self_attn", None)
             if self_attn is None:
                 continue  # no-op attention layer — no KV cache
+            # KV-shared layers (Gemma 4) read an earlier layer's cache and own
+            # none. mlx-lm marks them ``has_kv=False``, mlx-vlm
+            # ``is_kv_shared_layer=True``. Identity checks: MagicMock layers.
+            if (
+                getattr(self_attn, "has_kv", None) is False
+                or getattr(self_attn, "is_kv_shared_layer", None) is True
+            ):
+                continue
+            entry = None
+            if layout is not None:
+                if i >= len(layout):
+                    continue
+                entry = layout[i]
             layer_kv_heads = getattr(self_attn, "n_kv_heads", None)
             if not isinstance(layer_kv_heads, int):
                 # Try alternate attribute name (e.g. Qwen3-Next uses
@@ -268,6 +288,12 @@ def estimate_kv_cache_bytes(
                     break
             if layer_sw is None and isinstance(sliding_window, int):
                 layer_sw = sliding_window
+            rotating_size = _rotating_max_size(entry)
+            if rotating_size is not None:
+                # The layout is authoritative: a rotating entry is capped at
+                # its own size whatever ``self_attn`` reports.
+                is_sliding = True
+                layer_sw = rotating_size
             if is_sliding and layer_sw is None:
                 # A sliding-window layer with no resolvable window size
                 # falls through to a full-prompt estimate (safe overestimate
@@ -290,7 +316,11 @@ def estimate_kv_cache_bytes(
                 * layer_head_dim
                 * effective_tokens
                 * bytes_per_element
-                * _quant_ratio(layer_head_dim)
+                * (
+                    _quant_ratio(layer_head_dim)
+                    if entry is None or _is_plain_kv_cache(entry)
+                    else 1.0
+                )
             )
         # Only trust introspection when every encountered layer reported its
         # KV heads.  found_attn_layer == False likely means the attention
@@ -304,6 +334,39 @@ def estimate_kv_cache_bytes(
     num_kv_heads = getattr(args, "num_key_value_heads", num_heads)
     raw = num_layers * 2 * num_kv_heads * head_dim * num_tokens * bytes_per_element
     return int(raw * _quant_ratio(head_dim) * MEMORY_SAFETY_FACTOR)
+
+
+def _default_cache_layout(model: Any) -> list | None:
+    """The model's default per-layer cache list (``model.make_cache()``),
+    the layout every KV-quant factory starts from — or ``None`` when the
+    model has none (mlx-lm then builds one plain ``KVCache`` per layer).
+
+    Building it is cheap: the caches are empty until the first forward.
+    A failing or non-list ``make_cache`` (e.g. a MagicMock) yields ``None``
+    so the estimate falls back to per-layer introspection.
+    """
+    make_cache = getattr(model, "make_cache", None)
+    if not callable(make_cache):
+        return None
+    try:
+        layout = make_cache()
+    except Exception:
+        logger.debug("make_cache() failed; estimating from layers", exc_info=True)
+        return None
+    return layout if isinstance(layout, list) else None
+
+
+def _rotating_max_size(entry: Any) -> int | None:
+    """``max_size`` of a rotating (sliding-window) cache entry, else ``None``.
+
+    Matched by class name so mlx-vlm's ``RotatingKVCache`` (which doesn't
+    subclass mlx-lm's) counts too."""
+    if entry is None or not any(
+        cls.__name__ == "RotatingKVCache" for cls in type(entry).__mro__
+    ):
+        return None
+    size = getattr(entry, "max_size", None)
+    return size if isinstance(size, int) and size > 0 else None
 
 
 def tokenize_for_cache(tokenizer: Any, prompt_text: str) -> list[int]:
