@@ -244,8 +244,15 @@ def estimate_kv_cache_bytes(
     # mlx-lm builds a plain ``KVCache`` per layer (yes); with an all-plain
     # layout every cache is (yes); with a mixed layout that couldn't be mapped
     # onto the layers it's unknown, so never charge such a layer below fp16.
+    # Entry types only matter under ``kv_cache_quant``; checking them
+    # otherwise would resolve mlx-vlm's cache class on the event loop for
+    # every text-only preflight.
     unmapped_quantized: bool | None = (
-        True if layout is None or all(_is_plain_kv_cache(e) for e in layout) else None
+        True
+        if kv_cache_quant is None
+        or layout is None
+        or all(_is_plain_kv_cache(e) for e in layout)
+        else None
     )
 
     def _layer_bytes(
@@ -262,7 +269,9 @@ def estimate_kv_cache_bytes(
             tokens = num_tokens
         else:
             tokens = min(num_tokens, window + PREFILL_CHUNK_TOKENS)
-        if entry is not None:
+        if kv_cache_quant is None:
+            ratio = 1.0
+        elif entry is not None:
             ratio = _quant_ratio(layer_head_dim) if _is_plain_kv_cache(entry) else 1.0
         elif unmapped_quantized:
             ratio = _quant_ratio(layer_head_dim)
@@ -402,10 +411,12 @@ def _default_cache_layout(model: Any) -> list | None:
     from olmlx.engine.turboquant_cache import default_cache_layout
 
     try:
-        return default_cache_layout(model)
+        layout = default_cache_layout(model)
     except Exception:
         logger.debug("make_cache() failed; estimating from layers", exc_info=True)
         return None
+    # An empty layout would zero the args fallback and disable the preflight.
+    return layout or None
 
 
 def _has_cache_class(cache: Any, name: str) -> bool:

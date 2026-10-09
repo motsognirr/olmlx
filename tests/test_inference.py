@@ -5188,6 +5188,29 @@ class TestEstimateKvCacheBytesCacheLayout:
             raw * _inf_mod.MEMORY_SAFETY_FACTOR
         )
 
+    def test_empty_layout_is_ignored(self):
+        """An empty ``make_cache()`` result must not zero the estimate (that
+        would disable the preflight); it counts as no layout."""
+        model = self._model(flags="mlx_lm", layout=[])
+        for layer in model.model.layers:
+            layer.self_attn.n_kv_heads = None  # force the args fallback
+        n = 1000
+        raw = self.N_LAYERS * 2 * 1 * 256 * n * 2
+        assert estimate_kv_cache_bytes(model, n) == int(
+            raw * _inf_mod.MEMORY_SAFETY_FACTOR
+        )
+
+    def test_no_quant_skips_entry_type_checks(self):
+        """Without ``kv_cache_quant`` the entry types don't change the charge,
+        so the estimate must not call ``_is_plain_kv_cache`` (it can import
+        mlx-vlm on the event loop / warn on text-only deployments)."""
+        model = self._model()
+        with patch(
+            "olmlx.engine.turboquant_cache._is_plain_kv_cache",
+            side_effect=AssertionError("called without kv_cache_quant"),
+        ):
+            estimate_kv_cache_bytes(model, 40000)
+
     def test_args_fallback_follows_layout(self):
         """When per-layer introspection fails (no int ``n_kv_heads``), the
         args-based fallback charges one entry per cache in the layout —
