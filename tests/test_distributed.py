@@ -35,14 +35,16 @@ def isolated_olmlx_home(tmp_path, monkeypatch):
     olmlx_home = tmp_path / "olmlx-home"
     monkeypatch.setattr(cli_module, "_olmlx_home", lambda: olmlx_home)
     yield olmlx_home
-    stray = fake_home / ".olmlx"
-    if stray.exists():
-        written = (
-            sorted(p.name for p in stray.iterdir()) if stray.is_dir() else [stray.name]
-        )
-        pytest.fail(
-            f"test wrote under Path.home()/.olmlx, bypassing _olmlx_home: {written}"
-        )
+    # Also check the effective home: a test may override HOME itself, and this
+    # teardown runs before monkeypatch restores the env.
+    for stray in {fake_home / ".olmlx", Path.home() / ".olmlx"}:
+        if stray.exists():
+            written = (
+                sorted(p.name for p in stray.iterdir())
+                if stray.is_dir()
+                else [stray.name]
+            )
+            pytest.fail(f"test wrote under {stray}, bypassing _olmlx_home: {written}")
 
 
 class TestDistributedSettings:
