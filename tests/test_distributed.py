@@ -9,10 +9,11 @@ from unittest.mock import MagicMock
 
 import pytest
 
+import olmlx.cli.distributed_launch as _distributed_launch
 from olmlx.config import Settings
 
-
-_real_helpers: dict = {}
+# Captured at import, before the autouse fixture monkeypatches it.
+_REAL_OLMLX_HOME = _distributed_launch._olmlx_home
 
 
 @pytest.fixture(autouse=True)
@@ -32,14 +33,16 @@ def isolated_olmlx_home(tmp_path, monkeypatch):
     fake_home.mkdir()
     monkeypatch.setenv("HOME", str(fake_home))
     olmlx_home = tmp_path / "olmlx-home"
-    _real_helpers["olmlx_home"] = cli_module._olmlx_home
     monkeypatch.setattr(cli_module, "_olmlx_home", lambda: olmlx_home)
     yield olmlx_home
     stray = fake_home / ".olmlx"
-    assert not stray.exists(), (
-        f"test wrote under Path.home()/.olmlx, bypassing _olmlx_home: "
-        f"{sorted(p.name for p in stray.iterdir())}"
-    )
+    if stray.exists():
+        written = (
+            sorted(p.name for p in stray.iterdir()) if stray.is_dir() else [stray.name]
+        )
+        pytest.fail(
+            f"test wrote under Path.home()/.olmlx, bypassing _olmlx_home: {written}"
+        )
 
 
 class TestDistributedSettings:
@@ -1268,11 +1271,13 @@ class TestRingHostfileGeneration:
 
     def test_olmlx_home_defaults_to_home_dot_olmlx(self, monkeypatch, tmp_path):
         monkeypatch.setenv("HOME", str(tmp_path))
-        assert _real_helpers["olmlx_home"]() == tmp_path / ".olmlx"
+        assert _REAL_OLMLX_HOME() == tmp_path / ".olmlx"
 
     def test_cleanup_unlinks_ring_hostfile_via_helper(self, isolated_olmlx_home):
         import olmlx.cli.distributed_launch as cli_module
 
+        cli_module._worker_procs.clear()
+        cli_module._worker_log_fhs.clear()
         isolated_olmlx_home.mkdir(parents=True)
         ring = cli_module._ring_hostfile_path()
         ring.write_text("[]")
