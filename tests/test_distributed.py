@@ -9,7 +9,46 @@ from unittest.mock import MagicMock
 
 import pytest
 
+import olmlx.cli.distributed_launch as _distributed_launch
 from olmlx.config import Settings
+
+# Captured at import, before the autouse fixture monkeypatches it.
+_REAL_OLMLX_HOME = _distributed_launch._olmlx_home
+
+
+@pytest.fixture(autouse=True)
+def isolated_olmlx_home(tmp_path, monkeypatch):
+    """Keep every test in this module off the real ``~/.olmlx`` (#742).
+
+    The launcher writes the ring hostfile and worker logs under the olmlx
+    home, and ``_cleanup_workers`` unlinks the hostfile; on the real home that
+    raced between tests (flaky ``FileNotFoundError``) and wrote into the
+    developer's model store. ``_olmlx_home`` is redirected to a tmp dir, and
+    ``HOME`` points at an empty fake home so any write that bypasses the
+    helper lands there and fails the test instead of touching the real one.
+    """
+    import olmlx.cli.distributed_launch as cli_module
+
+    fake_home = tmp_path / "fake-home"
+    fake_home.mkdir()
+    monkeypatch.setenv("HOME", str(fake_home))
+    olmlx_home = tmp_path / "olmlx-home"
+    monkeypatch.setattr(cli_module, "_olmlx_home", lambda: olmlx_home)
+    yield olmlx_home
+    # Also check the effective home: a test may override HOME itself, and this
+    # teardown runs before monkeypatch restores the env. Only when HOME is set —
+    # unset, Path.home() falls back to the real home via passwd.
+    guarded = {fake_home / ".olmlx"}
+    if os.environ.get("HOME"):
+        guarded.add(Path(os.environ["HOME"]) / ".olmlx")
+    for stray in guarded:
+        if stray.exists():
+            written = (
+                sorted(p.name for p in stray.iterdir())
+                if stray.is_dir()
+                else [stray.name]
+            )
+            pytest.fail(f"test wrote under {stray}, bypassing _olmlx_home: {written}")
 
 
 class TestDistributedSettings:
@@ -1227,7 +1266,31 @@ class TestRemoteExecutionConfig:
 class TestRingHostfileGeneration:
     """Tests for MLX ring hostfile generation."""
 
-    def test_ring_hostfile_generated(self, tmp_path, monkeypatch):
+    def test_ring_hostfile_path_under_olmlx_home(self, isolated_olmlx_home):
+        """Writer and cleanup share one path helper rooted at _olmlx_home."""
+        import olmlx.cli.distributed_launch as cli_module
+
+        assert (
+            cli_module._ring_hostfile_path()
+            == isolated_olmlx_home / "ring_hostfile.json"
+        )
+
+    def test_olmlx_home_defaults_to_home_dot_olmlx(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("HOME", str(tmp_path))
+        assert _REAL_OLMLX_HOME() == tmp_path / ".olmlx"
+
+    def test_cleanup_unlinks_ring_hostfile_via_helper(self, isolated_olmlx_home):
+        import olmlx.cli.distributed_launch as cli_module
+
+        cli_module._worker_procs.clear()
+        cli_module._worker_log_fhs.clear()
+        isolated_olmlx_home.mkdir(parents=True)
+        ring = cli_module._ring_hostfile_path()
+        ring.write_text("[]")
+        cli_module._cleanup_workers()
+        assert not ring.exists()
+
+    def test_ring_hostfile_generated(self, tmp_path, monkeypatch, isolated_olmlx_home):
         """_launch_distributed_workers should generate a ring hostfile."""
         import olmlx.cli.distributed_launch as cli_module
 
@@ -1270,7 +1333,8 @@ class TestRingHostfileGeneration:
         cli_module._launch_distributed_workers()
 
         # Ring hostfile should be written
-        ring_hostfile = Path.home() / ".olmlx" / "ring_hostfile.json"
+        ring_hostfile = cli_module._ring_hostfile_path()
+        assert ring_hostfile.parent == isolated_olmlx_home
         assert ring_hostfile.exists()
         import json
 
@@ -1283,6 +1347,7 @@ class TestRingHostfileGeneration:
         assert os.environ.get("MLX_HOSTFILE") == str(ring_hostfile)
 
         cli_module._cleanup_workers()
+        assert not ring_hostfile.exists()
 
         # Clean up env
         for key in ("MLX_RANK", "MLX_HOSTFILE"):
@@ -1330,7 +1395,7 @@ class TestRingHostfileGeneration:
 
         cli_module._launch_distributed_workers()
 
-        ring_hostfile = Path.home() / ".olmlx" / "ring_hostfile.json"
+        ring_hostfile = cli_module._ring_hostfile_path()
         import json
 
         content = json.loads(ring_hostfile.read_text())
