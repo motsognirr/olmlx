@@ -72,6 +72,16 @@ def _install_signal_handlers() -> None:
         signal.signal(signum, _make_handler(signal.getsignal(signum)))
 
 
+def _olmlx_home() -> Path:
+    """Directory for the coordinator's ring hostfile and worker logs."""
+    return Path.home() / ".olmlx"
+
+
+def _ring_hostfile_path() -> Path:
+    """Ring hostfile location, shared by the launcher and ``_cleanup_workers``."""
+    return _olmlx_home() / "ring_hostfile.json"
+
+
 def _cleanup_workers():
     """Terminate all distributed worker processes and close log file handles."""
     for proc in _worker_procs:
@@ -94,7 +104,7 @@ def _cleanup_workers():
     _worker_procs.clear()
     _worker_log_fhs.clear()
     try:
-        (Path.home() / ".olmlx" / "ring_hostfile.json").unlink(missing_ok=True)
+        _ring_hostfile_path().unlink(missing_ok=True)
     except Exception:
         pass
 
@@ -322,7 +332,7 @@ def _launch_distributed_workers() -> tuple[list[str], str, list[int] | None]:
     coordinator_host = hosts[0]
     print(f"Distributed mode: {world_size} nodes, coordinator={coordinator_host}")
 
-    log_dir = Path.home() / ".olmlx"
+    log_dir = _olmlx_home()
     log_dir.mkdir(parents=True, exist_ok=True)
 
     # Generate ring hostfile for MLX distributed backend
@@ -337,7 +347,7 @@ def _launch_distributed_workers() -> tuple[list[str], str, list[int] | None]:
             file=sys.stderr,
         )
         sys.exit(1)
-    ring_hostfile_path = log_dir / "ring_hostfile.json"
+    ring_hostfile_path = _ring_hostfile_path()
     with open(ring_hostfile_path, "w") as f:
         json.dump(ring_hostfile_data, f)
 
