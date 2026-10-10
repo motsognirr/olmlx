@@ -332,7 +332,8 @@ def _launch_distributed_workers() -> tuple[list[str], str, list[int] | None]:
     coordinator_host = hosts[0]
     print(f"Distributed mode: {world_size} nodes, coordinator={coordinator_host}")
 
-    log_dir = _olmlx_home()
+    ring_hostfile_path = _ring_hostfile_path()
+    log_dir = ring_hostfile_path.parent
     log_dir.mkdir(parents=True, exist_ok=True)
 
     # Generate ring hostfile for MLX distributed backend
@@ -347,7 +348,6 @@ def _launch_distributed_workers() -> tuple[list[str], str, list[int] | None]:
             file=sys.stderr,
         )
         sys.exit(1)
-    ring_hostfile_path = _ring_hostfile_path()
     with open(ring_hostfile_path, "w") as f:
         json.dump(ring_hostfile_data, f)
 

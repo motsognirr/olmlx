@@ -36,8 +36,12 @@ def isolated_olmlx_home(tmp_path, monkeypatch):
     monkeypatch.setattr(cli_module, "_olmlx_home", lambda: olmlx_home)
     yield olmlx_home
     # Also check the effective home: a test may override HOME itself, and this
-    # teardown runs before monkeypatch restores the env.
-    for stray in {fake_home / ".olmlx", Path.home() / ".olmlx"}:
+    # teardown runs before monkeypatch restores the env. Only when HOME is set —
+    # unset, Path.home() falls back to the real home via passwd.
+    guarded = {fake_home / ".olmlx"}
+    if os.environ.get("HOME"):
+        guarded.add(Path(os.environ["HOME"]) / ".olmlx")
+    for stray in guarded:
         if stray.exists():
             written = (
                 sorted(p.name for p in stray.iterdir())
