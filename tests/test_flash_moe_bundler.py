@@ -407,8 +407,13 @@ class TestBundleMoeExperts:
         # Should list only MoE layer indices
         assert sorted(config["layers"].keys()) == ["1", "2"]
 
-    def test_bundle_handles_sharded_safetensors(self, tmp_path):
-        """Should handle models split across multiple safetensors shards."""
+    @pytest.mark.parametrize("with_index", [True, False])
+    def test_bundle_handles_sharded_safetensors(self, tmp_path, with_index):
+        """Should handle models split across multiple safetensors shards.
+
+        Without model.safetensors.index.json (e.g. RecursiveSI/flint-int4) the
+        weight map is rebuilt from the shard headers, as mlx-lm loads any shards.
+        """
         from safetensors.numpy import save_file
 
         hidden, inter, experts = 64, 32, 4
@@ -447,7 +452,8 @@ class TestBundleMoeExperts:
             "model.layers.0.mlp.switch_mlp.down_proj.weight": "model-00002-of-00002.safetensors",
         }
         index = {"weight_map": weight_map}
-        (model_dir / "model.safetensors.index.json").write_text(json.dumps(index))
+        if with_index:
+            (model_dir / "model.safetensors.index.json").write_text(json.dumps(index))
 
         # Write config
         config = {

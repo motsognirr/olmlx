@@ -226,6 +226,33 @@ class _FlashMoEMiniMax(_FlashMoEBase):
         return y
 
 
+class _FlashMoEFlint(_FlashMoEBase):
+    """Replacement MoE layer for Recursive Flint.
+
+    Gate is nn.Linear returning logits; sigmoid scoring without a correction
+    bias, renormalized top-k, plus an ungated ``shared_expert`` (singular).
+    Structurally it looks like plain Qwen3-MoE, which would softmax-route
+    and drop the shared expert, hence the explicit module check.
+    """
+
+    def __init__(self, original_moe, flash_moe: FlashMoE):
+        super().__init__(original_moe, flash_moe)
+        self.gate = original_moe.gate
+        self.top_k = original_moe.top_k
+        self.shared_expert = original_moe.shared_expert
+
+    def _route(self, x):
+        scores = mx.sigmoid(self.gate(x.astype(mx.float32)))
+        k = self.top_k
+        inds = mx.argpartition(-scores, kth=k - 1, axis=-1)[..., :k]
+        scores = mx.take_along_axis(scores, inds, axis=-1)
+        scores = scores / scores.sum(axis=-1, keepdims=True)
+        return inds, scores.astype(x.dtype)
+
+    def _combine(self, x, y):
+        return y + self.shared_expert(x)
+
+
 class _FlashMoEGemma4(nn.Module):
     """Replacement experts module for Gemma4 VLM-style layers.
 
@@ -441,6 +468,12 @@ def _find_moe_module(layer: nn.Module) -> tuple[str, nn.Module]:
     )
 
 
+def _is_flint_moe(moe_module: nn.Module) -> bool:
+    """True for Flint's SparseMoeBlock — vendored (olmlx.engine.backports.flint)
+    or upstream (mlx_lm.models.flint)."""
+    return type(moe_module).__module__.rsplit(".", 1)[-1] == "flint"
+
+
 def _replace_moe_layers(
     model: nn.Module,
     weight_store: FlashMoeWeightStore,
@@ -517,6 +550,8 @@ def _replace_moe_layers(
             elif hasattr(moe_module, "shared_expert_gate") and gate_is_linear:
                 # Qwen3-Next style: linear gate + shared_expert + shared_expert_gate
                 replacement = _FlashMoEQwen3Next(moe_module, flash_moe)
+            elif gate_is_linear and _is_flint_moe(moe_module):
+                replacement = _FlashMoEFlint(moe_module, flash_moe)
             elif gate_is_linear and hasattr(moe_module, "e_score_correction_bias"):
                 # MiniMax style: linear gate with sigmoid scoring + correction bias
                 replacement = _FlashMoEMiniMax(moe_module, flash_moe)

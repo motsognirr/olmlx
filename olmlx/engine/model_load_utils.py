@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING, Any
 import mlx.core as mx
 import mlx.nn as nn
 
+from olmlx.engine.backports import install_mlx_lm_backports
 from olmlx.engine.prompt_cache import CachedPromptState, PromptCacheStore  # noqa: F401
 
 # Speculative-decoder draft loaders live in a focused mixin module (#454).
@@ -25,6 +26,10 @@ if TYPE_CHECKING:
 
 
 logger = logging.getLogger(__name__)
+
+# Architectures newer than the pinned mlx-lm (e.g. Flint) must be registered
+# before any mlx_lm.load / find_spec probe sees their model_type.
+install_mlx_lm_backports()
 
 
 def _sanitize_model_config_in_place(load_path) -> None:

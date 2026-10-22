@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import logging
+import struct
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -156,6 +157,32 @@ def _load_tensor(model_dir: Path, name: str, index: dict | None) -> np.ndarray:
 
     mx.eval(arr)
     return np.array(arr)
+
+
+def _load_safetensors_index(model_dir: Path) -> dict | None:
+    """Return the shard index, synthesizing one when a sharded checkpoint lacks it.
+
+    mlx-lm loads every ``*.safetensors`` in the directory, so some exports
+    (e.g. RecursiveSI/flint-int4) ship shards without
+    ``model.safetensors.index.json``. Build the ``weight_map`` from the shard
+    headers — reads only the JSON header, never the tensors. A single
+    ``model.safetensors`` keeps the index-less path (``None``).
+    """
+    index_path = model_dir / "model.safetensors.index.json"
+    if index_path.exists():
+        return json.loads(index_path.read_text())
+    shards = sorted(model_dir.glob("*.safetensors"))
+    if not shards or shards == [model_dir / "model.safetensors"]:
+        return None
+    weight_map: dict[str, str] = {}
+    for shard in shards:
+        with open(shard, "rb") as f:
+            (header_len,) = struct.unpack("<Q", f.read(8))
+            header = json.loads(f.read(header_len))
+        for name in header:
+            if name != "__metadata__":
+                weight_map[name] = shard.name
+    return {"weight_map": weight_map}
 
 
 def _clear_shard_cache():
@@ -467,8 +494,7 @@ def bundle_moe_experts(
         )
 
     # Check for safetensors index (sharded models)
-    index_path = model_dir / "model.safetensors.index.json"
-    index = json.loads(index_path.read_text()) if index_path.exists() else None
+    index = _load_safetensors_index(model_dir)
 
     # Detect quantization from config. mlx-community checkpoints with a
     # `text_config` wrapper (e.g. Qwen3.5-35B-A3B-4bit) keep `quantization`
