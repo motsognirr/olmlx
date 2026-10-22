@@ -87,7 +87,8 @@ def _bits_overrides(packed: dict, quant: dict) -> dict:
                 f"scales {s_shape}, group_size {group_size}"
             )
         if bits != current.get("bits", default_bits):
-            overrides[module] = {"group_size": group_size, "bits": bits}
+            # Merge: keep any other per-module keys (e.g. mode) the config has.
+            overrides[module] = {**current, "group_size": group_size, "bits": bits}
     return overrides
 
 
@@ -142,7 +143,9 @@ def _normalize_locked(model_dir: Path, config_path: Path) -> bool:
     except json.JSONDecodeError as exc:
         raise PackedWeightsError(f"Unreadable {config_path}: {exc}") from exc
     quant = dict(cfg.get("quantization") or cfg.get("quantization_config") or {})
-    overrides = _bits_overrides(packed, quant)
+    # Only the modules this pass converts: uint32 ones are already loadable as
+    # configured (or were covered by the config write of an interrupted pass).
+    overrides = _bits_overrides({m: packed[m] for m in u8_modules}, quant)
     if overrides:
         # Shapes give bits x group_size, not each separately: a module quantized
         # with an undeclared group_size reads as a different bit width. Surface

@@ -229,3 +229,39 @@ def test_gemma4_unified_path_is_normalized_first(tmp_path, monkeypatch):
     mlu._load_with_model_type_fallback(MagicMock(), tmp_path)
 
     assert calls == ["norm", "gemma4"]
+
+
+def test_override_merges_existing_module_keys(tmp_path):
+    """Extra per-module keys (e.g. mode) survive when bits are corrected."""
+    model_dir = tmp_path / "m"
+    _write_checkpoint(model_dir, as_uint8=True)
+    cfg = json.loads((model_dir / "config.json").read_text())
+    cfg["quantization"]["model.embed_tokens"] = {
+        "group_size": GROUP,
+        "bits": 4,
+        "mode": "affine",
+    }
+    (model_dir / "config.json").write_text(json.dumps(cfg))
+
+    normalize_uint8_packing_in_place(model_dir)
+
+    q = json.loads((model_dir / "config.json").read_text())["quantization"]
+    assert q["model.embed_tokens"] == {"group_size": GROUP, "bits": 8, "mode": "affine"}
+
+
+def test_uninferable_uint32_module_does_not_block_conversion(tmp_path):
+    """Inference only covers the uint8 modules being converted."""
+    model_dir = tmp_path / "m"
+    originals = _write_checkpoint(model_dir, as_uint8=True)
+    mx.save_safetensors(
+        str(model_dir / "model-00002.safetensors"),
+        {
+            "odd.weight": mx.zeros((4, 7), dtype=mx.uint32),
+            "odd.scales": mx.zeros((4, 1)),
+            "odd.biases": mx.zeros((4, 1)),
+        },
+    )
+
+    assert normalize_uint8_packing_in_place(model_dir) is True
+    weights = _all_weights(model_dir)
+    assert all(weights[f"{m}.weight"].dtype == mx.uint32 for m in originals)
