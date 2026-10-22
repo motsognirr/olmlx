@@ -407,8 +407,13 @@ class TestBundleMoeExperts:
         # Should list only MoE layer indices
         assert sorted(config["layers"].keys()) == ["1", "2"]
 
-    def test_bundle_handles_sharded_safetensors(self, tmp_path):
-        """Should handle models split across multiple safetensors shards."""
+    @pytest.mark.parametrize("with_index", [True, False])
+    def test_bundle_handles_sharded_safetensors(self, tmp_path, with_index):
+        """Should handle models split across multiple safetensors shards.
+
+        Without model.safetensors.index.json (e.g. RecursiveSI/flint-int4) the
+        weight map is rebuilt from the shard headers, as mlx-lm loads any shards.
+        """
         from safetensors.numpy import save_file
 
         hidden, inter, experts = 64, 32, 4
@@ -447,7 +452,8 @@ class TestBundleMoeExperts:
             "model.layers.0.mlp.switch_mlp.down_proj.weight": "model-00002-of-00002.safetensors",
         }
         index = {"weight_map": weight_map}
-        (model_dir / "model.safetensors.index.json").write_text(json.dumps(index))
+        if with_index:
+            (model_dir / "model.safetensors.index.json").write_text(json.dumps(index))
 
         # Write config
         config = {
@@ -1535,3 +1541,64 @@ class TestDetectMoeLayersEnum:
         }
         with pytest.raises(ValueError, match="beyond num_hidden_layers"):
             _detect_moe_layers(config)
+
+
+def test_synthesized_index_rejects_corrupt_shard(tmp_path):
+    """A garbage header length must name the shard, not allocate or raise struct.error."""
+    import struct
+
+    from olmlx.engine.flash.moe_bundler import _load_safetensors_index
+
+    (tmp_path / "model-00001.safetensors").write_bytes(struct.pack("<Q", 2**40) + b"{}")
+    (tmp_path / "model-00002.safetensors").write_bytes(b"\x02")
+    with pytest.raises(ValueError, match="model-00001.safetensors: not a readable"):
+        _load_safetensors_index(tmp_path)
+
+
+def test_synthesized_index_caps_header_on_large_shard(tmp_path, monkeypatch):
+    """A header length within the file but above the cap is rejected before reading."""
+    import struct
+
+    from olmlx.engine.flash import moe_bundler
+
+    monkeypatch.setattr(moe_bundler, "_MAX_HEADER_BYTES", 1024)
+    (tmp_path / "model-00001.safetensors").write_bytes(
+        struct.pack("<Q", 4096) + b"{" + b" " * 5000
+    )
+    (tmp_path / "model-00002.safetensors").write_bytes(b"")
+    with pytest.raises(ValueError, match="exceeds"):
+        moe_bundler._load_safetensors_index(tmp_path)
+
+
+def test_synthesized_index_ignores_non_model_safetensors(tmp_path):
+    """Only model*.safetensors count as shards, as in mlx-lm's loader."""
+    from safetensors.numpy import save_file
+
+    from olmlx.engine.flash.moe_bundler import _load_safetensors_index
+
+    save_file(
+        {"a": np.zeros(2, np.float16)},
+        str(tmp_path / "model-00001-of-00002.safetensors"),
+    )
+    save_file(
+        {"b": np.zeros(2, np.float16)},
+        str(tmp_path / "model-00002-of-00002.safetensors"),
+    )
+    (tmp_path / "adapters.safetensors").write_bytes(b"garbage")
+    assert _load_safetensors_index(tmp_path) == {
+        "weight_map": {
+            "a": "model-00001-of-00002.safetensors",
+            "b": "model-00002-of-00002.safetensors",
+        }
+    }
+
+
+def test_synthesized_index_rejects_non_object_header(tmp_path):
+    import struct
+
+    from olmlx.engine.flash.moe_bundler import _load_safetensors_index
+
+    (tmp_path / "model-00001.safetensors").write_bytes(struct.pack("<Q", 2) + b"[]")
+    (tmp_path / "model-00002.safetensors").write_bytes(struct.pack("<Q", 2) + b"{}")
+    with pytest.raises(ValueError, match="not a JSON object"):
+        _load_safetensors_index(tmp_path)

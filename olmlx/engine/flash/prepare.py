@@ -62,6 +62,10 @@ def load_model_with_strict_fallback(model_path: str, *, lazy: bool) -> tuple:
     """
     import mlx_lm
 
+    from olmlx.engine.backports import install_mlx_lm_backports
+
+    install_mlx_lm_backports()
+
     # Function-local import: model_manager doesn't import flash.prepare at
     # module level, but a top-level import here would still cross a module
     # boundary for an internal helper. Keep the dependency lazy.

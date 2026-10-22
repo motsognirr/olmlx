@@ -1596,6 +1596,10 @@ class ModelManager(SpeculativeLoaderMixin):
 
     def _detect_model_kind(self, hf_path: str) -> str:
         """Return 'text', 'vlm', or 'unknown' by checking config.json against installed libraries."""
+        # Register backported architectures so the find_spec probes below see them.
+        from olmlx.engine.backports import install_mlx_lm_backports
+
+        install_mlx_lm_backports()
         # Never returns "image": image models (#723) are declared via
         # models.json and threaded through as ``image_config`` — their
         # diffusers layout has no top-level config.json, and mflux's name
