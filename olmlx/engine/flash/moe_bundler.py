@@ -185,9 +185,15 @@ def _load_safetensors_index(model_dir: Path) -> dict | None:
                 (header_len,) = struct.unpack("<Q", f.read(8))
                 # Headers are KiB of JSON; a garbage length must not turn
                 # into a multi-GB allocation, even on a multi-GB shard.
-                if header_len > min(size - 8, _MAX_HEADER_BYTES):
-                    raise ValueError(f"header length {header_len} exceeds file")
+                limit = min(size - 8, _MAX_HEADER_BYTES)
+                if header_len > limit:
+                    raise ValueError(
+                        f"header length {header_len} exceeds limit {limit} "
+                        "(file size or header cap)"
+                    )
                 header = json.loads(f.read(header_len))
+                if not isinstance(header, dict):
+                    raise ValueError("header is not a JSON object")
         except (OSError, struct.error, ValueError) as exc:
             raise ValueError(
                 f"{shard}: not a readable safetensors shard ({exc})"

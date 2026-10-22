@@ -47,6 +47,13 @@ def test_registration_resolves_flint_model_type():
     assert importlib.util.find_spec("mlx_lm.models.flint") is not None
 
 
+def test_registration_is_a_real_submodule():
+    install_mlx_lm_backports()
+    from mlx_lm.models import flint  # needs the package attribute, not just sys.modules
+
+    assert hasattr(flint, "Model")
+
+
 def test_tiny_flint_forward_with_cache():
     model = _tiny_model()
     cache = model.make_cache()

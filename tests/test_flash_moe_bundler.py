@@ -1591,3 +1591,14 @@ def test_synthesized_index_ignores_non_model_safetensors(tmp_path):
             "b": "model-00002-of-00002.safetensors",
         }
     }
+
+
+def test_synthesized_index_rejects_non_object_header(tmp_path):
+    import struct
+
+    from olmlx.engine.flash.moe_bundler import _load_safetensors_index
+
+    (tmp_path / "model-00001.safetensors").write_bytes(struct.pack("<Q", 2) + b"[]")
+    (tmp_path / "model-00002.safetensors").write_bytes(struct.pack("<Q", 2) + b"{}")
+    with pytest.raises(ValueError, match="not a JSON object"):
+        _load_safetensors_index(tmp_path)

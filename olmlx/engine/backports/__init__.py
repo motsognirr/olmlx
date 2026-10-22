@@ -42,7 +42,11 @@ def install_mlx_lm_backports() -> None:
         try:
             if target in sys.modules or importlib.util.find_spec(target) is not None:
                 continue
-            sys.modules[target] = importlib.import_module(module_name)
+            module = importlib.import_module(module_name)
+            sys.modules[target] = module
+            # Also bind it on the package, so `from mlx_lm.models import flint`
+            # and attribute access behave like a real submodule.
+            setattr(importlib.import_module("mlx_lm.models"), model_type, module)
             logger.debug("Registered backported mlx-lm architecture %r", model_type)
         except Exception as exc:  # any drift must only cost this architecture
             ok = False
