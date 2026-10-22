@@ -105,12 +105,6 @@ def _bits_overrides(packed: dict, quant: dict) -> dict:
     return overrides
 
 
-def _shard_tmp(shard: Path) -> Path:
-    """Temp file for rewriting *shard*: beside its resolved target, same filesystem."""
-    target = shard.resolve()
-    return target.with_name(target.stem + _TMP_SUFFIX)
-
-
 def _write_json_atomic(path: Path, data: dict) -> None:
     tmp = path.with_name(path.name + ".tmp")
     tmp.write_text(json.dumps(data, indent=2))
@@ -160,21 +154,34 @@ def normalize_uint8_packing_in_place(model_dir: str | Path) -> bool:
 
 
 def _normalize_locked(model_dir: Path, config_path: Path) -> bool:
-    # Left by an interrupted rewrite; the originals are intact. Shard temps sit
-    # next to the resolved shard, which for symlinked (HF-cache) shards is
-    # outside model_dir, so derive them per shard as well as globbing here.
-    shards = [
-        p for p in model_dir.glob("*.safetensors") if not p.name.endswith(_TMP_SUFFIX)
-    ]
-    for stale in {
-        *model_dir.glob(f"*{_TMP_SUFFIX}"),
-        *(_shard_tmp(p) for p in shards),
-        model_dir / "config.json.tmp",
-    }:
+    for stale in [*model_dir.glob(f"*{_TMP_SUFFIX}"), model_dir / "config.json.tmp"]:
+        # Left by an interrupted rewrite; the original file is intact.
         stale.unlink(missing_ok=True)
     headers, packed, u8_modules = _scan(model_dir)
     if not u8_modules:
         return False  # another caller finished while we waited for the lock
+
+    # Symlinked files (a Hugging Face hub cache snapshot) point at
+    # content-addressed blobs shared by other snapshots; rewriting them would
+    # corrupt those, and replacing the links breaks the cache. Leave such a
+    # directory alone. olmlx's own downloads are plain files.
+    linked = [
+        p.name
+        for p in (config_path, *headers)
+        if p.is_symlink()
+        and (
+            p == config_path or {f"{m}.weight" for m in u8_modules} & headers[p].keys()
+        )
+    ]
+    if linked:
+        logger.warning(
+            "%s has uint8-packed weights but %s are symlinks (shared cache blobs); "
+            "not normalizing in place. Load it from a plain copy instead "
+            "(e.g. 'olmlx pull'), or loading will fail with a shape mismatch",
+            model_dir,
+            ", ".join(sorted(linked)),
+        )
+        return False
 
     try:
         cfg = json.loads(config_path.read_text())
@@ -194,9 +201,16 @@ def _normalize_locked(model_dir: Path, config_path: Path) -> bool:
             model_dir,
             overrides,
         )
-        quant.update(overrides)
-        cfg["quantization"] = quant
-        cfg["quantization_config"] = quant
+        # Update each section the config has on its own terms, so differing
+        # contents between the two are kept rather than copied over.
+        for key in [k for k in ("quantization", "quantization_config") if k in cfg] or [
+            "quantization"
+        ]:
+            cfg[key] = (
+                {**cfg[key], **overrides}
+                if isinstance(cfg.get(key), dict)
+                else {**quant, **overrides}
+            )
         _write_json_atomic(config_path, cfg)
     logger.info(
         "Converting %d uint8-packed weights in %s to uint32",
@@ -214,11 +228,8 @@ def _normalize_locked(model_dir: Path, config_path: Path) -> bool:
         weights = {
             k: v.view(mx.uint32) if k in names else v for k, v in weights.items()
         }
-        # Rewrite the real file: replacing a symlinked shard (HF hub cache
-        # snapshots point into blobs/) would turn the link into a copy.
-        target = path.resolve()
-        tmp = _shard_tmp(path)
+        tmp = path.with_name(path.stem + _TMP_SUFFIX)
         mx.save_safetensors(str(tmp), weights, metadata=meta or {"format": "mlx"})
-        os.replace(tmp, target)
+        os.replace(tmp, path)
         del weights
     return True

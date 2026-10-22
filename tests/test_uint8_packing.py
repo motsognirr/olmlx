@@ -86,7 +86,7 @@ def test_converts_uint8_and_adds_bit_overrides(tmp_path):
         "model.embed_tokens": {"group_size": GROUP, "bits": 8},
     }
     assert cfg["quantization"] == expected
-    assert cfg["quantization_config"] == expected
+    assert "quantization_config" not in cfg  # only sections the config had are updated
 
 
 def test_second_call_is_noop(tmp_path):
@@ -282,8 +282,8 @@ def test_corrupt_shard_is_skipped_not_raised(tmp_path):
     assert all(weights[f"{m}.weight"].dtype == mx.uint32 for m in originals)
 
 
-def test_symlinked_shard_keeps_link(tmp_path):
-    """HF-cache style snapshot symlinks keep pointing at the (rewritten) blob."""
+def test_symlinked_checkpoint_is_left_alone(tmp_path, caplog):
+    """HF-cache snapshots link to shared blobs: warn and touch nothing."""
     model_dir = tmp_path / "m"
     _write_checkpoint(model_dir, as_uint8=True)
     blobs = tmp_path / "blobs"
@@ -292,13 +292,53 @@ def test_symlinked_shard_keeps_link(tmp_path):
     blob = blobs / "abc123"
     shard.rename(blob)
     shard.symlink_to(blob)
-
-    assert normalize_uint8_packing_in_place(model_dir) is True
-    assert shard.is_symlink() and shard.resolve() == blob
-    assert (
-        mx.load(str(blob), format="safetensors")["model.embed_tokens.weight"].dtype
-        == mx.uint32
+    blob_bytes, config_before = (
+        blob.read_bytes(),
+        (model_dir / "config.json").read_text(),
     )
+
+    with caplog.at_level("WARNING", logger="olmlx.engine.uint8_packing"):
+        assert normalize_uint8_packing_in_place(model_dir) is False
+
+    assert "symlinks" in caplog.text and "model-00001.safetensors" in caplog.text
+    assert shard.is_symlink() and blob.read_bytes() == blob_bytes
+    assert (model_dir / "config.json").read_text() == config_before
+    assert not list(model_dir.glob("*.u32tmp.safetensors"))
+
+
+def test_symlinked_config_is_left_alone(tmp_path):
+    model_dir = tmp_path / "m"
+    _write_checkpoint(model_dir, as_uint8=True)
+    real = tmp_path / "config-blob"
+    (model_dir / "config.json").rename(real)
+    (model_dir / "config.json").symlink_to(real)
+
+    assert normalize_uint8_packing_in_place(model_dir) is False
+    assert (model_dir / "config.json").is_symlink()
+
+
+def test_both_quant_sections_updated_independently(tmp_path):
+    model_dir = tmp_path / "m"
+    _write_checkpoint(model_dir, as_uint8=True)
+    cfg = json.loads((model_dir / "config.json").read_text())
+    cfg["quantization_config"] = {"group_size": GROUP, "bits": 4, "quant_method": "mlx"}
+    (model_dir / "config.json").write_text(json.dumps(cfg))
+
+    normalize_uint8_packing_in_place(model_dir)
+
+    out = json.loads((model_dir / "config.json").read_text())
+    embed = {"group_size": GROUP, "bits": 8}
+    assert out["quantization"] == {
+        "group_size": GROUP,
+        "bits": 4,
+        "model.embed_tokens": embed,
+    }
+    assert out["quantization_config"] == {
+        "group_size": GROUP,
+        "bits": 4,
+        "quant_method": "mlx",
+        "model.embed_tokens": embed,
+    }
 
 
 def test_unwritable_dir_warns_and_skips(tmp_path, caplog):
@@ -313,20 +353,3 @@ def test_unwritable_dir_warns_and_skips(tmp_path, caplog):
     finally:
         os.chmod(model_dir, 0o755)
     assert "can't be normalized in place" in caplog.text
-
-
-def test_stale_temp_beside_symlinked_blob_is_cleaned(tmp_path):
-    """An interrupted rewrite of a symlinked shard leaves its temp in blobs/; a rerun removes it."""
-    model_dir = tmp_path / "m"
-    _write_checkpoint(model_dir, as_uint8=True)
-    blobs = tmp_path / "blobs"
-    blobs.mkdir()
-    shard = model_dir / "model-00001.safetensors"
-    blob = blobs / "abc123"
-    shard.rename(blob)
-    shard.symlink_to(blob)
-    orphan = blobs / "abc123.u32tmp.safetensors"
-    orphan.write_bytes(b"partial")
-
-    assert normalize_uint8_packing_in_place(model_dir) is True
-    assert not orphan.exists()
