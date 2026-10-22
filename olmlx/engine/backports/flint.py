@@ -137,7 +137,7 @@ class SparseMoeBlock(nn.Module):
 
     def __call__(self, x: mx.array) -> mx.array:
         if self.sharding_group is not None:
-            x = sum_gradients(self.sharding_group)(x)
+            x = sum_gradients(self.sharding_group)(x)  # pyright: ignore[reportCallIssue]
 
         logits = self.gate(x.astype(mx.float32))
 

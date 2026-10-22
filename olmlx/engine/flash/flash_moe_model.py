@@ -179,6 +179,15 @@ class _FlashMoEQwen3(_FlashMoEBase):
 
     def __init__(self, original_moe, flash_moe: FlashMoE):
         super().__init__(original_moe, flash_moe)
+        # This branch is the catch-all for linear-gated blocks; one carrying a
+        # shared expert would lose it here and produce silently wrong logits.
+        for attr in ("shared_expert", "shared_experts"):
+            if getattr(original_moe, attr, None) is not None:
+                raise NotImplementedError(
+                    f"Flash-MoE has no router for {type(original_moe).__module__}."
+                    f"{type(original_moe).__name__}: linear gate with an ungated "
+                    f"{attr!r}. Disable flash_moe for this model."
+                )
         self.gate = original_moe.gate
         self.top_k = original_moe.top_k
         self.norm_topk_prob = original_moe.norm_topk_prob
@@ -469,9 +478,15 @@ def _find_moe_module(layer: nn.Module) -> tuple[str, nn.Module]:
 
 
 def _is_flint_moe(moe_module: nn.Module) -> bool:
-    """True for Flint's SparseMoeBlock — vendored (olmlx.engine.backports.flint)
-    or upstream (mlx_lm.models.flint)."""
-    return type(moe_module).__module__.rsplit(".", 1)[-1] == "flint"
+    """True for Flint's SparseMoeBlock (or a subclass) — upstream mlx-lm's
+    module when it ships one, else the vendored backport."""
+    import sys
+
+    for name in ("mlx_lm.models.flint", "olmlx.engine.backports.flint"):
+        mod = sys.modules.get(name)
+        if mod is not None and isinstance(moe_module, mod.SparseMoeBlock):
+            return True
+    return False
 
 
 def _replace_moe_layers(

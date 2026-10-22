@@ -27,10 +27,6 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# Architectures newer than the pinned mlx-lm (e.g. Flint) must be registered
-# before any mlx_lm.load / find_spec probe sees their model_type.
-install_mlx_lm_backports()
-
 
 def _sanitize_model_config_in_place(load_path) -> None:
     """Fix known on-disk config.json issues that block transformers loading.
@@ -235,6 +231,9 @@ def _load_with_model_type_fallback(mlx_lm, load_path, **kwargs):
     So we load the model first with the real config, then patch config.json
     temporarily to load only the tokenizer.
     """
+    # Architectures newer than the pinned mlx-lm (e.g. Flint) must be
+    # registered before mlx_lm.load resolves the model_type.
+    install_mlx_lm_backports()
     # mlx-community 'gemma4_unified' text checkpoints (e.g. gemma-4-12B-it-4bit)
     # need a dedicated loader: their model_type has no mlx-lm module and their
     # multimodal weights must be dropped to load the language tower. The loader

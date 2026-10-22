@@ -26,14 +26,26 @@ _installed = False
 
 
 def install_mlx_lm_backports() -> None:
-    """Register vendored architectures that the installed mlx-lm lacks. Idempotent."""
+    """Register vendored architectures that the installed mlx-lm lacks. Idempotent.
+
+    A backport that fails to import (e.g. mlx/mlx-lm drift) is logged and left
+    unregistered rather than raised, so it only affects loading that
+    architecture; the call is retried on the next load until it succeeds.
+    """
     global _installed
     if _installed:
         return
-    _installed = True
+    ok = True
     for model_type, module_name in _BACKPORTS.items():
         target = f"mlx_lm.models.{model_type}"
-        if target in sys.modules or importlib.util.find_spec(target) is not None:
-            continue
-        sys.modules[target] = importlib.import_module(module_name)
-        logger.debug("Registered backported mlx-lm architecture %r", model_type)
+        try:
+            if target in sys.modules or importlib.util.find_spec(target) is not None:
+                continue
+            sys.modules[target] = importlib.import_module(module_name)
+            logger.debug("Registered backported mlx-lm architecture %r", model_type)
+        except ImportError as exc:
+            ok = False
+            logger.warning(
+                "Backported mlx-lm architecture %r not registered: %s", model_type, exc
+            )
+    _installed = ok

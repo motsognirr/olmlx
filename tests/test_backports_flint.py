@@ -75,3 +75,33 @@ def test_flash_moe_flint_matches_sparse_block():
     expected = block(x)
     actual = replacement(x)
     assert mx.allclose(actual, expected, atol=1e-4).item()
+
+
+def test_failed_backport_is_logged_and_retried(monkeypatch, caplog):
+    import olmlx.engine.backports as bp
+
+    monkeypatch.setattr(bp, "_installed", False)
+    monkeypatch.setattr(
+        bp, "_BACKPORTS", {"nope_arch": "olmlx.engine.backports.does_not_exist"}
+    )
+    with caplog.at_level("WARNING", logger="olmlx.engine.backports"):
+        bp.install_mlx_lm_backports()  # must not raise
+    assert "nope_arch" in caplog.text
+    assert bp._installed is False  # not latched: the next load retries
+
+
+def test_flash_moe_qwen3_branch_rejects_shared_expert():
+    import pytest
+
+    from olmlx.engine.flash.flash_moe_model import _FlashMoEQwen3
+
+    class _LinearGatedWithShared(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.gate = nn.Linear(4, 4, bias=False)
+            self.shared_expert = nn.Linear(4, 4)
+            self.top_k = 2
+            self.norm_topk_prob = True
+
+    with pytest.raises(NotImplementedError, match="shared_expert"):
+        _FlashMoEQwen3(_LinearGatedWithShared(), lambda *a: None)
