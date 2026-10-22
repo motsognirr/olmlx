@@ -23,12 +23,13 @@ _BACKPORTS = {
 }
 
 _installed = False
+_warned: set[str] = set()  # warn once per architecture; retries log at debug
 
 
 def install_mlx_lm_backports() -> None:
     """Register vendored architectures that the installed mlx-lm lacks. Idempotent.
 
-    A backport that fails to import (e.g. mlx/mlx-lm drift) is logged and left
+    A backport that fails to import (any exception, e.g. mlx/mlx-lm drift) is logged and left
     unregistered rather than raised, so it only affects loading that
     architecture; the call is retried on the next load until it succeeds.
     """
@@ -43,9 +44,9 @@ def install_mlx_lm_backports() -> None:
                 continue
             sys.modules[target] = importlib.import_module(module_name)
             logger.debug("Registered backported mlx-lm architecture %r", model_type)
-        except ImportError as exc:
+        except Exception as exc:  # any drift must only cost this architecture
             ok = False
-            logger.warning(
-                "Backported mlx-lm architecture %r not registered: %s", model_type, exc
-            )
+            log = logger.debug if model_type in _warned else logger.warning
+            _warned.add(model_type)
+            log("Backported mlx-lm architecture %r not registered: %s", model_type, exc)
     _installed = ok

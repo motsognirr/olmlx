@@ -112,6 +112,7 @@ class MoeExpertLayout:
 # Cache for loaded shard files to avoid re-reading the same shard.
 # Bounded to prevent unbounded memory growth with many-shard models.
 MAX_SHARD_CACHE_SIZE = 3
+_MAX_HEADER_BYTES = 100 * 2**20  # safetensors header sanity cap
 _shard_cache: dict[str, dict] = {}
 
 
@@ -171,7 +172,9 @@ def _load_safetensors_index(model_dir: Path) -> dict | None:
     index_path = model_dir / "model.safetensors.index.json"
     if index_path.exists():
         return json.loads(index_path.read_text())
-    shards = sorted(model_dir.glob("*.safetensors"))
+    # Same file set mlx-lm loads; unrelated .safetensors (adapters, stale
+    # exports) next to the model are ignored.
+    shards = sorted(model_dir.glob("model*.safetensors"))
     if not shards or shards == [model_dir / "model.safetensors"]:
         return None
     weight_map: dict[str, str] = {}
@@ -180,9 +183,9 @@ def _load_safetensors_index(model_dir: Path) -> dict | None:
             size = shard.stat().st_size
             with open(shard, "rb") as f:
                 (header_len,) = struct.unpack("<Q", f.read(8))
-                # Bound the read by the file size: a garbage length must not
-                # turn into a multi-GB allocation.
-                if header_len > size - 8:
+                # Headers are KiB of JSON; a garbage length must not turn
+                # into a multi-GB allocation, even on a multi-GB shard.
+                if header_len > min(size - 8, _MAX_HEADER_BYTES):
                     raise ValueError(f"header length {header_len} exceeds file")
                 header = json.loads(f.read(header_len))
         except (OSError, struct.error, ValueError) as exc:

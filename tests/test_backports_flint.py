@@ -90,6 +90,27 @@ def test_failed_backport_is_logged_and_retried(monkeypatch, caplog):
     assert bp._installed is False  # not latched: the next load retries
 
 
+def test_backport_non_import_error_is_contained(monkeypatch, caplog):
+    """API drift surfacing as e.g. AttributeError must not break other loads."""
+    import importlib
+
+    import olmlx.engine.backports as bp
+
+    monkeypatch.setattr(bp, "_installed", False)
+    monkeypatch.setattr(bp, "_warned", set())
+    monkeypatch.setattr(bp, "_BACKPORTS", {"drift_arch": "x.y"})
+
+    def boom(name):
+        raise AttributeError("mlx.nn has no attribute 'shard_linear'")
+
+    monkeypatch.setattr(importlib, "import_module", boom)
+    with caplog.at_level("DEBUG", logger="olmlx.engine.backports"):
+        bp.install_mlx_lm_backports()
+        bp.install_mlx_lm_backports()
+    warnings = [r for r in caplog.records if r.levelname == "WARNING"]
+    assert len(warnings) == 1  # warned once, retry logged at debug
+
+
 def test_flash_moe_qwen3_branch_rejects_shared_expert():
     import pytest
 
