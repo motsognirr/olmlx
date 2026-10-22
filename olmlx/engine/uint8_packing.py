@@ -32,10 +32,23 @@ _TMP_SUFFIX = ".u32tmp.safetensors"
 _LOCK_NAME = ".uint8-normalize.lock"
 
 
-def _read_header(path: Path) -> dict:
-    with open(path, "rb") as f:
-        (n,) = struct.unpack("<Q", f.read(8))
-        header = json.loads(f.read(n))
+def _read_header(path: Path) -> dict | None:
+    """Shard header, or None if the file isn't a readable safetensors shard.
+
+    A bad shard is not this module's to report: skipping it lets the loader
+    raise its own error for it.
+    """
+    try:
+        size = path.stat().st_size
+        with open(path, "rb") as f:
+            (n,) = struct.unpack("<Q", f.read(8))
+            if n > size - 8:
+                return None
+            header = json.loads(f.read(n))
+    except (OSError, struct.error, ValueError):
+        return None
+    if not isinstance(header, dict):
+        return None
     header.pop("__metadata__", None)
     return header
 
@@ -102,7 +115,7 @@ def _scan(model_dir: Path) -> tuple[dict[Path, dict], dict, set[str]]:
     shards = sorted(
         p for p in model_dir.glob("*.safetensors") if not p.name.endswith(_TMP_SUFFIX)
     )
-    headers = {p: _read_header(p) for p in shards}
+    headers = {p: h for p in shards if (h := _read_header(p)) is not None}
     packed = _packed_weights(headers)
     u8_modules = {m for m, (dtype, _, _) in packed.items() if dtype == "U8"}
     return headers, packed, u8_modules
@@ -122,7 +135,17 @@ def normalize_uint8_packing_in_place(model_dir: str | Path) -> bool:
 
     import fcntl
 
-    with open(model_dir / _LOCK_NAME, "w") as lock:
+    try:
+        lock = open(model_dir / _LOCK_NAME, "w")
+    except OSError as exc:
+        logger.warning(
+            "%s has uint8-packed weights but can't be normalized in place (%s); "
+            "loading will likely fail with a shape mismatch",
+            model_dir,
+            exc,
+        )
+        return False
+    with lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
         try:
             return _normalize_locked(model_dir, config_path)
@@ -176,8 +199,11 @@ def _normalize_locked(model_dir: Path, config_path: Path) -> bool:
         weights = {
             k: v.view(mx.uint32) if k in names else v for k, v in weights.items()
         }
-        tmp = path.with_name(path.stem + _TMP_SUFFIX)
+        # Rewrite the real file: replacing a symlinked shard (HF hub cache
+        # snapshots point into blobs/) would turn the link into a copy.
+        target = path.resolve()
+        tmp = target.with_name(target.stem + _TMP_SUFFIX)
         mx.save_safetensors(str(tmp), weights, metadata=meta or {"format": "mlx"})
-        os.replace(tmp, path)
+        os.replace(tmp, target)
         del weights
     return True

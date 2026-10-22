@@ -265,3 +265,51 @@ def test_uninferable_uint32_module_does_not_block_conversion(tmp_path):
     assert normalize_uint8_packing_in_place(model_dir) is True
     weights = _all_weights(model_dir)
     assert all(weights[f"{m}.weight"].dtype == mx.uint32 for m in originals)
+
+
+def test_corrupt_shard_is_skipped_not_raised(tmp_path):
+    """A bad extra shard is the loader's to report; the uint8 ones still convert."""
+    model_dir = tmp_path / "m"
+    originals = _write_checkpoint(model_dir, as_uint8=True)
+    (model_dir / "model-00009.safetensors").write_bytes(b"\x01")
+
+    assert normalize_uint8_packing_in_place(model_dir) is True
+    weights = {
+        k: v
+        for p in sorted(model_dir.glob("model-0000[01].safetensors"))
+        for k, v in mx.load(str(p)).items()
+    }
+    assert all(weights[f"{m}.weight"].dtype == mx.uint32 for m in originals)
+
+
+def test_symlinked_shard_keeps_link(tmp_path):
+    """HF-cache style snapshot symlinks keep pointing at the (rewritten) blob."""
+    model_dir = tmp_path / "m"
+    _write_checkpoint(model_dir, as_uint8=True)
+    blobs = tmp_path / "blobs"
+    blobs.mkdir()
+    shard = model_dir / "model-00001.safetensors"
+    blob = blobs / "abc123"
+    shard.rename(blob)
+    shard.symlink_to(blob)
+
+    assert normalize_uint8_packing_in_place(model_dir) is True
+    assert shard.is_symlink() and shard.resolve() == blob
+    assert (
+        mx.load(str(blob), format="safetensors")["model.embed_tokens.weight"].dtype
+        == mx.uint32
+    )
+
+
+def test_unwritable_dir_warns_and_skips(tmp_path, caplog):
+    import os
+
+    model_dir = tmp_path / "m"
+    _write_checkpoint(model_dir, as_uint8=True)
+    os.chmod(model_dir, 0o555)
+    try:
+        with caplog.at_level("WARNING", logger="olmlx.engine.uint8_packing"):
+            assert normalize_uint8_packing_in_place(model_dir) is False
+    finally:
+        os.chmod(model_dir, 0o755)
+    assert "can't be normalized in place" in caplog.text
