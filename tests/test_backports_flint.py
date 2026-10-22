@@ -105,3 +105,20 @@ def test_flash_moe_qwen3_branch_rejects_shared_expert():
 
     with pytest.raises(NotImplementedError, match="shared_expert"):
         _FlashMoEQwen3(_LinearGatedWithShared(), lambda *a: None)
+
+
+def test_flash_moe_qwen3_branch_rejects_share_expert_spelling():
+    import pytest
+
+    from olmlx.engine.flash.flash_moe_model import _FlashMoEQwen3
+
+    class _Block(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.gate = nn.Linear(4, 4, bias=False)
+            self.share_expert = nn.Linear(4, 4)
+            self.top_k = 2
+            self.norm_topk_prob = True
+
+    with pytest.raises(NotImplementedError, match="share_expert"):
+        _FlashMoEQwen3(_Block(), lambda *a: None)

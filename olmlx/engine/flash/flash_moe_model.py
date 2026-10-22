@@ -181,7 +181,8 @@ class _FlashMoEQwen3(_FlashMoEBase):
         super().__init__(original_moe, flash_moe)
         # This branch is the catch-all for linear-gated blocks; one carrying a
         # shared expert would lose it here and produce silently wrong logits.
-        for attr in ("shared_expert", "shared_experts"):
+        # All shared-expert spellings this file knows ("share_expert": Step-3.5).
+        for attr in ("shared_expert", "shared_experts", "share_expert"):
             if getattr(original_moe, attr, None) is not None:
                 raise NotImplementedError(
                     f"Flash-MoE has no router for {type(original_moe).__module__}."
@@ -483,8 +484,8 @@ def _is_flint_moe(moe_module: nn.Module) -> bool:
     import sys
 
     for name in ("mlx_lm.models.flint", "olmlx.engine.backports.flint"):
-        mod = sys.modules.get(name)
-        if mod is not None and isinstance(moe_module, mod.SparseMoeBlock):
+        cls = getattr(sys.modules.get(name), "SparseMoeBlock", None)
+        if cls is not None and isinstance(moe_module, cls):
             return True
     return False
 

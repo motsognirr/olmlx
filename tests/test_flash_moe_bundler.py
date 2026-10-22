@@ -1541,3 +1541,17 @@ class TestDetectMoeLayersEnum:
         }
         with pytest.raises(ValueError, match="beyond num_hidden_layers"):
             _detect_moe_layers(config)
+
+
+def test_synthesized_index_rejects_corrupt_shard(tmp_path):
+    """A garbage header length must name the shard, not allocate or raise struct.error."""
+    import struct
+
+    from olmlx.engine.flash.moe_bundler import _load_safetensors_index
+
+    (tmp_path / "a.safetensors").write_bytes(struct.pack("<Q", 2**40) + b"{}")
+    (tmp_path / "b.safetensors").write_bytes(b"\x02")
+    with pytest.raises(
+        ValueError, match="a.safetensors: not a readable safetensors shard"
+    ):
+        _load_safetensors_index(tmp_path)

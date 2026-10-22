@@ -176,9 +176,19 @@ def _load_safetensors_index(model_dir: Path) -> dict | None:
         return None
     weight_map: dict[str, str] = {}
     for shard in shards:
-        with open(shard, "rb") as f:
-            (header_len,) = struct.unpack("<Q", f.read(8))
-            header = json.loads(f.read(header_len))
+        try:
+            size = shard.stat().st_size
+            with open(shard, "rb") as f:
+                (header_len,) = struct.unpack("<Q", f.read(8))
+                # Bound the read by the file size: a garbage length must not
+                # turn into a multi-GB allocation.
+                if header_len > size - 8:
+                    raise ValueError(f"header length {header_len} exceeds file")
+                header = json.loads(f.read(header_len))
+        except (OSError, struct.error, ValueError) as exc:
+            raise ValueError(
+                f"{shard}: not a readable safetensors shard ({exc})"
+            ) from exc
         for name in header:
             if name != "__metadata__":
                 weight_map[name] = shard.name
