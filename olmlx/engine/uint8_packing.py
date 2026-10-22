@@ -105,6 +105,12 @@ def _bits_overrides(packed: dict, quant: dict) -> dict:
     return overrides
 
 
+def _shard_tmp(shard: Path) -> Path:
+    """Temp file for rewriting *shard*: beside its resolved target, same filesystem."""
+    target = shard.resolve()
+    return target.with_name(target.stem + _TMP_SUFFIX)
+
+
 def _write_json_atomic(path: Path, data: dict) -> None:
     tmp = path.with_name(path.name + ".tmp")
     tmp.write_text(json.dumps(data, indent=2))
@@ -154,8 +160,17 @@ def normalize_uint8_packing_in_place(model_dir: str | Path) -> bool:
 
 
 def _normalize_locked(model_dir: Path, config_path: Path) -> bool:
-    for stale in [*model_dir.glob(f"*{_TMP_SUFFIX}"), model_dir / "config.json.tmp"]:
-        # Left by an interrupted rewrite; the original file is intact.
+    # Left by an interrupted rewrite; the originals are intact. Shard temps sit
+    # next to the resolved shard, which for symlinked (HF-cache) shards is
+    # outside model_dir, so derive them per shard as well as globbing here.
+    shards = [
+        p for p in model_dir.glob("*.safetensors") if not p.name.endswith(_TMP_SUFFIX)
+    ]
+    for stale in {
+        *model_dir.glob(f"*{_TMP_SUFFIX}"),
+        *(_shard_tmp(p) for p in shards),
+        model_dir / "config.json.tmp",
+    }:
         stale.unlink(missing_ok=True)
     headers, packed, u8_modules = _scan(model_dir)
     if not u8_modules:
@@ -202,7 +217,7 @@ def _normalize_locked(model_dir: Path, config_path: Path) -> bool:
         # Rewrite the real file: replacing a symlinked shard (HF hub cache
         # snapshots point into blobs/) would turn the link into a copy.
         target = path.resolve()
-        tmp = target.with_name(target.stem + _TMP_SUFFIX)
+        tmp = _shard_tmp(path)
         mx.save_safetensors(str(tmp), weights, metadata=meta or {"format": "mlx"})
         os.replace(tmp, target)
         del weights

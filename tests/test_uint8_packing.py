@@ -313,3 +313,20 @@ def test_unwritable_dir_warns_and_skips(tmp_path, caplog):
     finally:
         os.chmod(model_dir, 0o755)
     assert "can't be normalized in place" in caplog.text
+
+
+def test_stale_temp_beside_symlinked_blob_is_cleaned(tmp_path):
+    """An interrupted rewrite of a symlinked shard leaves its temp in blobs/; a rerun removes it."""
+    model_dir = tmp_path / "m"
+    _write_checkpoint(model_dir, as_uint8=True)
+    blobs = tmp_path / "blobs"
+    blobs.mkdir()
+    shard = model_dir / "model-00001.safetensors"
+    blob = blobs / "abc123"
+    shard.rename(blob)
+    shard.symlink_to(blob)
+    orphan = blobs / "abc123.u32tmp.safetensors"
+    orphan.write_bytes(b"partial")
+
+    assert normalize_uint8_packing_in_place(model_dir) is True
+    assert not orphan.exists()
