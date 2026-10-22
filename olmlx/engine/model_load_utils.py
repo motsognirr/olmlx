@@ -13,6 +13,7 @@ import mlx.nn as nn
 
 from olmlx.engine.backports import install_mlx_lm_backports
 from olmlx.engine.prompt_cache import CachedPromptState, PromptCacheStore  # noqa: F401
+from olmlx.engine.uint8_packing import normalize_uint8_packing_in_place
 
 # Speculative-decoder draft loaders live in a focused mixin module (#454).
 # ``_resolve_attention_causal`` is re-exported for back-compat with tests that
@@ -247,6 +248,7 @@ def _load_with_model_type_fallback(mlx_lm, load_path, **kwargs):
         return gemma4_unified
 
     _sanitize_model_config_in_place(load_path)
+    normalize_uint8_packing_in_place(load_path)
     kwargs.setdefault("tokenizer_config", {"trust_remote_code": True})
     try:
         model, tokenizer = mlx_lm.load(str(load_path), **kwargs)

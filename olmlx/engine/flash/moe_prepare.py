@@ -63,6 +63,11 @@ def prepare_moe_for_flash(
     if progress_callback:
         progress_callback("Reading model config", 0.0)
 
+    # The bundler reads raw shards, so uint8-packed exports must be normalized first.
+    from olmlx.engine.uint8_packing import normalize_uint8_packing_in_place
+
+    normalize_uint8_packing_in_place(model_dir)
+
     config = json.loads((model_dir / "config.json").read_text())
     # Handle wrapper models (e.g., Kimi-K2.5 wraps DeepSeek-V3)
     text_config = config.get("text_config", config)
