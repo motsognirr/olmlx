@@ -13,6 +13,7 @@ import mlx.nn as nn
 
 from olmlx.engine.backports import install_mlx_lm_backports
 from olmlx.engine.prompt_cache import CachedPromptState, PromptCacheStore  # noqa: F401
+from olmlx.engine.uint8_packing import normalize_uint8_packing_in_place
 
 # Speculative-decoder draft loaders live in a focused mixin module (#454).
 # ``_resolve_attention_causal`` is re-exported for back-compat with tests that
@@ -234,6 +235,10 @@ def _load_with_model_type_fallback(mlx_lm, load_path, **kwargs):
     # Architectures newer than the pinned mlx-lm (e.g. Flint) must be
     # registered before mlx_lm.load resolves the model_type.
     install_mlx_lm_backports()
+    # Before every loader, including the gemma4_unified early return below,
+    # which reads raw shards too.
+    normalize_uint8_packing_in_place(load_path)
+
     # mlx-community 'gemma4_unified' text checkpoints (e.g. gemma-4-12B-it-4bit)
     # need a dedicated loader: their model_type has no mlx-lm module and their
     # multimodal weights must be dropped to load the language tower. The loader

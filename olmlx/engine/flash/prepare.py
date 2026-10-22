@@ -63,7 +63,9 @@ def load_model_with_strict_fallback(model_path: str, *, lazy: bool) -> tuple:
     import mlx_lm
 
     from olmlx.engine.backports import install_mlx_lm_backports
+    from olmlx.engine.uint8_packing import normalize_uint8_packing_in_place
 
+    normalize_uint8_packing_in_place(model_path)
     install_mlx_lm_backports()
 
     # Function-local import: model_manager doesn't import flash.prepare at
