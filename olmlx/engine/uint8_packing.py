@@ -11,7 +11,7 @@ the per-module ``bits`` overrides the shapes imply. Done once, in place, before
 the first load or Flash-MoE prepare; later calls find no ``uint8`` weights and
 return immediately after reading the shard headers.
 
-Crash safety: config.json is updated first (overrides are derived from shapes,
+Crash safety: config.json is updated first (atomically) (overrides are derived from shapes,
 which read the same for uint8 and uint32), then each shard is replaced
 atomically. A rerun after an interruption converts whatever shards remain.
 """
@@ -58,27 +58,51 @@ def _packed_weights(headers: dict[Path, dict]) -> dict[str, tuple[str, list, lis
     return out
 
 
-def _bits_overrides(packed: dict, group_size: int, default_bits: int) -> dict:
+class PackedWeightsError(RuntimeError):
+    """A uint8-packed checkpoint whose layout can't be normalized.
+
+    Deliberately not a ValueError: load paths treat ValueError from mlx-lm as
+    "unsupported model type" and fall back to the VLM loader.
+    """
+
+
+def _bits_overrides(packed: dict, quant: dict) -> dict:
+    """Per-module overrides the packed shapes imply, relative to *quant*.
+
+    A module's existing override supplies its group_size; only modules whose
+    inferred width differs from what the config already says are returned.
+    """
+    default_gs, default_bits = quant.get("group_size", 64), quant.get("bits", 4)
     overrides = {}
     for module, (dtype, w_shape, s_shape) in packed.items():
+        current = quant.get(module)
+        current = current if isinstance(current, dict) else {}
+        group_size = current.get("group_size", default_gs)
         in_features = s_shape[-1] * group_size
         bits, rem = divmod(w_shape[-1] * _BYTES_PER_ELEM[dtype] * 8, in_features)
         if rem or bits not in (2, 3, 4, 5, 6, 8):
-            raise ValueError(
+            raise PackedWeightsError(
                 f"Cannot infer bit width for {module}: packed {w_shape} {dtype}, "
                 f"scales {s_shape}, group_size {group_size}"
             )
-        if bits != default_bits:
+        if bits != current.get("bits", default_bits):
             overrides[module] = {"group_size": group_size, "bits": bits}
     return overrides
+
+
+def _write_json_atomic(path: Path, data: dict) -> None:
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(json.dumps(data, indent=2))
+    os.replace(tmp, path)
 
 
 def normalize_uint8_packing_in_place(model_dir: str | Path) -> bool:
     """Rewrite uint8-packed quantized weights as uint32. Returns True if anything changed."""
     model_dir = Path(model_dir)
     config_path = model_dir / "config.json"
-    for stale in model_dir.glob(f"*{_TMP_SUFFIX}"):
-        stale.unlink()  # left by an interrupted rewrite; the original shard is intact
+    for stale in [*model_dir.glob(f"*{_TMP_SUFFIX}"), model_dir / "config.json.tmp"]:
+        # Left by an interrupted rewrite; the original file is intact.
+        stale.unlink(missing_ok=True)
     shards = sorted(model_dir.glob("*.safetensors"))
     if not shards or not config_path.exists():
         return False
@@ -88,15 +112,17 @@ def normalize_uint8_packing_in_place(model_dir: str | Path) -> bool:
     if not u8_modules:
         return False
 
-    cfg = json.loads(config_path.read_text())
+    try:
+        cfg = json.loads(config_path.read_text())
+    except json.JSONDecodeError as exc:
+        raise PackedWeightsError(f"Unreadable {config_path}: {exc}") from exc
     quant = dict(cfg.get("quantization") or cfg.get("quantization_config") or {})
-    group_size, default_bits = quant.get("group_size", 64), quant.get("bits", 4)
-    overrides = _bits_overrides(packed, group_size, default_bits)
-    if any(quant.get(m) != q for m, q in overrides.items()):
+    overrides = _bits_overrides(packed, quant)
+    if overrides:
         quant.update(overrides)
         cfg["quantization"] = quant
         cfg["quantization_config"] = quant
-        config_path.write_text(json.dumps(cfg, indent=2))
+        _write_json_atomic(config_path, cfg)
     logger.info(
         "Converting %d uint8-packed weights in %s to uint32 (%d bit-width overrides)",
         len(u8_modules),

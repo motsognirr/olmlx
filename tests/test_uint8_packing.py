@@ -5,7 +5,10 @@ import json
 import mlx.core as mx
 import pytest
 
-from olmlx.engine.uint8_packing import normalize_uint8_packing_in_place
+from olmlx.engine.uint8_packing import (
+    PackedWeightsError,
+    normalize_uint8_packing_in_place,
+)
 
 GROUP = 64
 
@@ -145,5 +148,36 @@ def test_rejects_uninferable_bit_width(tmp_path):
         json.dumps({"quantization": {"group_size": GROUP, "bits": 4}})
     )
 
-    with pytest.raises(ValueError, match="Cannot infer bit width"):
+    with pytest.raises(PackedWeightsError, match="Cannot infer bit width"):
         normalize_uint8_packing_in_place(model_dir)
+
+
+def test_existing_per_module_group_size_is_respected(tmp_path):
+    """A module override with its own group_size must not be recomputed with the global one."""
+    model_dir = tmp_path / "m"
+    model_dir.mkdir()
+    w = mx.random.normal((16, 256), key=mx.random.key(3))
+    q, s, b = mx.quantize(w, group_size=32, bits=4)
+    mx.save_safetensors(
+        str(model_dir / "model.safetensors"),
+        {"a.weight": q.view(mx.uint8), "a.scales": s, "a.biases": b},
+    )
+    quant = {"group_size": 64, "bits": 4, "a": {"group_size": 32, "bits": 4}}
+    (model_dir / "config.json").write_text(json.dumps({"quantization": quant}))
+
+    assert normalize_uint8_packing_in_place(model_dir) is True
+
+    assert json.loads((model_dir / "config.json").read_text())["quantization"] == quant
+
+
+def test_interrupted_config_write_leaves_original(tmp_path):
+    """A stale config.json.tmp from a crash is discarded; config.json itself stays valid."""
+    model_dir = tmp_path / "m"
+    _write_checkpoint(model_dir, as_uint8=True)
+    (model_dir / "config.json.tmp").write_text("{trunc")
+
+    assert normalize_uint8_packing_in_place(model_dir) is True
+
+    assert not (model_dir / "config.json.tmp").exists()
+    cfg = json.loads((model_dir / "config.json").read_text())
+    assert cfg["quantization"]["model.embed_tokens"]["bits"] == 8
