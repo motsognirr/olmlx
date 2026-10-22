@@ -181,3 +181,51 @@ def test_interrupted_config_write_leaves_original(tmp_path):
     assert not (model_dir / "config.json.tmp").exists()
     cfg = json.loads((model_dir / "config.json").read_text())
     assert cfg["quantization"]["model.embed_tokens"]["bits"] == 8
+
+
+def test_concurrent_callers_convert_once(tmp_path):
+    """Two first loads racing: the flock serializes them, the second finds nothing to do."""
+    import threading
+
+    model_dir = tmp_path / "m"
+    originals = _write_checkpoint(model_dir, as_uint8=True)
+    results, errors = [], []
+
+    def run():
+        try:
+            results.append(normalize_uint8_packing_in_place(model_dir))
+        except Exception as exc:  # surfaced below
+            errors.append(exc)
+
+    threads = [threading.Thread(target=run) for _ in range(2)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert not errors
+    assert sorted(results) == [False, True]
+    weights = _all_weights(model_dir)
+    assert all(weights[f"{m}.weight"].dtype == mx.uint32 for m in originals)
+
+
+def test_gemma4_unified_path_is_normalized_first(tmp_path, monkeypatch):
+    """The gemma4_unified early return must not bypass normalization."""
+    from unittest.mock import MagicMock
+
+    import olmlx.engine.model_load_utils as mlu
+
+    calls = []
+    monkeypatch.setattr(
+        mlu, "normalize_uint8_packing_in_place", lambda p: calls.append("norm")
+    )
+    monkeypatch.setattr(
+        mlu,
+        "_maybe_load_gemma4_unified_text",
+        lambda p: calls.append("gemma4") or (MagicMock(), MagicMock()),
+    )
+    monkeypatch.setattr(mlu, "_materialize_module_buffers", lambda m: None)
+
+    mlu._load_with_model_type_fallback(MagicMock(), tmp_path)
+
+    assert calls == ["norm", "gemma4"]

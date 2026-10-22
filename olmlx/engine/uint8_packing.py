@@ -29,6 +29,7 @@ logger = logging.getLogger(__name__)
 _BYTES_PER_ELEM = {"U8": 1, "U32": 4}
 # mx.save_safetensors appends ".safetensors" to any other name.
 _TMP_SUFFIX = ".u32tmp.safetensors"
+_LOCK_NAME = ".uint8-normalize.lock"
 
 
 def _read_header(path: Path) -> dict:
@@ -96,21 +97,45 @@ def _write_json_atomic(path: Path, data: dict) -> None:
     os.replace(tmp, path)
 
 
-def normalize_uint8_packing_in_place(model_dir: str | Path) -> bool:
-    """Rewrite uint8-packed quantized weights as uint32. Returns True if anything changed."""
-    model_dir = Path(model_dir)
-    config_path = model_dir / "config.json"
-    for stale in [*model_dir.glob(f"*{_TMP_SUFFIX}"), model_dir / "config.json.tmp"]:
-        # Left by an interrupted rewrite; the original file is intact.
-        stale.unlink(missing_ok=True)
-    shards = sorted(model_dir.glob("*.safetensors"))
-    if not shards or not config_path.exists():
-        return False
+def _scan(model_dir: Path) -> tuple[dict[Path, dict], dict, set[str]]:
+    shards = sorted(
+        p for p in model_dir.glob("*.safetensors") if not p.name.endswith(_TMP_SUFFIX)
+    )
     headers = {p: _read_header(p) for p in shards}
     packed = _packed_weights(headers)
     u8_modules = {m for m, (dtype, _, _) in packed.items() if dtype == "U8"}
+    return headers, packed, u8_modules
+
+
+def normalize_uint8_packing_in_place(model_dir: str | Path) -> bool:
+    """Rewrite uint8-packed quantized weights as uint32. Returns True if anything changed.
+
+    Concurrent callers (two first loads, or a load racing Flash-MoE prepare) are
+    serialized by an flock on ``model_dir/.uint8-normalize.lock``; whoever gets
+    it second re-scans and finds nothing left to do.
+    """
+    model_dir = Path(model_dir)
+    config_path = model_dir / "config.json"
+    if not config_path.exists() or not _scan(model_dir)[2]:
+        return False  # fast path: headers only, no lock
+
+    import fcntl
+
+    with open(model_dir / _LOCK_NAME, "w") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        try:
+            return _normalize_locked(model_dir, config_path)
+        finally:
+            fcntl.flock(lock, fcntl.LOCK_UN)
+
+
+def _normalize_locked(model_dir: Path, config_path: Path) -> bool:
+    for stale in [*model_dir.glob(f"*{_TMP_SUFFIX}"), model_dir / "config.json.tmp"]:
+        # Left by an interrupted rewrite; the original file is intact.
+        stale.unlink(missing_ok=True)
+    headers, packed, u8_modules = _scan(model_dir)
     if not u8_modules:
-        return False
+        return False  # another caller finished while we waited for the lock
 
     try:
         cfg = json.loads(config_path.read_text())
@@ -119,15 +144,23 @@ def normalize_uint8_packing_in_place(model_dir: str | Path) -> bool:
     quant = dict(cfg.get("quantization") or cfg.get("quantization_config") or {})
     overrides = _bits_overrides(packed, quant)
     if overrides:
+        # Shapes give bits x group_size, not each separately: a module quantized
+        # with an undeclared group_size reads as a different bit width. Surface
+        # what was inferred so a wrong guess is visible in the log.
+        logger.warning(
+            "Inferred per-module quantization for %s from packed shapes "
+            "(assumes declared group sizes): %s",
+            model_dir,
+            overrides,
+        )
         quant.update(overrides)
         cfg["quantization"] = quant
         cfg["quantization_config"] = quant
         _write_json_atomic(config_path, cfg)
     logger.info(
-        "Converting %d uint8-packed weights in %s to uint32 (%d bit-width overrides)",
+        "Converting %d uint8-packed weights in %s to uint32",
         len(u8_modules),
         model_dir,
-        len(overrides),
     )
 
     import mlx.core as mx
