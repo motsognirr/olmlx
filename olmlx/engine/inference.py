@@ -117,6 +117,7 @@ from olmlx.engine.kv_budget import (  # noqa: F401
     MEMORY_SAFETY_FACTOR,
     PREFILL_CHUNK_TOKENS,
     _parse_kv_cache_quant_kv,
+    _parse_kv_eviction,
     build_context_input_tokens,
     estimate_kv_cache_bytes,
     tokenize_for_cache,
@@ -1226,13 +1227,6 @@ def _make_shard_prompt_cache(
     return make_shard_cache(
         cache_model, calibration_dir, bits=bits, fused=settings.shard_fused
     )
-
-
-def _parse_kv_eviction(spec: str) -> tuple[int, int]:
-    """Split an ``OLMLX_KV_EVICTION`` value like ``"4:512"`` into
-    ``(sink, window)``. Format is validated at config load time (#505)."""
-    sink_str, window_str = spec.split(":")
-    return int(sink_str), int(window_str)
 
 
 def _make_eviction_prompt_cache(model: Any, sink: int, window: int) -> list:
@@ -2503,6 +2497,20 @@ async def _kv_cache_preflight_check(
     """
     result = _PreflightResult(prompt=prompt)
 
+    # The estimate must model the cache this request actually runs with
+    # (#755 review). When the bounded eviction cache governs — the shared
+    # attach/window-exemption gate — it holds only sink+window tokens while
+    # prefilling, not the full prompt+max_tokens horizon. ``lm.is_speculative``
+    # as the speculation answer is deliberately conservative: a speculative
+    # model never receives the bounded cache, and the speculative-with-media
+    # request that *is* attached stays charged the full horizon (an
+    # overestimate, never an OOM).
+    eviction_arg = (
+        lm.kv_eviction
+        if _eviction_will_bound(lm, will_speculate=lm.is_speculative)
+        else None
+    )
+
     if cache_creation_tokens > 0:
         num_prefill_tokens = cache_creation_tokens
     elif isinstance(prompt, list):
@@ -2533,6 +2541,7 @@ async def _kv_cache_preflight_check(
             lm.model,
             num_prefill_tokens + max_tokens,
             kv_cache_quant=lm.kv_cache_quant,
+            kv_eviction=eviction_arg,
         )
         current_metal = memory_utils.get_metal_memory()
         if current_metal + kv_bytes > result.memory_limit:
@@ -2587,6 +2596,7 @@ async def _kv_cache_preflight_check(
                 lm.model,
                 estimate_total,
                 kv_cache_quant=lm.kv_cache_quant,
+                kv_eviction=eviction_arg,
             )
             _safe_sync()
             current_metal = memory_utils.get_metal_memory()
