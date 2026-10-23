@@ -5725,6 +5725,85 @@ class TestKvCachePreflightCheck:
             if _inference_lock.locked():
                 _inference_lock.release()
 
+    @staticmethod
+    def _tight_memory_patches():
+        """24 GB system / 12 GB limit with 10.5 GB resident: the uncapped
+        horizon estimate (22000+512 tokens ≈ 1.9 GB) breaches it, the capped
+        estimate (sink+window+chunk ≈ 0.2 GB) fits."""
+        return (
+            patch(
+                "olmlx.utils.memory.get_system_memory_bytes",
+                return_value=24 * 1024**3,
+            ),
+            patch(
+                "olmlx.utils.memory.get_metal_memory",
+                return_value=10.5 * 1024**3,
+            ),
+        )
+
+    def _eviction_lm(self, mock_lm):
+        mock_lm.model.args = self._eviction_args()
+        mock_lm.kv_cache_quant = None
+        mock_lm.kv_eviction = "4:512"
+        mock_lm.kv_eviction_effective = True  # layout probe memo (text model)
+        return mock_lm
+
+    @pytest.mark.asyncio
+    async def test_preflight_cap_follows_request_level_will_speculate(self, mock_lm):
+        """#755 review round 2: the preflight must judge the *request*, not
+        the model. A speculative model on a grammar/media request (for which
+        the dispatch keeps plain decoding and ``_attach_kv_cache`` installs
+        the bounded cache) is estimated via the cap and admitted — previously
+        it was charged the full horizon and 503'd after the surface had
+        already waived the window check for exactly this case."""
+        from olmlx.engine.inference import _kv_cache_preflight_check
+
+        lm = self._eviction_lm(mock_lm)
+        gen_kwargs: dict = {}
+        p1, p2 = self._tight_memory_patches()
+        with p1, p2:
+            with (
+                patch("olmlx.engine.inference.settings") as mock_settings,
+                patch("olmlx.engine.inference.mx"),
+                patch("olmlx.engine.inference._safe_sync"),
+            ):
+                mock_settings.memory_limit_fraction = 0.5
+                mock_settings.prompt_cache = False
+                # Round trip 1: will_speculate=False reproduces the request the
+                # surface decided to keep plain (grammar active / media) —
+                # bounded cache governs, admission rides the cap.
+                result = await _kv_cache_preflight_check(
+                    lm,
+                    list(range(22000)),
+                    512,
+                    gen_kwargs,
+                    cache_read_tokens=0,
+                    cache_creation_tokens=0,
+                    full_prompt_tokens=None,
+                    cache_id="",
+                    will_speculate=False,
+                )
+                assert result.prompt == list(range(22000))  # unchanged
+                assert "prompt_cache" not in gen_kwargs  # nothing dropped
+
+                # Round trip 2: will_speculate=True on the same model (a true
+                # speculative request, unbounded generation) keeps the
+                # conservative full-horizon rejection.
+                mock_settings.memory_limit_fraction = 0.5
+                mock_settings.prompt_cache = False
+                with pytest.raises(MemoryError, match="prompt too long"):
+                    await _kv_cache_preflight_check(
+                        self._eviction_lm(mock_lm),
+                        list(range(22000)),
+                        512,
+                        {},
+                        cache_read_tokens=0,
+                        cache_creation_tokens=0,
+                        full_prompt_tokens=None,
+                        cache_id="",
+                        will_speculate=True,
+                    )
+
 
 class TestPrefillMemoryCallback:
     """Tests for memory checking during prefill."""

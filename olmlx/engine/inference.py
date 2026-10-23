@@ -2483,6 +2483,7 @@ async def _kv_cache_preflight_check(
     full_prompt_tokens: list[int] | None,
     cache_id: str,
     has_deferred_prefill: bool = False,
+    will_speculate: bool = False,
 ) -> _PreflightResult:
     """Estimate KV cache memory and reject if it would exceed the limit.
 
@@ -2494,20 +2495,30 @@ async def _kv_cache_preflight_check(
     trim (flat lazy-state path) to the worker, so the working cache does not
     yet match ``full_prompt_tokens[:cache_read_tokens]`` and the prompt may be
     a suffix even when ``cache_read_tokens == 0``.
+
+    ``will_speculate``: the request-level speculation decision, computed by
+    the caller via ``_request_will_speculate`` and reused for the
+    ``_attach_kv_cache`` right after, so the estimator's eviction cap rides
+    the exact same predicate the attach does (#755 review). Production
+    callers must always pass it — the ``False`` default means the cap may
+    apply, which is only correct when the request indeed receives the
+    bounded cache.
     """
     result = _PreflightResult(prompt=prompt)
 
     # The estimate must model the cache this request actually runs with
-    # (#755 review). When the bounded eviction cache governs — the shared
-    # attach/window-exemption gate — it holds only sink+window tokens while
-    # prefilling, not the full prompt+max_tokens horizon. ``lm.is_speculative``
-    # as the speculation answer is deliberately conservative: a speculative
-    # model never receives the bounded cache, and the speculative-with-media
-    # request that *is* attached stays charged the full horizon (an
-    # overestimate, never an OOM).
+    # (#755 review). Under the shared attach/window-exemption gate the
+    # generation receives the bounded eviction cache (prompt-cache setup
+    # builds it; `_attach_kv_cache` rebuilds it when the preflight pops it),
+    # and that cache holds only sink+window tokens while prefilling — not
+    # the full prompt+max_tokens horizon. ``will_speculate`` is the
+    # request-level answer, computed by the caller with the same
+    # ``_request_will_speculate`` call it reuses for the attach, so the
+    # estimate and the attach can't disagree: speculative requests (which
+    # never receive the bounded cache) keep the full-horizon charge.
     eviction_arg = (
         lm.kv_eviction
-        if _eviction_will_bound(lm, will_speculate=lm.is_speculative)
+        if _eviction_will_bound(lm, will_speculate=will_speculate)
         else None
     )
 
@@ -3615,6 +3626,20 @@ async def _stream_completion(
         full_prompt_tokens = cs.full_prompt_tokens
         cache_setup_done = cs.cache_setup_done
 
+        # The request-level speculation answer, computed once and used by
+        # both the preflight's eviction cap and the attach below — the two
+        # must make the same decision (#755 review).
+        will_speculate = _request_will_speculate(
+            lm,
+            stream=True,
+            images=images,
+            # audio_paths (materialized above): exactly the media test the
+            # dispatch below recomputes — `audio` is the caller's raw
+            # data, truthiness-equivalent but not the same variable.
+            audio=audio_paths,
+            grammar_active=grammar_active,
+        )
+
         # Pre-flight KV cache memory check
         pf = await _kv_cache_preflight_check(
             lm,
@@ -3626,6 +3651,7 @@ async def _stream_completion(
             full_prompt_tokens=full_prompt_tokens,
             cache_id=cache_id,
             has_deferred_prefill=cs.deferred_prefill is not None,
+            will_speculate=will_speculate,
         )
         prompt = pf.prompt
         memory_limit = pf.memory_limit
@@ -3642,20 +3668,7 @@ async def _stream_completion(
         # it under memory pressure), the attach here rebuilds the bounded
         # eviction cache — the window exemption never silently degrades to
         # mlx-lm's unbounded cache.
-        _attach_kv_cache(
-            lm,
-            gen_kwargs,
-            will_speculate=_request_will_speculate(
-                lm,
-                stream=True,
-                images=images,
-                # audio_paths (materialized above): exactly the media test the
-                # dispatch below recomputes — `audio` is the caller's raw
-                # data, truthiness-equivalent but not the same variable.
-                audio=audio_paths,
-                grammar_active=grammar_active,
-            ),
-        )
+        _attach_kv_cache(lm, gen_kwargs, will_speculate=will_speculate)
 
         # Yield cache stats after the pre-flight check so routers can
         # use them.  This starts the HTTP response — no 503 after this.
@@ -3684,6 +3697,10 @@ async def _stream_completion(
             }
             _maybe_broadcast_distributed(lm, tokens, text, max_tokens, broadcast_kwargs)
 
+        # Single source: `will_speculate` (hoisted above for preflight+attach)
+        # IS the dispatch decision — `_request_will_speculate` returns False
+        # in exactly the grammar case below.
+        use_speculative = will_speculate
         if lm.is_speculative and not (images or audio_paths) and grammar_active:
             # Speculative decoders do not consume gen_kwargs["logits_processors"],
             # so a grammar-constrained request would bypass the mask entirely.
@@ -3693,14 +3710,6 @@ async def _stream_completion(
                 "Speculative decoding disabled for this request: "
                 "grammar-constrained decoding is not yet plumbed through "
                 "the speculative path"
-            )
-            use_speculative = False
-        else:
-            # Grammar was handled in the branch above; the media rule must be
-            # the one `_request_will_speculate` publishes, so this decision and
-            # the attach/window-exemption can't drift (#755 review).
-            use_speculative = _request_will_speculate(
-                lm, stream=True, images=images, audio=audio_paths, grammar_active=False
             )
 
         # prompt is a str or a token-id list; only the latter gives a count here.
@@ -4207,6 +4216,19 @@ async def _full_completion(
             generated_tokens: list[int] = []
             result_dict: dict = {}
             deferred_prefill: Callable[[threading.Event | None], None] | None = None
+            # The request-level speculation answer, computed once and used by
+            # both the preflight's eviction cap and the attach below — the two
+            # must make the same decision (#755 review).
+            will_speculate = _request_will_speculate(
+                lm,
+                stream=False,
+                images=images,
+                # `audio` is the caller's raw data — the request-level media
+                # fact; `audio_paths` here is only materialized later, inside
+                # `_full_completion_inner`/`_generate_sync`.
+                audio=audio,
+                grammar_active=grammar_active,
+            )
             try:
                 if use_prompt_cache and lm.is_vlm:
                     # VLM: attach an mlx_vlm PromptCacheState. Leave ``prompt``
@@ -4253,6 +4275,7 @@ async def _full_completion(
                         full_prompt_tokens=full_prompt_tokens,
                         cache_id=cache_id,
                         has_deferred_prefill=deferred_prefill is not None,
+                        will_speculate=will_speculate,
                     )
                     prompt = pf.prompt
                     if pf.cache_dropped:
@@ -4269,17 +4292,10 @@ async def _full_completion(
                 # text request reaches the exclusive path without one), the
                 # attach rebuilds the bounded eviction cache instead of
                 # letting generation silently build the unbounded default.
-                _attach_kv_cache(
-                    lm,
-                    gen_kwargs,
-                    will_speculate=_request_will_speculate(
-                        lm,
-                        stream=False,
-                        images=images,
-                        audio=audio,
-                        grammar_active=grammar_active,
-                    ),
-                )
+                # The hoisted `will_speculate` is also what the preflight
+                # above judged, so a capped admission always corresponds to
+                # an attached bounded cache and vice versa.
+                _attach_kv_cache(lm, gen_kwargs, will_speculate=will_speculate)
                 result_dict = await _full_completion_inner(
                     lm,
                     prompt,
@@ -4439,10 +4455,10 @@ async def _full_completion_inner(
             use_speculative = False
         else:
             # Grammar was handled in the branch above. ``audio_paths`` is
-            # still [] at this point (materialization happens downstream), so
-            # passing it reproduces the old ``is_vlm and (images or
-            # audio_paths)`` probe exactly — the rule lives in one place now
-            # (#755 review).
+            # materialized in the outer scope before ``_generate_sync()`` is
+            # invoked, so passing it here reproduces the original
+            # ``is_vlm and (images or audio_paths)`` probe verbatim — the rule
+            # lives in one place now (#755 review).
             use_speculative = _request_will_speculate(
                 lm, stream=False, images=images, audio=audio_paths, grammar_active=False
             )
