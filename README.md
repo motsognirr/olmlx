@@ -436,6 +436,7 @@ All settings can be overridden with `OLMLX_`-prefixed environment variables or a
 | `OLMLX_SPECULATIVE_TOKENS` | `4` | Candidate tokens generated per verification step (also `--speculative-tokens`) |
 | `OLMLX_SPECULATIVE_CACHE_SLOTS` | `2` | Cross-request KV snapshots kept per model so each agent turn prefills only the new suffix (`classic`/`pld` only). `0` disables (fresh prefill every turn). Each slot is a full target (+draft) KV snapshot — keep small. |
 | `OLMLX_KV_CACHE_QUANT` | `None` | KV cache quantization: `turboquant:4` (~3.9x), `turboquant:2` (~7.5x), `spectral:4` (~5.9x), `spectral:2`, `spectral-qa:{2,4}` (attention-aware calibration), `shard:{2,4,8}` (asymmetric K/V + sink/window), or `kvarn:k4v2` / `kvarn:{2,4}` (variance-normalized, per-K/V bits) (also `--kv-cache-quant`) |
+| `OLMLX_KV_EVICTION` | `None` | StreamingLLM sink+window KV eviction `'<sink>:<window>'` (e.g. `4:512`, #505): pure full-attention models keep the first `sink` attention-sink tokens plus a rotating `window` and drop the middle, bounding KV memory and letting the server serve prompts past the nominal context window. Applies to every text generation path (#755); VLMs and hybrid/SWA models keep the default cache. KV quant takes precedence when both are set (also per-model `kv_eviction` in models.json) |
 
 ### Flash inference settings
 

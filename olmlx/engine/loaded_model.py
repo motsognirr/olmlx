@@ -246,6 +246,9 @@ class LoadedModel:
     context_length: int | None = None
     # Memo for ``_kv_eviction_bounds_cache``: whether ``kv_eviction`` really
     # swaps in the bounded cache (pure full-attention layout). None = unprobed.
+    # #755: the same gate decides the post-preflight ``_attach_kv_cache``
+    # rebuild, so a memoized False also means generation keeps the default
+    # unbounded cache and the window check applies.
     kv_eviction_effective: bool | None = None
     # Per-model override for continuous batching. ``_batch_eligible``
     # consults this in place of ``settings.batching`` when set; None defers
