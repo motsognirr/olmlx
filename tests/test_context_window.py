@@ -210,7 +210,10 @@ class TestGenerateChatRejectsOverWindow:
             patch.object(inf, "_stream_completion", stream_fn),
         ):
             result = await generate_chat(
-                mock_manager, "qwen3", [{"role": "user", "content": "hi"}], stream=stream
+                mock_manager,
+                "qwen3",
+                [{"role": "user", "content": "hi"}],
+                stream=stream,
             )
         if stream:
             async for _ in result:
@@ -708,9 +711,7 @@ class TestEvictionCacheLossRemediatedByAttach:
         from tests.test_prompt_cache import _make_mock_stream, _make_stream_tokens
 
         mock_stream_fn = MagicMock(
-            return_value=_make_mock_stream(
-                _make_stream_tokens("Hi", prompt_tokens=150)
-            )
+            return_value=_make_mock_stream(_make_stream_tokens("Hi", prompt_tokens=150))
         )
         with (
             patch.object(inf, "_setup_prompt_cache", _setup),
@@ -754,4 +755,3 @@ class TestEvictionCacheLossRemediatedByAttach:
                     stream=False,
                 )
         full.assert_not_called()
-

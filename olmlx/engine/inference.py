@@ -1391,11 +1391,7 @@ def _attach_kv_cache(
     never broadcast). Identity/type checks so a MagicMock ``lm`` can't
     route here.
     """
-    if (
-        will_speculate
-        or lm.is_distributed is True
-        or "prompt_cache" in gen_kwargs
-    ):
+    if will_speculate or lm.is_distributed is True or "prompt_cache" in gen_kwargs:
         return
     if not isinstance(lm.kv_cache_quant, str):
         # kv_eviction branch: only attach where it really yields the bounded
