@@ -58,6 +58,29 @@ drive. A ``RotatingKVCache`` holds up to ``max_size - 1 + chunk`` tokens while
 prefilling, so the KV estimate charges its window plus one chunk (#762)."""
 
 
+def _parse_kv_eviction(spec: str) -> tuple[int, int]:
+    """Split an ``OLMLX_KV_EVICTION`` value like ``"4:512"`` into
+    ``(sink, window)`` (#505). Lives next to the estimate that uses it;
+    ``olmlx.engine.inference`` re-exports it."""
+    if not isinstance(spec, str):
+        raise TypeError(f"kv_eviction={spec!r} must be a string")
+    parts = spec.split(":")
+    if len(parts) != 2:
+        raise ValueError(f"kv_eviction={spec!r} must be '<sink>:<window>'")
+    try:
+        sink, window = int(parts[0]), int(parts[1])
+    except ValueError as exc:
+        raise ValueError(
+            f"Invalid kv_eviction={spec!r}. Sink and window must be integers "
+            f"(e.g. '4:512')."
+        ) from exc
+    if sink < 0:
+        raise ValueError(f"Invalid kv_eviction={spec!r}: sink must be >= 0.")
+    if window < 1:
+        raise ValueError(f"Invalid kv_eviction={spec!r}: window must be >= 1.")
+    return sink, window
+
+
 MEMORY_SAFETY_FACTOR = 1.3
 """Safety multiplier for KV cache memory estimates (Bug #125).
 
@@ -87,7 +110,11 @@ def _parse_kv_cache_quant_kv(spec: str) -> tuple[str, int, int]:
 
 
 def estimate_kv_cache_bytes(
-    model: Any, num_tokens: int, *, kv_cache_quant: str | None = None
+    model: Any,
+    num_tokens: int,
+    *,
+    kv_cache_quant: str | None = None,
+    kv_eviction: str | None = None,
 ) -> int:
     """Estimate KV cache memory for a given number of tokens.
 
@@ -99,6 +126,19 @@ def estimate_kv_cache_bytes(
     TurboQuant family (``turboquant``/``kvarn``) — the full-precision dequant
     side buffer they keep resident while generating. Layers whose head dim
     the codec can't take stay fp16.
+
+    When *kv_eviction* is set (e.g. ``"4:512"``, #505), ``num_tokens`` is
+    capped at ``sink + window + PREFILL_CHUNK_TOKENS`` — the peak a bounded
+    ``RotatingKVCache`` holds while prefilling (#762's formula). Gated the
+    same way the cache factory is gated: the default layout must be
+    all-plain full attention (or layout introspection must be unavailable,
+    trusting a caller that already made the gate's probe). Charging the full
+    prompt+generation horizon for a bounded cache would 503 exactly the
+    over-window prompts eviction exists to serve (#755 review); speculative
+    and distributed requests never receive the bounded cache, so their
+    callers pass ``None`` and stay on the horizon. The MLA early return
+    below stays uncapped: its compressed layout isn't the all-plain probe
+    the conversion runs on, and overestimating there is safe.
 
     For NAS models (e.g. nemotron-nas) that have per-layer variable attention
     (some layers are no-op with self_attn=None, and KV head counts vary per
@@ -254,6 +294,25 @@ def estimate_kv_cache_bytes(
         or all(_is_plain_kv_cache(e) for e in layout)
         else None
     )
+
+    # #755 review: kv_eviction bounds the cache the request will actually
+    # run with, so cap the charged horizon — but only where the bounded
+    # RotatingKVCache is really built (same all-plain/hybrid rule the cache
+    # factory applies; layout introspection unavailable ⇒ trust the caller,
+    # which passed ``kv_eviction`` only after its own layout probe). A
+    # hybrid layout here means the probe that admitted this spec can't have
+    # taken it, so keep the (conservative) full horizon.
+    if kv_eviction is not None and (
+        layout is None or all(_is_plain_kv_cache(e) for e in layout)
+    ):
+        try:
+            sink, window = _parse_kv_eviction(kv_eviction)
+        except (ValueError, TypeError):
+            # The spec format is validated at config load; a malformed one
+            # just means no cap — the conservative full-horizon charge stands.
+            pass
+        else:
+            num_tokens = min(num_tokens, sink + window + PREFILL_CHUNK_TOKENS)
 
     def _layer_bytes(
         kv_heads: int, layer_head_dim: int, entry: Any, window: int | None
