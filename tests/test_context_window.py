@@ -635,6 +635,53 @@ class TestEvictionCacheLossRemediatedByAttach:
         lm.is_distributed = True
         assert inf._eviction_will_bound(lm, will_speculate=False) is False
 
+    def test_media_parity_between_router_and_generation_scope(self, mock_manager):
+        """#755 round 7 (deepseek): the pre-lock #715 exemption answers the
+        speculation question from the router's raw ``audio``, while the
+        attach/dispatch consume the materialized ``audio_paths`` — the two
+        agree only because ``materialize_audio`` preserves media-ness. Pin
+        that parity on both surfaces for every media shape, so a future
+        change to ``materialize_audio`` (e.g. filtering or dedup) that
+        would silently re-break #715 fails here first."""
+        import base64
+
+        from olmlx.utils.audio_input import cleanup_temp_audio, materialize_audio
+
+        lm = self._lm(mock_manager)
+        lm.speculative_decoder = object()  # speculative lm: media decides
+        uri = "data:audio/wav;base64," + base64.b64encode(b"RIFF").decode()
+        for stream in (False, True):
+            for images in (None, ["img.png"]):
+                for audio_raw in (None, [], [uri]):
+                    paths, temps = materialize_audio(audio_raw)
+                    try:
+                        raw_decision = inf._request_will_speculate(
+                            lm,
+                            stream=stream,
+                            images=images,
+                            audio=audio_raw,
+                            grammar_active=False,
+                        )
+                        materialized_decision = inf._request_will_speculate(
+                            lm,
+                            stream=stream,
+                            images=images,
+                            audio=paths,
+                            grammar_active=False,
+                        )
+                        assert raw_decision == materialized_decision
+                    finally:
+                        cleanup_temp_audio(temps)
+
+        # And both agree on the decision at every shape: media → no
+        # speculation, no media → speculation (it's a speculative model).
+        assert (
+            inf._request_will_speculate(
+                lm, stream=False, images=None, audio=None, grammar_active=False
+            )
+            is True
+        )
+
     @pytest.mark.asyncio
     async def test_full_completion_rebuilds_bounded_cache_after_preflight_drop(
         self, mock_manager
