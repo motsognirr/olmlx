@@ -93,6 +93,17 @@ def test_materialize_none_returns_empty():
     assert paths == [] and temps == []
 
 
+def test_materialize_empty_audio_is_empty():
+    """#755 review round 6: the exemption/attach elaborate the speculation
+    decision on truthiness-equivalent media inputs (raw ``audio`` in router
+    scope vs materialized ``audio_paths`` in generation scope). Pin the
+    invariant that makes them equivalent: materialization is one path out
+    per item in — an empty request stays empty, so no decision consumer can
+    see a media-ness the others don't."""
+    paths, temps = materialize_audio([])
+    assert paths == [] and temps == []
+
+
 def test_materialize_invalid_base64_raises():
     with pytest.raises(ValueError, match="invalid base64"):
         materialize_audio(["data:audio/wav;base64,!!!notbase64!!!"])
