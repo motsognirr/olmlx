@@ -2926,6 +2926,7 @@ class TestFullCompletionInner:
                 100,
                 {},
                 stats,
+                will_speculate=False,
             )
 
         assert result["text"] == "result text"
@@ -2980,6 +2981,7 @@ class TestFullCompletionInner:
                 stats,
                 generated_tokens_out=generated,
                 stop_sequences=["STOP"],
+                will_speculate=False,
             )
 
         # Generation halted at the STOP token — later tokens were never decoded.
@@ -3020,7 +3022,13 @@ class TestFullCompletionInner:
             patch("olmlx.engine.inference.mx", MagicMock()),
         ):
             result = await _full_completion_inner(
-                lm, "prompt", 200, {}, stats, stop_sequences=None
+                lm,
+                "prompt",
+                200,
+                {},
+                stats,
+                stop_sequences=None,
+                will_speculate=False,
             )
 
         assert pulled == [0, 1, 2]
@@ -3045,7 +3053,9 @@ class TestFullCompletionInner:
             "olmlx.engine.inference.asyncio.to_thread", new_callable=AsyncMock
         ) as mt:
             mt.return_value = (mock_result, "truncated")
-            result = await _full_completion_inner(lm, "prompt", 200, {}, stats)
+            result = await _full_completion_inner(
+                lm, "prompt", 200, {}, stats, will_speculate=False
+            )
         assert result["done_reason"] == "length"
 
     @pytest.mark.asyncio
@@ -3066,7 +3076,9 @@ class TestFullCompletionInner:
             "olmlx.engine.inference.asyncio.to_thread", new_callable=AsyncMock
         ) as mt:
             mt.return_value = (mock_result, "complete")
-            result = await _full_completion_inner(lm, "prompt", 200, {}, stats)
+            result = await _full_completion_inner(
+                lm, "prompt", 200, {}, stats, will_speculate=False
+            )
         assert "done_reason" not in result
 
     @pytest.mark.asyncio
@@ -3082,7 +3094,9 @@ class TestFullCompletionInner:
             "olmlx.engine.inference.asyncio.to_thread", new_callable=AsyncMock
         ) as mt:
             mt.return_value = (mock_result, "some text")
-            result = await _full_completion_inner(lm, "prompt", 200, {}, stats)
+            result = await _full_completion_inner(
+                lm, "prompt", 200, {}, stats, will_speculate=False
+            )
         assert "done_reason" not in result
 
     @pytest.mark.asyncio
@@ -3102,6 +3116,7 @@ class TestFullCompletionInner:
                 100,
                 {},
                 stats,
+                will_speculate=False,
             )
 
         assert result["text"] == "plain string"
@@ -3143,6 +3158,7 @@ class TestFullCompletionInner:
                 100,
                 {},
                 stats,
+                will_speculate=False,
             )
 
         assert stats.prompt_eval_count == 12
@@ -3168,6 +3184,7 @@ class TestFullCompletionInner:
                 100,
                 {},
                 TimingStats(),
+                will_speculate=False,
             )
 
         assert result["text"] == "42"
@@ -3192,6 +3209,7 @@ class TestFullCompletionInner:
                     {},
                     TimingStats(),
                     images=["img.jpg"],
+                    will_speculate=False,
                 )
 
         assert result["text"] == "vlm output"
@@ -4865,6 +4883,95 @@ class TestEstimateKvCacheBytes:
         assert naive > 10 * 1024**3  # confirm the old estimate was wrong
         assert result < naive / 3  # introspection should be at least 3x lower
 
+    def test_kv_eviction_caps_num_tokens(self):
+        """#755 review: a kv_eviction request runs with the bounded
+        RotatingKVCache, so the charged horizon caps at
+        ``sink + window + PREFILL_CHUNK_TOKENS`` (the same #762 formula the
+        layout-rotating entries use) instead of prompt + max_tokens."""
+        model = self._make_model(
+            num_hidden_layers=32,
+            num_attention_heads=32,
+            num_key_value_heads=8,
+            hidden_size=4096,
+        )
+        # head_dim = 128, kv_heads = 8. Cap = 4 + 512 + 2048 = 2564.
+        capped_raw = 32 * 2 * 8 * 128 * 2564 * 2
+        assert estimate_kv_cache_bytes(model, 22000, kv_eviction="4:512") == int(
+            capped_raw * _inf_mod.MEMORY_SAFETY_FACTOR
+        )
+        # The horizon itself, below the cap, is charged as-is.
+        assert estimate_kv_cache_bytes(model, 2564, kv_eviction="4:512") == int(
+            capped_raw * _inf_mod.MEMORY_SAFETY_FACTOR
+        )
+        uncapped_raw = 32 * 2 * 8 * 128 * 2565 * 2
+        assert estimate_kv_cache_bytes(model, 2565, kv_eviction="4:512") == int(
+            capped_raw * _inf_mod.MEMORY_SAFETY_FACTOR
+        )
+        assert uncapped_raw > capped_raw  # the cap decided, not identity
+
+    def test_kv_eviction_quant_wins_no_cap(self):
+        """#755 round-4: the factory's 'KV quant wins over eviction'
+        precedence is encoded in the estimator — with both configured the
+        built cache is the unbounded quant one, so no cap even if a future
+        caller passes both."""
+        model = self._make_model()
+        assert estimate_kv_cache_bytes(
+            model, 22000, kv_cache_quant="turboquant:4", kv_eviction="4:512"
+        ) == estimate_kv_cache_bytes(model, 22000, kv_cache_quant="turboquant:4")
+
+    def test_kv_eviction_under_cap_is_unchanged(self):
+        """A horizon already below the cap is charged as-is."""
+        model = self._make_model()
+        assert estimate_kv_cache_bytes(
+            model, 1000, kv_eviction="4:512"
+        ) == estimate_kv_cache_bytes(model, 1000)
+
+    def test_kv_eviction_invalid_spec_stays_uncapped(self):
+        """Config load validates the spec; a malformed one that still reaches
+        the estimator must not crash the preflight — it stays on the
+        conservative full-horizon charge."""
+        model = self._make_model()
+        assert estimate_kv_cache_bytes(
+            model, 1000, kv_eviction="garbage"
+        ) == estimate_kv_cache_bytes(model, 1000)
+
+    def test_kv_eviction_hybrid_layout_stays_uncapped(self):
+        """A mixed layout can't host the bounded cache (the factory leaves it
+        untouched), so the horizon is not capped even with kv_eviction set."""
+        from mlx_lm.models.cache import KVCache, RotatingKVCache
+
+        args = MagicMock(spec=[])
+        args.num_hidden_layers = 2
+        args.num_attention_heads = 8
+        args.num_key_value_heads = 2
+        args.hidden_size = 1024
+        args.head_dim = 128
+        model = MagicMock(spec=["args", "make_cache"])
+        model.args = args
+        model.make_cache = MagicMock(
+            side_effect=lambda: [
+                KVCache(),
+                RotatingKVCache(max_size=512, keep=0),
+            ]
+        )
+        assert estimate_kv_cache_bytes(
+            model, 40000, kv_eviction="4:512"
+        ) == estimate_kv_cache_bytes(model, 40000)
+
+    def test_kv_eviction_mla_early_return_stays_uncapped(self):
+        """The MLA branch runs before any layout introspection and keeps the
+        full horizon — an overestimate for an MLA model with eviction is the
+        safe direction."""
+        args = MagicMock(spec=[])
+        args.kv_lora_rank = 512
+        args.qk_rope_head_dim = 64
+        args.num_hidden_layers = 60
+        model = MagicMock(spec=[])
+        model.args = args
+        result = estimate_kv_cache_bytes(model, 22000, kv_eviction="4:512")
+        raw = 60 * 2 * (512 + 64) * 22000 * 2
+        assert result == int(raw * _inf_mod.MEMORY_SAFETY_FACTOR)
+
 
 class TestEstimateKvCacheBytesCacheLayout:
     """#762: the estimate follows the model's actual cache layout
@@ -5459,6 +5566,272 @@ class TestKvCachePreflightCheck:
             if _inference_lock.locked():
                 _inference_lock.release()
 
+    # --- kv_eviction: the preflight estimate follows the bounded cache ---
+    # (#755 review). The bounded RotatingKVCache holds at most
+    # sink + window + one prefill chunk, so an over-window prompt that was
+    # admitted *because* eviction is configured must not be 503'd by an
+    # estimator charging the full prompt+max_tokens horizon.
+
+    def _eviction_args(self):
+        """Model args whose uncapped KV estimate for 22000+512 tokens is
+        ~1.9 GB: the cap trims it to ~0.2 GB."""
+        args = MagicMock()
+        args.num_hidden_layers = 17
+        args.num_attention_heads = 32
+        args.num_key_value_heads = 8
+        args.hidden_size = 4096
+        args.head_dim = 128
+        return args
+
+    @pytest.mark.asyncio
+    async def test_eviction_bounded_prompt_not_rejected(self, mock_lm):
+        """Over-window prompt + eviction configured: the capped estimate fits,
+        so the preflight admits the request it used to 503."""
+        mock_lm.model.args = self._eviction_args()
+        # Eviction governs: text, no quant, layout probe already True.
+        mock_lm.kv_cache_quant = None
+        mock_lm.kv_eviction = "4:512"
+        mock_lm.kv_eviction_effective = True
+        stats = TimingStats()
+
+        total_mem = 24 * 1024**3
+        current_metal = 10.5 * 1024**3  # only 1.5 GB headroom under the 12 GB limit
+        # Uncapped horizon estimate (22000 + 512 tokens) ≈ 1.9 GB → would
+        # exceed the limit; capped (sink+window+chunk = 2564 tokens) ≈ 0.2 GB.
+
+        final_token = StreamToken(
+            text="hi",
+            token=1,
+            prompt_tokens=100,
+            generation_tokens=1,
+            prompt_tps=100.0,
+            generation_tps=50.0,
+        )
+        mock_stream = AsyncMock()
+        mock_stream.__aiter__ = MagicMock(return_value=mock_stream)
+        mock_stream.__anext__ = AsyncMock(side_effect=[final_token, StopAsyncIteration])
+        mock_stream._thread = None
+        mock_stream.drain_and_join = AsyncMock()
+        mock_stream.cancel = MagicMock()
+
+        await _inference_lock.acquire()
+        try:
+            with (
+                patch(
+                    "olmlx.utils.memory.get_system_memory_bytes", return_value=total_mem
+                ),
+                patch(
+                    "olmlx.utils.memory.get_metal_memory", return_value=current_metal
+                ),
+                patch("olmlx.engine.inference.settings") as mock_settings,
+                patch("olmlx.engine.inference.mx"),
+                patch("olmlx.engine.inference._safe_sync"),
+                patch(
+                    "olmlx.engine.inference._await_deferred_cleanup",
+                    new_callable=AsyncMock,
+                ),
+                patch(
+                    "olmlx.engine.inference._acquire_inference_lock",
+                    new_callable=AsyncMock,
+                ),
+                patch(
+                    "olmlx.engine.inference.async_mlx_stream", return_value=mock_stream
+                ),
+                patch("olmlx.engine.inference.parse_keep_alive", return_value=300),
+            ):
+                mock_settings.memory_limit_fraction = 0.5
+                mock_settings.prompt_cache = False
+                mock_settings.default_keep_alive = "5m"
+                mock_settings.inference_timeout = None
+                mock_settings.sync_mode = "full"
+
+                gen = _inf_mod._stream_completion(
+                    mock_lm, list(range(22000)), 512, {}, stats
+                )
+                # The adversarial setup leaves ~1.9 GB of KV headroom: only the
+                # capped estimate fits. Must not raise MemoryError.
+                chunks = []
+                async for chunk in gen:
+                    chunks.append(chunk)
+        finally:
+            if _inference_lock.locked():
+                _inference_lock.release()
+
+    @pytest.mark.asyncio
+    async def test_horizon_without_eviction_still_rejected(self, mock_lm):
+        """Same numbers without kv_eviction (its own failure mode kept green):
+        the unbounded fp16 cache is charged the full horizon → MemoryError."""
+        mock_lm.model.args = self._eviction_args()
+        mock_lm.kv_cache_quant = None
+        mock_lm.kv_eviction = None
+        stats = TimingStats()
+
+        await _inference_lock.acquire()
+        try:
+            with (
+                patch(
+                    "olmlx.utils.memory.get_system_memory_bytes",
+                    return_value=24 * 1024**3,
+                ),
+                patch(
+                    "olmlx.utils.memory.get_metal_memory",
+                    return_value=10.5 * 1024**3,
+                ),
+                patch("olmlx.engine.inference.settings") as mock_settings,
+                patch("olmlx.engine.inference.mx"),
+                patch("olmlx.engine.inference._safe_sync"),
+                patch(
+                    "olmlx.engine.inference._await_deferred_cleanup",
+                    new_callable=AsyncMock,
+                ),
+                patch(
+                    "olmlx.engine.inference._acquire_inference_lock",
+                    new_callable=AsyncMock,
+                ),
+            ):
+                mock_settings.memory_limit_fraction = 0.5
+                mock_settings.prompt_cache = False
+                mock_settings.inference_timeout = None
+                mock_settings.sync_mode = "full"
+
+                gen = _inf_mod._stream_completion(
+                    mock_lm, list(range(22000)), 512, {}, stats
+                )
+                with pytest.raises(MemoryError, match="prompt too long"):
+                    async for _ in gen:
+                        pass
+        finally:
+            if _inference_lock.locked():
+                _inference_lock.release()
+
+    @pytest.mark.asyncio
+    async def test_speculative_model_stays_charged_on_horizon(self, mock_lm):
+        """Speculative models never receive the bounded cache, so their
+        preflight keeps the full-horizon charge (the safe direction)."""
+        mock_lm.model.args = self._eviction_args()
+        mock_lm.kv_cache_quant = None
+        mock_lm.kv_eviction = "4:512"
+        mock_lm.kv_eviction_effective = True
+        mock_lm.speculative_decoder = object()
+        stats = TimingStats()
+
+        await _inference_lock.acquire()
+        try:
+            with (
+                patch(
+                    "olmlx.utils.memory.get_system_memory_bytes",
+                    return_value=24 * 1024**3,
+                ),
+                patch(
+                    "olmlx.utils.memory.get_metal_memory",
+                    return_value=10.5 * 1024**3,
+                ),
+                patch("olmlx.engine.inference.settings") as mock_settings,
+                patch("olmlx.engine.inference.mx"),
+                patch("olmlx.engine.inference._safe_sync"),
+                patch(
+                    "olmlx.engine.inference._await_deferred_cleanup",
+                    new_callable=AsyncMock,
+                ),
+                patch(
+                    "olmlx.engine.inference._acquire_inference_lock",
+                    new_callable=AsyncMock,
+                ),
+            ):
+                mock_settings.memory_limit_fraction = 0.5
+                mock_settings.prompt_cache = False
+                mock_settings.inference_timeout = None
+                mock_settings.sync_mode = "full"
+
+                gen = _inf_mod._stream_completion(
+                    mock_lm, list(range(22000)), 512, {}, stats
+                )
+                with pytest.raises(MemoryError, match="prompt too long"):
+                    async for _ in gen:
+                        pass
+        finally:
+            if _inference_lock.locked():
+                _inference_lock.release()
+
+    @staticmethod
+    def _tight_memory_patches():
+        """24 GB system / 12 GB limit with 10.5 GB resident: the uncapped
+        horizon estimate (22000+512 tokens ≈ 1.9 GB) breaches it, the capped
+        estimate (sink+window+chunk ≈ 0.2 GB) fits."""
+        return (
+            patch(
+                "olmlx.utils.memory.get_system_memory_bytes",
+                return_value=24 * 1024**3,
+            ),
+            patch(
+                "olmlx.utils.memory.get_metal_memory",
+                return_value=10.5 * 1024**3,
+            ),
+        )
+
+    def _eviction_lm(self, mock_lm):
+        mock_lm.model.args = self._eviction_args()
+        mock_lm.kv_cache_quant = None
+        mock_lm.kv_eviction = "4:512"
+        mock_lm.kv_eviction_effective = True  # layout probe memo (text model)
+        return mock_lm
+
+    @pytest.mark.asyncio
+    async def test_preflight_cap_follows_request_level_will_speculate(self, mock_lm):
+        """#755 review round 2: the preflight must judge the *request*, not
+        the model. A speculative model on a grammar/media request (for which
+        the dispatch keeps plain decoding and ``_attach_kv_cache`` installs
+        the bounded cache) is estimated via the cap and admitted — previously
+        it was charged the full horizon and 503'd after the surface had
+        already waived the window check for exactly this case."""
+        from olmlx.engine.inference import _kv_cache_preflight_check
+
+        lm = self._eviction_lm(mock_lm)
+        gen_kwargs: dict = {}
+        p1, p2 = self._tight_memory_patches()
+        with p1, p2:
+            with (
+                patch("olmlx.engine.inference.settings") as mock_settings,
+                patch("olmlx.engine.inference.mx"),
+                patch("olmlx.engine.inference._safe_sync"),
+            ):
+                mock_settings.memory_limit_fraction = 0.5
+                mock_settings.prompt_cache = False
+                # Round trip 1: will_speculate=False reproduces the request the
+                # surface decided to keep plain (grammar active / media) —
+                # bounded cache governs, admission rides the cap.
+                result = await _kv_cache_preflight_check(
+                    lm,
+                    list(range(22000)),
+                    512,
+                    gen_kwargs,
+                    cache_read_tokens=0,
+                    cache_creation_tokens=0,
+                    full_prompt_tokens=None,
+                    cache_id="",
+                    will_speculate=False,
+                )
+                assert result.prompt == list(range(22000))  # unchanged
+                assert "prompt_cache" not in gen_kwargs  # nothing dropped
+
+                # Round trip 2: will_speculate=True on the same model (a true
+                # speculative request, unbounded generation) keeps the
+                # conservative full-horizon rejection.
+                mock_settings.memory_limit_fraction = 0.5
+                mock_settings.prompt_cache = False
+                with pytest.raises(MemoryError, match="prompt too long"):
+                    await _kv_cache_preflight_check(
+                        self._eviction_lm(mock_lm),
+                        list(range(22000)),
+                        512,
+                        {},
+                        cache_read_tokens=0,
+                        cache_creation_tokens=0,
+                        full_prompt_tokens=None,
+                        cache_id="",
+                        will_speculate=True,
+                    )
+
 
 class TestPrefillMemoryCallback:
     """Tests for memory checking during prefill."""
@@ -5727,6 +6100,7 @@ class TestKvCachePreflightCheckHelper:
                 cache_creation_tokens=3,
                 full_prompt_tokens=None,
                 cache_id="test",
+                will_speculate=False,
             )
 
         assert result.memory_limit == 12 * 1024**3
@@ -5765,6 +6139,7 @@ class TestKvCachePreflightCheckHelper:
                     cache_creation_tokens=3,
                     full_prompt_tokens=None,
                     cache_id="test",
+                    will_speculate=False,
                 )
 
     @pytest.mark.asyncio
@@ -5789,6 +6164,7 @@ class TestKvCachePreflightCheckHelper:
                 cache_creation_tokens=0,
                 full_prompt_tokens=None,
                 cache_id="test",
+                will_speculate=False,
             )
 
         # cache_creation_tokens=0 and no tokenizable prompt → num_prefill_tokens=0 → skip check
@@ -5821,7 +6197,9 @@ class TestKvCachePreflightCheckHelper:
                 cache_creation_tokens=3,
                 full_prompt_tokens=None,
                 cache_id="test",
+                will_speculate=False,
             )
+
         assert result.memory_limit > 0
 
     @pytest.mark.asyncio
@@ -5866,6 +6244,7 @@ class TestKvCachePreflightCheckHelper:
                     cache_creation_tokens=1,
                     full_prompt_tokens=[1, 2, 3],
                     cache_id="test",
+                    will_speculate=False,
                 )
 
         # The non-persistable cache must NOT be re-stored, even though
@@ -5932,6 +6311,7 @@ class TestKvCachePreflightCheckHelper:
                 full_prompt_tokens=[1, 2, 3, 4, 5],
                 cache_id="test",
                 has_deferred_prefill=True,
+                will_speculate=False,
             )
 
         assert "prompt_cache" not in gen_kwargs
@@ -5972,7 +6352,9 @@ class TestKvCachePreflightCheckHelper:
                 full_prompt_tokens=[1, 2, 3, 4, 5],
                 cache_id="test",
                 has_deferred_prefill=True,
+                will_speculate=False,
             )
+
         assert result.cache_dropped is False
         assert result.prompt == [5]
 

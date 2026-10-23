@@ -3339,10 +3339,11 @@ class TestCacheListContainsLazyState:
         assert _cache_list_contains_lazy_state([MagicMock()]) is False
 
 
-class TestKvQuantCacheAttach:
-    """``kv_cache_quant`` must reach generation even when no prompt cache was
-    set up: mlx-lm / mlx-vlm otherwise build a plain fp16 cache, silently
-    ignoring the setting (VLMs always; text models with the prompt cache off).
+class TestKvCacheAttach:
+    """``kv_cache_quant``/``kv_eviction`` must reach generation even when no
+    prompt cache was set up: mlx-lm / mlx-vlm otherwise build a plain fp16
+    cache, silently ignoring the setting (VLMs always; text models with the
+    prompt cache off) — #754 for quant, #755 for eviction.
     """
 
     @staticmethod
@@ -3354,25 +3355,67 @@ class TestKvQuantCacheAttach:
             setattr(lm, k, v)
         return lm
 
-    def test_attaches_when_no_cache_was_set_up(self):
-        from olmlx.engine.inference import _attach_kv_quant_cache
+    def test_quant_attaches_when_no_cache_was_set_up(self):
+        from olmlx.engine.inference import _attach_kv_cache
 
         lm = self._lm()
         gen_kwargs: dict = {}
         with patch(
             "olmlx.engine.inference._make_prompt_cache_for_lm", return_value=["q"]
         ) as make:
-            _attach_kv_quant_cache(lm, gen_kwargs, will_speculate=False)
+            _attach_kv_cache(lm, gen_kwargs, will_speculate=False)
         make.assert_called_once_with(lm)
         assert gen_kwargs["prompt_cache"] == ["q"]
 
+    def test_eviction_attaches_when_bounds_cache_holds(self):
+        from olmlx.engine.inference import _attach_kv_cache
+
+        lm = self._lm(
+            kv_cache_quant=None, kv_eviction="4:64", kv_eviction_effective=True
+        )
+        gen_kwargs: dict = {}
+        with (
+            patch(
+                "olmlx.engine.inference._make_prompt_cache_for_lm",
+                return_value=["evict"],
+            ) as make,
+            patch(
+                "olmlx.engine.inference._kv_eviction_bounds_cache", return_value=True
+            ) as bounds,
+        ):
+            _attach_kv_cache(lm, gen_kwargs, will_speculate=False)
+        bounds.assert_called_once_with(lm)
+        make.assert_called_once_with(lm)
+        assert gen_kwargs["prompt_cache"] == ["evict"]
+
+    def test_eviction_not_bounded_never_attaches(self):
+        # VLM / hybrid / no-eviction models: an mlx-lm RotatingKVCache would
+        # mask wrongly or silently do nothing — window logic stays intact.
+        from olmlx.engine.inference import _attach_kv_cache
+
+        for kwargs in (
+            {"kv_cache_quant": None, "kv_eviction": None},
+            {"kv_cache_quant": None, "kv_eviction": "4:64", "is_vlm": True},
+        ):
+            gen_kwargs: dict = {}
+            with (
+                patch("olmlx.engine.inference._make_prompt_cache_for_lm") as make,
+                patch(
+                    "olmlx.engine.inference._kv_eviction_bounds_cache",
+                    return_value=False,
+                ),
+            ):
+                _attach_kv_cache(self._lm(**kwargs), gen_kwargs, will_speculate=False)
+            make.assert_not_called()
+            assert "prompt_cache" not in gen_kwargs
+
     def test_keeps_cache_from_prompt_cache_setup(self):
-        from olmlx.engine.inference import _attach_kv_quant_cache
+        from olmlx.engine.inference import _attach_kv_cache
 
         existing = ["existing"]
         gen_kwargs = {"prompt_cache": existing}
         with patch("olmlx.engine.inference._make_prompt_cache_for_lm") as make:
-            _attach_kv_quant_cache(self._lm(), gen_kwargs, will_speculate=False)
+            _attach_kv_cache(self._lm(), gen_kwargs, will_speculate=False)
         make.assert_not_called()
         assert gen_kwargs["prompt_cache"] is existing
 
@@ -3385,16 +3428,36 @@ class TestKvQuantCacheAttach:
             # would diverge (prompt_cache is never broadcast).
             ({"is_distributed": True}, False),
             ({"kv_cache_quant": None}, False),
+            # Eviction set but the layout probe says the default would not be
+            # pure plain KVCache — a silent quant-cache regression would hide
+            # behind a MagicMock lm here.
+            (
+                {
+                    "kv_cache_quant": None,
+                    "kv_eviction": "4:64",
+                    "kv_eviction_effective": False,
+                },
+                False,
+            ),
             # MagicMock-safe: a non-str setting must not reach the parser.
             ({"kv_cache_quant": MagicMock()}, False),
+            ({"kv_cache_quant": None, "kv_eviction": MagicMock()}, False),
         ],
     )
     def test_skips(self, overrides, will_speculate):
-        from olmlx.engine.inference import _attach_kv_quant_cache
+        from olmlx.engine.inference import _attach_kv_cache
 
         gen_kwargs: dict = {}
-        with patch("olmlx.engine.inference._make_prompt_cache_for_lm") as make:
-            _attach_kv_quant_cache(
+        with (
+            patch("olmlx.engine.inference._make_prompt_cache_for_lm") as make,
+            # return False (not a truthy MagicMock): a MagicMock probe would
+            # claim the eviction layout is bounded.
+            patch(
+                "olmlx.engine.inference._kv_eviction_bounds_cache",
+                MagicMock(return_value=False),
+            ),
+        ):
+            _attach_kv_cache(
                 self._lm(**overrides), gen_kwargs, will_speculate=will_speculate
             )
         make.assert_not_called()
@@ -3449,3 +3512,63 @@ class TestKvQuantCacheAttach:
 
         used = mock_stream_fn if stream else mock_stream_generate
         assert used.call_args.kwargs["prompt_cache"] is quant_cache
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("stream", [True, False])
+    async def test_text_model_with_prompt_cache_off_gets_eviction_cache(
+        self, mock_manager, stream
+    ):
+        """#755: kv_eviction reaches generation on the prompt-cache-off path.
+
+        Mirrors the quant test above: with ``OLMLX_PROMPT_CACHE=false`` (or the
+        per-model toggle), `_setup_prompt_cache` never runs, and before #755
+        mlx-lm silently built an unbounded fp16 cache instead.
+        """
+        import mlx_lm
+
+        from olmlx.engine.inference import generate_chat
+
+        lm = mock_manager._loaded["qwen3:latest"]
+        lm.kv_cache_quant = None
+        lm.kv_eviction = "4:64"
+        lm.kv_eviction_effective = True
+        lm.tokenizer.apply_chat_template = MagicMock(return_value="formatted prompt")
+        evict_cache = [MagicMock(spec=[])]
+        # The eviction attach rides on the #715 exemption gate too: an
+        # over-window prompt must be exempt exactly when this attaches.
+
+        mock_stream_fn = MagicMock(
+            return_value=_make_mock_stream(_make_stream_tokens("Hi", prompt_tokens=5))
+        )
+        mock_stream_generate = MagicMock(
+            return_value=iter(
+                [_make_gen_response("Hi", 100, prompt_tokens=5, generation_tokens=1)]
+            )
+        )
+        with (
+            patch("olmlx.engine.inference.mx", MagicMock()),
+            patch("olmlx.engine.inference.async_mlx_stream", mock_stream_fn),
+            patch.object(mlx_lm, "stream_generate", mock_stream_generate),
+            patch(
+                "olmlx.engine.inference._make_prompt_cache_for_lm",
+                return_value=evict_cache,
+            ),
+            patch("olmlx.engine.inference.settings") as mock_settings,
+        ):
+            mock_settings.prompt_cache = False
+            mock_settings.prompt_cache_max_tokens = 32768
+            mock_settings.default_keep_alive = "5m"
+            mock_settings.inference_timeout = None
+            mock_settings.sync_mode = "full"
+            result = await generate_chat(
+                mock_manager,
+                "qwen3",
+                [{"role": "user", "content": "hi"}],
+                stream=stream,
+            )
+            if stream:
+                async for _ in result:
+                    pass
+
+        used = mock_stream_fn if stream else mock_stream_generate
+        assert used.call_args.kwargs["prompt_cache"] is evict_cache
