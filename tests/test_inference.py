@@ -4891,6 +4891,16 @@ class TestEstimateKvCacheBytes:
         )
         assert uncapped_raw > capped_raw  # the cap decided, not identity
 
+    def test_kv_eviction_quant_wins_no_cap(self):
+        """#755 round-4: the factory's 'KV quant wins over eviction'
+        precedence is encoded in the estimator — with both configured the
+        built cache is the unbounded quant one, so no cap even if a future
+        caller passes both."""
+        model = self._make_model()
+        assert estimate_kv_cache_bytes(
+            model, 22000, kv_cache_quant="turboquant:4", kv_eviction="4:512"
+        ) == estimate_kv_cache_bytes(model, 22000, kv_cache_quant="turboquant:4")
+
     def test_kv_eviction_under_cap_is_unchanged(self):
         """A horizon already below the cap is charged as-is."""
         model = self._make_model()

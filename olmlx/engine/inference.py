@@ -1344,6 +1344,14 @@ def _eviction_will_bound(lm: LoadedModel, *, will_speculate: bool) -> bool:
     the #715 exemption and the attach can't disagree: when this is True the
     bounded cache is either built by prompt-cache setup or rebuilt by the
     post-preflight attach — never silently unbounded.
+
+    The batched engine needs no separate exclusion here: ``_batch_eligible``
+    rejects what this gate would admit on the layout probe alone
+    (``_make_prompt_cache_for_lm`` builds a ``RotatingKVCache`` for an
+    evictable model, which fails ``caches_plain_kv``'s exact-type check and
+    memoizes ``batch_convertible=False``), and it excludes ``kv_cache_quant``
+    explicitly — where quant wins. Pinned by
+    ``test_batching.py::TestBatchEligible::test_kv_eviction_model_never_batches``.
     """
     if will_speculate or lm.is_distributed is True:
         return False
