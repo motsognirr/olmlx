@@ -2926,6 +2926,7 @@ class TestFullCompletionInner:
                 100,
                 {},
                 stats,
+                will_speculate=False,
             )
 
         assert result["text"] == "result text"
@@ -2980,6 +2981,7 @@ class TestFullCompletionInner:
                 stats,
                 generated_tokens_out=generated,
                 stop_sequences=["STOP"],
+                will_speculate=False,
             )
 
         # Generation halted at the STOP token — later tokens were never decoded.
@@ -3020,7 +3022,13 @@ class TestFullCompletionInner:
             patch("olmlx.engine.inference.mx", MagicMock()),
         ):
             result = await _full_completion_inner(
-                lm, "prompt", 200, {}, stats, stop_sequences=None
+                lm,
+                "prompt",
+                200,
+                {},
+                stats,
+                stop_sequences=None,
+                will_speculate=False,
             )
 
         assert pulled == [0, 1, 2]
@@ -3045,7 +3053,9 @@ class TestFullCompletionInner:
             "olmlx.engine.inference.asyncio.to_thread", new_callable=AsyncMock
         ) as mt:
             mt.return_value = (mock_result, "truncated")
-            result = await _full_completion_inner(lm, "prompt", 200, {}, stats)
+            result = await _full_completion_inner(
+                lm, "prompt", 200, {}, stats, will_speculate=False
+            )
         assert result["done_reason"] == "length"
 
     @pytest.mark.asyncio
@@ -3066,7 +3076,9 @@ class TestFullCompletionInner:
             "olmlx.engine.inference.asyncio.to_thread", new_callable=AsyncMock
         ) as mt:
             mt.return_value = (mock_result, "complete")
-            result = await _full_completion_inner(lm, "prompt", 200, {}, stats)
+            result = await _full_completion_inner(
+                lm, "prompt", 200, {}, stats, will_speculate=False
+            )
         assert "done_reason" not in result
 
     @pytest.mark.asyncio
@@ -3082,7 +3094,9 @@ class TestFullCompletionInner:
             "olmlx.engine.inference.asyncio.to_thread", new_callable=AsyncMock
         ) as mt:
             mt.return_value = (mock_result, "some text")
-            result = await _full_completion_inner(lm, "prompt", 200, {}, stats)
+            result = await _full_completion_inner(
+                lm, "prompt", 200, {}, stats, will_speculate=False
+            )
         assert "done_reason" not in result
 
     @pytest.mark.asyncio
@@ -3102,6 +3116,7 @@ class TestFullCompletionInner:
                 100,
                 {},
                 stats,
+                will_speculate=False,
             )
 
         assert result["text"] == "plain string"
@@ -3143,6 +3158,7 @@ class TestFullCompletionInner:
                 100,
                 {},
                 stats,
+                will_speculate=False,
             )
 
         assert stats.prompt_eval_count == 12
@@ -3168,6 +3184,7 @@ class TestFullCompletionInner:
                 100,
                 {},
                 TimingStats(),
+                will_speculate=False,
             )
 
         assert result["text"] == "42"
@@ -3192,6 +3209,7 @@ class TestFullCompletionInner:
                     {},
                     TimingStats(),
                     images=["img.jpg"],
+                    will_speculate=False,
                 )
 
         assert result["text"] == "vlm output"

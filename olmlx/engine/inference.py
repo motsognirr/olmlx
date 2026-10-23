@@ -4223,16 +4223,18 @@ async def _full_completion(
             generated_tokens: list[int] = []
             result_dict: dict = {}
             deferred_prefill: Callable[[threading.Event | None], None] | None = None
-            # The request-level speculation answer, computed once and used by
-            # both the preflight's eviction cap and the attach below — the two
-            # must make the same decision (#755 review).
+            # The request-level speculation answer — computed once, here,
+            # from the request's raw media (this function's scope is the only
+            # place it must be computed) and threaded into every consumer:
+            # the preflight's eviction cap, the attach below, and the
+            # dispatch inside ``_full_completion_inner`` (passed down). One
+            # value for all three, so the exemption/estimate/attach/dispatch
+            # can never disagree (#755 review, round 5: structurally, not by
+            # truthiness equivalence).
             will_speculate = _request_will_speculate(
                 lm,
                 stream=False,
                 images=images,
-                # `audio` is the caller's raw data — the request-level media
-                # fact; `audio_paths` here is only materialized later, inside
-                # `_full_completion_inner`/`_generate_sync`.
                 audio=audio,
                 grammar_active=grammar_active,
             )
@@ -4292,16 +4294,15 @@ async def _full_completion(
                     if pf.cache_creation_tokens is not None:
                         cache_creation_tokens = pf.cache_creation_tokens
 
-                # Mirrors _generate_sync's branch choice: a VLM request with
-                # media and a grammar request never take the speculative path.
                 # #755: when kv_eviction governs this request and setup left
                 # no cache (prompt cache off — the only way a non-streaming
                 # text request reaches the exclusive path without one), the
                 # attach rebuilds the bounded eviction cache instead of
                 # letting generation silently build the unbounded default.
-                # The hoisted `will_speculate` is also what the preflight
-                # above judged, so a capped admission always corresponds to
-                # an attached bounded cache and vice versa.
+                # ``will_speculate`` here is the same bool the preflight above
+                # judged and the dispatch below receives, so a capped
+                # admission always corresponds to an attached bounded cache
+                # and bounded dispatch — never a drift (#755).
                 _attach_kv_cache(lm, gen_kwargs, will_speculate=will_speculate)
                 result_dict = await _full_completion_inner(
                     lm,
@@ -4311,6 +4312,7 @@ async def _full_completion(
                     stats,
                     images,
                     audio,
+                    will_speculate=will_speculate,
                     has_tools=has_tools,
                     generated_tokens_out=(
                         generated_tokens
@@ -4421,6 +4423,7 @@ async def _full_completion_inner(
     *,
     generated_tokens_out: list[int] | None = None,
     grammar_active: bool = False,
+    will_speculate: bool,
     deferred_prefill: Callable[[threading.Event | None], None] | None = None,
     stop_sequences: list[str] | None = None,
     thinking_expected: bool = False,
@@ -4445,10 +4448,14 @@ async def _full_completion_inner(
             # and decode share its thread-local generation_stream (#284/#499).
             deferred_prefill(None)
 
-        # Decide speculative use explicitly (mirrors _stream_completion).
-        # The disable-on-grammar path is taken when both speculative is
-        # loaded and grammar is requested for this request; otherwise
-        # fall through to the speculative branch unchanged.
+        # Single-source dispatch decision, part of the #755 invariant: the
+        # caller computed ``will_speculate`` once (raw request-level media)
+        # and the same bool feeds its preflight + attach; re-deriving it
+        # here from the materialized ``audio_paths`` would rest on a
+        # truthiness-equivalence assumption instead of one shared value
+        # (#755 round-5 review). Grammar/media arbitration happened in that
+        # one computation.
+        use_speculative = will_speculate
         if (
             lm.is_speculative
             and grammar_active
@@ -4459,16 +4466,8 @@ async def _full_completion_inner(
                 "grammar-constrained decoding is not yet plumbed through "
                 "the speculative path"
             )
-            use_speculative = False
-        else:
-            # Grammar was handled in the branch above. ``audio_paths`` is
-            # materialized in the outer scope before ``_generate_sync()`` is
-            # invoked, so passing it here reproduces the original
-            # ``is_vlm and (images or audio_paths)`` probe verbatim — the rule
-            # lives in one place now (#755 review).
-            use_speculative = _request_will_speculate(
-                lm, stream=False, images=images, audio=audio_paths, grammar_active=False
-            )
+            # ``use_speculative`` is False by construction: the caller's
+            # ``_request_will_speculate`` resolves exactly this case.
 
         try:
             if lm.is_vlm and (images or audio_paths):
