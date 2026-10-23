@@ -1698,6 +1698,28 @@ class TestBatchEligible:
     def test_kv_quant_disqualifies(self):
         assert not self._eligible(_eligible_lm(kv_cache_quant="turboquant:4"))
 
+    def test_kv_eviction_model_never_batches(self, monkeypatch):
+        """#755: an evictable model's cache layout is the bounded
+        ``RotatingKVCache`` (`_make_prompt_cache_for_lm` →
+        `_make_eviction_prompt_cache`), which fails ``caches_plain_kv``'s
+        exact-type probe, so the batched engine is unreachable for it — the
+        KV preflight/attach can't be bypassed via batching."""
+        from mlx_lm.models.cache import RotatingKVCache
+
+        from olmlx.engine import inference
+
+        # Plug in exactly the layout the real factory builds for
+        # kv_eviction (a real model build is out of scope here).
+        def fake_factory(lm):
+            assert lm.kv_eviction == "4:512"
+            return [RotatingKVCache(max_size=516, keep=4)]
+
+        monkeypatch.setattr(inference, "_make_prompt_cache_for_lm", fake_factory)
+        lm = _eligible_lm(kv_eviction="4:512", batch_convertible=None)
+        assert not self._eligible(lm)
+        # Memoized: the probe verdict sticks, never flips back.
+        assert lm.batch_convertible is False
+
     def test_images_audio_disqualify(self):
         assert not self._eligible(_eligible_lm(), images=["img"])
         assert not self._eligible(_eligible_lm(), audio=["clip"])

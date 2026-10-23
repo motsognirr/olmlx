@@ -132,7 +132,9 @@ def estimate_kv_cache_bytes(
     ``RotatingKVCache`` holds while prefilling (#762's formula). Gated the
     same way the cache factory is gated: the default layout must be
     all-plain full attention (or layout introspection must be unavailable,
-    trusting a caller that already made the gate's probe). Charging the full
+    trusting a caller that already made the gate's probe) AND
+    ``kv_cache_quant`` must be unset — quant wins over eviction (#505), so a
+    dual-configured call stays on the full horizon. Charging the full
     prompt+generation horizon for a bounded cache would 503 exactly the
     over-window prompts eviction exists to serve (#755 review); speculative
     and distributed requests never receive the bounded cache, so their
@@ -301,9 +303,15 @@ def estimate_kv_cache_bytes(
     # factory applies; layout introspection unavailable ⇒ trust the caller,
     # which passed ``kv_eviction`` only after its own layout probe). A
     # hybrid layout here means the probe that admitted this spec can't have
-    # taken it, so keep the (conservative) full horizon.
-    if kv_eviction is not None and (
-        layout is None or all(_is_plain_kv_cache(e) for e in layout)
+    # taken it, so keep the (conservative) full horizon. The factory's
+    # "KV quant wins over eviction" precedence is encoded here too: with
+    # both configured the built cache is the quant one (unbounded), so no
+    # cap — a future caller passing both can never get a compound
+    # under-estimate (#755 round-4 review).
+    if (
+        kv_eviction is not None
+        and kv_cache_quant is None
+        and (layout is None or all(_is_plain_kv_cache(e) for e in layout))
     ):
         try:
             sink, window = _parse_kv_eviction(kv_eviction)
