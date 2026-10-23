@@ -1325,6 +1325,17 @@ def _request_will_speculate(
     window-exemption decision: the exemption holds only when the attach
     really installed (or setup already built) the bounded cache, so both
     must answer the speculation question identically (#755).
+
+    Callers pass whichever media variable their scope holds: the raw
+    request data (router scope, ``audio``) or its materialization
+    (generation scope, ``audio_paths``). These are truthiness-equivalent
+    by construction: ``materialize_audio`` is exactly one path out per
+    item in (data URIs temp-write to disk, URLs/paths pass through) and
+    raises before returning on any failure, so it never turns a non-empty
+    list empty or vice versa — pinned by
+    ``test_audio_input_util.py::test_materialize_empty_audio_is_empty``.
+    #755 round-5/6: keep the *consumers* on the single pass-down bool, not
+    a re-derivation, so the equivalence assumption has no runtime teeth.
     """
     has_media = (
         bool(images or audio) if stream else bool(lm.is_vlm and (images or audio))
@@ -1340,10 +1351,20 @@ def _eviction_will_bound(lm: LoadedModel, *, will_speculate: bool) -> bool:
     (``_kv_eviction_bounds_cache``), and neither speculative (its decoders
     never read ``prompt_cache``, so the bound attach is skipped) nor
     distributed (workers build their own caches; ``prompt_cache`` is never
-    broadcast). Exactly the preconditions ``_attach_kv_cache`` enforces, so
-    the #715 exemption and the attach can't disagree: when this is True the
-    bounded cache is either built by prompt-cache setup or rebuilt by the
-    post-preflight attach — never silently unbounded.
+    broadcast).
+
+    Relationship to ``_attach_kv_cache`` (#755 round 6, precisely): a
+    bounded cache is attached-or-already-present whenever this gate is
+    True, but the attach has one precondition this gate cannot see — it
+    skips when ``prompt_cache`` is already in ``gen_kwargs``. That skip is
+    safe, not a disagreement: a present cache was attached seconds earlier
+    by prompt-cache setup through the same ``lm.kv_eviction``
+    configuration, so it is the bounded cache exactly when this gate is
+    True. Hence the #715 window exemption can be waived (gate True) only
+    when setup's bounded cache or the post-preflight attach reaches
+    generation — never silently unbounded. The rationale for the skip is
+    in ``_attach_kv_cache``'s docstring; this gate only answers "what
+    *would* this request run with if it were attached now".
 
     The batched engine needs no separate exclusion here: ``_batch_eligible``
     rejects what this gate would admit on the layout probe alone
@@ -1379,8 +1400,11 @@ def _attach_kv_cache(
       an mlx-lm ``RotatingKVCache`` would mask wrongly, and hybrid/SWA/GDN
       models stay on their default cache. The exemption in
       ``generate_chat`` / ``generate_completion`` rides on the same gate
-      (``_eviction_will_bound``), so the bounded cache is present whenever
-      the window check was waived.
+      (``_eviction_will_bound``); the one relationship caveat is recorded
+      there: the attach's "give up when a ``prompt_cache`` is already in
+      ``gen_kwargs``" branch is not a disagreement — a cache attached by
+      setup came through the same ``lm.kv_eviction`` configuration and is
+      the bounded cache precisely when the gate is True.
 
     Built on the event loop like the text path's: the rotations are
     eager-eval'd at construction, and the generating worker materializes the
