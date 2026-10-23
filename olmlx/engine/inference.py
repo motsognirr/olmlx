@@ -3649,7 +3649,10 @@ async def _stream_completion(
                 lm,
                 stream=True,
                 images=images,
-                audio=audio,
+                # audio_paths (materialized above): exactly the media test the
+                # dispatch below recomputes — `audio` is the caller's raw
+                # data, truthiness-equivalent but not the same variable.
+                audio=audio_paths,
                 grammar_active=grammar_active,
             ),
         )
@@ -3693,8 +3696,11 @@ async def _stream_completion(
             )
             use_speculative = False
         else:
-            use_speculative = _will_speculate(
-                lm, has_media=bool(images or audio_paths), grammar_active=False
+            # Grammar was handled in the branch above; the media rule must be
+            # the one `_request_will_speculate` publishes, so this decision and
+            # the attach/window-exemption can't drift (#755 review).
+            use_speculative = _request_will_speculate(
+                lm, stream=True, images=images, audio=audio_paths, grammar_active=False
             )
 
         # prompt is a str or a token-id list; only the latter gives a count here.
@@ -4432,10 +4438,13 @@ async def _full_completion_inner(
             )
             use_speculative = False
         else:
-            use_speculative = _will_speculate(
-                lm,
-                has_media=bool(lm.is_vlm and (images or audio_paths)),
-                grammar_active=False,
+            # Grammar was handled in the branch above. ``audio_paths`` is
+            # still [] at this point (materialization happens downstream), so
+            # passing it reproduces the old ``is_vlm and (images or
+            # audio_paths)`` probe exactly — the rule lives in one place now
+            # (#755 review).
+            use_speculative = _request_will_speculate(
+                lm, stream=False, images=images, audio=audio_paths, grammar_active=False
             )
 
         try:
