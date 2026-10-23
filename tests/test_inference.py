@@ -6072,6 +6072,7 @@ class TestKvCachePreflightCheckHelper:
                 cache_creation_tokens=3,
                 full_prompt_tokens=None,
                 cache_id="test",
+                will_speculate=False,
             )
 
         assert result.memory_limit == 12 * 1024**3
@@ -6110,6 +6111,7 @@ class TestKvCachePreflightCheckHelper:
                     cache_creation_tokens=3,
                     full_prompt_tokens=None,
                     cache_id="test",
+                    will_speculate=False,
                 )
 
     @pytest.mark.asyncio
@@ -6134,6 +6136,7 @@ class TestKvCachePreflightCheckHelper:
                 cache_creation_tokens=0,
                 full_prompt_tokens=None,
                 cache_id="test",
+                will_speculate=False,
             )
 
         # cache_creation_tokens=0 and no tokenizable prompt → num_prefill_tokens=0 → skip check
@@ -6166,7 +6169,9 @@ class TestKvCachePreflightCheckHelper:
                 cache_creation_tokens=3,
                 full_prompt_tokens=None,
                 cache_id="test",
+                will_speculate=False,
             )
+
         assert result.memory_limit > 0
 
     @pytest.mark.asyncio
@@ -6211,6 +6216,7 @@ class TestKvCachePreflightCheckHelper:
                     cache_creation_tokens=1,
                     full_prompt_tokens=[1, 2, 3],
                     cache_id="test",
+                    will_speculate=False,
                 )
 
         # The non-persistable cache must NOT be re-stored, even though
@@ -6277,6 +6283,7 @@ class TestKvCachePreflightCheckHelper:
                 full_prompt_tokens=[1, 2, 3, 4, 5],
                 cache_id="test",
                 has_deferred_prefill=True,
+                will_speculate=False,
             )
 
         assert "prompt_cache" not in gen_kwargs
@@ -6317,7 +6324,9 @@ class TestKvCachePreflightCheckHelper:
                 full_prompt_tokens=[1, 2, 3, 4, 5],
                 cache_id="test",
                 has_deferred_prefill=True,
+                will_speculate=False,
             )
+
         assert result.cache_dropped is False
         assert result.prompt == [5]
 

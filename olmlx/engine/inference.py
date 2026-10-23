@@ -2483,7 +2483,7 @@ async def _kv_cache_preflight_check(
     full_prompt_tokens: list[int] | None,
     cache_id: str,
     has_deferred_prefill: bool = False,
-    will_speculate: bool = False,
+    will_speculate: bool,
 ) -> _PreflightResult:
     """Estimate KV cache memory and reject if it would exceed the limit.
 
@@ -2499,10 +2499,9 @@ async def _kv_cache_preflight_check(
     ``will_speculate``: the request-level speculation decision, computed by
     the caller via ``_request_will_speculate`` and reused for the
     ``_attach_kv_cache`` right after, so the estimator's eviction cap rides
-    the exact same predicate the attach does (#755 review). Production
-    callers must always pass it — the ``False`` default means the cap may
-    apply, which is only correct when the request indeed receives the
-    bounded cache.
+    the exact same predicate the attach does (#755 review). Required — no
+    default — because a silent ``False`` would silently enable the cap for
+    a request whose cache may be unbounded: callers must state it.
     """
     result = _PreflightResult(prompt=prompt)
 
