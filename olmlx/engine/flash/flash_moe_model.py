@@ -10,7 +10,7 @@ from __future__ import annotations
 import gc
 import logging
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -297,6 +297,7 @@ class FlashMoeModelWrapper(nn.Module):
         intermediate_size: int,
         num_experts: int,
         num_experts_per_tok: int,
+        dispatch_factory: Callable[[int], Any] | None = None,
     ):
         super().__init__()
         self._model = model
@@ -320,6 +321,7 @@ class FlashMoeModelWrapper(nn.Module):
             intermediate_size,
             num_experts,
             num_experts_per_tok,
+            dispatch_factory=dispatch_factory,
         )
 
     def __call__(
@@ -381,6 +383,19 @@ def wrap_flash_moe(
 
     flash_moe_dir = Path(flash_moe_dir)
     moe_config = json.loads((flash_moe_dir / "flash_moe_config.json").read_text())
+
+    if moe_config.get("format") == "edge0_latent":
+        # Edge0 latent pack: experts are streamed from the pack's own
+        # experts.bin, not from a .flashexperts bundle.
+        from olmlx.engine.edge0.loader import wrap_edge0_latent
+
+        return wrap_edge0_latent(
+            model,
+            flash_moe_dir,
+            moe_config,
+            io_threads=io_threads,
+            cache_budget_experts=cache_budget_experts,
+        )
 
     store = FlashMoeWeightStore(
         flash_moe_dir,
@@ -498,8 +513,15 @@ def _replace_moe_layers(
     intermediate_size: int,
     num_experts: int,
     num_experts_per_tok: int,
+    dispatch_factory: Callable[[int], Any] | None = None,
 ) -> None:
-    """Replace MoE layers with FlashMoE variants."""
+    """Replace MoE layers with FlashMoE variants.
+
+    *dispatch_factory* builds the per-layer routed-expert dispatch (called as
+    ``dispatch(x, inds, scores)``) instead of the default SSD-bundle
+    :class:`FlashMoE` — Edge0 latent packs supply one. Router detection and
+    the removal of the original expert weights are unchanged.
+    """
     layers = model.layers
     replaced = 0
 
@@ -520,16 +542,19 @@ def _replace_moe_layers(
                     activation = switch.activation
                     break
 
-        # Create FlashMoE for this layer
-        flash_moe = FlashMoE(
-            layer_idx=layer_idx,
-            hidden_size=hidden_size,
-            intermediate_size=intermediate_size,
-            num_experts=num_experts,
-            num_experts_per_tok=num_experts_per_tok,
-            weight_store=weight_store,
-            activation=activation,
-        )
+        # Create the routed-expert dispatch for this layer
+        if dispatch_factory is not None:
+            flash_moe = dispatch_factory(layer_idx)
+        else:
+            flash_moe = FlashMoE(
+                layer_idx=layer_idx,
+                hidden_size=hidden_size,
+                intermediate_size=intermediate_size,
+                num_experts=num_experts,
+                num_experts_per_tok=num_experts_per_tok,
+                weight_store=weight_store,
+                activation=activation,
+            )
 
         if moe_attr == "experts":
             # Gemma4 VLM: router stays on layer, only replace experts

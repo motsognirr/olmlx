@@ -2210,6 +2210,52 @@ Token arrives at MoE layer
 - Experts must be pre-bundled to SSD with layout metadata (`flash_moe_layout.json`)
 - NVMe SSD strongly recommended for I/O throughput
 
+### Edge0 latent-MoE packs
+
+[Edge0](https://huggingface.co/Edge0) models such as `Edge0/Edge0-145B-q3k` are Qwen3.8-Flash-Next with every layer's routed experts rebuilt as *latent* experts: a shared per-group projection maps the hidden state down to a narrower width, the expert runs there, and a second shared projection maps the result back. They are published as a "strata pack" (raw expert records, a GGUF skeleton and a GGUF n-gram table), not as an MLX checkpoint.
+
+olmlx serves these packs directly:
+
+```bash
+olmlx models pull Edge0/Edge0-145B-q3k
+olmlx chat Edge0/Edge0-145B-q3k
+```
+
+- **Conversion is automatic and in place.** After the download, olmlx writes a `config.json`, the trunk and vision weights (`model-*.safetensors`, about 7 GiB), a tokenizer and a `flash_moe/` directory (about 4 GiB) into the pack's own directory. It takes about a minute.
+- **Nothing is re-quantized.** The routed experts (`experts.bin`, 37 GiB) and the n-gram table (`ple-fp8.gguf`, 48 GiB) are read from the pack's files as they are; the trunk's 8-bit weights are repacked losslessly.
+- **Flash-MoE is always on for these models** — `flash_moe: true` is not needed. `flash_moe_cache_budget_experts` and `flash_moe_io_threads` apply as usual; one cached expert is about 1.6 MB, so the default budget of 48 per layer is about 3.7 GiB.
+- **Speculative decoding with the pack's draft head.** The pack's MTP head (`mtp/`) is converted too. When a text request runs without the prompt cache, it is decoded speculatively: the head proposes the next tokens and the model verifies them in one pass. The output is still the model's own; with sampling the output distribution is preserved. By default the prompt cache takes priority (see `OLMLX_EDGE0_DRAFT_OVER_PROMPT_CACHE`).
+- **Images and tool calls work** when the pack ships its vision projector (`mmproj-*.gguf`).
+
+| Setting | Default | Description |
+|---|---|---|
+| `OLMLX_EDGE0_PROJECTION_BITS` | `4` | Use the pack's 4- or 8-bit shared projections. 4-bit is what Edge0's own Metal build uses; 8-bit needs about 1.8 GiB more RAM and is slower. Changing it re-converts the pack on next load. |
+| `OLMLX_EDGE0_DRAFT_HEAD` | `true` | Load the pack's draft head and decode speculatively when a request is eligible. |
+| `OLMLX_EDGE0_DRAFT_OVER_PROMPT_CACHE` | `false` | Drafting and the prompt cache cannot share a request. By default the cache wins, so multi-turn chats re-read only the new tokens (measured: 22 tokens in 2 s instead of 1,362 in 23 s) and decode at the non-speculative rate. Set to `true` to draft on every eligible request and re-read the whole conversation each turn instead. |
+| `OLMLX_EDGE0_DRAFT_BLOCK_SIZE` | `3` | Tokens verified per model pass (one certain token plus this many minus one drafts). |
+
+Measured on a 24 GB M5 with `Edge0/Edge0-145B-q3k`, default settings:
+
+| | |
+|---|---|
+| Memory after load | about 10 GiB |
+| Memory while generating | about 14.3 GiB |
+| Decode, greedy | about 5.9 tokens/s; about 7 when drafting |
+| Decode, default sampling, drafting | about 6.2 tokens/s |
+| Prompt processing | about 48 tokens/s |
+
+This is well below the figures Edge0 publishes for its own engine on larger machines. On 24 GB the limit is memory, not compute: about a third of expert lookups miss the cache and each miss is a 1.6 MB disk read. Raising `flash_moe_cache_budget_experts` only helps while total memory stays comfortably below what the machine has free — on this machine 64 was already slower than 48, and 96 ran out of GPU memory.
+
+Limitations:
+
+- Disk: the pack is 99 GiB and conversion adds about 10 GiB.
+- Only `Q3_K` + `IQ4_NL` packs (the `-q3k` repositories) are supported, not the `-NVFP4` ones.
+- A pack that ships only one of the two projection files is converted with that one, whatever `OLMLX_EDGE0_PROJECTION_BITS` says (a warning is logged).
+- Speculative decoding is skipped for requests that use the prompt cache (unless `OLMLX_EDGE0_DRAFT_OVER_PROMPT_CACHE=true`), carry images, a JSON grammar/schema or an Anthropic thinking budget, or run with `kv_cache_quant`. While it is active, repetition penalty is not applied.
+- Greedy output with the draft head is not guaranteed to be token-identical to output without it: verifying several tokens in one pass rounds differently from one-at-a-time decoding, which can flip a near-tie.
+- The pack's `profile.bin` (a static ranking of "hot" experts) is not used. On recorded routing it predicted actual expert use barely better than chance, while the recency cache is close to the best a fixed set could do.
+- Not compatible with distributed inference, LoRA adapters or `weight_quant`.
+
 ---
 
 ## Benchmarking
