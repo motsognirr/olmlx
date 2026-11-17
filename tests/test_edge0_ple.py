@@ -85,6 +85,18 @@ class TestFp8NGramEmbedding:
         out = ple.Fp8NGramEmbedding(manifest)(mx.zeros((1, 0, 16), dtype=mx.int64))
         assert out.shape == (1, 0, 16, PLE_ROW_WIDTH)
 
+    @pytest.mark.parametrize("data_file", ["../outside.bin", "/etc/hosts"])
+    def test_manifest_cannot_point_outside_its_directory(self, tmp_path, data_file):
+        model = tmp_path / "model"
+        model.mkdir()
+        manifest, _ = _manifest(model)
+        (tmp_path / "outside.bin").write_bytes(b"\0" * 64)
+        payload = json.loads(manifest.read_text())
+        payload["data_file"] = data_file
+        manifest.write_text(json.dumps(payload))
+        with pytest.raises(ValueError, match="escapes the model directory"):
+            ple.Fp8NGramEmbedding(manifest)
+
     def test_truncated_table_is_rejected(self, tmp_path):
         manifest, _ = _manifest(tmp_path)
         data = tmp_path / "ple-fp8.gguf"

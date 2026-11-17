@@ -19,6 +19,7 @@ import mlx.core as mx
 from mlx.utils import tree_flatten
 
 from olmlx.engine.edge0.convert import LATENT_DIRNAME, read_edge0_config
+from olmlx.engine.edge0.draft_head import DRAFT_DIRNAME
 from olmlx.engine.edge0.latent_moe import LatentExpertStore, LatentMoE
 from olmlx.engine.edge0.pack import Edge0Pack, Edge0PackError
 
@@ -107,7 +108,9 @@ def load_draft_head(model: Any, model_dir: Path) -> Any | None:
 
     section = read_edge0_config(model_dir) or {}
     dirname = section.get("draft_head")
-    if settings.edge0_draft_head is not True or not isinstance(dirname, str):
+    # Only the directory the converter writes: config.json may come from a
+    # download and must not point the loader anywhere else.
+    if settings.edge0_draft_head is not True or dirname != DRAFT_DIRNAME:
         return None
     draft_dir = model_dir / dirname
     if not (draft_dir / "config.json").is_file():

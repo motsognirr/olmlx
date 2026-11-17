@@ -141,6 +141,22 @@ class TestLoading:
         finally:
             store.close()
 
+    def test_config_cannot_redirect_the_draft_head(self, tmp_path):
+        from tests.test_edge0_loader import _load
+
+        full = make_full_pack(tmp_path, with_vision=False)
+        convert.convert_pack(full.root)
+        outside = tmp_path / "elsewhere"
+        (full.root / draft_head.DRAFT_DIRNAME).rename(outside)
+        config = json.loads((full.root / "config.json").read_text())
+        config["edge0"]["draft_head"] = "../elsewhere"
+        (full.root / "config.json").write_text(json.dumps(config))
+        wrapped, _, store = _load(full.root)
+        try:
+            assert wrapped._vlm_draft_head is None
+        finally:
+            store.close()
+
     def test_broken_draft_head_only_costs_the_speedup(self, tmp_path):
         from tests.test_edge0_loader import _load
 

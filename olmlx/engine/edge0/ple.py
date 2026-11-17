@@ -86,7 +86,15 @@ class Fp8NGramEmbedding:
             raise ValueError(f"unsupported PLE encoding {manifest.get('encoding')!r}")
         self.row_count = int(manifest["row_count"])
         self.row_width = int(manifest["row_width"])
-        data_path = (manifest_path.parent / manifest["data_file"]).resolve()
+        # The manifest sits in a downloaded directory: never let it name a
+        # file outside that directory.
+        root = manifest_path.parent.resolve()
+        data_path = (root / str(manifest["data_file"])).resolve()
+        if not data_path.is_relative_to(root):
+            raise ValueError(
+                f"PLE manifest data_file {manifest['data_file']!r} escapes the "
+                "model directory"
+            )
         offset = int(manifest["data_offset"])
         expected = offset + self.row_count * self.row_width
         if data_path.stat().st_size < expected:
