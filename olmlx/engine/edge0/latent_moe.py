@@ -24,17 +24,20 @@ from __future__ import annotations
 import logging
 import os
 from concurrent.futures import ThreadPoolExecutor
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
 
 from olmlx.engine.edge0 import ggml_quants, latent_kernels
-from olmlx.engine.edge0.pack import Edge0Pack, LatentGeometry
+from olmlx.engine.edge0.affine import blocks_to_affine
 from olmlx.engine.flash._ssd_base import LayerLruCache, full_pread
 from olmlx.engine.flash.moe_weight_store import ExpertCacheStats
 from olmlx.utils import tracing as _tracing
+
+if TYPE_CHECKING:
+    from olmlx.engine.edge0.pack import Edge0Pack, LatentGeometry
 
 logger = logging.getLogger(__name__)
 
@@ -49,25 +52,6 @@ DEFAULT_MAX_KERNEL_EXPERTS = 64
 #: The dense reference path decodes each expert to ~14 MB of float32 plus
 #: several times that in intermediates.
 DEFAULT_MAX_DECODE_EXPERTS = 24
-
-_KVALUES_IQ4NL = (
-    -127,
-    -104,
-    -83,
-    -65,
-    -49,
-    -35,
-    -22,
-    -10,
-    1,
-    13,
-    25,
-    38,
-    53,
-    69,
-    89,
-    113,
-)
 
 
 # ---------------------------------------------------------------------------
@@ -116,7 +100,7 @@ def decode_iq4_nl(blocks: mx.array) -> mx.array:
     nibbles = mx.concatenate(
         [mx.bitwise_and(qs, 15), mx.right_shift(qs, 4)], axis=-1
     ).astype(mx.uint32)
-    codebook = mx.array(_KVALUES_IQ4NL, dtype=mx.float32)
+    codebook = mx.array(ggml_quants.KVALUES_IQ4NL, dtype=mx.float32)
     values = codebook[nibbles] * _half_scale(blocks[..., 0:2])[..., None]
     return values.reshape(*lead, n_blocks * 32)
 
@@ -150,39 +134,6 @@ def decode_records(
 # ---------------------------------------------------------------------------
 
 
-def _blocks_to_affine(raw: np.ndarray, ggml_type: int, rows: int):
-    """Repack ``Q8_0`` / ``Q4_0`` rows as MLX affine (weight, scales, biases).
-
-    Exact: ``Q8_0`` is ``d * q`` with int8 ``q``, i.e. ``d * u - 128 d`` for
-    ``u = q + 128``; ``Q4_0`` is ``d * (n - 8)``. Returned arrays keep a
-    ``[rows, blocks, ...]`` layout so callers can regroup rows before
-    flattening.
-    """
-    if ggml_type == ggml_quants.GGML_Q8_0:
-        blocks = raw.reshape(rows, -1, 34)
-        codes = blocks[..., 2:] ^ np.uint8(0x80)
-        offset = -128.0
-    elif ggml_type == ggml_quants.GGML_Q4_0:
-        blocks = raw.reshape(rows, -1, 18)
-        qs = blocks[..., 2:]
-        # ggml: byte j = element j | element j+16 << 4. MLX: nibble i = element i.
-        low, high = qs & 0x0F, qs >> 4
-        codes = np.concatenate(
-            [
-                low[..., 0::2] | (low[..., 1::2] << 4),
-                high[..., 0::2] | (high[..., 1::2] << 4),
-            ],
-            axis=-1,
-        )
-        offset = -8.0
-    else:
-        raise ValueError(f"unsupported projection ggml type {ggml_type}")
-    scales = (
-        np.ascontiguousarray(blocks[..., :2]).view("<f2")[..., 0].astype(np.float32)
-    )
-    return np.ascontiguousarray(codes), scales, scales * np.float32(offset)
-
-
 def pack_projections(pack: Edge0Pack, layer: int) -> dict[str, Any]:
     """Build one layer's D/U as MLX affine-quantized matrices.
 
@@ -193,7 +144,7 @@ def pack_projections(pack: Edge0Pack, layer: int) -> dict[str, Any]:
     g = pack.geometry
     bits = 8 if pack.latent_dense_type == ggml_quants.GGML_Q8_0 else 4
 
-    codes, scales, biases = _blocks_to_affine(
+    codes, scales, biases = blocks_to_affine(
         np.asarray(pack.down_projection_raw(layer)),
         pack.latent_dense_type,
         g.n_groups * g.latent,
@@ -205,7 +156,7 @@ def pack_projections(pack: Edge0Pack, layer: int) -> dict[str, Any]:
         "down.biases": mx.array(biases),
     }
 
-    codes, scales, biases = _blocks_to_affine(
+    codes, scales, biases = blocks_to_affine(
         np.asarray(pack.up_projection_raw(layer)),
         pack.latent_dense_type,
         g.n_groups * g.hidden,

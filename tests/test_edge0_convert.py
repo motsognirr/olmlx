@@ -373,3 +373,30 @@ class TestProjectionBits:
             rtol=1e-5,
             atol=1e-7,
         )
+
+    def test_pack_with_only_one_projection_file_does_not_look_stale(self, tmp_path):
+        # Asking for 4-bit on a pack that ships only 8-bit converts with 8-bit
+        # and must then count as converted *for that request*, or every load
+        # would convert again.
+        full = make_full_pack(tmp_path, with_vision=False, with_draft_head=False)
+        (full.root / "latent_dense_q4.bin").unlink()
+        convert.convert_pack(full.root, projection_bits=4)
+        section = convert.read_edge0_config(full.root)
+        assert section["latent"]["projection_bits"] == 8
+        assert convert.is_converted(full.root, projection_bits=4)
+
+    def test_failed_validation_keeps_the_previous_conversion(
+        self, tmp_path, monkeypatch
+    ):
+        from mlx_vlm.models.qwen4_exp import language
+
+        full = make_full_pack(tmp_path, with_vision=False, with_draft_head=False)
+        convert.convert_pack(full.root)
+        shards = sorted(p.name for p in full.root.glob("model-*.safetensors"))
+        monkeypatch.setattr(
+            language, "_build_layer_multipliers", lambda *a, **k: mx.array([1, 2, 3])
+        )
+        with pytest.raises(Edge0PackError, match="n-gram hashing"):
+            convert.convert_pack(full.root)
+        assert convert.is_converted(full.root)
+        assert sorted(p.name for p in full.root.glob("model-*.safetensors")) == shards

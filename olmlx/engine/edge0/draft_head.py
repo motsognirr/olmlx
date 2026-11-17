@@ -32,7 +32,8 @@ import mlx.core as mx
 import numpy as np
 
 from olmlx.engine.edge0 import ggml_quants
-from olmlx.engine.edge0.latent_moe import _blocks_to_affine
+from olmlx.engine.edge0.affine import bf16 as _bf16
+from olmlx.engine.edge0.affine import blocks_to_affine, packed_q8_0_to_bf16_affine
 from olmlx.engine.edge0.pack import Edge0PackError
 
 DRAFT_DIRNAME = "mtp_draft"
@@ -56,10 +57,6 @@ def has_draft_head(pack_root: Path | str) -> bool:
     return (mtp / "dense.txt").is_file() and (mtp / "experts.bin").is_file()
 
 
-def _bf16(values: np.ndarray) -> mx.array:
-    return mx.array(np.ascontiguousarray(values, dtype=np.float32)).astype(mx.bfloat16)
-
-
 def _convert_dense(mtp: Path) -> dict[str, mx.array]:
     dense = np.memmap(mtp / "dense.bin", dtype=np.uint8, mode="r")
     out: dict[str, mx.array] = {}
@@ -76,16 +73,12 @@ def _convert_dense(mtp: Path) -> dict[str, mx.array]:
             raise Edge0PackError(f"mtp/dense.bin is truncated at {name!r}")
         key = name if name.startswith(_TOP_LEVEL) else f"layers.0.{name}"
         if kind == "q8_0":
-            codes, scales, _ = _blocks_to_affine(raw, ggml_quants.GGML_Q8_0, rows)
+            codes, scales, _ = blocks_to_affine(raw, ggml_quants.GGML_Q8_0, rows)
             if codes.shape[1] * 32 != cols:
                 raise Edge0PackError(f"mtp tensor {name!r} is not {rows}x{cols}")
-            # Same rule as the trunk: bias from the bfloat16-rounded scale, so
-            # a block keeps a pure scale error and no constant offset.
-            scales_bf16 = _bf16(scales)
-            prefix = key[: -len(".weight")]
-            out[f"{prefix}.weight"] = mx.array(codes.reshape(rows, -1).view("<u4"))
-            out[f"{prefix}.scales"] = scales_bf16
-            out[f"{prefix}.biases"] = scales_bf16 * -128.0
+            out.update(
+                packed_q8_0_to_bf16_affine(codes, scales, key[: -len(".weight")])
+            )
             continue
         values = ggml_quants.dequantize(raw, _KINDS[kind])
         if kind == "f32":

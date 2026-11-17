@@ -96,7 +96,7 @@ def test_batched_kernel_path_matches_reference(tmp_path):
         store.close()
 
 
-@pytest.mark.parametrize("separate_record_limit", [0, 16])
+@pytest.mark.parametrize("separate_record_limit", [0, 24])
 def test_stacked_and_separate_record_kernels_agree(tmp_path, separate_record_limit):
     # separate_record_limit=0 forces the stacked-buffer kernels; 16 hands each
     # expert record to the kernel as its own input (the decode fast path).
@@ -120,7 +120,9 @@ def test_stacked_and_separate_record_kernels_agree(tmp_path, separate_record_lim
 
 def test_too_many_separate_records_is_rejected(tmp_path):
     geometry = Edge0Pack(make_pack(tmp_path).root).geometry
-    records = [mx.zeros(geometry.record_bytes, dtype=mx.uint8)] * 17
+    records = [mx.zeros(geometry.record_bytes, dtype=mx.uint8)] * (
+        latent_kernels.MAX_SEPARATE_RECORDS + 1
+    )
     with pytest.raises(ValueError, match="separate records"):
         latent_kernels.routed_latent(
             records,

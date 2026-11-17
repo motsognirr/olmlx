@@ -218,15 +218,16 @@ def _lm(drafter=None, **overrides):
 
 
 class TestRequestGating:
-    def _will(self, lm, **overrides):
+    def _will(self, lm, gen_kwargs=None, **overrides):
         from olmlx.engine import inference
 
         args = dict(has_media=False, grammar_active=False, max_tokens=64)
         args.update(overrides)
-        return inference._will_draft(lm, **args)
+        return inference._will_draft(lm, gen_kwargs or {}, **args)
 
     def test_drafts_for_a_plain_text_request(self):
         assert self._will(_lm(nn.Linear(2, 2)))
+        assert self._will(_lm(nn.Linear(2, 2)), {"repetition_penalty": 1.1})
 
     @pytest.mark.parametrize(
         "lm_overrides,call_overrides",
@@ -243,6 +244,13 @@ class TestRequestGating:
     def test_does_not_draft(self, lm_overrides, call_overrides):
         assert not self._will(_lm(nn.Linear(2, 2), **lm_overrides), **call_overrides)
 
+    def test_does_not_draft_with_a_logits_processor(self):
+        # mlx-vlm's speculative loop applies processors to the first token
+        # only, so a thinking budget would silently stop being enforced.
+        assert not self._will(
+            _lm(nn.Linear(2, 2)), {"logits_processors": [lambda tokens, logits: logits]}
+        )
+
     def test_no_draft_head_no_drafting(self):
         assert not self._will(_lm(None))
 
@@ -250,6 +258,17 @@ class TestRequestGating:
         from unittest.mock import MagicMock
 
         assert not self._will(MagicMock())
+
+    def test_prompt_cache_wins_by_default(self, monkeypatch):
+        from olmlx.engine import inference
+
+        args = dict(has_media=False, grammar_active=False, max_tokens=64)
+        lm = _lm(nn.Linear(2, 2))
+        assert inference.settings.edge0_draft_over_prompt_cache is False
+        assert not inference._draft_replaces_prompt_cache(lm, {}, **args)
+        monkeypatch.setattr(inference.settings, "edge0_draft_over_prompt_cache", True)
+        assert inference._draft_replaces_prompt_cache(lm, {}, **args)
+        assert not inference._draft_replaces_prompt_cache(_lm(None), {}, **args)
 
     def test_attach_adds_mlx_vlm_kwargs(self, monkeypatch):
         from olmlx.engine import inference

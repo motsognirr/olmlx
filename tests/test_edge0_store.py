@@ -132,3 +132,12 @@ class TestProjectionSetting:
         from olmlx.config import Settings
 
         assert Settings().edge0_projection_bits == 4
+
+    def test_setting_is_read_from_the_environment(self, monkeypatch):
+        from olmlx.config import Settings
+
+        monkeypatch.setenv("OLMLX_EDGE0_PROJECTION_BITS", "8")
+        assert Settings().edge0_projection_bits == 8
+        monkeypatch.setenv("OLMLX_EDGE0_PROJECTION_BITS", "5")
+        with pytest.raises(ValueError):
+            Settings()

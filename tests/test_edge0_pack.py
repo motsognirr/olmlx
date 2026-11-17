@@ -96,20 +96,11 @@ class TestContents:
             )
             np.testing.assert_array_equal(up.reshape(2, 64, 256), truth.up_proj[layer])
 
-    def test_dense_tensors(self, tmp_path):
-        truth = make_pack(tmp_path)
-        pack = Edge0Pack(truth.root)
-        for name, expected in truth.dense.items():
-            got = pack.dense_tensor(name)
-            assert got.shape == expected.shape
-            np.testing.assert_array_equal(got, expected)
-
-    def test_skeleton_only_entry(self, tmp_path):
+    def test_index_shapes(self, tmp_path):
         pack = Edge0Pack(make_pack(tmp_path).root)
-        entry = pack.index["blk.0.ffn_up_shexp.weight"]
-        assert entry.ggml_type is None and entry.shape == (32, 64)
-        with pytest.raises(KeyError, match="skeleton"):
-            pack.dense_tensor("blk.0.ffn_up_shexp.weight")
+        assert pack.index["blk.0.ffn_gate_inp.weight"] == (8, 64)
+        assert pack.index["blk.0.hc_ffn_norm.weight"] == (64,)
+        assert pack.index["blk.0.ffn_up_shexp.weight"] == (32, 64)
 
     def test_manifest_paths(self, tmp_path):
         truth = make_pack(tmp_path)
@@ -117,7 +108,13 @@ class TestContents:
         root = truth.root.resolve()
         assert pack.skeleton_path == root / "model-skeleton.gguf"
         assert pack.ple_path == root / "ple-fp8.gguf"
-        assert pack.tokenizer_dir == root / "tokenizer"
+
+    def test_unread_manifest_fields_cannot_reject_a_pack(self, tmp_path):
+        truth = make_pack(tmp_path)
+        manifest = json.loads((truth.root / "model.json").read_text())
+        manifest["tokenizer"] = "../../somewhere/else"
+        (truth.root / "model.json").write_text(json.dumps(manifest))
+        Edge0Pack(truth.root)
 
 
 class TestValidation:
@@ -172,6 +169,7 @@ class TestProjectionChoice:
         truth = make_pack(tmp_path, dense_fmt=8, extra_dense_fmts=(4,))
         pack = Edge0Pack(truth.root, projection_bits=4)
         assert pack.latent_dense_type == gq.GGML_Q4_0
+        assert pack.projection_bits == 4
         assert pack.latent_dense_path.name == "latent_dense_q4.bin"
         assert pack.geometry.n_groups == 2
         down = gq.dequantize(pack.down_projection_raw(1), gq.GGML_Q4_0)
@@ -186,7 +184,10 @@ class TestProjectionChoice:
             Edge0Pack(truth.root, projection_bits=8).latent_dense_type == gq.GGML_Q8_0
         )
 
-    def test_missing_sibling_is_an_error(self, tmp_path):
+    def test_missing_sibling_falls_back_to_the_manifest_file(self, tmp_path, caplog):
         truth = make_pack(tmp_path, dense_fmt=8)
-        with pytest.raises(Edge0PackError, match="latent_dense_q4.bin"):
-            Edge0Pack(truth.root, projection_bits=4)
+        with caplog.at_level("WARNING"):
+            pack = Edge0Pack(truth.root, projection_bits=4)
+        assert pack.projection_bits == 8
+        assert pack.latent_dense_type == gq.GGML_Q8_0
+        assert "latent_dense_q4.bin" in caplog.text

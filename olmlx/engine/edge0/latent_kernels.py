@@ -20,12 +20,14 @@ decoded weights); ``tests/test_edge0_latent_kernels.py`` holds them to it.
 from __future__ import annotations
 
 from functools import lru_cache
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import mlx.core as mx
 
 from olmlx.engine.edge0 import ggml_quants
-from olmlx.engine.edge0.pack import LatentGeometry
+
+if TYPE_CHECKING:
+    from olmlx.engine.edge0.pack import LatentGeometry
 
 _HEADER = r"""
 inline float edge0_half(const device uchar* p) {
@@ -63,9 +65,7 @@ inline float edge0_q3k_dot(const device uchar* w, const device float* x, int n) 
     return acc;
 }
 
-constant float EDGE0_IQ4NL[16] = {
-    -127.0f, -104.0f, -83.0f, -65.0f, -49.0f, -35.0f, -22.0f, -10.0f,
-    1.0f, 13.0f, 25.0f, 38.0f, 53.0f, 69.0f, 89.0f, 113.0f};
+constant float EDGE0_IQ4NL[16] = {EDGE0_IQ4NL_VALUES};
 
 // Dot of one IQ4_NL weight row (n values, 18 bytes per 32) with x.
 inline float edge0_iq4nl_dot(const device uchar* w, const device float* x, int n) {
@@ -91,6 +91,10 @@ inline float edge0_iq4nl_dot(const device uchar* w, const device float* x, int n
 # or one input per expert. The second avoids copying the records into a
 # stacked buffer on every layer call, which costs more than the kernels
 # themselves when a single token routes to ten experts.
+_HEADER = _HEADER.replace(
+    "EDGE0_IQ4NL_VALUES", ", ".join(f"{v}.0f" for v in ggml_quants.KVALUES_IQ4NL)
+)
+
 _GATE_UP_SRC = r"""
     uint row = thread_position_in_grid.x;
     uint route = thread_position_in_grid.y;
@@ -122,8 +126,10 @@ _STACKED_RECORD = (
     "const device uchar* record = records + (ulong)local[route] * (ulong)params[4];"
 )
 
-#: Most experts the one-input-per-expert kernels are built for.
-MAX_SEPARATE_RECORDS = 16
+#: Most experts the one-input-per-expert kernels are built for. A speculative
+#: verify of three tokens routes to up to 30; Metal allows 31 buffers per
+#: kernel and five more are taken by the other arguments.
+MAX_SEPARATE_RECORDS = 24
 
 
 def _separate_record(count: int) -> str:

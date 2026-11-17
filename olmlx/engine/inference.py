@@ -1347,24 +1347,56 @@ def _vlm_draft_head(lm: LoadedModel) -> Any | None:
 
 
 def _will_draft(
-    lm: LoadedModel, *, has_media: bool, grammar_active: bool, max_tokens: int
+    lm: LoadedModel,
+    gen_kwargs: dict,
+    *,
+    has_media: bool,
+    grammar_active: bool,
+    max_tokens: int,
 ) -> bool:
-    """Whether this request decodes speculatively through mlx-vlm's MTP path.
+    """Whether this request may decode speculatively through mlx-vlm's MTP path.
 
-    Text-only: mlx-vlm drafts over token ids. Not with a grammar — drafted
-    tokens bypass logits processors, and a grammar must hold on every token
-    (repetition penalty and the thinking budget are best-effort and are
-    simply not applied to drafted tokens, like olmlx's own speculative
-    decoders). Not with a KV-quant cache, whose rollback under speculation is
-    untested. mlx-vlm's loop needs a positive token budget.
+    Text-only: mlx-vlm drafts over token ids. mlx-vlm's speculative loop takes
+    no logits processors at all (they would only shape the first token), so a
+    request that carries one — a grammar, the Anthropic thinking budget — does
+    not draft; ``repetition_penalty`` is the one thing left unenforced, as on
+    olmlx's own speculative decoders. Not with a KV-quant cache, whose rollback
+    under speculation is untested. The loop needs a positive token budget.
     """
     return (
         _vlm_draft_head(lm) is not None
         and not has_media
         and not grammar_active
+        and not gen_kwargs.get("logits_processors")
         and not isinstance(lm.kv_cache_quant, str)
         and isinstance(max_tokens, int)
         and max_tokens > 0
+    )
+
+
+def _draft_replaces_prompt_cache(
+    lm: LoadedModel,
+    gen_kwargs: dict,
+    *,
+    has_media: bool,
+    grammar_active: bool,
+    max_tokens: int,
+) -> bool:
+    """Whether to give up the VLM prompt cache so this request can draft.
+
+    The two cannot share a request: after a speculative round the cache no
+    longer lines up with the emitted token ids, and the hybrid caches cannot
+    be trimmed back, so a stored state would poison the next turn. Prefix
+    reuse is worth far more than drafting on a multi-turn chat (a second turn
+    re-reads ~20 tokens instead of the whole history), so the cache wins
+    unless ``edge0_draft_over_prompt_cache`` says otherwise.
+    """
+    return settings.edge0_draft_over_prompt_cache is True and _will_draft(
+        lm,
+        gen_kwargs,
+        has_media=has_media,
+        grammar_active=grammar_active,
+        max_tokens=max_tokens,
     )
 
 
@@ -1378,13 +1410,15 @@ def _attach_vlm_draft_head(
 ) -> bool:
     """Add mlx-vlm's speculative kwargs to *gen_kwargs* when the request drafts.
 
-    Callers turn the VLM prompt cache off for drafting requests (see
-    ``_will_draft`` call sites): after a speculative round the cache no longer
-    lines up with the emitted token ids, and the hybrid caches cannot be
-    trimmed back.
+    Never alongside a prompt cache (see ``_draft_replaces_prompt_cache``): a
+    request that has one attached keeps it and decodes normally.
     """
     if not _will_draft(
-        lm, has_media=has_media, grammar_active=grammar_active, max_tokens=max_tokens
+        lm,
+        gen_kwargs,
+        has_media=has_media,
+        grammar_active=grammar_active,
+        max_tokens=max_tokens,
     ) or ("prompt_cache" in gen_kwargs or "prompt_cache_state" in gen_kwargs):
         return False
     gen_kwargs["draft_model"] = _vlm_draft_head(lm)
@@ -3522,13 +3556,13 @@ async def _stream_completion(
     thinking_expected: bool = False,
     collect_generated_tokens: bool = False,
 ) -> AsyncGenerator[dict, None]:
-    if _will_draft(
+    if _draft_replaces_prompt_cache(
         lm,
+        gen_kwargs,
         has_media=bool(images or audio),
         grammar_active=grammar_active,
         max_tokens=max_tokens,
     ):
-        # Draft-head speculation and the VLM prompt cache don't combine.
         use_prompt_cache = False
     # Continuous batching (docs/batching-plan.md): eligible requests join
     # the per-model batch instead of serializing on the inference lock.
@@ -4159,13 +4193,13 @@ async def _full_completion(
     thinking_expected: bool = False,
     collect_generated_tokens: bool = False,
 ) -> dict:
-    if _will_draft(
+    if _draft_replaces_prompt_cache(
         lm,
+        gen_kwargs,
         has_media=bool(images or audio),
         grammar_active=grammar_active,
         max_tokens=max_tokens,
     ):
-        # Draft-head speculation and the VLM prompt cache don't combine.
         use_prompt_cache = False
     # Continuous batching (plan §4 item 6): eligible non-streaming
     # requests internally consume the batched stream and aggregate —

@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Annotated, Literal
 
-from pydantic import Field, field_validator, model_validator
+from pydantic import BeforeValidator, Field, field_validator, model_validator
 from pydantic_settings import BaseSettings
 
 logger = logging.getLogger(__name__)
@@ -514,12 +514,21 @@ class Settings(BaseSettings):
     # from the pack (it ships both). 4-bit is what Edge0's own Metal build
     # uses: half the per-token memory traffic of 8-bit and ~1.8 GB less RAM.
     # Changing it re-converts the pack on next load.
-    edge0_projection_bits: Literal[4, 8] = 4
+    # BeforeValidator: an environment value arrives as a string, which a bare
+    # int Literal rejects.
+    edge0_projection_bits: Annotated[Literal[4, 8], BeforeValidator(int)] = 4
     # Edge0 packs ship an MTP draft head; when on, text requests are decoded
     # speculatively through mlx-vlm (the head drafts, the model verifies).
-    # Output stays the target model's; repetition penalty and other logits
-    # processors are not applied to drafted tokens.
+    # Output stays the target model's. mlx-vlm applies no logits processors
+    # on that path, so repetition penalty is not enforced while drafting, and
+    # requests carrying a processor (grammar, thinking budget) do not draft.
     edge0_draft_head: bool = True
+    # Drafting and the VLM prompt cache cannot share a request (the cache no
+    # longer lines up with the emitted tokens after a speculative round). By
+    # default the cache wins — re-reading a long conversation costs far more
+    # than drafting saves — and only requests without it draft. Set this to
+    # draft on every eligible request and give up prefix reuse instead.
+    edge0_draft_over_prompt_cache: bool = False
     # Tokens verified per target forward (the bonus token + N-1 drafts).
     edge0_draft_block_size: Annotated[int, Field(ge=2, le=8)] = 3
 

@@ -21,11 +21,11 @@ The pack is a directory of raw files rather than a single checkpoint:
 ``scales/l{N}.f32``
     float32 ``[latent]`` column scale ``s``. The stored gate/up rows are
     ``A * diag(s)``, so the latent input is multiplied by ``1/s``.
-``index.txt`` + ``dense.bin``
-    The trunk's float tensors. Entries with no bytes are served from the
-    skeleton GGUF instead.
+``index.txt``
+    Tensor directory; read here only for the router's shape.
 ``model-skeleton.gguf`` / ``ple-fp8.gguf`` / ``mmproj-*.gguf``
-    Quantized trunk matrices, the n-gram embedding table, the vision tower.
+    The whole trunk, the n-gram embedding table, the vision tower. (The
+    pack's ``dense.bin`` repeats the trunk's float tensors and is not read.)
 
 This module only describes and validates the pack and hands out raw bytes;
 decoding lives in :mod:`olmlx.engine.edge0.ggml_quants`.
@@ -34,6 +34,7 @@ decoding lives in :mod:`olmlx.engine.edge0.ggml_quants`.
 from __future__ import annotations
 
 import json
+import logging
 import re
 from dataclasses import dataclass
 from functools import cached_property
@@ -43,18 +44,12 @@ import numpy as np
 
 from olmlx.engine.edge0 import ggml_quants
 
+logger = logging.getLogger(__name__)
+
 MANIFEST_NAME = "model.json"
 NATIVE_EXPERTS_NAME = "native_experts.txt"
 INDEX_NAME = "index.txt"
-DENSE_NAME = "dense.bin"
 
-# index.txt ``kind`` -> ggml type of the bytes stored in dense.bin.
-_INDEX_KIND_TO_GGML = {
-    2: ggml_quants.GGML_F32,
-    3: ggml_quants.GGML_F32,
-    4: ggml_quants.GGML_BF16,
-    5: ggml_quants.GGML_F16,
-}
 _LATENT_DENSE_FMT_TO_GGML = {8: ggml_quants.GGML_Q8_0, 4: ggml_quants.GGML_Q4_0}
 
 _EXPERT_EMBD_RE = re.compile(r"expert_embd\s+(\d+)")
@@ -103,20 +98,6 @@ class LatentGeometry:
         return self.down_offset + self.down_row_bytes * self.latent
 
 
-@dataclass(frozen=True)
-class IndexEntry:
-    """One ``index.txt`` row."""
-
-    name: str
-    #: ggml type of the bytes in dense.bin; ``None`` when the tensor is not in
-    #: dense.bin and must be read from the skeleton GGUF.
-    ggml_type: int | None
-    offset: int
-    nbytes: int
-    #: Numpy shape (outermost first).
-    shape: tuple[int, ...]
-
-
 def is_edge0_pack(model_dir: Path | str) -> bool:
     """True when *model_dir* looks like an Edge0 latent pack (cheap check)."""
     model_dir = Path(model_dir)
@@ -162,19 +143,29 @@ class Edge0Pack:
             sibling = self.latent_dense_path.with_name(
                 f"latent_dense_q{projection_bits}.bin"
             )
-            if not sibling.is_file():
-                raise Edge0PackError(
-                    f"pack has no {sibling.name} for {projection_bits}-bit projections"
+            if sibling.is_file():
+                self.latent_dense_path, fmt = sibling, projection_bits
+            else:
+                # A preference, not a requirement: a pack that ships only the
+                # file its manifest names is still perfectly usable.
+                logger.warning(
+                    "Edge0 pack %s has no %s; using its %d-bit projections "
+                    "(%s) instead of the requested %d-bit ones",
+                    self.root,
+                    sibling.name,
+                    fmt,
+                    self.latent_dense_path.name,
+                    projection_bits,
                 )
-            self.latent_dense_path, fmt = sibling, projection_bits
         if fmt not in _LATENT_DENSE_FMT_TO_GGML:
             raise Edge0PackError(f"unsupported latent projection format q{fmt}")
         self.latent_dense_type = _LATENT_DENSE_FMT_TO_GGML[fmt]
+        #: Bits of the D/U file actually in use (4 or 8).
+        self.projection_bits = fmt
         self.skeleton_path = self._resolve(
             _flag_value(args, "--native"), "model-skeleton.gguf"
         )
         self.ple_path = self._resolve(_flag_value(args, "--ple-gguf"), "ple-fp8.gguf")
-        self.tokenizer_dir = self._resolve(self.manifest.get("tokenizer"), "tokenizer")
 
         self.index = self._read_index()
         self.geometry = self._read_geometry()
@@ -188,11 +179,16 @@ class Edge0Pack:
             raise Edge0PackError(f"manifest path {value!r} escapes the pack directory")
         return path
 
-    # -- index.txt / dense.bin -------------------------------------------
+    # -- index.txt -------------------------------------------------------
 
-    def _read_index(self) -> dict[str, IndexEntry]:
+    def _read_index(self) -> dict[str, tuple[int, ...]]:
+        """Tensor shapes (numpy order) from ``index.txt``.
+
+        Only the shapes are used: the trunk weights themselves are read from
+        the skeleton GGUF, which holds every tensor ``dense.bin`` does.
+        """
         path = self.root / INDEX_NAME
-        entries: dict[str, IndexEntry] = {}
+        shapes: dict[str, tuple[int, ...]] = {}
         try:
             lines = path.read_text().splitlines()
         except OSError as exc:
@@ -203,39 +199,15 @@ class Edge0Pack:
             fields = line.split()
             if len(fields) != 19:
                 raise Edge0PackError(f"{INDEX_NAME}: malformed row {line!r}")
-            name = fields[0]
-            file_id, kind, src_off, src_bytes = (int(v) for v in fields[1:5])
-            ne0, ne1 = int(fields[7]), int(fields[8])
+            try:
+                ne0, ne1 = int(fields[7]), int(fields[8])
+            except ValueError as exc:
+                raise Edge0PackError(f"{INDEX_NAME}: malformed row {line!r}") from exc
             # ne0 is the contiguous (input) axis; ne1 == 0 marks a vector.
-            shape = (ne1, ne0) if ne1 else (ne0,)
-            if src_bytes == 0:
-                entries[name] = IndexEntry(name, None, 0, 0, shape)
-                continue
-            if file_id != 0 or kind not in _INDEX_KIND_TO_GGML:
-                raise Edge0PackError(
-                    f"{INDEX_NAME}: unsupported storage for {name!r} "
-                    f"(file {file_id}, kind {kind})"
-                )
-            entries[name] = IndexEntry(
-                name, _INDEX_KIND_TO_GGML[kind], src_off, src_bytes, shape
-            )
-        if not entries:
+            shapes[fields[0]] = (ne1, ne0) if ne1 else (ne0,)
+        if not shapes:
             raise Edge0PackError(f"{INDEX_NAME} lists no tensors")
-        return entries
-
-    @cached_property
-    def _dense(self) -> np.memmap:
-        return np.memmap(self.root / DENSE_NAME, dtype=np.uint8, mode="r")
-
-    def dense_tensor(self, name: str) -> np.ndarray:
-        """Decode a dense.bin tensor to float32 in its numpy shape."""
-        entry = self.index[name]
-        if entry.ggml_type is None:
-            raise KeyError(f"{name!r} is stored in the skeleton GGUF, not dense.bin")
-        raw = self._dense[entry.offset : entry.offset + entry.nbytes]
-        if raw.size != entry.nbytes:
-            raise Edge0PackError(f"{DENSE_NAME} is truncated at {name!r}")
-        return ggml_quants.dequantize(raw, entry.ggml_type).reshape(entry.shape)
+        return shapes
 
     # -- latent pool -------------------------------------------------------
 
@@ -247,9 +219,9 @@ class Edge0Pack:
             raise Edge0PackError(f"{NATIVE_EXPERTS_NAME} lists no layers")
 
         router = self.index.get("blk.0.ffn_gate_inp.weight")
-        if router is None or len(router.shape) != 2:
+        if router is None or len(router) != 2:
             raise Edge0PackError(f"{INDEX_NAME} has no router (blk.0.ffn_gate_inp)")
-        n_experts, hidden = router.shape
+        n_experts, hidden = router
         if match := _N_EXPERT_RE.search(header):
             n_experts = int(match.group(1))
         latent = int(m.group(1)) if (m := _EXPERT_EMBD_RE.search(header)) else hidden

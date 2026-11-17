@@ -36,7 +36,9 @@ import numpy as np
 
 from olmlx.engine.edge0 import draft_head, ggml_quants, ple, templates
 from olmlx.engine.edge0.gguf import GGUFFile
-from olmlx.engine.edge0.latent_moe import _blocks_to_affine, pack_projections
+from olmlx.engine.edge0.affine import bf16 as _bf16
+from olmlx.engine.edge0.affine import blocks_to_affine, packed_q8_0_to_bf16_affine
+from olmlx.engine.edge0.latent_moe import pack_projections
 from olmlx.engine.edge0.pack import Edge0Pack, Edge0PackError
 
 logger = logging.getLogger(__name__)
@@ -191,7 +193,9 @@ def is_converted(model_dir: Path | str, *, projection_bits: int | None = None) -
         return False
     if projection_bits is None:
         return True
-    return (section.get("latent") or {}).get("projection_bits") == projection_bits
+    # Compared with what was *asked for*: a pack that ships only one of the
+    # two files is converted with that one, and must not look stale forever.
+    return section.get("projection_bits_requested") == projection_bits
 
 
 def mlx_key_for(gguf_name: str) -> tuple[str, str] | None:
@@ -210,10 +214,6 @@ def mlx_key_for(gguf_name: str) -> tuple[str, str] | None:
         if suffix in _INDEXER_PARTS or suffix.endswith(_IGNORED_SUFFIXES):
             return None
     raise Edge0ConversionError(f"skeleton tensor {gguf_name!r} has no known mapping")
-
-
-def _bf16(values: np.ndarray) -> mx.array:
-    return mx.array(np.ascontiguousarray(values, dtype=np.float32)).astype(mx.bfloat16)
 
 
 def _gdn_head_index(name: str, shape: tuple[int, ...], gdn: dict[str, int] | None):
@@ -252,7 +252,7 @@ def _convert_tensor(
     reorder = _gdn_head_index(name, tensor.shape, gdn)
     if kind == "linear" and tensor.ggml_type == ggml_quants.GGML_Q8_0:
         rows = tensor.shape[0]
-        codes, scales, _ = _blocks_to_affine(gguf.raw(name), tensor.ggml_type, rows)
+        codes, scales, _ = blocks_to_affine(gguf.raw(name), tensor.ggml_type, rows)
         if reorder is not None:
             # Rows are independent, and a head's columns are whole 32-value
             # blocks, so the packed form reorders without touching a weight.
@@ -267,17 +267,7 @@ def _convert_tensor(
                 index = index.reshape(-1, 32)[:, 0] // 32
             codes = np.take(codes, index, axis=axis)
             scales = np.take(scales, index, axis=axis)
-        # The model runs in bfloat16, so the block scales are rounded to it.
-        # Derive the bias from the *rounded* scale (x128 is exact) so the
-        # weight stays ``scale * (u - 128)``: a relative scale error only,
-        # never a constant offset on every weight of the block.
-        scales_bf16 = _bf16(scales)
-        prefix = key[: -len(".weight")]
-        return {
-            f"{prefix}.weight": mx.array(codes.reshape(rows, -1).view("<u4")),
-            f"{prefix}.scales": scales_bf16,
-            f"{prefix}.biases": scales_bf16 * -128.0,
-        }
+        return packed_q8_0_to_bf16_affine(codes, scales, key[: -len(".weight")])
     values = gguf.load(name)
     if reorder is not None:
         values = np.take(values, reorder[1], axis=reorder[0])
@@ -611,16 +601,8 @@ def convert_pack(
         if not path.is_file():
             raise Edge0ConversionError(f"pack is missing {path.name}")
 
-    # Drop the previous conversion first: without config.json the directory
-    # is not a model, so an interrupted run can never be served half-written.
-    (model_dir / "config.json").unlink(missing_ok=True)
-    for stale in model_dir.glob("model-*.safetensors"):
-        stale.unlink()
     flash_dir = model_dir / FLASH_MOE_DIRNAME
     latent_dir = flash_dir / LATENT_DIRNAME
-    latent_dir.mkdir(parents=True, exist_ok=True)
-    for stale in latent_dir.glob("*.safetensors"):
-        stale.unlink()
 
     writer = _ShardWriter(model_dir, "model")
     with GGUFFile(pack.skeleton_path) as skeleton:
@@ -657,6 +639,17 @@ def convert_pack(
                 "skeleton GGUF and expert pool disagree on the model's shape"
             )
         _check_ple_hashing(metadata, text_config)
+
+        # Everything above only reads and validates. From here the previous
+        # conversion is replaced: drop its marker first — without config.json
+        # the directory is not a model, so an interrupted run can never be
+        # served half-written — then its weights.
+        (model_dir / "config.json").unlink(missing_ok=True)
+        for stale in model_dir.glob("model-*.safetensors"):
+            stale.unlink()
+        latent_dir.mkdir(parents=True, exist_ok=True)
+        for stale in latent_dir.glob("*.safetensors"):
+            stale.unlink()
 
         report("converting trunk weights")
         _convert_trunk(
@@ -774,6 +767,7 @@ def convert_pack(
             "model_name": pack.manifest.get("model_name"),
             "has_vision": bool(mmproj_files),
             "draft_head": draft_dirname,
+            "projection_bits_requested": projection_bits,
             "latent": latent,
         },
     }

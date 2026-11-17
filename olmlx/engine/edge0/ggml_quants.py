@@ -42,11 +42,27 @@ _BLOCK_GEOMETRY: dict[int, tuple[int, int]] = {
     GGML_IQ4_NL: (32, 18),
 }
 
-#: ggml's non-linear 4-bit codebook (``kvalues_iq4nl``).
-_KVALUES_IQ4NL = np.array(
-    [-127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113],
-    dtype=np.int8,
+#: ggml's non-linear 4-bit codebook (``kvalues_iq4nl``). The one definition:
+#: the MLX-op decoder and the Metal kernels build theirs from it.
+KVALUES_IQ4NL = (
+    -127,
+    -104,
+    -83,
+    -65,
+    -49,
+    -35,
+    -22,
+    -10,
+    1,
+    13,
+    25,
+    38,
+    53,
+    69,
+    89,
+    113,
 )
+_KVALUES_IQ4NL = np.array(KVALUES_IQ4NL, dtype=np.int8)
 
 _Q3K_SHIFTS = np.arange(4, dtype=np.uint8) * 2
 _Q3K_HIGH_BITS = np.arange(8, dtype=np.uint8)
