@@ -26,6 +26,13 @@ jobs:
         with:
           fetch-depth: 1
 
+      # aider-chat needs Python >=3.10,<3.13 and the action uses whatever the
+      # runner provides; ubuntu-latest's default has moved past that range.
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
       # `gpt-5.6-luna` is the budget tier of the GPT-5.6 family and the direct
       # successor to gpt-5.4-mini: ahead on 27 of 32 shared benchmarks
       # (SWE-bench Verified 93 vs 73) at ~73% lower cost ($0.20/$1.20 vs
@@ -58,6 +65,13 @@ jobs:
         uses: actions/checkout@v4
         with:
           fetch-depth: 1
+
+      # aider-chat needs Python >=3.10,<3.13 and the action uses whatever the
+      # runner provides; ubuntu-latest's default has moved past that range.
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
 
       # `deepseek-flash` = DeepSeek-V4.1-Flash (released 2026-09-10), the newest
       # model on the first-party API. The old `deepseek-v4-pro` alias has been
