@@ -120,7 +120,9 @@ class Fp8NGramEmbedding:
             return mx.zeros((*ids.shape, self.row_width), dtype=mx.bfloat16)
         # Read each distinct row once, in file order.
         unique, inverse = np.unique(flat, return_inverse=True)
-        values = self._values[self._rows[unique]][inverse]
+        # Expand to request order while the rows are still bytes, so the
+        # float32 values are materialized once rather than twice.
+        values = self._values[self._rows[unique][inverse]]
         return mx.array(values).astype(mx.bfloat16).reshape(*ids.shape, self.row_width)
 
     lookup = __call__

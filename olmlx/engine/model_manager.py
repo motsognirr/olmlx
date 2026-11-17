@@ -2746,6 +2746,26 @@ class ModelManager(SpeculativeLoaderMixin):
             return read_edge0_config(self.store.model_dir(hf_path)) is not None
         return False
 
+    def _require_edge0_bundle(self, hf_path: str, flash_moe_dir: Path | None) -> None:
+        """Refuse to load a converted Edge0 pack whose ``flash_moe/`` is gone.
+
+        Its routed experts exist only behind that bundle. Falling through to
+        the ordinary loaders would load it non-strictly (the experts are
+        absent from the safetensors by design) with randomly initialized
+        experts, and serve garbage instead of failing.
+        """
+        if flash_moe_dir is not None or self.store is None:
+            return
+        from olmlx.engine.edge0.convert import read_edge0_config
+
+        model_dir = self.store.model_dir(hf_path)
+        if read_edge0_config(model_dir) is not None:
+            raise ValueError(
+                f"Edge0 pack '{hf_path}' is converted but its flash_moe bundle "
+                f"is missing from {model_dir}. Delete config.json there (or "
+                "re-pull the model) to convert it again."
+            )
+
     def _load_flash_moe_model(
         self,
         hf_path: str,
@@ -2984,6 +3004,7 @@ class ModelManager(SpeculativeLoaderMixin):
         # Check for flash-MoE-prepared model
         if self._is_flash_moe_enabled(flash_moe_config, hf_path):
             flash_moe_dir = self._flash_moe_dir(hf_path)
+            self._require_edge0_bundle(hf_path, flash_moe_dir)
             if flash_moe_dir is not None:
                 if (
                     spec_enabled

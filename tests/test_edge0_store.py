@@ -104,6 +104,26 @@ class TestManagerRouting:
         assert mock_manager._is_flash_moe_enabled(disabled, HF_PATH) is True
         assert mock_manager._flash_moe_dir(HF_PATH) == local / "flash_moe"
 
+    def test_converted_pack_without_its_bundle_refuses_to_load(
+        self, mock_manager, mock_store, pack_template
+    ):
+        # Without flash_moe/ the ordinary loaders would load it non-strictly
+        # with random experts.
+        local = _place(mock_store, pack_template)
+        convert.convert_pack(local, projection_bits=4)
+        shutil.rmtree(local / "flash_moe")
+        assert mock_manager._flash_moe_dir(HF_PATH) is None
+        with pytest.raises(ValueError, match="flash_moe bundle is missing"):
+            mock_manager._require_edge0_bundle(HF_PATH, None)
+        with pytest.raises(ValueError, match="flash_moe bundle is missing"):
+            mock_manager._load_model(HF_PATH)
+
+    def test_bundle_check_ignores_other_models(self, mock_manager, mock_store):
+        local = mock_store.local_path("org/plain-model")
+        local.mkdir(parents=True)
+        (local / "config.json").write_text(json.dumps({"model_type": "qwen3"}))
+        mock_manager._require_edge0_bundle("org/plain-model", None)
+
     def test_other_models_follow_the_flag(self, mock_manager, mock_store):
         from olmlx.engine.registry import ModelConfig
 

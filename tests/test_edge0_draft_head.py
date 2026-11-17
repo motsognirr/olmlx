@@ -244,6 +244,20 @@ class TestRequestGating:
     def test_does_not_draft(self, lm_overrides, call_overrides):
         assert not self._will(_lm(nn.Linear(2, 2), **lm_overrides), **call_overrides)
 
+    def test_default_sampling_request_carries_no_processor(self):
+        # The Ollama-parity defaults reach mlx-vlm as plain kwargs
+        # (repetition_penalty=...), not as a logits processor, so an ordinary
+        # request is still eligible to draft.
+        from olmlx.engine.generation_options import _build_generate_kwargs
+
+        kwargs = _build_generate_kwargs(
+            {"temperature": 0.8, "top_p": 0.9, "top_k": 40, "repeat_penalty": 1.1},
+            is_vlm=True,
+        )
+        assert "logits_processors" not in kwargs
+        assert kwargs["repetition_penalty"] == 1.1
+        assert self._will(_lm(nn.Linear(2, 2)), kwargs)
+
     def test_does_not_draft_with_a_logits_processor(self):
         # mlx-vlm's speculative loop applies processors to the first token
         # only, so a thinking budget would silently stop being enforced.
