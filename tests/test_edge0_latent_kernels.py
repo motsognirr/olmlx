@@ -131,3 +131,22 @@ def test_too_many_separate_records_is_rejected(tmp_path):
             mx.ones(1),
             geometry,
         )
+
+
+def test_separate_record_kernels_compile_for_two_sizes_only(tmp_path):
+    geometry = Edge0Pack(make_pack(tmp_path).root).geometry
+    latent_kernels._kernels.cache_clear()
+    rng = np.random.default_rng(0)
+    record = mx.array(rng.integers(0, 256, size=geometry.record_bytes, dtype=np.uint8))
+    for count in (1, 3, 10, 12, 13, 24):
+        out = latent_kernels.routed_latent(
+            [record] * count,
+            mx.ones((2, geometry.latent)),
+            mx.array([0, count - 1], dtype=mx.uint32),
+            mx.ones(2),
+            geometry,
+        )
+        mx.eval(out)
+        # Padding never changes a route's result: both routes use `record`.
+        np.testing.assert_array_equal(np.array(out[0]), np.array(out[1]))
+    assert latent_kernels._kernels.cache_info().currsize == 2

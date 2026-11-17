@@ -130,6 +130,7 @@ _STACKED_RECORD = (
 #: verify of three tokens routes to up to 30; Metal allows 31 buffers per
 #: kernel and five more are taken by the other arguments.
 MAX_SEPARATE_RECORDS = 24
+_SEPARATE_SIZES = (12, MAX_SEPARATE_RECORDS)
 
 
 def _separate_record(count: int) -> str:
@@ -205,8 +206,12 @@ def routed_latent(
             raise ValueError(
                 f"expected 1..{MAX_SEPARATE_RECORDS} separate records, got {len(records)}"
             )
-        record_inputs = records
-        gate_up, down = _kernels(len(records))
+        # Kernels are compiled per input count. Round the count up to one of
+        # two sizes (padding with a record no route indexes) so decoding
+        # compiles two variants, not one per distinct expert count it meets.
+        size = next(s for s in _SEPARATE_SIZES if len(records) <= s)
+        record_inputs = records + [records[0]] * (size - len(records))
+        gate_up, down = _kernels(size)
     else:
         record_inputs = [records]
         gate_up, down = _kernels(0)

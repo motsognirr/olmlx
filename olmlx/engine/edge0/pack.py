@@ -245,6 +245,20 @@ class Edge0Pack:
                     f"expert weights use unsupported ggml type {ggml_type}"
                 ) from exc
 
+        # Expert rows are whole ggml blocks: gate/up rows are ``latent`` wide,
+        # down rows ``ff`` wide. A width that is not would make every record
+        # size and offset below silently wrong.
+        for width, ggml_type, what in (
+            (latent, gu_type, "expert_embd"),
+            (ff, down_type, "expert_ff"),
+        ):
+            per_block, _ = ggml_quants.block_geometry(ggml_type)
+            if width < per_block or width % per_block:
+                raise Edge0PackError(
+                    f"{what} {width} is not a multiple of the {per_block}-value "
+                    f"blocks of ggml type {ggml_type}"
+                )
+
         # The group count is not written anywhere; recover it from the size of
         # the D/U file, which holds 2 * G * latent * hidden weights per layer.
         per_block, block_bytes = ggml_quants.block_geometry(self.latent_dense_type)

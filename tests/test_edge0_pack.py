@@ -191,3 +191,12 @@ class TestProjectionChoice:
         assert pack.projection_bits == 8
         assert pack.latent_dense_type == gq.GGML_Q8_0
         assert "latent_dense_q4.bin" in caplog.text
+
+
+class TestBlockAlignment:
+    def test_expert_width_must_be_whole_blocks(self, tmp_path):
+        truth = make_pack(tmp_path)
+        path = truth.root / "native_experts.txt"
+        path.write_text(path.read_text().replace("expert_embd 256", "expert_embd 300"))
+        with pytest.raises(Edge0PackError, match="expert_embd 300 is not a multiple"):
+            Edge0Pack(truth.root)

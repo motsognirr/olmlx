@@ -130,3 +130,19 @@ class TestGGUFFile:
         path.write_bytes(path.read_bytes()[:-8])
         with pytest.raises(ValueError, match="past the end"):
             GGUFFile(path)
+
+    @pytest.mark.parametrize("alignment", [0])
+    def test_rejects_zero_alignment(self, tmp_path, alignment):
+        path = tmp_path / "align.gguf"
+        _write_gguf(
+            path,
+            {"general.alignment": (4, struct.pack("<I", 32))},
+            [("t", [4], 0, np.zeros(4, "<f4").tobytes())],
+        )
+        data = bytearray(path.read_bytes())
+        marker = b"general.alignment" + struct.pack("<I", 4)
+        position = data.index(marker) + len(marker)
+        data[position : position + 4] = struct.pack("<I", alignment)
+        path.write_bytes(bytes(data))
+        with pytest.raises(ValueError, match="invalid GGUF alignment"):
+            GGUFFile(path)

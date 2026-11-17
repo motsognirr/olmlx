@@ -129,7 +129,13 @@ class GGUFFile:
             relative_offset = cursor.unpack("<Q")
             directory.append((name, tuple(reversed(dims)), ggml_type, relative_offset))
 
-        alignment = int(metadata.get("general.alignment", _DEFAULT_ALIGNMENT))
+        alignment = metadata.get("general.alignment", _DEFAULT_ALIGNMENT)
+        if (
+            not isinstance(alignment, int)
+            or isinstance(alignment, bool)
+            or alignment < 1
+        ):
+            raise ValueError(f"{self.path}: invalid GGUF alignment {alignment!r}")
         data_start = cursor.pos + (-cursor.pos) % alignment
 
         tensors: dict[str, GGUFTensor] = {}
