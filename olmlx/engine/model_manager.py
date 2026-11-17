@@ -2732,8 +2732,19 @@ class ModelManager(SpeculativeLoaderMixin):
             return flash_moe_path
         return None
 
-    def _is_flash_moe_enabled(self, flash_moe_config: FlashMoeConfig) -> bool:
-        return flash_moe_config.enabled
+    def _is_flash_moe_enabled(
+        self, flash_moe_config: FlashMoeConfig, hf_path: str | None = None
+    ) -> bool:
+        if flash_moe_config.enabled:
+            return True
+        # A converted Edge0 latent pack has no other way to run: its routed
+        # experts exist only as records in the pack's experts.bin, which the
+        # Flash-MoE path streams. Don't make the user opt in to the only mode.
+        if hf_path is not None and self.store is not None:
+            from olmlx.engine.edge0.convert import read_edge0_config
+
+            return read_edge0_config(self.store.model_dir(hf_path)) is not None
+        return False
 
     def _load_flash_moe_model(
         self,
@@ -2971,7 +2982,7 @@ class ModelManager(SpeculativeLoaderMixin):
             return self._load_model_image(hf_path, image_config, load_path)
 
         # Check for flash-MoE-prepared model
-        if self._is_flash_moe_enabled(flash_moe_config):
+        if self._is_flash_moe_enabled(flash_moe_config, hf_path):
             flash_moe_dir = self._flash_moe_dir(hf_path)
             if flash_moe_dir is not None:
                 if (

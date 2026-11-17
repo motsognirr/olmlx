@@ -510,6 +510,18 @@ class Settings(BaseSettings):
     flash_moe: bool = False
     flash_moe_cache_budget_experts: Annotated[int, Field(ge=0)] = 48
     flash_moe_io_threads: Annotated[int, Field(gt=0)] = 32
+    # Edge0 latent packs: quantization of the shared D/U projections taken
+    # from the pack (it ships both). 4-bit is what Edge0's own Metal build
+    # uses: half the per-token memory traffic of 8-bit and ~1.8 GB less RAM.
+    # Changing it re-converts the pack on next load.
+    edge0_projection_bits: Literal[4, 8] = 4
+    # Edge0 packs ship an MTP draft head; when on, text requests are decoded
+    # speculatively through mlx-vlm (the head drafts, the model verifies).
+    # Output stays the target model's; repetition penalty and other logits
+    # processors are not applied to drafted tokens.
+    edge0_draft_head: bool = True
+    # Tokens verified per target forward (the bonus token + N-1 drafts).
+    edge0_draft_block_size: Annotated[int, Field(ge=2, le=8)] = 3
 
     # (MoE expert predictive prefetch / lookahead was removed 2026-07-11: it
     # never beat plain LRU. Root cause — expert I/O is not the bottleneck

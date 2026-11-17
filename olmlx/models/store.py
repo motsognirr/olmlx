@@ -117,6 +117,29 @@ def _has_model_marker(model_dir: Path) -> bool:
     return any((model_dir / name).exists() for name in _MODEL_MARKER_FILES)
 
 
+def _edge0_needs_conversion(model_dir: Path) -> bool:
+    """True for an Edge0 latent pack with no (current) in-place conversion.
+
+    Edge0 packs ship raw expert/trunk files instead of an MLX checkpoint;
+    ``olmlx.engine.edge0.convert`` writes the ``config.json``, trunk
+    safetensors and Flash-MoE files next to them.
+    """
+    from olmlx.engine.edge0.convert import is_converted
+    from olmlx.engine.edge0.pack import is_edge0_pack
+
+    return is_edge0_pack(model_dir) and not is_converted(
+        model_dir, projection_bits=settings.edge0_projection_bits
+    )
+
+
+def _convert_edge0_pack_if_needed(model_dir: Path) -> None:
+    if _edge0_needs_conversion(model_dir):
+        from olmlx.engine.edge0 import convert
+
+        logger.info("Converting Edge0 pack in %s for MLX", model_dir)
+        convert.convert_pack(model_dir, projection_bits=settings.edge0_projection_bits)
+
+
 #: Version of the metadata derivation in :func:`_extract_metadata` /
 #: :func:`_estimate_param_count`, stamped into every written manifest. BUMP
 #: THIS whenever the family / parameter_size / quantization_level derivation
@@ -423,13 +446,15 @@ class ModelStore:
             return converted_dir
 
         local_dir = self.local_path(hf_path)
-        if self.is_downloaded(hf_path):
+        if self.is_downloaded(hf_path) and not _edge0_needs_conversion(local_dir):
             return local_dir
 
         with self._download_lock(hf_path):
             # Re-check after acquiring lock — another thread may have
             # completed the download while we waited.
             if self.is_downloaded(hf_path):
+                # Only reachable for a pack converted by an older converter.
+                _convert_edge0_pack_if_needed(local_dir)
                 return local_dir
 
             from huggingface_hub import snapshot_download
@@ -443,6 +468,11 @@ class ModelStore:
             # resume on retry.  The .downloading marker keeps is_downloaded()
             # safe either way.
             snapshot_download(repo_id=hf_path, local_dir=str(local_dir))
+            # An Edge0 pack is not an MLX checkpoint: convert it in place.
+            # This writes the config.json the marker check below looks for,
+            # and a failure leaves .downloading set so the model is never
+            # listed half-converted.
+            _convert_edge0_pack_if_needed(local_dir)
             # huggingface_hub silently no-ops on a 404 (logs a warning and
             # returns the empty local_dir), so "didn't raise" is not proof of
             # success (#695). Verify the download actually produced model

@@ -13,6 +13,7 @@ from collections.abc import AsyncGenerator, Callable
 from typing import TYPE_CHECKING, Any, Literal, overload
 
 import mlx.core as mx
+import mlx.nn as nn
 import numpy as np
 
 from olmlx.engine.model_manager import (
@@ -1330,6 +1331,69 @@ def _will_speculate(lm: LoadedModel, *, has_media: bool, grammar_active: bool) -
     from speculation, non-streaming only a VLM's.
     """
     return bool(lm.is_speculative) and not has_media and not grammar_active
+
+
+def _vlm_draft_head(lm: LoadedModel) -> Any | None:
+    """The mlx-vlm MTP drafter loaded next to a VLM, if any.
+
+    Edge0 packs carry one (``edge0.loader.load_draft_head`` hangs it on the
+    model wrapper). Identity/type checks so a MagicMock ``lm`` can't route
+    here.
+    """
+    if lm.is_vlm is not True or lm.is_distributed is True:
+        return None
+    drafter = getattr(lm.model, "_vlm_draft_head", None)
+    return drafter if isinstance(drafter, nn.Module) else None
+
+
+def _will_draft(
+    lm: LoadedModel, *, has_media: bool, grammar_active: bool, max_tokens: int
+) -> bool:
+    """Whether this request decodes speculatively through mlx-vlm's MTP path.
+
+    Text-only: mlx-vlm drafts over token ids. Not with a grammar — drafted
+    tokens bypass logits processors, and a grammar must hold on every token
+    (repetition penalty and the thinking budget are best-effort and are
+    simply not applied to drafted tokens, like olmlx's own speculative
+    decoders). Not with a KV-quant cache, whose rollback under speculation is
+    untested. mlx-vlm's loop needs a positive token budget.
+    """
+    return (
+        _vlm_draft_head(lm) is not None
+        and not has_media
+        and not grammar_active
+        and not isinstance(lm.kv_cache_quant, str)
+        and isinstance(max_tokens, int)
+        and max_tokens > 0
+    )
+
+
+def _attach_vlm_draft_head(
+    lm: LoadedModel,
+    gen_kwargs: dict,
+    *,
+    has_media: bool,
+    grammar_active: bool,
+    max_tokens: int,
+) -> bool:
+    """Add mlx-vlm's speculative kwargs to *gen_kwargs* when the request drafts.
+
+    Callers turn the VLM prompt cache off for drafting requests (see
+    ``_will_draft`` call sites): after a speculative round the cache no longer
+    lines up with the emitted token ids, and the hybrid caches cannot be
+    trimmed back.
+    """
+    if not _will_draft(
+        lm, has_media=has_media, grammar_active=grammar_active, max_tokens=max_tokens
+    ) or ("prompt_cache" in gen_kwargs or "prompt_cache_state" in gen_kwargs):
+        return False
+    gen_kwargs["draft_model"] = _vlm_draft_head(lm)
+    gen_kwargs["draft_kind"] = "mtp"
+    gen_kwargs["draft_block_size"] = settings.edge0_draft_block_size
+    if gen_kwargs.get("temperature") == 0:
+        # mlx-vlm only takes its fused greedy verify when no sampler is given.
+        gen_kwargs.pop("sampler", None)
+    return True
 
 
 def _attach_kv_quant_cache(
@@ -3458,6 +3522,14 @@ async def _stream_completion(
     thinking_expected: bool = False,
     collect_generated_tokens: bool = False,
 ) -> AsyncGenerator[dict, None]:
+    if _will_draft(
+        lm,
+        has_media=bool(images or audio),
+        grammar_active=grammar_active,
+        max_tokens=max_tokens,
+    ):
+        # Draft-head speculation and the VLM prompt cache don't combine.
+        use_prompt_cache = False
     # Continuous batching (docs/batching-plan.md): eligible requests join
     # the per-model batch instead of serializing on the inference lock.
     # A context request (#656) skips it — the batched path aggregates its
@@ -3709,6 +3781,13 @@ async def _stream_completion(
                 # OTel context does not cross threads, so hand the current context
                 # (under the request's inference span) to the stream for the worker
                 # to re-attach — otherwise worker-thread spans (e.g. flash) orphan.
+                _attach_vlm_draft_head(
+                    lm,
+                    gen_kwargs,
+                    has_media=bool(images or audio_paths),
+                    grammar_active=grammar_active,
+                    max_tokens=max_tokens,
+                )
                 stream = async_mlx_stream(
                     lm.model,
                     lm.tokenizer,
@@ -4080,6 +4159,14 @@ async def _full_completion(
     thinking_expected: bool = False,
     collect_generated_tokens: bool = False,
 ) -> dict:
+    if _will_draft(
+        lm,
+        has_media=bool(images or audio),
+        grammar_active=grammar_active,
+        max_tokens=max_tokens,
+    ):
+        # Draft-head speculation and the VLM prompt cache don't combine.
+        use_prompt_cache = False
     # Continuous batching (plan §4 item 6): eligible non-streaming
     # requests internally consume the batched stream and aggregate —
     # stop sequences stay in gen_kwargs for the stream to handle.
@@ -4444,6 +4531,13 @@ async def _full_completion_inner(
                     generation_stream,
                 )  # used by mx.synchronize below
 
+                _attach_vlm_draft_head(
+                    lm,
+                    gen_kwargs,
+                    has_media=False,
+                    grammar_active=grammar_active,
+                    max_tokens=max_tokens,
+                )
                 result = None
                 text_parts = []
                 for response in mlx_vlm.stream_generate(  # pyright: ignore[reportPrivateImportUsage]
