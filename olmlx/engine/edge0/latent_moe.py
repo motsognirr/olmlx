@@ -202,8 +202,11 @@ class LatentExpertStore:
             max_per_layer=cache_budget_experts
         )
         self.stats = ExpertCacheStats()
-        self._fd: int | None = os.open(pack.experts_path, os.O_RDONLY)
+        # Executor first: if opening the file fails there is no descriptor to
+        # leak, and ``__del__`` always finds both attributes.
+        self._fd: int | None = None
         self._executor = ThreadPoolExecutor(max_workers=num_io_threads)
+        self._fd = os.open(pack.experts_path, os.O_RDONLY)
 
     def _read(self, layer: int, expert: int) -> mx.array:
         if self._fd is None:

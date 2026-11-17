@@ -237,13 +237,15 @@ class Edge0Pack:
         except ValueError as exc:
             raise Edge0PackError(f"{NATIVE_EXPERTS_NAME}: malformed row") from exc
         gu_type, down_type = parsed[0][1], parsed[0][2]
-        for ggml_type in (gu_type, down_type):
-            try:
-                ggml_quants.block_geometry(ggml_type)
-            except ValueError as exc:
-                raise Edge0PackError(
-                    f"expert weights use unsupported ggml type {ggml_type}"
-                ) from exc
+        # The only expert layout the latent forward implements. Refuse the
+        # rest here (e.g. the NVFP4 packs) rather than after a 100 GB
+        # download has been converted and loaded.
+        if (gu_type, down_type) != (ggml_quants.GGML_Q3_K, ggml_quants.GGML_IQ4_NL):
+            raise Edge0PackError(
+                f"unsupported expert format (ggml types {gu_type}/{down_type}); "
+                "only Q3_K gate/up + IQ4_NL down packs (the -q3k releases) "
+                "are supported"
+            )
 
         # Expert rows are whole ggml blocks: gate/up rows are ``latent`` wide,
         # down rows ``ff`` wide. A width that is not would make every record

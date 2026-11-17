@@ -200,3 +200,25 @@ class TestBlockAlignment:
         path.write_text(path.read_text().replace("expert_embd 256", "expert_embd 300"))
         with pytest.raises(Edge0PackError, match="expert_embd 300 is not a multiple"):
             Edge0Pack(truth.root)
+
+    def test_unsupported_expert_format_is_rejected_up_front(self, tmp_path):
+        # e.g. an NVFP4 pack (ggml type 40), or any type the latent forward
+        # has no kernels for.
+        truth = make_pack(tmp_path)
+        path = truth.root / "native_experts.txt"
+        for types in ("40 40", "8 8"):
+            path.write_text(
+                "\n".join(
+                    line
+                    if line.startswith("#")
+                    else line.replace(" 11 20 ", f" {types} ")
+                    for line in (
+                        "# strata native experts v6 (expert_embd 256, expert_ff 32)",
+                        f"0 11 20 0 {truth.record_bytes}",
+                        f"1 11 20 {8 * truth.record_bytes} {truth.record_bytes}",
+                    )
+                )
+                + "\n"
+            )
+            with pytest.raises(Edge0PackError, match="unsupported expert format"):
+                Edge0Pack(truth.root)
