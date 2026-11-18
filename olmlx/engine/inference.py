@@ -1805,11 +1805,21 @@ def _drive_segmented_prefill(
     insert_checkpoint: Callable[[CachedPromptState], None],
     already_covered_tokens: int = 0,
     cancel_event: threading.Event | None = None,
+    memory_limit: int = 0,
 ) -> list[int]:
-    """Run prefill in at most two ``model(...)`` calls and snapshot the
-    cache at the deepest interior message boundary (the end of the final
-    message when a generation prompt follows it); return the suffix to
-    hand off to stream_generate.
+    """Prefill the uncovered tail in a few chunks, snapshotting the cache at
+    the chunk boundaries; return the suffix to hand off to stream_generate.
+
+    Snapshot points: the end of the final message when a generation prompt
+    follows it (the deepest point the next turn shares), else the deepest
+    interior message boundary. A cold start (nothing covered) also keeps the
+    deepest interior boundary, which on a first turn is the end of the system
+    prompt that every new conversation with the same system prompt shares.
+
+    ``memory_limit`` (bytes, 0 disables) replaces the ``prompt_progress_callback``
+    guard ``stream_generate``'s own prefill would have had: before each forward
+    the drive raises ``MemoryError`` (→ 503 / in-stream error) once Metal
+    active + cache memory exceeds it.
 
     ``already_covered_tokens`` is the depth at which ``cache`` is already
     populated (from a checkpoint hit). Segments wholly inside that depth
@@ -1827,7 +1837,7 @@ def _drive_segmented_prefill(
     the prefilled cache is a no-op for the cache but produces the
     correct first-token logits.
 
-    **Why two chunks, not one-per-segment.** mlx-lm's ``gated_delta_kernel``
+    **Why a few chunks, not one-per-segment.** mlx-lm's ``gated_delta_kernel``
     (GatedDeltaNet linear attention in Qwen3.5 / Qwen3-Next text towers)
     is not exactly chunking-invariant: feeding ``[A, B]`` and then ``[C]``
     yields a slightly different recurrent state than feeding ``[A, B, C]``
@@ -1836,20 +1846,18 @@ def _drive_segmented_prefill(
     expert-routing thresholds and the model derails into verbatim
     paragraph repetition by the second turn.  The pre-fix per-segment
     drive made this scale linearly with conversation depth — every
-    extra turn added another chunk boundary.  This implementation keeps
-    drift bounded by driving the uncovered tail as a single
-    ``[already_covered_tokens .. deepest_interior_boundary]`` chunk
-    (snapshot point for future requests) followed by a single
-    ``[deepest_interior_boundary .. len(flat)-1]`` chunk (the final
-    message minus the reserved trailing token).  If there is no usable
-    interior boundary the whole tail goes in one chunk and no snapshot
-    is taken.  Trade-off: only the deepest interior boundary is
-    snapshotted per request, not every boundary — for the
-    sequentially-extending chat workload this is the only snapshot
-    future requests actually use (earlier ones in the same request
-    would be shadowed by the deeper hit anyway), and earlier requests'
-    boundary snapshots remain in the store and still serve shallower
-    branched lookups.
+    extra turn added another chunk boundary.  This implementation splits
+    the uncovered tail only at its snapshot points: warm starts use two
+    chunks (``[covered .. snapshot]`` and ``[snapshot .. len(flat)-1]``,
+    the generation prompt minus the reserved trailing token); cold starts
+    add the shallower interior boundary as a third.  If there is no
+    snapshot point the whole tail goes in one chunk.  Each chunk is still
+    fed in ``_PREFILL_CHUNK``-token sub-chunks (as ``stream_generate``'s
+    own prefill is), so these few boundaries add little drift.  Trade-off:
+    not every boundary is snapshotted — for the sequentially-extending
+    chat workload the end of the final message is the snapshot future
+    requests use, and earlier requests' snapshots remain in the store to
+    serve shallower branched lookups.
 
     The last boundary (``boundary == len(flat)``) is never a snapshot
     point: the final segment's trailing token is reserved for
@@ -1868,27 +1876,33 @@ def _drive_segmented_prefill(
     boundaries = segmented.boundary_offsets()
 
     # Find the deepest interior boundary strictly greater than what's
-    # already covered and strictly less than len(flat).  This is both the
-    # snapshot point and the split between the two prefill chunks.
-    deepest_boundary: int | None = None
-    deepest_role: Any = None
+    # already covered and strictly less than len(flat).
+    interior_boundary: int | None = None
+    interior_role: Any = None
     for boundary, seg in zip(boundaries, segmented.segments, strict=True):
         if already_covered_tokens < boundary < len(flat):
-            deepest_boundary = boundary
-            deepest_role = seg.role
-    # Deeper still: the end of the final message, before the generation
-    # prompt. The next turn keeps this message verbatim and only replaces the
+            interior_boundary = boundary
+            interior_role = seg.role
+    # Snapshot points, shallowest first; each is also a chunk split.
+    # Deepest: the end of the final message, before the generation prompt.
+    # The next turn keeps this message verbatim and only replaces the
     # generation prompt with the reply, so a snapshot here leaves just the
-    # reply and the new message to prefill. Snapshotting at the final
-    # message's *start* instead re-prefilled it every turn (in an agent loop,
-    # each tool result twice).
+    # reply and the new message to prefill. Snapshotting only at the final
+    # message's *start* re-prefilled it every turn (in an agent loop, each
+    # tool result twice). On a cold start the interior boundary is kept too:
+    # on a first turn it is the end of the system prompt, the prefix every
+    # new conversation with the same system prompt and tools shares.
+    snapshot_points: list[tuple[int, Any]] = []
     final_message_end = segmented.final_message_end()
     if (
         final_message_end is not None
         and already_covered_tokens < final_message_end < len(flat)
     ):
-        deepest_boundary = final_message_end
-        deepest_role = segmented.segments[-1].role
+        if already_covered_tokens == 0 and interior_boundary is not None:
+            snapshot_points.append((interior_boundary, interior_role))
+        snapshot_points.append((final_message_end, segmented.segments[-1].role))
+    elif interior_boundary is not None:
+        snapshot_points.append((interior_boundary, interior_role))
 
     final_prefill_end = len(flat) - 1  # reserve trailing token for stream_generate
 
@@ -1915,6 +1929,16 @@ def _drive_segmented_prefill(
         prefill_stream = mx.default_stream(mx.default_device())
     pure_rotating = _is_pure_rotating_cache(cache)
 
+    def _check_memory() -> None:
+        if memory_limit <= 0:
+            return
+        current = mx.get_active_memory() + mx.get_cache_memory()
+        if current > memory_limit:
+            raise MemoryError(
+                f"Prefill aborted: Metal memory {current / 1024**3:.1f} GB "
+                f"exceeds limit {memory_limit / 1024**3:.1f} GB"
+            )
+
     def _run(start: int, end: int) -> bool:
         """Prefill ``flat[start:end]``; return False iff a cancel cut it short.
 
@@ -1930,6 +1954,7 @@ def _drive_segmented_prefill(
                 # behavior their windowed attention depends on.
                 if cancel_event is not None and cancel_event.is_set():
                     return False
+                _check_memory()
                 model(mx.array(flat[start:end], dtype=mx.int32)[None, :], cache=cache)
                 mx.eval(flatten_cache_state(cache))
                 mx.clear_cache()
@@ -1943,6 +1968,7 @@ def _drive_segmented_prefill(
                 while pos < end:
                     if cancel_event is not None and cancel_event.is_set():
                         return False
+                    _check_memory()
                     stop = min(pos + _PREFILL_CHUNK, end)
                     model(
                         mx.array(flat[pos:stop], dtype=mx.int32)[None, :], cache=cache
@@ -1983,33 +2009,51 @@ def _drive_segmented_prefill(
                     is_checkpoint=True,
                 )
             )
-    elif deepest_boundary is None:
-        # No usable interior boundary — single chunk, no snapshot.
-        _run(already_covered_tokens, final_prefill_end)
     else:
-        # Chunk 1: uncovered prefix up to the deepest interior boundary.
-        # A cancel mid-chunk leaves only a prefix in the cache; snapshotting
-        # it under ``flat[:deepest_boundary]`` would make a retry skip the
-        # unfilled context (#761).
-        if not _run(already_covered_tokens, deepest_boundary):
-            return [flat[-1]]
-        # Snapshot at the boundary.  eager_eval=False because ``_run``'s
-        # inner ``mx.eval(flatten_cache_state(cache))`` just materialised
-        # the state on the prefill stream; deepcopy alone is sufficient.
-        snap = snapshot_cache_for_persistence(cache, eager_eval=False)
-        insert_checkpoint(
-            CachedPromptState(
-                tokens=flat[:deepest_boundary],
-                cache=snap,
-                cache_type=deepest_role,
-                is_checkpoint=True,
+        # One chunk per snapshot point, then the rest. With no snapshot
+        # point the whole tail is a single chunk and nothing is stored.
+        start = already_covered_tokens
+        for point, role in snapshot_points:
+            # A cancel mid-chunk leaves only a prefix in the cache;
+            # snapshotting it under ``flat[:point]`` would make a retry skip
+            # the unfilled context (#761).
+            if not _run(start, point):
+                return [flat[-1]]
+            # eager_eval=False because ``_run``'s inner
+            # ``mx.eval(flatten_cache_state(cache))`` just materialised the
+            # state on the prefill stream; deepcopy alone is sufficient.
+            snap = snapshot_cache_for_persistence(cache, eager_eval=False)
+            insert_checkpoint(
+                CachedPromptState(
+                    tokens=flat[:point],
+                    cache=snap,
+                    cache_type=role,
+                    is_checkpoint=True,
+                )
             )
-        )
-        # Chunk 2: boundary to the reserved trailing token (``_run`` checks
-        # cancel_event before each forward).
-        _run(deepest_boundary, final_prefill_end)
+            start = point
+        # Last chunk: up to the reserved trailing token (``_run`` checks
+        # cancel_event and memory before each forward).
+        _run(start, final_prefill_end)
 
     return [flat[-1]]
+
+
+def _prefill_memory_limit() -> int:
+    """Metal memory limit (bytes) for the checkpoint drive's prefill guard:
+    ``memory_limit_fraction`` of system RAM, as in the KV preflight. 0 (guard
+    off) when either is unavailable or not a real number (a MagicMock
+    ``settings`` in tests must not produce a 1-byte limit via ``int()``)."""
+    fraction = settings.memory_limit_fraction
+    total = memory_utils.get_system_memory_bytes()
+    if (
+        not isinstance(fraction, (int, float))
+        or isinstance(fraction, bool)
+        or not isinstance(total, int)
+        or total <= 0
+    ):
+        return 0
+    return int(total * fraction)
 
 
 def _cache_list_contains_lazy_state(cache: list[Any]) -> bool:
@@ -2083,50 +2127,44 @@ async def _setup_via_checkpoint_path(
     # Look up the longest stored prefix that is a STRICT prefix of our
     # tokens BEFORE the single-segment guard — a single-message request
     # that happens to be a strict extension of an existing checkpoint
-    # should still warm-start, even though it can't itself contribute a
-    # new mid-prompt checkpoint.
+    # should still warm-start.
     hit = lm.prompt_cache_store.fetch_nearest(prompt_tokens)
 
-    # No usable message boundaries AND no warm-start to inherit: a
-    # single-segment prompt has only one boundary at len(prompt_tokens),
-    # which the drive deliberately skips (the KV depth there is
-    # len(prompt_tokens)-1 because the trailing token is reserved for
-    # stream_generate). With nothing to gain on either side, skip the
-    # checkpoint path entirely — cheaper than driving a no-op snapshot.
-    # A single message followed by a generation prompt still has a usable
-    # snapshot point (the end of that message), which turn 2 of every
-    # conversation starts from, so it takes the drive.
-    if (
-        hit is None
-        and len(segmented.segments) <= 1
-        and segmented.final_message_end() is None
-    ):
-        logger.debug(
-            "Checkpoint path: no usable message boundaries detected "
-            "and no warm-start hit (segments=%d); falling back to fresh cache",
-            len(segmented.segments),
-        )
-        new_cache = _make_prompt_cache_for_lm(lm)
-        gen_kwargs["prompt_cache"] = new_cache
-        # Return prompt_tokens (list[int]) to stay consistent with the
-        # cold-start and warm-start branches below — handing the
-        # original string back would let downstream code re-tokenize
-        # via a different BOS path than prompt_tokens used.
-        return _CacheSetupResult(
-            prompt=list(prompt_tokens),
-            full_prompt_tokens=prompt_tokens,
-            cache_creation_tokens=len(prompt_tokens),
-            cache_setup_done=True,
-        )
-
     if hit is None:
-        # Cold start with usable boundaries: build a fresh cache.  The
-        # drive will then run at most two ``model(...)`` calls and store
-        # one checkpoint at the deepest interior boundary (see
+        # Cold start: build a fresh cache.  The drive will then split the
+        # prompt only at its snapshot points (see
         # ``_drive_segmented_prefill``'s docstring for why per-segment
         # chunking was abandoned).
         cache = _make_prompt_cache_for_lm(lm)
         already_covered = 0
+        # A single-segment prompt has no interior boundary, and the boundary
+        # at len(prompt_tokens) is never a snapshot point (the KV depth there
+        # is len(prompt_tokens)-1: the trailing token is reserved for
+        # stream_generate). A single message followed by a generation prompt
+        # still has one, the end of that message, which turn 2 of the
+        # conversation starts from, so it takes the drive. Two exceptions
+        # skip the checkpoint path and let stream_generate prefill in bounded
+        # steps: no such point (nothing to store), and pure-rotating layouts,
+        # whose drive prefills the whole prompt in one forward.
+        if len(segmented.segments) <= 1 and (
+            segmented.final_message_end() is None or _is_pure_rotating_cache(cache)
+        ):
+            logger.debug(
+                "Checkpoint path: single-segment cold start without a usable "
+                "snapshot point (segments=%d); falling back to fresh cache",
+                len(segmented.segments),
+            )
+            gen_kwargs["prompt_cache"] = cache
+            # Return prompt_tokens (list[int]) to stay consistent with the
+            # cold-start and warm-start branches below — handing the
+            # original string back would let downstream code re-tokenize
+            # via a different BOS path than prompt_tokens used.
+            return _CacheSetupResult(
+                prompt=list(prompt_tokens),
+                full_prompt_tokens=prompt_tokens,
+                cache_creation_tokens=len(prompt_tokens),
+                cache_setup_done=True,
+            )
     else:
         # Warm start: deepcopy the stored snapshot (so subsequent
         # mutation during drive doesn't corrupt the stored entry).
@@ -2171,6 +2209,11 @@ async def _setup_via_checkpoint_path(
 
     model = lm.model
 
+    # The drive replaces stream_generate's own prefill, so it takes over the
+    # memory guard its prompt_progress_callback applied (same limit as the
+    # KV preflight).
+    memory_limit = _prefill_memory_limit()
+
     def _deferred_prefill(cancel_event: threading.Event | None = None) -> None:
         _drive_segmented_prefill(
             model=model,
@@ -2179,6 +2222,7 @@ async def _setup_via_checkpoint_path(
             insert_checkpoint=_insert_checkpoint_threadsafe,
             already_covered_tokens=already_covered,
             cancel_event=cancel_event,
+            memory_limit=memory_limit,
         )
 
     gen_kwargs["prompt_cache"] = cache

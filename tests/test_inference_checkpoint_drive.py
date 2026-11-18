@@ -1185,27 +1185,35 @@ def test_checkpoint_path_next_turn_reuses_whole_previous_final_message(monkeypat
 
 
 def test_drive_snapshots_at_end_of_final_message_before_generation_prompt():
-    """The drive's snapshot point is the end of the final message (its
-    end-of-message marker), not its start, and it still uses two chunks."""
+    """Warm start: the drive's snapshot point is the end of the final message
+    (its end-of-message marker), not its start, and it uses two chunks."""
     tok = _FakeTokenizer()
     messages = [
         {"role": "system", "content": "AB"},
         {"role": "user", "content": "CD"},
+        {"role": "assistant", "content": "EF"},
+        {"role": "user", "content": "GH"},
     ]
     flat = _prompt_with_generation_suffix(messages)
+    covered = len(tok.apply_chat_template(messages[:2]))
     end_of_user = len(tok.apply_chat_template(messages))
     sp = tokenize_segmented_chat(tok, messages, full_tokens=flat)
     model = _DummyModel()
     store = PromptCacheStore(max_slots=8)
+    cache = [KVCache()]
+    cache[0].update_and_fetch(
+        mx.zeros((1, 1, covered, 4)), mx.zeros((1, 1, covered, 4))
+    )
 
     suffix = _drive_segmented_prefill(
         model=model,
         segmented=sp,
-        cache=[KVCache()],
+        cache=cache,
         insert_checkpoint=store.insert_checkpoint,
+        already_covered_tokens=covered,
     )
 
-    assert model.calls == [flat[:end_of_user], flat[end_of_user:-1]]
+    assert model.calls == [flat[covered:end_of_user], flat[end_of_user:-1]]
     assert suffix == [flat[-1]]
     assert len(store) == 1
     hit = store.fetch_nearest(flat[:end_of_user] + [3, 99])
@@ -1213,3 +1221,168 @@ def test_drive_snapshots_at_end_of_final_message_before_generation_prompt():
     state, _ = hit
     assert state.tokens == flat[:end_of_user]
     assert state.cache_type == "user"
+
+
+def test_drive_cold_start_also_keeps_the_shared_system_prompt_checkpoint():
+    """A cold first turn must still leave a checkpoint at the end of the system
+    prompt: it is the prefix every new conversation (or subagent) with the
+    same system prompt and tools shares. It is kept alongside the end of the
+    final message, which serves this conversation's next turn."""
+    tok = _FakeTokenizer()
+    messages = [
+        {"role": "system", "content": "AB"},
+        {"role": "user", "content": "CD"},
+    ]
+    flat = _prompt_with_generation_suffix(messages)
+    end_of_system = len(tok.apply_chat_template(messages[:1]))
+    end_of_user = len(tok.apply_chat_template(messages))
+    sp = tokenize_segmented_chat(tok, messages, full_tokens=flat)
+    model = _DummyModel()
+    store = PromptCacheStore(max_slots=8)
+
+    _drive_segmented_prefill(
+        model=model,
+        segmented=sp,
+        cache=[KVCache()],
+        insert_checkpoint=store.insert_checkpoint,
+    )
+
+    assert model.calls == [
+        flat[:end_of_system],
+        flat[end_of_system:end_of_user],
+        flat[end_of_user:-1],
+    ]
+    # A different conversation with the same system prompt reuses it.
+    other_conversation = flat[:end_of_system] + [2, 88, 9, 3, 50]
+    hit = store.fetch_nearest(other_conversation)
+    assert hit is not None
+    assert hit[0].tokens == flat[:end_of_system]
+    assert hit[0].cache_type == "system"
+    # This conversation's next turn reuses the whole first turn.
+    hit = store.fetch_nearest(flat[:end_of_user] + [3, 99])
+    assert hit is not None
+    assert hit[0].tokens == flat[:end_of_user]
+
+
+def test_setup_keeps_pure_rotating_single_message_on_stream_generate(monkeypatch):
+    """Pure-RotatingKVCache layouts (gpt-oss, Gemma 3) prefill the drive in one
+    forward. A single-message request must keep skipping the drive so a long
+    one-shot prompt is prefilled by stream_generate in bounded steps."""
+    from olmlx.engine import inference as inference_mod
+    from olmlx.engine.inference import _setup_prompt_cache
+
+    monkeypatch.setattr(
+        inference_mod,
+        "_make_prompt_cache_for_lm",
+        lambda m: [RotatingKVCache(max_size=8)],
+    )
+    tok = _FakeTokenizer()
+    lm = LoadedModel(
+        name="x",
+        hf_path="y",
+        model=_DummyModel(),
+        tokenizer=tok,
+        prompt_cache_store=PromptCacheStore(max_slots=8),
+        uses_checkpoint_persistence=True,
+        supports_cache_persistence=True,
+    )
+    messages = [{"role": "user", "content": "CD"}]
+    tokens = _prompt_with_generation_suffix(messages)
+
+    cs = asyncio.run(
+        _setup_prompt_cache(
+            lm,
+            "ignored",
+            {},
+            prompt_tokens=tokens,
+            cache_id="t",
+            messages=messages,
+            tokenizer=tok,
+        )
+    )
+
+    assert cs.deferred_prefill is None
+    assert cs.prompt == tokens
+
+
+def test_drive_aborts_with_memory_error_past_the_memory_limit(monkeypatch):
+    """The drive replaces stream_generate's prefill, so it must keep the same
+    safety net: stop before the next forward once Metal memory passes the
+    limit, rather than run on into an OOM or a GPU timeout."""
+    monkeypatch.setattr(mx, "get_active_memory", lambda: 10_000)
+    monkeypatch.setattr(mx, "get_cache_memory", lambda: 0)
+    tok = _FakeTokenizer()
+    messages = [{"role": "user", "content": "CD"}]
+    sp = tokenize_segmented_chat(
+        tok, messages, full_tokens=_prompt_with_generation_suffix(messages)
+    )
+    model = _DummyModel()
+    store = PromptCacheStore(max_slots=8)
+
+    with pytest.raises(MemoryError):
+        _drive_segmented_prefill(
+            model=model,
+            segmented=sp,
+            cache=[KVCache()],
+            insert_checkpoint=store.insert_checkpoint,
+            memory_limit=5_000,
+        )
+    assert model.calls == []
+    assert len(store) == 0
+
+
+def test_checkpoint_setup_passes_the_memory_limit_to_the_drive(monkeypatch):
+    from olmlx.engine import inference as inference_mod
+    from olmlx.engine.inference import _setup_prompt_cache
+
+    monkeypatch.setattr(
+        inference_mod, "_make_prompt_cache_for_lm", lambda m: [KVCache()]
+    )
+    monkeypatch.setattr(inference_mod, "_prefill_memory_limit", lambda: 5_000)
+    tok = _FakeTokenizer()
+    lm = LoadedModel(
+        name="x",
+        hf_path="y",
+        model=_DummyModel(),
+        tokenizer=tok,
+        prompt_cache_store=PromptCacheStore(max_slots=8),
+        uses_checkpoint_persistence=True,
+        supports_cache_persistence=True,
+    )
+    messages = [{"role": "user", "content": "CD"}]
+
+    cs = asyncio.run(
+        _setup_prompt_cache(
+            lm,
+            "ignored",
+            {},
+            prompt_tokens=_prompt_with_generation_suffix(messages),
+            cache_id="t",
+            messages=messages,
+            tokenizer=tok,
+        )
+    )
+
+    # Memory passes the limit only once generation starts, after setup's own
+    # pressure check.
+    monkeypatch.setattr(mx, "get_active_memory", lambda: 10_000)
+    monkeypatch.setattr(mx, "get_cache_memory", lambda: 0)
+    assert cs.deferred_prefill is not None
+    with pytest.raises(MemoryError):
+        cs.deferred_prefill(None)
+
+
+def test_prefill_memory_limit_follows_the_memory_limit_fraction(monkeypatch):
+    from unittest.mock import MagicMock
+
+    from olmlx.engine import inference as inference_mod
+
+    monkeypatch.setattr(
+        inference_mod.memory_utils, "get_system_memory_bytes", lambda: 1_000
+    )
+    monkeypatch.setattr(inference_mod.settings, "memory_limit_fraction", 0.5)
+    assert inference_mod._prefill_memory_limit() == 500
+
+    # A MagicMock settings object must disable the guard, not yield int() == 1.
+    monkeypatch.setattr(inference_mod, "settings", MagicMock())
+    assert inference_mod._prefill_memory_limit() == 0
