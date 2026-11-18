@@ -2172,12 +2172,15 @@ async def _setup_via_checkpoint_path(
         # skip the checkpoint path and let stream_generate prefill in bounded
         # steps: no such point (nothing to store), and pure-rotating layouts,
         # whose drive prefills the whole prompt in one forward.
-        if len(segmented.segments) <= 1 and (
-            segmented.final_message_end() is None or _is_pure_rotating_cache(cache)
-        ):
+        no_snapshot_point = segmented.final_message_end() is None
+        pure_rotating = _is_pure_rotating_cache(cache)
+        if len(segmented.segments) <= 1 and (no_snapshot_point or pure_rotating):
             logger.debug(
-                "Checkpoint path: single-segment cold start without a usable "
-                "snapshot point (segments=%d); falling back to fresh cache",
+                "Checkpoint path: single-segment cold start left to "
+                "stream_generate (%s; segments=%d); falling back to fresh cache",
+                "no snapshot point"
+                if no_snapshot_point
+                else "pure-rotating cache prefills in one forward",
                 len(segmented.segments),
             )
             gen_kwargs["prompt_cache"] = cache
