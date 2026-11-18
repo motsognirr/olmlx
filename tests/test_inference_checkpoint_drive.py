@@ -1458,3 +1458,31 @@ def test_prefill_memory_limit_accepts_a_float_system_memory(monkeypatch):
     )
     monkeypatch.setattr(inference_mod.settings, "memory_limit_fraction", 0.5)
     assert inference_mod._prefill_memory_limit() == 500
+
+
+def test_drive_memory_probe_failure_disables_the_guard(monkeypatch):
+    """Like stream_generate's prompt_progress_callback, a failing Metal memory
+    query switches the guard off instead of failing the request."""
+
+    def _broken():
+        raise RuntimeError("metal query failed")
+
+    monkeypatch.setattr(mx, "get_active_memory", _broken)
+    tok = _FakeTokenizer()
+    messages = [{"role": "user", "content": "CD"}]
+    flat = _prompt_with_generation_suffix(messages)
+    sp = tokenize_segmented_chat(tok, messages, full_tokens=flat)
+    model = _DummyModel()
+    stored: list = []
+
+    suffix = _drive_segmented_prefill(
+        model=model,
+        segmented=sp,
+        cache=[KVCache()],
+        insert_checkpoint=stored.append,
+        memory_limit=1_000,
+    )
+
+    assert suffix == [flat[-1]]
+    assert sum(len(c) for c in model.calls) == len(flat) - 1
+    assert len(stored) == 1

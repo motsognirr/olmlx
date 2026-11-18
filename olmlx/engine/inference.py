@@ -1933,11 +1933,28 @@ def _drive_segmented_prefill(
         prefill_stream = mx.default_stream(mx.default_device())
     pure_rotating = _is_pure_rotating_cache(cache)
 
+    guard_enabled = memory_limit > 0
+
+    def _memory_in_use() -> int | None:
+        """Metal active + cache bytes, or ``None`` with the guard switched off
+        when the query fails (as ``stream_generate``'s progress callback does)
+        — a failing probe must not turn prefill into an error."""
+        nonlocal guard_enabled
+        if not guard_enabled:
+            return None
+        try:
+            return mx.get_active_memory() + mx.get_cache_memory()
+        except Exception:
+            guard_enabled = False
+            logger.warning(
+                "Prefill memory check failed; memory guard disabled for this request",
+                exc_info=True,
+            )
+            return None
+
     def _check_memory() -> None:
-        if memory_limit <= 0:
-            return
-        current = mx.get_active_memory() + mx.get_cache_memory()
-        if current > memory_limit:
+        current = _memory_in_use()
+        if current is not None and current > memory_limit:
             raise MemoryError(
                 f"Prefill aborted: Metal memory {current / 1024**3:.1f} GB "
                 f"exceeds limit {memory_limit / 1024**3:.1f} GB"
@@ -1947,10 +1964,10 @@ def _drive_segmented_prefill(
         """The snapshot deep copy is the drive's largest allocation. A
         snapshot is optional (it only saves a later re-prefill), so one whose
         copy would pass the limit is skipped, not turned into an error."""
-        if memory_limit <= 0:
+        current = _memory_in_use()
+        if current is None:
             return True
         copy_bytes = estimate_cache_bytes(cache)
-        current = mx.get_active_memory() + mx.get_cache_memory()
         if current + copy_bytes <= memory_limit:
             return True
         logger.warning(
