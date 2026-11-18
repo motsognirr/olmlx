@@ -482,8 +482,11 @@ def tokenize_segmented_chat(
         )
 
     # Extend the last boundary to include any trailing template tokens
-    # (e.g. ``\n<|im_start|>assistant\n``) so flatten() == full.
-    if boundaries[-1] < len(full):
+    # (e.g. ``\n<|im_start|>assistant\n``) so flatten() == full, and record
+    # how many there were: the end of the final message is the deepest
+    # checkpoint a follow-up turn can reuse.
+    trailing = len(full) - boundaries[-1]
+    if trailing > 0:
         boundaries[-1] = len(full)
 
     # Build the role list, padding the front with extras using
@@ -497,7 +500,7 @@ def tokenize_segmented_chat(
     for k, end in enumerate(boundaries):
         segments.append(Segment(tokens=full[start:end], role=roles[k]))
         start = end
-    return SegmentedPrompt(segments=segments)
+    return SegmentedPrompt(segments=segments, trailing_tokens=trailing)
 
 
 def _normalize_tool_calls_in_messages(messages: list[dict]) -> list[dict]:

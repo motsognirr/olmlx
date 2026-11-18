@@ -1807,7 +1807,8 @@ def _drive_segmented_prefill(
     cancel_event: threading.Event | None = None,
 ) -> list[int]:
     """Run prefill in at most two ``model(...)`` calls and snapshot the
-    cache at the deepest interior message boundary; return the suffix to
+    cache at the deepest interior message boundary (the end of the final
+    message when a generation prompt follows it); return the suffix to
     hand off to stream_generate.
 
     ``already_covered_tokens`` is the depth at which ``cache`` is already
@@ -1875,6 +1876,19 @@ def _drive_segmented_prefill(
         if already_covered_tokens < boundary < len(flat):
             deepest_boundary = boundary
             deepest_role = seg.role
+    # Deeper still: the end of the final message, before the generation
+    # prompt. The next turn keeps this message verbatim and only replaces the
+    # generation prompt with the reply, so a snapshot here leaves just the
+    # reply and the new message to prefill. Snapshotting at the final
+    # message's *start* instead re-prefilled it every turn (in an agent loop,
+    # each tool result twice).
+    final_message_end = segmented.final_message_end()
+    if (
+        final_message_end is not None
+        and already_covered_tokens < final_message_end < len(flat)
+    ):
+        deepest_boundary = final_message_end
+        deepest_role = segmented.segments[-1].role
 
     final_prefill_end = len(flat) - 1  # reserve trailing token for stream_generate
 
@@ -1885,8 +1899,8 @@ def _drive_segmented_prefill(
     # corrupts MoE expert routing on Qwen3-Next-family targets once the
     # prompt is large enough (~16k+ tokens) — the model emits coherent but
     # off-prompt pretraining-data dumps instead of answering (Qwen3-Coder-Next,
-    # Qwen3.6-35B-A3B; same Metal-stream hazard family as #284).  Single-message
-    # requests never hit this because they skip the drive entirely and let
+    # Qwen3.6-35B-A3B; same Metal-stream hazard family as #284).  Requests
+    # that skip the drive (no snapshot point, no warm start) let
     # ``stream_generate`` prefill on ``generation_stream``.  ``mx.clear_cache()``
     # per chunk mirrors mlx-lm's prefill loop.
     # Resolve mlx-lm's generation stream AT CALL TIME: under mlx >= 0.31.2 it
@@ -2079,7 +2093,14 @@ async def _setup_via_checkpoint_path(
     # len(prompt_tokens)-1 because the trailing token is reserved for
     # stream_generate). With nothing to gain on either side, skip the
     # checkpoint path entirely — cheaper than driving a no-op snapshot.
-    if hit is None and len(segmented.segments) <= 1:
+    # A single message followed by a generation prompt still has a usable
+    # snapshot point (the end of that message), which turn 2 of every
+    # conversation starts from, so it takes the drive.
+    if (
+        hit is None
+        and len(segmented.segments) <= 1
+        and segmented.final_message_end() is None
+    ):
         logger.debug(
             "Checkpoint path: no usable message boundaries detected "
             "and no warm-start hit (segments=%d); falling back to fresh cache",

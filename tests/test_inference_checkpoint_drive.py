@@ -1099,3 +1099,117 @@ def test_checkpoint_kv_depth_unknown_when_layers_disagree():
     assert _checkpoint_kv_depth([a, a]) == 4
     assert _checkpoint_kv_depth([a, b]) is None
     assert _checkpoint_kv_depth([SimpleNamespace(), a]) == 4
+
+
+# The template's generation prompt after the final message's end marker
+# (Qwen: "\n<|im_start|>assistant\n<think>\n\n</think>\n\n"). Real requests
+# always end with one; next turn it is replaced by the assistant's reply.
+_GEN_PROMPT = [3, 50]
+
+
+def _prompt_with_generation_suffix(messages):
+    return _FakeTokenizer().apply_chat_template(messages) + _GEN_PROMPT
+
+
+def test_checkpoint_path_next_turn_reuses_whole_previous_final_message(monkeypatch):
+    """Each turn must leave a checkpoint covering its final message, so the
+    next turn only prefills what is new (the reply and the next message).
+
+    Before the fix the only snapshot was taken at the *start* of the final
+    message, and a single-message request took none at all: turn 2 of a chat
+    re-prefilled the whole first message, and every later turn re-prefilled
+    the previous turn's final message (in an agent loop, the tool result).
+    """
+    from olmlx.engine import inference as inference_mod
+    from olmlx.engine.inference import _setup_prompt_cache
+
+    monkeypatch.setattr(
+        inference_mod, "_make_prompt_cache_for_lm", lambda m: [KVCache()]
+    )
+    tok = _FakeTokenizer()
+    lm = LoadedModel(
+        name="x",
+        hf_path="y",
+        model=_DummyModel(),
+        tokenizer=tok,
+        prompt_cache_store=PromptCacheStore(max_slots=8),
+        uses_checkpoint_persistence=True,
+        supports_cache_persistence=True,
+    )
+
+    async def _turn(messages):
+        cs = await _setup_prompt_cache(
+            lm,
+            "ignored",
+            {},
+            prompt_tokens=_prompt_with_generation_suffix(messages),
+            cache_id="t",
+            messages=messages,
+            tokenizer=tok,
+        )
+        if cs.deferred_prefill is not None:
+            # Production runs the drive on the generation worker thread and
+            # marshals the checkpoint insert back onto the loop.
+            await asyncio.to_thread(cs.deferred_prefill, None)
+            await asyncio.sleep(0)
+        return cs
+
+    turn1 = [{"role": "user", "content": "CD"}]
+    turn2 = turn1 + [
+        {"role": "assistant", "content": "EF"},
+        {"role": "user", "content": "GH"},
+    ]
+    turn3 = turn2 + [
+        {"role": "assistant", "content": "IJ"},
+        {"role": "user", "content": "KL"},
+    ]
+
+    async def _conversation():
+        await _turn(turn1)
+        cs2 = await _turn(turn2)
+        cs3 = await _turn(turn3)
+        return cs2, cs3
+
+    cs2, cs3 = asyncio.run(_conversation())
+
+    turn1_messages_len = len(tok.apply_chat_template(turn1))
+    turn2_messages_len = len(tok.apply_chat_template(turn2))
+    assert cs2.cache_read_tokens == turn1_messages_len, (
+        f"turn 2 should reuse all {turn1_messages_len} tokens of turn 1's "
+        f"message, read {cs2.cache_read_tokens}"
+    )
+    assert cs3.cache_read_tokens == turn2_messages_len, (
+        f"turn 3 should reuse all {turn2_messages_len} tokens of turn 2's "
+        f"messages, read {cs3.cache_read_tokens}"
+    )
+
+
+def test_drive_snapshots_at_end_of_final_message_before_generation_prompt():
+    """The drive's snapshot point is the end of the final message (its
+    end-of-message marker), not its start, and it still uses two chunks."""
+    tok = _FakeTokenizer()
+    messages = [
+        {"role": "system", "content": "AB"},
+        {"role": "user", "content": "CD"},
+    ]
+    flat = _prompt_with_generation_suffix(messages)
+    end_of_user = len(tok.apply_chat_template(messages))
+    sp = tokenize_segmented_chat(tok, messages, full_tokens=flat)
+    model = _DummyModel()
+    store = PromptCacheStore(max_slots=8)
+
+    suffix = _drive_segmented_prefill(
+        model=model,
+        segmented=sp,
+        cache=[KVCache()],
+        insert_checkpoint=store.insert_checkpoint,
+    )
+
+    assert model.calls == [flat[:end_of_user], flat[end_of_user:-1]]
+    assert suffix == [flat[-1]]
+    assert len(store) == 1
+    hit = store.fetch_nearest(flat[:end_of_user] + [3, 99])
+    assert hit is not None
+    state, _ = hit
+    assert state.tokens == flat[:end_of_user]
+    assert state.cache_type == "user"
