@@ -1813,13 +1813,14 @@ def _drive_segmented_prefill(
     Snapshot points: the end of the final message when a generation prompt
     follows it (the deepest point the next turn shares), else the deepest
     interior message boundary. A cold start (nothing covered) also keeps the
-    deepest interior boundary, which on a first turn is the end of the system
-    prompt that every new conversation with the same system prompt shares.
+    end of the first segment: the system prompt (or a template-injected tools
+    block) that every new conversation with the same system prompt shares.
 
     ``memory_limit`` (bytes, 0 disables) replaces the ``prompt_progress_callback``
     guard ``stream_generate``'s own prefill would have had: before each forward
     the drive raises ``MemoryError`` (→ 503 / in-stream error) once Metal
-    active + cache memory exceeds it.
+    active + cache memory exceeds it, and a snapshot whose deep copy would
+    pass it is skipped (snapshots are optional).
 
     ``already_covered_tokens`` is the depth at which ``cache`` is already
     populated (from a checkpoint hit). Segments wholly inside that depth
@@ -1850,7 +1851,7 @@ def _drive_segmented_prefill(
     the uncovered tail only at its snapshot points: warm starts use two
     chunks (``[covered .. snapshot]`` and ``[snapshot .. len(flat)-1]``,
     the generation prompt minus the reserved trailing token); cold starts
-    add the shallower interior boundary as a third.  If there is no
+    add the end of the first segment as a third.  If there is no
     snapshot point the whole tail goes in one chunk.  Each chunk is still
     fed in ``_PREFILL_CHUNK``-token sub-chunks (as ``stream_generate``'s
     own prefill is), so these few boundaries add little drift.  Trade-off:
@@ -1869,6 +1870,7 @@ def _drive_segmented_prefill(
         flatten_cache_state,
         snapshot_cache_for_persistence,
     )
+    from olmlx.engine.prompt_cache.store import estimate_cache_bytes
 
     flat = segmented.flatten()
     if not flat:
@@ -1889,17 +1891,19 @@ def _drive_segmented_prefill(
     # generation prompt with the reply, so a snapshot here leaves just the
     # reply and the new message to prefill. Snapshotting only at the final
     # message's *start* re-prefilled it every turn (in an agent loop, each
-    # tool result twice). On a cold start the interior boundary is kept too:
-    # on a first turn it is the end of the system prompt, the prefix every
-    # new conversation with the same system prompt and tools shares.
+    # tool result twice). A cold start also keeps the end of the FIRST
+    # segment: the system prompt (or the tools block a template injects),
+    # the prefix every new conversation with the same system prompt and
+    # tools shares. Deeper interior boundaries are shared by nothing else.
     snapshot_points: list[tuple[int, Any]] = []
     final_message_end = segmented.final_message_end()
     if (
         final_message_end is not None
         and already_covered_tokens < final_message_end < len(flat)
     ):
-        if already_covered_tokens == 0 and interior_boundary is not None:
-            snapshot_points.append((interior_boundary, interior_role))
+        first_segment_end = boundaries[0]
+        if already_covered_tokens == 0 and first_segment_end < final_message_end:
+            snapshot_points.append((first_segment_end, segmented.segments[0].role))
         snapshot_points.append((final_message_end, segmented.segments[-1].role))
     elif interior_boundary is not None:
         snapshot_points.append((interior_boundary, interior_role))
@@ -1938,6 +1942,25 @@ def _drive_segmented_prefill(
                 f"Prefill aborted: Metal memory {current / 1024**3:.1f} GB "
                 f"exceeds limit {memory_limit / 1024**3:.1f} GB"
             )
+
+    def _snapshot_fits() -> bool:
+        """The snapshot deep copy is the drive's largest allocation. A
+        snapshot is optional (it only saves a later re-prefill), so one whose
+        copy would pass the limit is skipped, not turned into an error."""
+        if memory_limit <= 0:
+            return True
+        copy_bytes = estimate_cache_bytes(cache)
+        current = mx.get_active_memory() + mx.get_cache_memory()
+        if current + copy_bytes <= memory_limit:
+            return True
+        logger.warning(
+            "Skipping prompt-cache checkpoint: copying %.1f GB would pass the "
+            "memory limit (%.1f of %.1f GB in use)",
+            copy_bytes / 1024**3,
+            current / 1024**3,
+            memory_limit / 1024**3,
+        )
+        return False
 
     def _run(start: int, end: int) -> bool:
         """Prefill ``flat[start:end]``; return False iff a cancel cut it short.
@@ -1996,6 +2019,7 @@ def _drive_segmented_prefill(
             completed
             and final_prefill_end > already_covered_tokens
             and segmented.segments
+            and _snapshot_fits()
         ):
             snap = snapshot_cache_for_persistence(cache, eager_eval=False)
             insert_checkpoint(
@@ -2022,15 +2046,16 @@ def _drive_segmented_prefill(
             # eager_eval=False because ``_run``'s inner
             # ``mx.eval(flatten_cache_state(cache))`` just materialised the
             # state on the prefill stream; deepcopy alone is sufficient.
-            snap = snapshot_cache_for_persistence(cache, eager_eval=False)
-            insert_checkpoint(
-                CachedPromptState(
-                    tokens=flat[:point],
-                    cache=snap,
-                    cache_type=role,
-                    is_checkpoint=True,
+            if _snapshot_fits():
+                snap = snapshot_cache_for_persistence(cache, eager_eval=False)
+                insert_checkpoint(
+                    CachedPromptState(
+                        tokens=flat[:point],
+                        cache=snap,
+                        cache_type=role,
+                        is_checkpoint=True,
+                    )
                 )
-            )
             start = point
         # Last chunk: up to the reserved trailing token (``_run`` checks
         # cancel_event and memory before each forward).
@@ -2049,7 +2074,8 @@ def _prefill_memory_limit() -> int:
     if (
         not isinstance(fraction, (int, float))
         or isinstance(fraction, bool)
-        or not isinstance(total, int)
+        or not isinstance(total, (int, float))
+        or isinstance(total, bool)
         or total <= 0
     ):
         return 0

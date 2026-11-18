@@ -270,6 +270,12 @@ def _estimate_state_bytes(state: CachedPromptState) -> int:
     return total
 
 
+def estimate_cache_bytes(cache: list[Any]) -> int:
+    """Byte estimate of a live per-layer cache list (see
+    ``_estimate_state_bytes``), e.g. the size of a snapshot deep copy."""
+    return _estimate_state_bytes(CachedPromptState(tokens=[], cache=cache))
+
+
 class PromptCacheStore:
     """LRU store for per-agent KV caches with optional disk offload.
 

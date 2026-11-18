@@ -1386,3 +1386,75 @@ def test_prefill_memory_limit_follows_the_memory_limit_fraction(monkeypatch):
     # A MagicMock settings object must disable the guard, not yield int() == 1.
     monkeypatch.setattr(inference_mod, "settings", MagicMock())
     assert inference_mod._prefill_memory_limit() == 0
+
+
+def test_drive_cold_start_keeps_the_first_segment_not_the_second_to_last():
+    """On a cold start of a longer conversation the extra snapshot is the end
+    of the first segment (the shared system prompt), not the end of the
+    second-to-last message, which no other request shares."""
+    tok = _FakeTokenizer()
+    messages = [
+        {"role": "system", "content": "AB"},
+        {"role": "user", "content": "CD"},
+        {"role": "assistant", "content": "EF"},
+        {"role": "user", "content": "GH"},
+    ]
+    flat = _prompt_with_generation_suffix(messages)
+    end_of_system = len(tok.apply_chat_template(messages[:1]))
+    end_of_last_user = len(tok.apply_chat_template(messages))
+    sp = tokenize_segmented_chat(tok, messages, full_tokens=flat)
+    model = _DummyModel()
+    stored: list = []
+
+    _drive_segmented_prefill(
+        model=model,
+        segmented=sp,
+        cache=[KVCache()],
+        insert_checkpoint=stored.append,
+    )
+
+    assert [s.tokens for s in stored] == [
+        flat[:end_of_system],
+        flat[:end_of_last_user],
+    ]
+    assert model.calls == [
+        flat[:end_of_system],
+        flat[end_of_system:end_of_last_user],
+        flat[end_of_last_user:-1],
+    ]
+
+
+def test_drive_skips_a_snapshot_whose_copy_would_pass_the_memory_limit(monkeypatch):
+    """The snapshot deep copy is the drive's largest allocation. When the copy
+    would push memory past the limit the snapshot is skipped (caching is
+    optional); prefill itself carries on while memory stays under the limit."""
+    monkeypatch.setattr(mx, "get_active_memory", lambda: 1_000)
+    monkeypatch.setattr(mx, "get_cache_memory", lambda: 0)
+    tok = _FakeTokenizer()
+    messages = [{"role": "user", "content": "CD"}]
+    flat = _prompt_with_generation_suffix(messages)
+    sp = tokenize_segmented_chat(tok, messages, full_tokens=flat)
+    model = _DummyModel()
+    stored: list = []
+
+    suffix = _drive_segmented_prefill(
+        model=model,
+        segmented=sp,
+        cache=[KVCache()],
+        insert_checkpoint=stored.append,
+        memory_limit=1_001,  # forwards fit; a copy of the cache does not
+    )
+
+    assert stored == []
+    assert sum(len(c) for c in model.calls) == len(flat) - 1
+    assert suffix == [flat[-1]]
+
+
+def test_prefill_memory_limit_accepts_a_float_system_memory(monkeypatch):
+    from olmlx.engine import inference as inference_mod
+
+    monkeypatch.setattr(
+        inference_mod.memory_utils, "get_system_memory_bytes", lambda: 1_000.0
+    )
+    monkeypatch.setattr(inference_mod.settings, "memory_limit_fraction", 0.5)
+    assert inference_mod._prefill_memory_limit() == 500
