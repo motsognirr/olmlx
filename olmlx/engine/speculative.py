@@ -101,12 +101,15 @@ class _SpecCacheEntry:
     ``preamble`` marks a cold start's system-prompt snapshot. Every other
     entry is a conversation's tip (the end of its final message), which that
     conversation's next snapshot supersedes; a preamble is meant to be a
-    prefix of other entries and is never superseded.
+    prefix of other entries and is never superseded. ``seq`` is the store's
+    insertion counter, which orders snapshots by when they were taken (LRU
+    order changes on every lookup).
     """
 
     tokens: list[int]
     payload: Any = field(default=None)
     preamble: bool = False
+    seq: int = 0
 
 
 class _SpecCacheStore:
@@ -129,6 +132,7 @@ class _SpecCacheStore:
         # LRU order: index 0 is the least-recently-used entry (evicted first),
         # the last index is most-recently-used.
         self._entries: list[_SpecCacheEntry] = []
+        self._next_seq = 0
         # Guard backing _serialized() — never blocked on, only try-acquired.
         self._access_guard = threading.Lock()
 
@@ -218,8 +222,11 @@ class _SpecCacheStore:
             # Refresh: drop any prior entry for the same lineage so a re-prefill
             # of the same prompt doesn't consume two slots.
             self._entries = [e for e in self._entries if e.tokens != toks]
+            self._next_seq += 1
             self._entries.append(
-                _SpecCacheEntry(tokens=toks, payload=payload, preamble=preamble)
+                _SpecCacheEntry(
+                    tokens=toks, payload=payload, preamble=preamble, seq=self._next_seq
+                )
             )
             while len(self._entries) > self._capacity:
                 self._entries.remove(self._eviction_victim())
@@ -227,23 +234,26 @@ class _SpecCacheStore:
     def _eviction_victim(self) -> _SpecCacheEntry:
         """The entry to drop, least-recently-used first within each tier:
 
-        1. A tip that a more recently used entry extends. It is that
-           conversation's previous snapshot; its next turn continues the
-           newer one. (An entry can't be superseded by an *older* one: a
-           rewound conversation's new, shorter tip is the only one it can
-           extend.)
+        1. A tip that a later-taken entry extends. It is that conversation's
+           previous snapshot; its next turn continues the newer one. "Later"
+           is insertion order, not LRU order: a lookup that promotes the old
+           tip doesn't make its deeper successor the victim. (An entry can't
+           be superseded by an *earlier* one: a rewound conversation's new,
+           shorter tip is the only one it can extend.)
         2. A preamble. It only saves a new conversation's system prompt, while
            a tip saves a whole conversation, so with two slots two
            interleaved conversations keep both tips.
         3. The least-recently-used entry.
         """
-        for i, entry in enumerate(self._entries):
+        for entry in self._entries:
             if entry.preamble:
                 continue
             n = len(entry.tokens)
             if any(
-                len(newer.tokens) > n and newer.tokens[:n] == entry.tokens
-                for newer in self._entries[i + 1 :]
+                newer.seq > entry.seq
+                and len(newer.tokens) > n
+                and newer.tokens[:n] == entry.tokens
+                for newer in self._entries
             ):
                 return entry
         for entry in self._entries:

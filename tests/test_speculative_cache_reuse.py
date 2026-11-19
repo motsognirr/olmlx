@@ -163,6 +163,21 @@ class TestSpecCacheStore:
             "after rewind",
         ]
 
+    def test_a_lookup_does_not_unsupersede_an_older_snapshot(self):
+        # A lookup that promotes turn 1 above turn 2 (a request that branched
+        # at turn 1 and stored nothing, e.g. cancelled) must not make turn 2,
+        # its deeper successor, the eviction victim.
+        store = _SpecCacheStore(capacity=2)
+        store.insert([1, 2], payload="turn 1")
+        store.insert([1, 2, 3], payload="turn 2")
+        hit = store.find([1, 2, 9], full_prefix_only=True)
+        assert hit is not None and hit[0].payload == "turn 1"
+        store.insert([7, 7], payload="other conversation")
+        assert [e.payload for e in store._entries] == [
+            "turn 2",
+            "other conversation",
+        ]
+
 
 class TestReuseDecision:
     """Pure decision logic: trimmable trims to the common prefix; a
