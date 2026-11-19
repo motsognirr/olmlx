@@ -122,6 +122,9 @@ class _SpecCacheStore:
     client-supplied ids (the same problem the non-speculative path's radix
     index solves; at 2–4 slots a trie is unnecessary).
 
+    ``capacity`` bounds the conversation tips. On top of them the store keeps
+    at most one preamble (a system-prompt snapshot, only taken for
+    extend-only caches): a separate slot, so neither kind evicts the other.
     ``capacity == 0`` disables reuse entirely (``enabled()`` is False and
     ``insert`` is a no-op) — the ``OLMLX_SPECULATIVE_CACHE_SLOTS=0`` kill
     switch that restores the previous fresh-prefill-every-turn behavior.
@@ -185,10 +188,11 @@ class _SpecCacheStore:
         prefix of ``tokens``, so a longer partial overlap with another
         conversation can't shadow a usable system-prompt snapshot.
 
-        Note: promotion happens on any prefix overlap, even one the caller
-        later rejects (e.g. a non-trimmable partial-prefix hit that falls back
-        to fresh prefill). At the small default slot counts this near-miss
-        promotion is immaterial; revisit if slots are raised substantially.
+        Note: without ``full_prefix_only``, promotion happens on any prefix
+        overlap, even one the caller later rejects (``_spec_reuse_decision``
+        backs a trimmable hit off by one token and refuses a one-token
+        prompt). At the small default slot counts this near-miss promotion is
+        immaterial; revisit if slots are raised substantially.
         """
         with self._serialized():
             if not self.enabled() or not self._entries or not tokens:
@@ -212,8 +216,9 @@ class _SpecCacheStore:
         self, tokens: list[int], payload: Any, *, preamble: bool = False
     ) -> None:
         """Store ``payload`` under ``tokens`` as the most-recently-used entry,
-        replacing any existing entry with identical tokens, and evict entries
-        past ``capacity`` (see :meth:`_eviction_victim`). No-op when disabled.
+        replacing any existing entry with identical tokens. A preamble
+        replaces any other preamble; a tip evicts tips past ``capacity`` (see
+        :meth:`_eviction_victim`). No-op when disabled.
         """
         with self._serialized():
             if not self.enabled():
@@ -221,33 +226,36 @@ class _SpecCacheStore:
             toks = list(tokens)
             # Refresh: drop any prior entry for the same lineage so a re-prefill
             # of the same prompt doesn't consume two slots.
-            self._entries = [e for e in self._entries if e.tokens != toks]
+            self._entries = [
+                e
+                for e in self._entries
+                if e.tokens != toks and not (preamble and e.preamble)
+            ]
             self._next_seq += 1
             self._entries.append(
                 _SpecCacheEntry(
                     tokens=toks, payload=payload, preamble=preamble, seq=self._next_seq
                 )
             )
-            while len(self._entries) > self._capacity:
+            while sum(not e.preamble for e in self._entries) > self._capacity:
                 self._entries.remove(self._eviction_victim())
 
     def _eviction_victim(self) -> _SpecCacheEntry:
-        """The entry to drop, least-recently-used first within each tier:
+        """The tip to drop, least-recently-used first within each tier:
 
         1. A tip that a later-taken entry extends. It is that conversation's
-           previous snapshot; its next turn continues the newer one. "Later"
-           is insertion order, not LRU order: a lookup that promotes the old
-           tip doesn't make its deeper successor the victim. (An entry can't
-           be superseded by an *earlier* one: a rewound conversation's new,
+           previous snapshot; its next turn continues the newer one, so two
+           interleaved conversations keep both their tips. "Later" is
+           insertion order, not LRU order: a lookup that promotes the old tip
+           doesn't make its deeper successor the victim. (An entry can't be
+           superseded by an *earlier* one: a rewound conversation's new,
            shorter tip is the only one it can extend.)
-        2. A preamble. It only saves a new conversation's system prompt, while
-           a tip saves a whole conversation, so with two slots two
-           interleaved conversations keep both tips.
-        3. The least-recently-used entry.
+        2. The least-recently-used tip.
+
+        A preamble is never the victim; it has its own slot.
         """
-        for entry in self._entries:
-            if entry.preamble:
-                continue
+        tips = [e for e in self._entries if not e.preamble]
+        for entry in tips:
             n = len(entry.tokens)
             if any(
                 newer.seq > entry.seq
@@ -256,10 +264,7 @@ class _SpecCacheStore:
                 for newer in self._entries
             ):
                 return entry
-        for entry in self._entries:
-            if entry.preamble:
-                return entry
-        return self._entries[0]
+        return tips[0]
 
 
 # Cache-layer class names used to classify a working cache for reuse.
@@ -445,11 +450,12 @@ def _prefill_last_logit(
 
 def _spec_snapshot_points(
     segmented: Any, flat: list[int], already_covered: int, *, extend_only: bool
-) -> list[int]:
-    """Where a reuse prefill snapshots its caches (see
-    ``SegmentedPrompt.snapshot_points``). Only an extend-only (hybrid) cache
-    keeps a separate system-prompt snapshot on a cold start: a trimmable one
-    trims any deeper snapshot back to it.
+) -> list[tuple[int, bool]]:
+    """Where a reuse prefill snapshots its caches, as ``(offset, preamble)``
+    pairs, shallowest first (see ``SegmentedPrompt.snapshot_points``). The
+    deepest point is the conversation's tip; any shallower one is the
+    system-prompt preamble, which only an extend-only (hybrid) cache keeps on
+    a cold start: a trimmable one trims any deeper snapshot back to it.
 
     The boundaries are only meaningful if the segmentation tokenizes to
     exactly this prompt. A mismatch (re-tokenization drift) means no snapshot
@@ -457,18 +463,19 @@ def _spec_snapshot_points(
     """
     if segmented.flatten() != flat:
         return []
-    return [
+    points = [
         point
         for point, _role in segmented.snapshot_points(
             already_covered, include_first_segment=extend_only
         )
     ]
+    return [(point, i < len(points) - 1) for i, point in enumerate(points)]
 
 
 def _drive_spec_prefill(
     *,
     flat: list[int],
-    snapshot_points: list[int],
+    snapshot_points: list[tuple[int, bool]],
     already_covered: int,
     lanes: list[tuple[Any, list]],
     cancel_event: threading.Event | None,
@@ -478,10 +485,11 @@ def _drive_spec_prefill(
     """Forward each ``(model, cache)`` lane over ``flat[already_covered:]`` and
     return ``lanes[0]`` (the target)'s last-position logit (lazy).
 
-    Snapshots happen via ``on_boundary(point)``, once per snapshot point in
-    ``(already_covered, len(flat))`` (shallowest first, from
-    ``SegmentedPrompt.snapshot_points``), after every lane has been filled up
-    to that point, so the caller can persist all caches at a message boundary
+    Snapshots happen via ``on_boundary(point, preamble)``, once per
+    ``(point, preamble)`` in ``snapshot_points`` (shallowest first, from
+    :func:`_spec_snapshot_points`; points outside
+    ``(already_covered, len(flat))`` are skipped), after every lane has been
+    filled up to that point, so the caller can persist all caches at a message boundary
     for later turns. Each point is also the only place the span is split
     beyond the ``_PREFILL_CHUNK`` sub-chunks, which keeps the GatedDeltaNet
     chunking drift that ``inference._drive_segmented_prefill`` describes to a
@@ -505,7 +513,7 @@ def _drive_spec_prefill(
     sub-chunk.
     """
     n = len(flat)
-    points = sorted(p for p in set(snapshot_points) if already_covered < p < n)
+    points = [(p, pre) for p, pre in snapshot_points if already_covered < p < n]
 
     target_model = lanes[0][0]
     _acc = {"target_ns": 0, "draft_ns": 0, "target_chunks": 0}
@@ -561,10 +569,10 @@ def _drive_spec_prefill(
 
     # Up to each snapshot point (all lanes), then snapshot.
     start = already_covered
-    for point in points:
+    for point, preamble in points:
         for model, cache in lanes:
             _fill(model, cache, start, point)
-        on_boundary(point)
+        on_boundary(point, preamble)
         start = point
     # Last point to the end. Non-target lanes fill KV; the target captures
     # the seeding logit at the final position.
@@ -952,21 +960,19 @@ class SpeculativeDecoder(SpecDecoderBase):
         end of the final message (plus the system prompt on an extend-only
         cold start) for later turns. See :func:`_drive_spec_prefill` for the
         stream / chunking invariants."""
-        points = _spec_snapshot_points(
-            segmented, flat, already_covered, extend_only=extend_only
-        )
-        tip = points[-1] if points else None
         return _drive_spec_prefill(
             flat=flat,
-            snapshot_points=points,
+            snapshot_points=_spec_snapshot_points(
+                segmented, flat, already_covered, extend_only=extend_only
+            ),
             already_covered=already_covered,
             lanes=[
                 (self._target, self._target_cache),
                 (self._draft, self._draft_cache),
             ],
             cancel_event=cancel_event,
-            on_boundary=lambda point: self._store_snapshot(
-                flat[:point], preamble=point != tip
+            on_boundary=lambda point, preamble: self._store_snapshot(
+                flat[:point], preamble=preamble
             ),
             breakdown=self._last_prefill_breakdown,
         )
@@ -1733,18 +1739,16 @@ class PromptLookupDecoder(SpecDecoderBase):
                         trim_prompt_cache(self._target_cache, trim)
                 already_covered = covered
 
-        points = _spec_snapshot_points(
-            segmented, flat, already_covered, extend_only=not is_trimmable
-        )
-        tip = points[-1] if points else None
         logit = _drive_spec_prefill(
             flat=flat,
-            snapshot_points=points,
+            snapshot_points=_spec_snapshot_points(
+                segmented, flat, already_covered, extend_only=not is_trimmable
+            ),
             already_covered=already_covered,
             lanes=[(self._target, self._target_cache)],
             cancel_event=cancel_event,
-            on_boundary=lambda point: self._store_snapshot(
-                flat[:point], preamble=point != tip
+            on_boundary=lambda point, preamble: self._store_snapshot(
+                flat[:point], preamble=preamble
             ),
             breakdown=self._last_prefill_breakdown,
         )

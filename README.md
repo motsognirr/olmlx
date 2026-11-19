@@ -434,7 +434,7 @@ All settings can be overridden with `OLMLX_`-prefixed environment variables or a
 | `OLMLX_SPECULATIVE` | `false` | Enable speculative decoding with a draft model (also `--speculative` on `olmlx serve`) |
 | `OLMLX_SPECULATIVE_DRAFT_MODEL` | `None` | HuggingFace path of the draft model (also `--speculative-draft-model`) |
 | `OLMLX_SPECULATIVE_TOKENS` | `4` | Candidate tokens generated per verification step (also `--speculative-tokens`) |
-| `OLMLX_SPECULATIVE_CACHE_SLOTS` | `2` | Cross-request KV snapshots kept per model so each agent turn prefills only the new suffix (`classic`/`pld` only). `0` disables (fresh prefill every turn). Each slot is a full target (+draft) KV snapshot — keep small. |
+| `OLMLX_SPECULATIVE_CACHE_SLOTS` | `2` | Cross-request KV snapshots kept per model so each agent turn prefills only the new suffix (`classic`/`pld` only). `0` disables (fresh prefill every turn). Each slot is a full target (+draft) KV snapshot — keep small. Hybrid models also keep one system-prompt snapshot outside these slots. |
 | `OLMLX_KV_CACHE_QUANT` | `None` | KV cache quantization: `turboquant:4` (~3.9x), `turboquant:2` (~7.5x), `spectral:4` (~5.9x), `spectral:2`, `spectral-qa:{2,4}` (attention-aware calibration), `shard:{2,4,8}` (asymmetric K/V + sink/window), or `kvarn:k4v2` / `kvarn:{2,4}` (variance-normalized, per-K/V bits) (also `--kv-cache-quant`) |
 
 ### Flash inference settings

@@ -434,7 +434,9 @@ class Settings(BaseSettings):
     #: spare. ``0`` disables reuse entirely (fresh prefill every turn — the
     #: pre-#421 behavior, useful as a kill switch). Only the ``classic`` and
     #: ``pld`` strategies honor this; ``dflash``/``eagle``/``mtp`` always
-    #: fresh-prefill.
+    #: fresh-prefill. Hybrid (non-trimmable) caches also keep one
+    #: system-prompt snapshot outside these slots, so new conversations reuse
+    #: a shared system prompt (#781).
     speculative_cache_slots: Annotated[int, Field(ge=0)] = 2
 
     # Tree-structured speculative verification (#358).  When enabled,

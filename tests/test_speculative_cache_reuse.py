@@ -135,21 +135,48 @@ class TestSpecCacheStore:
     def test_eviction_keeps_a_preamble_its_tip_extends(self):
         # The system-prompt snapshot is a prefix of its own conversation's
         # tip by design; it is not superseded by it.
-        store = _SpecCacheStore(capacity=2)
+        store = _SpecCacheStore(capacity=1)
         store.insert([1, 2], payload="system", preamble=True)
         store.insert([1, 2, 3], payload="turn 1")
         store.insert([1, 2, 3, 4], payload="turn 2")
         assert [e.payload for e in store._entries] == ["system", "turn 2"]
 
-    def test_eviction_prefers_a_preamble_over_a_live_tip(self):
+    def test_a_preamble_does_not_take_a_tip_slot(self):
+        # Two interleaved conversations keep both tips and the shared system
+        # prompt; capacity counts tips only.
         store = _SpecCacheStore(capacity=2)
         store.insert([1, 2], payload="system", preamble=True)
         store.insert([1, 2, 3], payload="conversation A")
         store.insert([1, 2, 4], payload="conversation B")
         assert [e.payload for e in store._entries] == [
+            "system",
             "conversation A",
             "conversation B",
         ]
+
+    def test_a_new_preamble_survives_a_store_full_of_tips(self):
+        store = _SpecCacheStore(capacity=2)
+        store.insert([5, 5], payload="tip X")
+        store.insert([6, 6], payload="tip Y")
+        store.insert([1, 2], payload="system", preamble=True)
+        assert [e.payload for e in store._entries] == ["tip X", "tip Y", "system"]
+
+    def test_back_to_back_conversations_keep_the_preamble(self):
+        # One conversation per task: each new one reuses the system prompt
+        # and the finished conversations' tips age out instead.
+        store = _SpecCacheStore(capacity=2)
+        store.insert([1, 2], payload="system", preamble=True)
+        for task in (3, 4, 5, 6):
+            hit = store.find([1, 2, task, 0], full_prefix_only=True)
+            assert hit is not None and hit[0].payload == "system"
+            store.insert([1, 2, task], payload=f"task {task}")
+        assert {e.payload for e in store._entries} == {"system", "task 5", "task 6"}
+
+    def test_only_the_newest_preamble_is_kept(self):
+        store = _SpecCacheStore(capacity=2)
+        store.insert([1, 2], payload="system A", preamble=True)
+        store.insert([3, 4], payload="system B", preamble=True)
+        assert [e.payload for e in store._entries] == ["system B"]
 
     def test_a_new_snapshot_is_never_superseded_by_an_older_one(self):
         # A rewound conversation's new tip is a prefix of its old, deeper
@@ -535,7 +562,13 @@ class TestFinalMessageEndSnapshot:
         assert dec._last_reused_tokens == 5
         _prefill(dec, _TURN3)
         assert dec._last_reused_tokens == 11
-        assert [preamble for _, preamble in _stored(dec)] == [True, False]
+        # Turn 1's tip is superseded and gone; turns 2 and 3 fill the two tip
+        # slots, beside the system prompt.
+        assert _stored(dec) == [
+            ([1, 2, 3], True),
+            (_TURN2.flatten()[:11], False),
+            (_TURN3.flatten()[: _TURN3.final_message_end()], False),
+        ]
         _prefill(dec, _turn(_SYSTEM, [7]))
         assert dec._last_reused_tokens == 3
 
