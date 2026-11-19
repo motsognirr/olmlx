@@ -3637,8 +3637,19 @@ def _speculative_prompt(
     streaming and the non-streaming path call this; the non-streaming one
     used to skip it, so its turns never reused anything.
     """
+    # Lazy: the speculative module pulls in mlx-lm decoder machinery that the
+    # non-speculative import path doesn't need.
+    from olmlx.engine.speculative import _SpecCacheStore
+
+    # ``isinstance``, not a duck-typed ``getattr``: a decoder without a store
+    # (mtp / eagle / dflash) or a test double must never enable segmentation.
     store = getattr(lm.speculative_decoder, "_cache_store", None)
-    if store is None or not store.enabled() or messages is None or lm.is_vlm:
+    if (
+        not isinstance(store, _SpecCacheStore)
+        or not store.enabled()
+        or messages is None
+        or lm.is_vlm
+    ):
         return prompt, None
     tokens = (
         # ``tokenize_for_cache`` replicates mlx-lm's BOS heuristic; plain

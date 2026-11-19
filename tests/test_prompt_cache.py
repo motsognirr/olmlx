@@ -3539,3 +3539,16 @@ class TestSpeculativeSnapshotStorePlumbing:
         calls, _, seg_mock = await self._run(mock_manager, stream=False)
         seg_mock.assert_not_called()
         assert calls[0][1].get("segmented") is None
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("stream", [False, True])
+    async def test_decoder_without_a_real_store_skips_segmentation(
+        self, mock_manager, stream
+    ):
+        # A duck-typed decoder (here a MagicMock, whose missing attribute is
+        # a truthy mock) must not be mistaken for one with a snapshot store.
+        lm = self._setup(mock_manager)
+        lm.speculative_decoder = MagicMock()
+        calls, _, seg_mock = await self._run(mock_manager, stream=stream)
+        seg_mock.assert_not_called()
+        assert calls[0][1].get("segmented") is None
