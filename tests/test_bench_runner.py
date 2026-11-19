@@ -4,6 +4,8 @@ import json
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 
 from olmlx.bench.prompts import PROMPTS
 from olmlx.bench.results import PromptResult
@@ -683,3 +685,38 @@ class TestRunPromptsOverHttp:
             results = _run_prompts_over_http("model", [prompt], None, 11434)
         assert "300" in results[0].error
         assert "OLMLX_BENCH_REQUEST_TIMEOUT" in results[0].error
+        # No worker subprocess here, so the worker timeout can't help.
+        assert "OLMLX_BENCH_WORKER_TIMEOUT" not in results[0].error
+
+    @pytest.mark.parametrize(("raw", "expected"), [("true", True), ("off", False)])
+    def test_think_toggle_reaches_the_request(self, monkeypatch, raw, expected):
+        # OLMLX_BENCH_THINK is recorded in the run's bench_env, so the
+        # server-mode path must apply it like the worker does.
+        monkeypatch.setenv("OLMLX_BENCH_THINK", raw)
+        bodies = []
+
+        def fake_urlopen(req, timeout=None):
+            bodies.append(json.loads(req.data))
+            raise ConnectionRefusedError("refused")
+
+        prompt = {"name": "p", "category": "c", "messages": [], "max_tokens": 8}
+        with patch(
+            "olmlx.bench.runner.urllib.request.urlopen", side_effect=fake_urlopen
+        ):
+            _run_prompts_over_http("model", [prompt], None, 11434)
+        assert bodies[0]["think"] is expected
+
+    def test_think_unset_omits_the_field(self, monkeypatch):
+        monkeypatch.delenv("OLMLX_BENCH_THINK", raising=False)
+        bodies = []
+
+        def fake_urlopen(req, timeout=None):
+            bodies.append(json.loads(req.data))
+            raise ConnectionRefusedError("refused")
+
+        prompt = {"name": "p", "category": "c", "messages": [], "max_tokens": 8}
+        with patch(
+            "olmlx.bench.runner.urllib.request.urlopen", side_effect=fake_urlopen
+        ):
+            _run_prompts_over_http("model", [prompt], None, 11434)
+        assert "think" not in bodies[0]

@@ -88,13 +88,15 @@ def is_request_timeout(exc: BaseException) -> bool:
     )
 
 
-def request_timeout_error(timeout: float) -> str:
+def request_timeout_error(
+    timeout: float, *, mention_worker_timeout: bool = True
+) -> str:
     """The error recorded for a prompt whose request hit ``timeout``: names
-    the limit and the knob that raises it, not just "timed out"."""
-    return (
-        f"timed out after {timeout:g}s; raise {REQUEST_TIMEOUT_ENV} "
-        "(and OLMLX_BENCH_WORKER_TIMEOUT) for long prompts"
-    )
+    the limit and the knob that raises it, not just "timed out". Only the
+    worker path runs under ``OLMLX_BENCH_WORKER_TIMEOUT``; the server-mode
+    path passes ``mention_worker_timeout=False``."""
+    also = " (and OLMLX_BENCH_WORKER_TIMEOUT)" if mention_worker_timeout else ""
+    return f"timed out after {timeout:g}s; raise {REQUEST_TIMEOUT_ENV}{also} for long prompts"
 
 
 def _wait_for_server(port: int, proc: subprocess.Popen, timeout: float) -> bool:

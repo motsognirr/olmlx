@@ -653,15 +653,19 @@ def _run_prompts_over_http(
 ) -> list[PromptResult]:
     """Send prompts to a running olmlx server over HTTP."""
     from olmlx.bench.worker import (
+        _resolve_bench_think,
         is_request_timeout,
         request_timeout_error,
         resolve_request_timeout,
     )
 
     url = f"http://127.0.0.1:{port}/api/chat"
-    # Same knob as the worker path: server-mode (distributed) scenarios
-    # send their prompts from here instead.
+    # Same knobs as the worker path (OLMLX_BENCH_REQUEST_TIMEOUT and
+    # OLMLX_BENCH_THINK): server-mode (distributed) scenarios send their
+    # prompts from here instead, and _capture_bench_env records the think
+    # toggle for every run.
     timeout = resolve_request_timeout(os.environ)
+    think = _resolve_bench_think(os.environ)
     results = []
     for prompt in prompts_data:
         tok_limit = max_tokens or prompt.get("max_tokens", 256)
@@ -675,6 +679,8 @@ def _run_prompts_over_http(
                 "num_predict": tok_limit,
             },
         }
+        if think is not None:
+            body["think"] = think
         try:
             req = urllib.request.Request(
                 url,
@@ -719,7 +725,7 @@ def _run_prompts_over_http(
                     output_text="",
                     status_code=0,
                     error=(
-                        request_timeout_error(timeout)
+                        request_timeout_error(timeout, mention_worker_timeout=False)
                         if is_request_timeout(e)
                         else str(e)
                     ),
