@@ -469,7 +469,12 @@ def _spec_snapshot_points(
             already_covered, include_first_segment=extend_only
         )
     ]
-    return [(point, i < len(points) - 1) for i, point in enumerate(points)]
+    # Flag by offset, not position, so an extra interior point would be
+    # stored as a tip rather than replace the system-prompt snapshot.
+    first_segment_end = segmented.boundary_offsets()[0] if points else None
+    return [
+        (point, point == first_segment_end and point != points[-1]) for point in points
+    ]
 
 
 def _drive_spec_prefill(

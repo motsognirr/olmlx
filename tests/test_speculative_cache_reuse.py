@@ -18,6 +18,7 @@ from olmlx.engine.speculative import (
     SpeculativeDecoder,
     _common_prefix_len,
     _spec_reuse_decision,
+    _spec_snapshot_points,
     _SpecCacheStore,
 )
 from tests.test_flash_speculative import MockModel
@@ -502,6 +503,25 @@ def _stored(dec) -> list[tuple[list[int], bool]]:
 
 
 class TestFinalMessageEndSnapshot:
+    def test_only_the_first_segment_end_is_flagged_as_the_preamble(self, monkeypatch):
+        # The flag follows the offset, not the position: an extra interior
+        # point must be stored as a tip, not replace the system prompt.
+        seg = _turn(_SYSTEM, _U1, _A1, _U2)
+        monkeypatch.setattr(
+            SegmentedPrompt,
+            "snapshot_points",
+            lambda self, covered, include_first_segment=True: [
+                (3, "system"),
+                (5, "user"),
+                (11, "user"),
+            ],
+        )
+        assert _spec_snapshot_points(seg, seg.flatten(), 0, extend_only=True) == [
+            (3, True),
+            (5, False),
+            (11, False),
+        ]
+
     def test_classic_snapshots_the_end_of_the_final_message(self):
         dec = _decoder(cache_slots=2)
         _prefill(dec, _TURN1)
