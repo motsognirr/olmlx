@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import json
 import logging
-import math
 import os
 import signal
 import socket
@@ -80,30 +79,11 @@ def _worker_timeout() -> float:
     ``communicate(timeout=...)``) and warns on unparseable values so an ignored
     override is diagnosable instead of vanishing into the default.
     """
-    raw = os.environ.get("OLMLX_BENCH_WORKER_TIMEOUT", "")
-    if not raw:
-        return _DEFAULT_WORKER_TIMEOUT
-    try:
-        value = float(raw)
-    except ValueError:
-        logger.warning(
-            "Ignoring OLMLX_BENCH_WORKER_TIMEOUT=%r: not a number; using %.0fs",
-            raw,
-            _DEFAULT_WORKER_TIMEOUT,
-        )
-        return _DEFAULT_WORKER_TIMEOUT
-    # math.isfinite covers inf, -inf, and nan in one call. Negative or zero
-    # values fall through to the same warning rather than silently flipping
-    # to the default with no diagnostic.
-    if not math.isfinite(value) or value <= 0:
-        logger.warning(
-            "Ignoring OLMLX_BENCH_WORKER_TIMEOUT=%r: must be a positive finite "
-            "number; using %.0fs",
-            raw,
-            _DEFAULT_WORKER_TIMEOUT,
-        )
-        return _DEFAULT_WORKER_TIMEOUT
-    return value
+    from olmlx.bench.worker import positive_seconds_from_env
+
+    return positive_seconds_from_env(
+        os.environ, "OLMLX_BENCH_WORKER_TIMEOUT", _DEFAULT_WORKER_TIMEOUT, logger
+    )
 
 
 def build_prompts(prompt_set: str) -> list[BenchPrompt]:
@@ -284,6 +264,22 @@ def run_bench(
     # from the same single read of ``OLMLX_BENCH_WORKER_TIMEOUT``.
     worker_timeout = _worker_timeout()
     logger.info("Bench worker timeout: %.0fs", worker_timeout)
+    # The worker reads OLMLX_BENCH_REQUEST_TIMEOUT itself (it inherits this
+    # environment); resolve it here too so the run log shows it.
+    from olmlx.bench.worker import REQUEST_TIMEOUT_ENV, resolve_request_timeout
+
+    request_timeout = resolve_request_timeout(os.environ)
+    logger.info("Bench request timeout: %.0fs", request_timeout)
+    if request_timeout >= worker_timeout:
+        logger.warning(
+            "%s (%.0fs) is not below OLMLX_BENCH_WORKER_TIMEOUT (%.0fs): the "
+            "worker is killed after that for the whole scenario, losing every "
+            "prompt's result, before a request that slow can time out. Raise "
+            "OLMLX_BENCH_WORKER_TIMEOUT as well.",
+            REQUEST_TIMEOUT_ENV,
+            request_timeout,
+            worker_timeout,
+        )
     # If think is being toggled while running ``--prompt-set all``, the
     # throughput probes run in think mode too. The summary line later
     # combines tok/s and quality, but the tok/s figure won't be a

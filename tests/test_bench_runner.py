@@ -374,6 +374,46 @@ class TestRunBench:
         assert result is not None
         assert any("Could not build leaderboard" in r.message for r in caplog.records)
 
+    def _run_skipped(self, tmp_path, monkeypatch, caplog):
+        import logging
+
+        monkeypatch.setattr(
+            "olmlx.bench.runner._resolve_model_path",
+            lambda m: tmp_path / "model",
+        )
+        always_skip = Scenario(
+            name="baseline",
+            description="Baseline",
+            should_skip=lambda p: "skipped for test",
+        )
+        with (
+            patch("olmlx.bench.runner.get_scenarios", return_value=[always_skip]),
+            caplog.at_level(logging.INFO, logger="olmlx.bench.runner"),
+        ):
+            run_bench("model", bench_dir=tmp_path / "bench")
+        return [r.getMessage() for r in caplog.records]
+
+    def test_request_timeout_is_logged(self, tmp_path, monkeypatch, caplog):
+        monkeypatch.setenv("OLMLX_BENCH_REQUEST_TIMEOUT", "1200")
+        monkeypatch.delenv("OLMLX_BENCH_WORKER_TIMEOUT", raising=False)
+        messages = self._run_skipped(tmp_path, monkeypatch, caplog)
+        assert "Bench request timeout: 1200s" in messages
+        assert not any("OLMLX_BENCH_WORKER_TIMEOUT" in m for m in messages)
+
+    def test_warns_when_request_timeout_reaches_worker_timeout(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        # The worker is killed after OLMLX_BENCH_WORKER_TIMEOUT for the whole
+        # scenario, losing every prompt's result, so a request limit at or
+        # past it can never take effect.
+        monkeypatch.setenv("OLMLX_BENCH_REQUEST_TIMEOUT", "3600")
+        monkeypatch.setenv("OLMLX_BENCH_WORKER_TIMEOUT", "1800")
+        messages = self._run_skipped(tmp_path, monkeypatch, caplog)
+        assert any(
+            "OLMLX_BENCH_REQUEST_TIMEOUT" in m and "OLMLX_BENCH_WORKER_TIMEOUT" in m
+            for m in messages
+        )
+
     def test_server_mode_dispatched(self, tmp_path, monkeypatch):
         """Server-mode scenarios call _run_server_scenario, not _run_worker."""
         monkeypatch.setattr(
