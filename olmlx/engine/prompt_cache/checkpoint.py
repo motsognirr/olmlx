@@ -21,9 +21,25 @@ class Segment:
 
 @dataclass(frozen=True)
 class SegmentedPrompt:
-    """A prompt split into per-message segments, in submission order."""
+    """A prompt split into per-message segments, in submission order.
+
+    ``trailing_tokens`` counts the template tokens after the final message's
+    end-of-message marker (the generation prompt, e.g. Qwen's
+    ``\\n<|im_start|>assistant\\n``). They are part of the last segment so
+    ``flatten()`` equals the full prompt, but the next turn replaces them
+    with the reply, so the end of the final message is the deepest point a
+    follow-up request shares with this one.
+    """
 
     segments: list[Segment]
+    trailing_tokens: int = 0
+
+    def final_message_end(self) -> int | None:
+        """Offset just past the final message's end-of-message marker, or
+        ``None`` when nothing follows it (no generation prompt detected)."""
+        if self.trailing_tokens <= 0 or not self.segments:
+            return None
+        return self.total_tokens - self.trailing_tokens
 
     @property
     def total_tokens(self) -> int:

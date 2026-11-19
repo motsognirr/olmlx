@@ -353,9 +353,9 @@ def _message_boundary_token_ids(tokenizer: Any) -> set[int]:
 
     For tokenizers like Llama 2's where ``eos_token_id`` (``</s>``) can in
     principle appear inside content, ``tokenize_segmented_chat`` falls back
-    to a single-segment prompt via the ``len(boundaries) != len(messages)``
-    guard; ``_setup_via_checkpoint_path`` then skips the checkpoint path
-    for the request.
+    to a single-segment prompt with no final-message end when it finds fewer
+    boundaries than messages; ``_setup_via_checkpoint_path`` then skips the
+    checkpoint path for a cold start (a warm hit still applies).
     """
     out: set[int] = set()
     eos = getattr(tokenizer, "eos_token_id", None)
@@ -415,9 +415,10 @@ def tokenize_segmented_chat(
 
     Falls back to a single-segment prompt (logged at debug) when the
     tokenizer exposes no EOM token or the detected EOM count differs from
-    ``len(messages)``. Callers detect this via ``len(segmented.segments)
-    <= 1`` and skip the checkpoint path for the request, since a
-    single-segment prompt has no usable mid-prompt checkpoint boundary.
+    ``len(messages)``. The fallback records no ``trailing_tokens``, so it
+    has no snapshot point (``final_message_end()`` is ``None``) and a cold
+    start skips the checkpoint path. A correctly segmented single message
+    followed by a generation prompt does have one: the end of that message.
     """
     from olmlx.engine.prompt_cache.checkpoint import Segment, SegmentedPrompt
 
@@ -482,8 +483,11 @@ def tokenize_segmented_chat(
         )
 
     # Extend the last boundary to include any trailing template tokens
-    # (e.g. ``\n<|im_start|>assistant\n``) so flatten() == full.
-    if boundaries[-1] < len(full):
+    # (e.g. ``\n<|im_start|>assistant\n``) so flatten() == full, and record
+    # how many there were: the end of the final message is the deepest
+    # checkpoint a follow-up turn can reuse.
+    trailing = len(full) - boundaries[-1]
+    if trailing > 0:
         boundaries[-1] = len(full)
 
     # Build the role list, padding the front with extras using
@@ -497,7 +501,7 @@ def tokenize_segmented_chat(
     for k, end in enumerate(boundaries):
         segments.append(Segment(tokens=full[start:end], role=roles[k]))
         start = end
-    return SegmentedPrompt(segments=segments)
+    return SegmentedPrompt(segments=segments, trailing_tokens=trailing)
 
 
 def _normalize_tool_calls_in_messages(messages: list[dict]) -> list[dict]:

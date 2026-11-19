@@ -1099,3 +1099,390 @@ def test_checkpoint_kv_depth_unknown_when_layers_disagree():
     assert _checkpoint_kv_depth([a, a]) == 4
     assert _checkpoint_kv_depth([a, b]) is None
     assert _checkpoint_kv_depth([SimpleNamespace(), a]) == 4
+
+
+# The template's generation prompt after the final message's end marker
+# (Qwen: "\n<|im_start|>assistant\n<think>\n\n</think>\n\n"). Real requests
+# always end with one; next turn it is replaced by the assistant's reply.
+_GEN_PROMPT = [3, 50]
+
+
+def _prompt_with_generation_suffix(messages):
+    return _FakeTokenizer().apply_chat_template(messages) + _GEN_PROMPT
+
+
+def test_checkpoint_path_next_turn_reuses_whole_previous_final_message(monkeypatch):
+    """Each turn must leave a checkpoint covering its final message, so the
+    next turn only prefills what is new (the reply and the next message).
+
+    Before the fix the only snapshot was taken at the *start* of the final
+    message, and a single-message request took none at all: turn 2 of a chat
+    re-prefilled the whole first message, and every later turn re-prefilled
+    the previous turn's final message (in an agent loop, the tool result).
+    """
+    from olmlx.engine import inference as inference_mod
+    from olmlx.engine.inference import _setup_prompt_cache
+
+    monkeypatch.setattr(
+        inference_mod, "_make_prompt_cache_for_lm", lambda m: [KVCache()]
+    )
+    tok = _FakeTokenizer()
+    lm = LoadedModel(
+        name="x",
+        hf_path="y",
+        model=_DummyModel(),
+        tokenizer=tok,
+        prompt_cache_store=PromptCacheStore(max_slots=8),
+        uses_checkpoint_persistence=True,
+        supports_cache_persistence=True,
+    )
+
+    async def _turn(messages):
+        cs = await _setup_prompt_cache(
+            lm,
+            "ignored",
+            {},
+            prompt_tokens=_prompt_with_generation_suffix(messages),
+            cache_id="t",
+            messages=messages,
+            tokenizer=tok,
+        )
+        if cs.deferred_prefill is not None:
+            # Production runs the drive on the generation worker thread and
+            # marshals the checkpoint insert back onto the loop.
+            await asyncio.to_thread(cs.deferred_prefill, None)
+            await asyncio.sleep(0)
+        return cs
+
+    turn1 = [{"role": "user", "content": "CD"}]
+    turn2 = turn1 + [
+        {"role": "assistant", "content": "EF"},
+        {"role": "user", "content": "GH"},
+    ]
+    turn3 = turn2 + [
+        {"role": "assistant", "content": "IJ"},
+        {"role": "user", "content": "KL"},
+    ]
+
+    async def _conversation():
+        await _turn(turn1)
+        cs2 = await _turn(turn2)
+        cs3 = await _turn(turn3)
+        return cs2, cs3
+
+    cs2, cs3 = asyncio.run(_conversation())
+
+    turn1_messages_len = len(tok.apply_chat_template(turn1))
+    turn2_messages_len = len(tok.apply_chat_template(turn2))
+    assert cs2.cache_read_tokens == turn1_messages_len, (
+        f"turn 2 should reuse all {turn1_messages_len} tokens of turn 1's "
+        f"message, read {cs2.cache_read_tokens}"
+    )
+    assert cs3.cache_read_tokens == turn2_messages_len, (
+        f"turn 3 should reuse all {turn2_messages_len} tokens of turn 2's "
+        f"messages, read {cs3.cache_read_tokens}"
+    )
+
+
+def test_drive_snapshots_at_end_of_final_message_before_generation_prompt():
+    """Warm start: the drive's snapshot point is the end of the final message
+    (its end-of-message marker), not its start, and it uses two chunks."""
+    tok = _FakeTokenizer()
+    messages = [
+        {"role": "system", "content": "AB"},
+        {"role": "user", "content": "CD"},
+        {"role": "assistant", "content": "EF"},
+        {"role": "user", "content": "GH"},
+    ]
+    flat = _prompt_with_generation_suffix(messages)
+    covered = len(tok.apply_chat_template(messages[:2]))
+    end_of_user = len(tok.apply_chat_template(messages))
+    sp = tokenize_segmented_chat(tok, messages, full_tokens=flat)
+    model = _DummyModel()
+    store = PromptCacheStore(max_slots=8)
+    cache = [KVCache()]
+    cache[0].update_and_fetch(
+        mx.zeros((1, 1, covered, 4)), mx.zeros((1, 1, covered, 4))
+    )
+
+    suffix = _drive_segmented_prefill(
+        model=model,
+        segmented=sp,
+        cache=cache,
+        insert_checkpoint=store.insert_checkpoint,
+        already_covered_tokens=covered,
+    )
+
+    assert model.calls == [flat[covered:end_of_user], flat[end_of_user:-1]]
+    assert suffix == [flat[-1]]
+    assert len(store) == 1
+    hit = store.fetch_nearest(flat[:end_of_user] + [3, 99])
+    assert hit is not None
+    state, _ = hit
+    assert state.tokens == flat[:end_of_user]
+    assert state.cache_type == "user"
+
+
+def test_drive_cold_start_also_keeps_the_shared_system_prompt_checkpoint():
+    """A cold first turn must still leave a checkpoint at the end of the system
+    prompt: it is the prefix every new conversation (or subagent) with the
+    same system prompt and tools shares. It is kept alongside the end of the
+    final message, which serves this conversation's next turn."""
+    tok = _FakeTokenizer()
+    messages = [
+        {"role": "system", "content": "AB"},
+        {"role": "user", "content": "CD"},
+    ]
+    flat = _prompt_with_generation_suffix(messages)
+    end_of_system = len(tok.apply_chat_template(messages[:1]))
+    end_of_user = len(tok.apply_chat_template(messages))
+    sp = tokenize_segmented_chat(tok, messages, full_tokens=flat)
+    model = _DummyModel()
+    store = PromptCacheStore(max_slots=8)
+
+    _drive_segmented_prefill(
+        model=model,
+        segmented=sp,
+        cache=[KVCache()],
+        insert_checkpoint=store.insert_checkpoint,
+    )
+
+    assert model.calls == [
+        flat[:end_of_system],
+        flat[end_of_system:end_of_user],
+        flat[end_of_user:-1],
+    ]
+    # A different conversation with the same system prompt reuses it.
+    other_conversation = flat[:end_of_system] + [2, 88, 9, 3, 50]
+    hit = store.fetch_nearest(other_conversation)
+    assert hit is not None
+    assert hit[0].tokens == flat[:end_of_system]
+    assert hit[0].cache_type == "system"
+    # This conversation's next turn reuses the whole first turn.
+    hit = store.fetch_nearest(flat[:end_of_user] + [3, 99])
+    assert hit is not None
+    assert hit[0].tokens == flat[:end_of_user]
+
+
+def test_setup_keeps_pure_rotating_single_message_on_stream_generate(monkeypatch):
+    """Pure-RotatingKVCache layouts (gpt-oss, Gemma 3) prefill the drive in one
+    forward. A single-message request must keep skipping the drive so a long
+    one-shot prompt is prefilled by stream_generate in bounded steps."""
+    from olmlx.engine import inference as inference_mod
+    from olmlx.engine.inference import _setup_prompt_cache
+
+    monkeypatch.setattr(
+        inference_mod,
+        "_make_prompt_cache_for_lm",
+        lambda m: [RotatingKVCache(max_size=8)],
+    )
+    tok = _FakeTokenizer()
+    lm = LoadedModel(
+        name="x",
+        hf_path="y",
+        model=_DummyModel(),
+        tokenizer=tok,
+        prompt_cache_store=PromptCacheStore(max_slots=8),
+        uses_checkpoint_persistence=True,
+        supports_cache_persistence=True,
+    )
+    messages = [{"role": "user", "content": "CD"}]
+    tokens = _prompt_with_generation_suffix(messages)
+
+    cs = asyncio.run(
+        _setup_prompt_cache(
+            lm,
+            "ignored",
+            {},
+            prompt_tokens=tokens,
+            cache_id="t",
+            messages=messages,
+            tokenizer=tok,
+        )
+    )
+
+    assert cs.deferred_prefill is None
+    assert cs.prompt == tokens
+
+
+def test_drive_aborts_with_memory_error_past_the_memory_limit(monkeypatch):
+    """The drive replaces stream_generate's prefill, so it must keep the same
+    safety net: stop before the next forward once Metal memory passes the
+    limit, rather than run on into an OOM or a GPU timeout."""
+    monkeypatch.setattr(mx, "get_active_memory", lambda: 10_000)
+    monkeypatch.setattr(mx, "get_cache_memory", lambda: 0)
+    tok = _FakeTokenizer()
+    messages = [{"role": "user", "content": "CD"}]
+    sp = tokenize_segmented_chat(
+        tok, messages, full_tokens=_prompt_with_generation_suffix(messages)
+    )
+    model = _DummyModel()
+    store = PromptCacheStore(max_slots=8)
+
+    with pytest.raises(MemoryError):
+        _drive_segmented_prefill(
+            model=model,
+            segmented=sp,
+            cache=[KVCache()],
+            insert_checkpoint=store.insert_checkpoint,
+            memory_limit=5_000,
+        )
+    assert model.calls == []
+    assert len(store) == 0
+
+
+def test_checkpoint_setup_passes_the_memory_limit_to_the_drive(monkeypatch):
+    from olmlx.engine import inference as inference_mod
+    from olmlx.engine.inference import _setup_prompt_cache
+
+    monkeypatch.setattr(
+        inference_mod, "_make_prompt_cache_for_lm", lambda m: [KVCache()]
+    )
+    monkeypatch.setattr(inference_mod, "_prefill_memory_limit", lambda: 5_000)
+    tok = _FakeTokenizer()
+    lm = LoadedModel(
+        name="x",
+        hf_path="y",
+        model=_DummyModel(),
+        tokenizer=tok,
+        prompt_cache_store=PromptCacheStore(max_slots=8),
+        uses_checkpoint_persistence=True,
+        supports_cache_persistence=True,
+    )
+    messages = [{"role": "user", "content": "CD"}]
+
+    cs = asyncio.run(
+        _setup_prompt_cache(
+            lm,
+            "ignored",
+            {},
+            prompt_tokens=_prompt_with_generation_suffix(messages),
+            cache_id="t",
+            messages=messages,
+            tokenizer=tok,
+        )
+    )
+
+    # Memory passes the limit only once generation starts, after setup's own
+    # pressure check.
+    monkeypatch.setattr(mx, "get_active_memory", lambda: 10_000)
+    monkeypatch.setattr(mx, "get_cache_memory", lambda: 0)
+    assert cs.deferred_prefill is not None
+    with pytest.raises(MemoryError):
+        cs.deferred_prefill(None)
+
+
+def test_prefill_memory_limit_follows_the_memory_limit_fraction(monkeypatch):
+    from unittest.mock import MagicMock
+
+    from olmlx.engine import inference as inference_mod
+
+    monkeypatch.setattr(
+        inference_mod.memory_utils, "get_system_memory_bytes", lambda: 1_000
+    )
+    monkeypatch.setattr(inference_mod.settings, "memory_limit_fraction", 0.5)
+    assert inference_mod._prefill_memory_limit() == 500
+
+    # A MagicMock settings object must disable the guard, not yield int() == 1.
+    monkeypatch.setattr(inference_mod, "settings", MagicMock())
+    assert inference_mod._prefill_memory_limit() == 0
+
+
+def test_drive_cold_start_keeps_the_first_segment_not_the_second_to_last():
+    """On a cold start of a longer conversation the extra snapshot is the end
+    of the first segment (the shared system prompt), not the end of the
+    second-to-last message, which no other request shares."""
+    tok = _FakeTokenizer()
+    messages = [
+        {"role": "system", "content": "AB"},
+        {"role": "user", "content": "CD"},
+        {"role": "assistant", "content": "EF"},
+        {"role": "user", "content": "GH"},
+    ]
+    flat = _prompt_with_generation_suffix(messages)
+    end_of_system = len(tok.apply_chat_template(messages[:1]))
+    end_of_last_user = len(tok.apply_chat_template(messages))
+    sp = tokenize_segmented_chat(tok, messages, full_tokens=flat)
+    model = _DummyModel()
+    stored: list = []
+
+    _drive_segmented_prefill(
+        model=model,
+        segmented=sp,
+        cache=[KVCache()],
+        insert_checkpoint=stored.append,
+    )
+
+    assert [s.tokens for s in stored] == [
+        flat[:end_of_system],
+        flat[:end_of_last_user],
+    ]
+    assert model.calls == [
+        flat[:end_of_system],
+        flat[end_of_system:end_of_last_user],
+        flat[end_of_last_user:-1],
+    ]
+
+
+def test_drive_skips_a_snapshot_whose_copy_would_pass_the_memory_limit(monkeypatch):
+    """The snapshot deep copy is the drive's largest allocation. When the copy
+    would push memory past the limit the snapshot is skipped (caching is
+    optional); prefill itself carries on while memory stays under the limit."""
+    monkeypatch.setattr(mx, "get_active_memory", lambda: 1_000)
+    monkeypatch.setattr(mx, "get_cache_memory", lambda: 0)
+    tok = _FakeTokenizer()
+    messages = [{"role": "user", "content": "CD"}]
+    flat = _prompt_with_generation_suffix(messages)
+    sp = tokenize_segmented_chat(tok, messages, full_tokens=flat)
+    model = _DummyModel()
+    stored: list = []
+
+    suffix = _drive_segmented_prefill(
+        model=model,
+        segmented=sp,
+        cache=[KVCache()],
+        insert_checkpoint=stored.append,
+        memory_limit=1_001,  # forwards fit; a copy of the cache does not
+    )
+
+    assert stored == []
+    assert sum(len(c) for c in model.calls) == len(flat) - 1
+    assert suffix == [flat[-1]]
+
+
+def test_prefill_memory_limit_accepts_a_float_system_memory(monkeypatch):
+    from olmlx.engine import inference as inference_mod
+
+    monkeypatch.setattr(
+        inference_mod.memory_utils, "get_system_memory_bytes", lambda: 1_000.0
+    )
+    monkeypatch.setattr(inference_mod.settings, "memory_limit_fraction", 0.5)
+    assert inference_mod._prefill_memory_limit() == 500
+
+
+def test_drive_memory_probe_failure_disables_the_guard(monkeypatch):
+    """Like stream_generate's prompt_progress_callback, a failing Metal memory
+    query switches the guard off instead of failing the request."""
+
+    def _broken():
+        raise RuntimeError("metal query failed")
+
+    monkeypatch.setattr(mx, "get_active_memory", _broken)
+    tok = _FakeTokenizer()
+    messages = [{"role": "user", "content": "CD"}]
+    flat = _prompt_with_generation_suffix(messages)
+    sp = tokenize_segmented_chat(tok, messages, full_tokens=flat)
+    model = _DummyModel()
+    stored: list = []
+
+    suffix = _drive_segmented_prefill(
+        model=model,
+        segmented=sp,
+        cache=[KVCache()],
+        insert_checkpoint=stored.append,
+        memory_limit=1_000,
+    )
+
+    assert suffix == [flat[-1]]
+    assert sum(len(c) for c in model.calls) == len(flat) - 1
+    assert len(stored) == 1
