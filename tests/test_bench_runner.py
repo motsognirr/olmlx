@@ -374,7 +374,7 @@ class TestRunBench:
         assert result is not None
         assert any("Could not build leaderboard" in r.message for r in caplog.records)
 
-    def _run_skipped(self, tmp_path, monkeypatch, caplog):
+    def _run_skipped(self, tmp_path, monkeypatch, caplog, *, server_mode=False):
         import logging
 
         monkeypatch.setattr(
@@ -385,6 +385,7 @@ class TestRunBench:
             name="baseline",
             description="Baseline",
             should_skip=lambda p: "skipped for test",
+            server_mode=server_mode,
         )
         with (
             patch("olmlx.bench.runner.get_scenarios", return_value=[always_skip]),
@@ -413,6 +414,17 @@ class TestRunBench:
             "OLMLX_BENCH_REQUEST_TIMEOUT" in m and "OLMLX_BENCH_WORKER_TIMEOUT" in m
             for m in messages
         )
+
+    def test_no_worker_timeout_warning_for_server_mode_only_runs(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        # Server-mode scenarios run prompts in the parent, not under the
+        # worker kill, so the worker timeout can't cut them short.
+        monkeypatch.setenv("OLMLX_BENCH_REQUEST_TIMEOUT", "3600")
+        monkeypatch.setenv("OLMLX_BENCH_WORKER_TIMEOUT", "1800")
+        messages = self._run_skipped(tmp_path, monkeypatch, caplog, server_mode=True)
+        assert "Bench request timeout: 3600s" in messages
+        assert not any("OLMLX_BENCH_WORKER_TIMEOUT" in m for m in messages)
 
     def test_server_mode_dispatched(self, tmp_path, monkeypatch):
         """Server-mode scenarios call _run_server_scenario, not _run_worker."""
@@ -643,3 +655,31 @@ class TestRunPromptsOverHttp:
         assert len(results) == 1
         assert results[0].status_code == 0
         assert "refused" in results[0].error.lower()
+
+    def test_uses_the_configured_request_timeout(self, monkeypatch):
+        # Server-mode (distributed) scenarios send prompts here, not through
+        # the worker, so they must honor OLMLX_BENCH_REQUEST_TIMEOUT too.
+        monkeypatch.setenv("OLMLX_BENCH_REQUEST_TIMEOUT", "1234")
+        seen = []
+
+        def fake_urlopen(req, timeout=None):
+            seen.append(timeout)
+            raise ConnectionRefusedError("refused")
+
+        prompt = {"name": "p", "category": "c", "messages": [], "max_tokens": 8}
+        with patch(
+            "olmlx.bench.runner.urllib.request.urlopen", side_effect=fake_urlopen
+        ):
+            _run_prompts_over_http("model", [prompt, prompt], None, 11434)
+        assert seen == [1234.0, 1234.0]
+
+    def test_timeout_error_names_the_limit_and_the_knob(self, monkeypatch):
+        monkeypatch.delenv("OLMLX_BENCH_REQUEST_TIMEOUT", raising=False)
+        prompt = {"name": "p", "category": "c", "messages": [], "max_tokens": 8}
+        with patch(
+            "olmlx.bench.runner.urllib.request.urlopen",
+            side_effect=TimeoutError("timed out"),
+        ):
+            results = _run_prompts_over_http("model", [prompt], None, 11434)
+        assert "300" in results[0].error
+        assert "OLMLX_BENCH_REQUEST_TIMEOUT" in results[0].error

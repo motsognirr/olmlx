@@ -77,7 +77,7 @@ def resolve_request_timeout(env: Mapping[str, str]) -> float:
     )
 
 
-def _is_timeout(exc: BaseException) -> bool:
+def is_request_timeout(exc: BaseException) -> bool:
     """Whether a urlopen failure is its timeout firing. A slow response
     raises ``TimeoutError`` directly; a slow connect wraps it in
     ``URLError``."""
@@ -85,6 +85,15 @@ def _is_timeout(exc: BaseException) -> bool:
         return True
     return isinstance(exc, urllib.error.URLError) and isinstance(
         exc.reason, TimeoutError
+    )
+
+
+def request_timeout_error(timeout: float) -> str:
+    """The error recorded for a prompt whose request hit ``timeout``: names
+    the limit and the knob that raises it, not just "timed out"."""
+    return (
+        f"timed out after {timeout:g}s; raise {REQUEST_TIMEOUT_ENV} "
+        "(and OLMLX_BENCH_WORKER_TIMEOUT) for long prompts"
     )
 
 
@@ -218,13 +227,7 @@ def _run_prompts(
                 }
             )
         except Exception as e:
-            error = str(e)
-            if _is_timeout(e):
-                error = (
-                    f"timed out after {timeout:g}s; raise "
-                    f"{REQUEST_TIMEOUT_ENV} (and OLMLX_BENCH_WORKER_TIMEOUT) "
-                    "for long prompts"
-                )
+            error = request_timeout_error(timeout) if is_request_timeout(e) else str(e)
             results.append(
                 {
                     "prompt_name": prompt["name"],

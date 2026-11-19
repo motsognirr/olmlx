@@ -270,7 +270,10 @@ def run_bench(
 
     request_timeout = resolve_request_timeout(os.environ)
     logger.info("Bench request timeout: %.0fs", request_timeout)
-    if request_timeout >= worker_timeout:
+    # Only worker scenarios run under the worker kill; server-mode ones send
+    # their prompts from this process.
+    uses_worker = any(not s.server_mode for s in scenarios)
+    if uses_worker and request_timeout >= worker_timeout:
         logger.warning(
             "%s (%.0fs) is not below OLMLX_BENCH_WORKER_TIMEOUT (%.0fs): the "
             "worker is killed after that for the whole scenario, losing every "
@@ -649,7 +652,16 @@ def _run_prompts_over_http(
     port: int,
 ) -> list[PromptResult]:
     """Send prompts to a running olmlx server over HTTP."""
+    from olmlx.bench.worker import (
+        is_request_timeout,
+        request_timeout_error,
+        resolve_request_timeout,
+    )
+
     url = f"http://127.0.0.1:{port}/api/chat"
+    # Same knob as the worker path: server-mode (distributed) scenarios
+    # send their prompts from here instead.
+    timeout = resolve_request_timeout(os.environ)
     results = []
     for prompt in prompts_data:
         tok_limit = max_tokens or prompt.get("max_tokens", 256)
@@ -670,7 +682,7 @@ def _run_prompts_over_http(
                 headers={"Content-Type": "application/json"},
                 method="POST",
             )
-            with urllib.request.urlopen(req, timeout=300) as resp:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
                 data = json.loads(resp.read().decode())
                 results.append(
                     PromptResult(
@@ -706,7 +718,11 @@ def _run_prompts_over_http(
                     category=prompt["category"],
                     output_text="",
                     status_code=0,
-                    error=str(e),
+                    error=(
+                        request_timeout_error(timeout)
+                        if is_request_timeout(e)
+                        else str(e)
+                    ),
                 )
             )
     return results
