@@ -282,6 +282,12 @@ olmlx bench list
 | `--max-tokens` | *(per-scenario)* | Override max tokens for all prompts |
 | `--output-dir` | `~/.olmlx/bench/runs` | Output directory for results |
 
+| Environment variable | Default | Description |
+|---|---|---|
+| `OLMLX_BENCH_REQUEST_TIMEOUT` | `300` | Seconds each prompt's request may take. Raise it for long prompts on slow models: `agentic-69k` prefills for about 15 minutes on a flash-MoE giant like Edge0-145B. |
+| `OLMLX_BENCH_WORKER_TIMEOUT` | `1800` | Seconds a whole scenario may take before its worker is killed and all of that scenario's results are lost. Keep it above `OLMLX_BENCH_REQUEST_TIMEOUT`; the run warns if it isn't. |
+| `OLMLX_BENCH_THINK` | *(engine default)* | `true` / `false` forces the model's thinking mode on or off for every prompt. |
+
 **Examples:**
 
 ```bash
@@ -290,6 +296,10 @@ olmlx bench run
 
 # Run specific scenarios with a larger model
 olmlx bench run --model qwen3:8b --scenarios throughput,latency
+
+# Give each prompt up to an hour (and each scenario 90 minutes) on a slow model
+OLMLX_BENCH_REQUEST_TIMEOUT=3600 OLMLX_BENCH_WORKER_TIMEOUT=5400 \
+  olmlx bench run --model Edge0/Edge0-145B-q3k --scenarios flash-moe
 
 # Compare two runs (by timestamp or path)
 olmlx bench compare 20260401T120000Z 20260402T150000Z

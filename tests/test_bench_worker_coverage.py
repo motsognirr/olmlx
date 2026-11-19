@@ -305,6 +305,60 @@ class TestRunPrompts:
 
 
 # --------------------------------------------------------------------------
+# OLMLX_BENCH_REQUEST_TIMEOUT
+# --------------------------------------------------------------------------
+class TestRequestTimeout:
+    """The per-request limit must be raisable: a ~69k-token prompt on a
+    flash-MoE giant prefills for ~15 min, so a fixed 300 s always failed it."""
+
+    def test_unset_returns_default(self):
+        assert worker.resolve_request_timeout({}) == 300.0
+
+    def test_positive_value_used(self):
+        env = {"OLMLX_BENCH_REQUEST_TIMEOUT": "1800"}
+        assert worker.resolve_request_timeout(env) == 1800.0
+
+    @pytest.mark.parametrize("raw", ["abc", "0", "-5", "inf", "nan"])
+    def test_invalid_values_warn_and_fall_back(self, raw, caplog):
+        env = {"OLMLX_BENCH_REQUEST_TIMEOUT": raw}
+        with caplog.at_level("WARNING", logger="olmlx.bench.worker"):
+            assert worker.resolve_request_timeout(env) == 300.0
+        assert any(
+            "OLMLX_BENCH_REQUEST_TIMEOUT" in r.getMessage() for r in caplog.records
+        )
+
+    def test_run_prompts_uses_the_configured_timeout(self, monkeypatch):
+        monkeypatch.delenv("OLMLX_BENCH_THINK", raising=False)
+        monkeypatch.setenv("OLMLX_BENCH_REQUEST_TIMEOUT", "1234")
+        seen = []
+
+        def fake_urlopen(req, timeout=None):
+            seen.append(timeout)
+            return _ok_response({"message": {"content": "x"}})
+
+        with patch.object(worker.urllib.request, "urlopen", side_effect=fake_urlopen):
+            _run_prompts(11435, "m", [_prompt(), _prompt(name="p2")], None)
+        assert seen == [1234.0, 1234.0]
+
+    @pytest.mark.parametrize(
+        "exc",
+        [
+            TimeoutError("timed out"),
+            urllib.error.URLError(TimeoutError("timed out")),
+        ],
+        ids=["read", "connect"],
+    )
+    def test_timeout_error_names_the_limit_and_the_knob(self, monkeypatch, exc):
+        monkeypatch.delenv("OLMLX_BENCH_THINK", raising=False)
+        monkeypatch.delenv("OLMLX_BENCH_REQUEST_TIMEOUT", raising=False)
+        with patch.object(worker.urllib.request, "urlopen", side_effect=exc):
+            results = _run_prompts(11435, "m", [_prompt()], None)
+        error = results[0]["error"]
+        assert "300" in error
+        assert "OLMLX_BENCH_REQUEST_TIMEOUT" in error
+
+
+# --------------------------------------------------------------------------
 # main
 # --------------------------------------------------------------------------
 class TestMain:

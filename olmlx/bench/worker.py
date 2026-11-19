@@ -13,6 +13,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import math
 import os
 import subprocess
 import sys
@@ -28,6 +29,74 @@ logger = logging.getLogger(__name__)
 _SERVER_PORT = 11435  # Use a non-default port to avoid conflicts
 _SERVER_STARTUP_TIMEOUT = 120
 _SERVER_POLL_INTERVAL = 1
+REQUEST_TIMEOUT_ENV = "OLMLX_BENCH_REQUEST_TIMEOUT"
+_DEFAULT_REQUEST_TIMEOUT = 300.0
+
+
+def positive_seconds_from_env(
+    env: Mapping[str, str], name: str, default: float, log: logging.Logger
+) -> float:
+    """Read a timeout in seconds from ``env[name]``, else ``default``.
+
+    Rejects ``inf`` / ``nan`` (a timeout of either never fires) and zero or
+    negative values, and warns on anything it ignores, so a typo'd override
+    is diagnosable instead of silently becoming the default. ``log`` is the
+    caller's logger, so the warning names the module that reads the knob.
+    """
+    raw = env.get(name, "")
+    if not raw:
+        return default
+    try:
+        value = float(raw)
+    except ValueError:
+        log.warning("Ignoring %s=%r: not a number; using %.0fs", name, raw, default)
+        return default
+    # math.isfinite covers inf, -inf, and nan in one call.
+    if not math.isfinite(value) or value <= 0:
+        log.warning(
+            "Ignoring %s=%r: must be a positive finite number; using %.0fs",
+            name,
+            raw,
+            default,
+        )
+        return default
+    return value
+
+
+def resolve_request_timeout(env: Mapping[str, str]) -> float:
+    """Per-request HTTP timeout, in seconds, from ``OLMLX_BENCH_REQUEST_TIMEOUT``.
+
+    Defaults to 300 s, plenty for the short probes on any model that fits in
+    memory. A long prompt on a flash-MoE giant needs more: ``agentic-69k``
+    prefills ~69k tokens at ~78 tok/s on Edge0-145B (about 15 min), so it
+    always failed at 300 s. The whole scenario still runs under
+    ``OLMLX_BENCH_WORKER_TIMEOUT``, so raise that too.
+    """
+    return positive_seconds_from_env(
+        env, REQUEST_TIMEOUT_ENV, _DEFAULT_REQUEST_TIMEOUT, logger
+    )
+
+
+def is_request_timeout(exc: BaseException) -> bool:
+    """Whether a urlopen failure is its timeout firing. A slow response
+    raises ``TimeoutError`` directly; a slow connect wraps it in
+    ``URLError``."""
+    if isinstance(exc, TimeoutError):
+        return True
+    return isinstance(exc, urllib.error.URLError) and isinstance(
+        exc.reason, TimeoutError
+    )
+
+
+def request_timeout_error(
+    timeout: float, *, mention_worker_timeout: bool = True
+) -> str:
+    """The error recorded for a prompt whose request hit ``timeout``: names
+    the limit and the knob that raises it, not just "timed out". Only the
+    worker path runs under ``OLMLX_BENCH_WORKER_TIMEOUT``; the server-mode
+    path passes ``mention_worker_timeout=False``."""
+    also = " (and OLMLX_BENCH_WORKER_TIMEOUT)" if mention_worker_timeout else ""
+    return f"timed out after {timeout:g}s; raise {REQUEST_TIMEOUT_ENV}{also} for long prompts"
 
 
 def _wait_for_server(port: int, proc: subprocess.Popen, timeout: float) -> bool:
@@ -101,6 +170,7 @@ def _run_prompts(
     """Send prompts to a running server over HTTP."""
     url = f"http://127.0.0.1:{port}/api/chat"
     think = _resolve_bench_think(os.environ)
+    timeout = resolve_request_timeout(os.environ)
     results = []
     for prompt in prompts:
         tok_limit = max_tokens_override or prompt.get("max_tokens", 256)
@@ -123,7 +193,7 @@ def _run_prompts(
                 headers={"Content-Type": "application/json"},
                 method="POST",
             )
-            with urllib.request.urlopen(req, timeout=300) as resp:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
                 data = json.loads(resp.read().decode())
                 results.append(
                     {
@@ -159,13 +229,14 @@ def _run_prompts(
                 }
             )
         except Exception as e:
+            error = request_timeout_error(timeout) if is_request_timeout(e) else str(e)
             results.append(
                 {
                     "prompt_name": prompt["name"],
                     "category": prompt["category"],
                     "output_text": "",
                     "status_code": 0,
-                    "error": str(e),
+                    "error": error,
                     "eval_count": 0,
                     "eval_duration_ns": 0,
                     "prompt_eval_count": 0,
