@@ -243,7 +243,7 @@ class _SpecCacheStore:
     def _eviction_victim(self) -> _SpecCacheEntry:
         """The tip to drop, least-recently-used first within each tier:
 
-        1. A tip that a later-taken entry extends. It is that conversation's
+        1. A tip that a later-taken tip extends. It is that conversation's
            previous snapshot; its next turn continues the newer one, so two
            interleaved conversations keep both their tips. "Later" is
            insertion order, not LRU order: a lookup that promotes the old tip
@@ -254,6 +254,8 @@ class _SpecCacheStore:
 
         A preamble is never the victim; it has its own slot.
         """
+        # Only another tip can supersede a tip: a system-prompt snapshot is
+        # no conversation's continuation, even if a tip is a prefix of it.
         tips = [e for e in self._entries if not e.preamble]
         for entry in tips:
             n = len(entry.tokens)
@@ -261,7 +263,7 @@ class _SpecCacheStore:
                 newer.seq > entry.seq
                 and len(newer.tokens) > n
                 and newer.tokens[:n] == entry.tokens
-                for newer in self._entries
+                for newer in tips
             ):
                 return entry
         return tips[0]

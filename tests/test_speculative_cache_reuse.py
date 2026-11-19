@@ -179,6 +179,16 @@ class TestSpecCacheStore:
         store.insert([3, 4], payload="system B", preamble=True)
         assert [e.payload for e in store._entries] == ["system B"]
 
+    def test_a_preamble_does_not_supersede_a_tip(self):
+        # A system-prompt snapshot is no conversation's continuation, even if
+        # a tip happens to be a prefix of it; the LRU tip goes instead.
+        store = _SpecCacheStore(capacity=2)
+        store.insert([5, 5], payload="tip B")
+        store.insert([1, 2], payload="tip A")
+        store.insert([1, 2, 3], payload="system", preamble=True)
+        store.insert([7, 7], payload="tip C")
+        assert {e.payload for e in store._entries} == {"tip A", "system", "tip C"}
+
     def test_a_new_snapshot_is_never_superseded_by_an_older_one(self):
         # A rewound conversation's new tip is a prefix of its old, deeper
         # tip; an extend-only cache can only continue the new one.
