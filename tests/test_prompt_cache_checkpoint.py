@@ -405,3 +405,48 @@ def test_snapshot_spectralquant_cache_deepcopies():
     assert snap is not sq
     snap_via_path = snapshot_cache_for_persistence([sq], eager_eval=False)
     assert snap_via_path[0] is not sq
+
+
+# --- snapshot_points (#781): one rule for both prefill drives ---------------
+
+
+def _chat(*lists: list[int], trailing: int = 0) -> SegmentedPrompt:
+    """system + users; the last segment carries ``trailing`` generation-prompt
+    tokens, as ``tokenize_segmented_chat`` builds it."""
+    roles = ["system"] + ["user"] * (len(lists) - 1)
+    return SegmentedPrompt(
+        segments=[Segment(tokens=list(t), role=r) for t, r in zip(lists, roles)],
+        trailing_tokens=trailing,
+    )
+
+
+def test_snapshot_points_cold_start_keeps_first_segment_and_final_message_end():
+    # system [1,2,3] | user [4,5,6,7] where 6,7 are the generation prompt.
+    sp = _chat([1, 2, 3], [4, 5, 6, 7], trailing=2)
+    assert sp.snapshot_points(0) == [(3, "system"), (5, "user")]
+
+
+def test_snapshot_points_warm_start_keeps_only_final_message_end():
+    sp = _chat([1, 2, 3], [4, 5], [6, 7, 8, 9], trailing=2)
+    assert sp.snapshot_points(5) == [(7, "user")]
+
+
+def test_snapshot_points_can_leave_out_the_first_segment():
+    sp = _chat([1, 2, 3], [4, 5, 6, 7], trailing=2)
+    assert sp.snapshot_points(0, include_first_segment=False) == [(5, "user")]
+
+
+def test_snapshot_points_single_message_snapshots_its_end():
+    sp = _chat([1, 2, 3, 4], trailing=2)
+    assert sp.snapshot_points(0) == [(2, "system")]
+
+
+def test_snapshot_points_without_generation_prompt_use_deepest_interior_boundary():
+    sp = _chat([1, 2, 3], [4, 5], [6, 7])
+    assert sp.snapshot_points(0) == [(5, "user")]
+    assert sp.snapshot_points(5) == []
+
+
+def test_snapshot_points_none_past_the_final_message_end():
+    sp = _chat([1, 2, 3], [4, 5, 6, 7], trailing=2)
+    assert sp.snapshot_points(5) == []

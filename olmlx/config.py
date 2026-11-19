@@ -433,7 +433,8 @@ class Settings(BaseSettings):
     #: ``OLMLX_MEMORY_LIMIT_FRACTION``, so raise this only with headroom to
     #: spare. ``0`` disables reuse entirely (fresh prefill every turn — the
     #: pre-#421 behavior, useful as a kill switch). Only the ``classic`` and
-    #: ``pld`` strategies honor this; ``dflash``/``eagle`` always fresh-prefill.
+    #: ``pld`` strategies honor this; ``dflash``/``eagle``/``mtp`` always
+    #: fresh-prefill.
     speculative_cache_slots: Annotated[int, Field(ge=0)] = 2
 
     # Tree-structured speculative verification (#358).  When enabled,

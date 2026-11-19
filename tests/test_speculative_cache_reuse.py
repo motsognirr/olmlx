@@ -10,6 +10,7 @@ segmented-prefix reuse logic in `SpeculativeDecoder.prefill` /
 from __future__ import annotations
 
 import mlx.core as mx
+from mlx_lm.models.cache import KVCache
 
 from olmlx.engine.prompt_cache.checkpoint import Segment, SegmentedPrompt
 from olmlx.engine.speculative import (
@@ -97,6 +98,70 @@ class TestSpecCacheStore:
         store.insert([4, 4], payload="other")
         assert store.find([1, 2, 3]) is not None
         assert store.find([4, 4]) is not None
+
+    # --- #781: lookups and eviction for end-of-final-message snapshots ---
+
+    def test_full_prefix_lookup_skips_longer_partial_overlaps(self):
+        # An extend-only (hybrid) cache can't use an entry that diverges from
+        # the prompt, however long the overlap: only a strict prefix counts.
+        store = _SpecCacheStore(capacity=4)
+        store.insert([1, 2, 3], payload="system", preamble=True)
+        store.insert([1, 2, 3, 4, 5], payload="other conversation")
+        hit = store.find([1, 2, 3, 4, 9, 9], full_prefix_only=True)
+        assert hit is not None
+        entry, common = hit
+        assert entry.payload == "system"
+        assert common == 3
+
+    def test_full_prefix_lookup_ignores_an_exact_match(self):
+        # An exact match leaves no token to forward for the seeding logit.
+        store = _SpecCacheStore(capacity=2)
+        store.insert([1, 2, 3], payload="A")
+        assert store.find([1, 2, 3], full_prefix_only=True) is None
+
+    def test_eviction_drops_a_superseded_tip_first(self):
+        # A conversation's previous snapshot is a prefix of its new one; the
+        # next turn extends the new one, so the old one goes first, not the
+        # LRU entry (another conversation's tip).
+        store = _SpecCacheStore(capacity=2)
+        store.insert([7, 7], payload="other conversation")
+        store.insert([1, 2], payload="turn 1")
+        store.insert([1, 2, 3, 4], payload="turn 2")
+        assert [e.payload for e in store._entries] == [
+            "other conversation",
+            "turn 2",
+        ]
+
+    def test_eviction_keeps_a_preamble_its_tip_extends(self):
+        # The system-prompt snapshot is a prefix of its own conversation's
+        # tip by design; it is not superseded by it.
+        store = _SpecCacheStore(capacity=2)
+        store.insert([1, 2], payload="system", preamble=True)
+        store.insert([1, 2, 3], payload="turn 1")
+        store.insert([1, 2, 3, 4], payload="turn 2")
+        assert [e.payload for e in store._entries] == ["system", "turn 2"]
+
+    def test_eviction_prefers_a_preamble_over_a_live_tip(self):
+        store = _SpecCacheStore(capacity=2)
+        store.insert([1, 2], payload="system", preamble=True)
+        store.insert([1, 2, 3], payload="conversation A")
+        store.insert([1, 2, 4], payload="conversation B")
+        assert [e.payload for e in store._entries] == [
+            "conversation A",
+            "conversation B",
+        ]
+
+    def test_a_new_snapshot_is_never_superseded_by_an_older_one(self):
+        # A rewound conversation's new tip is a prefix of its old, deeper
+        # tip; an extend-only cache can only continue the new one.
+        store = _SpecCacheStore(capacity=2)
+        store.insert([5, 5], payload="other conversation")
+        store.insert([1, 2, 3, 4], payload="before rewind")
+        store.insert([1, 2], payload="after rewind")
+        assert [e.payload for e in store._entries] == [
+            "before rewind",
+            "after rewind",
+        ]
 
 
 class TestReuseDecision:
@@ -341,3 +406,147 @@ class TestStreamPlumbing:
         self._drain(dec, seg.flatten(), None)
         assert dec._last_reused_tokens == 0
         assert dec._cache_store.find(seg.flatten()) is None
+
+
+# --- #781: snapshot at the end of the final message --------------------------
+
+_GEN = [8, 9]  # the generation prompt; the next turn replaces it with the reply
+_SYSTEM = [1, 2, 3]
+_U1 = [4, 5]
+_A1 = [8, 9, 20, 21]  # rendered reply: starts where the generation prompt did
+_U2 = [22, 23]
+_A2 = [8, 9, 24]
+_U3 = [25]
+
+
+def _turn(*messages: list[int]) -> SegmentedPrompt:
+    """A chat prompt with one segment per message and the generation prompt
+    appended to the last one, as ``tokenize_segmented_chat`` builds it."""
+    segs = [Segment(tokens=list(m), role="user") for m in messages]
+    segs[-1] = Segment(tokens=list(messages[-1]) + _GEN, role="user")
+    return SegmentedPrompt(segments=segs, trailing_tokens=len(_GEN))
+
+
+_TURN1 = _turn(_SYSTEM, _U1)  # final message ends at 5
+_TURN2 = _turn(_SYSTEM, _U1, _A1, _U2)  # ... at 11
+_TURN3 = _turn(_SYSTEM, _U1, _A1, _U2, _A2, _U3)
+
+
+class _ExtendOnlyCache(KVCache):
+    """A KVCache the reuse logic classifies as non-trimmable (it goes by class
+    name), standing in for a hybrid GatedDeltaNet cache."""
+
+
+class _ExtendOnlyModel(MockModel):
+    def make_cache(self):
+        return [_ExtendOnlyCache() for _ in self.layers]
+
+
+def _extend_only_decoder(cache_slots: int = 2) -> SpeculativeDecoder:
+    return SpeculativeDecoder(
+        draft_model=_ExtendOnlyModel(64, 16),
+        target_model=_ExtendOnlyModel(64, 16),
+        num_speculative_tokens=2,
+        cache_slots=cache_slots,
+    )
+
+
+def _prefill(dec, seg: SegmentedPrompt) -> int:
+    return dec.prefill(mx.array([seg.flatten()]), segmented=seg)
+
+
+def _stored(dec) -> list[tuple[list[int], bool]]:
+    return [(e.tokens, e.preamble) for e in dec._cache_store._entries]
+
+
+class TestFinalMessageEndSnapshot:
+    def test_classic_snapshots_the_end_of_the_final_message(self):
+        dec = _decoder(cache_slots=2)
+        _prefill(dec, _TURN1)
+        # A trimmable cache serves the system prompt from any deeper
+        # snapshot, so it keeps no separate one.
+        assert _stored(dec) == [([1, 2, 3, 4, 5], False)]
+
+    def test_classic_next_turn_prefills_only_the_reply_and_new_message(self):
+        dec = _decoder(cache_slots=2)
+        _prefill(dec, _TURN1)
+        _prefill(dec, _TURN2)
+        assert dec._last_reused_tokens == 5
+        _prefill(dec, _TURN3)
+        assert dec._last_reused_tokens == 11
+
+    def test_classic_reuse_is_token_identical_to_fresh_prefill(self):
+        dec = _decoder(cache_slots=2)
+        fresh = _prefill(dec, _TURN2)
+        dec._cache_store.clear()
+        _prefill(dec, _TURN1)
+        reused = _prefill(dec, _TURN2)
+        assert dec._last_reused_tokens == 5
+        assert reused == fresh
+
+    def test_classic_single_message_prompt_is_snapshotted(self):
+        dec = _decoder(cache_slots=2)
+        first = _turn([1, 2, 3, 4])
+        _prefill(dec, first)
+        assert _stored(dec) == [([1, 2, 3, 4], False)]
+        _prefill(dec, _turn([1, 2, 3, 4], [8, 9, 20], [21]))
+        assert dec._last_reused_tokens == 4
+
+    def test_pld_snapshots_the_end_of_the_final_message(self):
+        dec = _pld(cache_slots=2)
+        _prefill(dec, _TURN1)
+        assert _stored(dec) == [([1, 2, 3, 4, 5], False)]
+        _prefill(dec, _TURN2)
+        assert dec._last_reused_tokens == 5
+        assert dec._tokens == _TURN2.flatten()
+
+    def test_extend_only_cold_start_also_keeps_the_system_prompt(self):
+        dec = _extend_only_decoder()
+        _prefill(dec, _TURN1)
+        assert _stored(dec) == [([1, 2, 3], True), ([1, 2, 3, 4, 5], False)]
+
+    def test_extend_only_new_conversation_reuses_the_system_prompt(self):
+        # The other conversation's tip overlaps the new prompt further
+        # ([1, 2, 3, 4]) but diverges from it, so it is unusable.
+        dec = _extend_only_decoder()
+        _prefill(dec, _TURN1)
+        _prefill(dec, _turn(_SYSTEM, [4, 6]))
+        assert dec._last_reused_tokens == 3
+
+    def test_extend_only_agent_loop_keeps_the_system_prompt(self):
+        dec = _extend_only_decoder(cache_slots=2)
+        _prefill(dec, _TURN1)
+        _prefill(dec, _TURN2)
+        assert dec._last_reused_tokens == 5
+        _prefill(dec, _TURN3)
+        assert dec._last_reused_tokens == 11
+        assert [preamble for _, preamble in _stored(dec)] == [True, False]
+        _prefill(dec, _turn(_SYSTEM, [7]))
+        assert dec._last_reused_tokens == 3
+
+    def test_extend_only_two_interleaved_conversations_both_reuse(self):
+        dec = _extend_only_decoder(cache_slots=2)
+        b1 = _turn(_SYSTEM, [6])
+        b2 = _turn(_SYSTEM, [6], [8, 9, 30], [31])
+        _prefill(dec, _TURN1)
+        _prefill(dec, b1)
+        _prefill(dec, _TURN2)
+        assert dec._last_reused_tokens == 5
+        _prefill(dec, b2)
+        assert dec._last_reused_tokens == 4
+        _prefill(dec, _TURN3)
+        assert dec._last_reused_tokens == 11
+
+    def test_pld_extend_only_cold_start_also_keeps_the_system_prompt(self):
+        dec = PromptLookupDecoder(
+            target_model=_ExtendOnlyModel(64, 16),
+            num_speculative_tokens=3,
+            max_ngram_size=2,
+            min_ngram_size=1,
+            lookup_window=8192,
+            cache_slots=2,
+        )
+        _prefill(dec, _TURN1)
+        assert _stored(dec) == [([1, 2, 3], True), ([1, 2, 3, 4, 5], False)]
+        _prefill(dec, _turn(_SYSTEM, [4, 6]))
+        assert dec._last_reused_tokens == 3

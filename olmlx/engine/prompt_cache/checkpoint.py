@@ -41,6 +41,40 @@ class SegmentedPrompt:
             return None
         return self.total_tokens - self.trailing_tokens
 
+    def snapshot_points(
+        self, already_covered: int = 0, *, include_first_segment: bool = True
+    ) -> list[tuple[int, SegmentRole]]:
+        """Offsets to snapshot the cache at while prefilling past
+        ``already_covered``, shallowest first, each with the role of the
+        segment it ends. Both prefill drives (plain and speculative) use it.
+
+        The deepest is the end of the final message: the next turn keeps that
+        message verbatim and only replaces the generation prompt with the
+        reply, so a snapshot there leaves just the reply and the new message
+        to prefill. A cold start (``already_covered == 0``) also keeps the end
+        of the first segment, the system prompt or template-injected tools
+        block that every new conversation with the same setup shares, unless
+        ``include_first_segment`` is False (a trimmable cache can serve that
+        prefix from any deeper snapshot). With no generation prompt detected
+        the deepest interior message boundary is used instead. Offsets are
+        always strictly inside ``(already_covered, total_tokens)``.
+        """
+        total = self.total_tokens
+        boundaries = self.boundary_offsets()
+        end = self.final_message_end()
+        if end is not None and already_covered < end < total:
+            points: list[tuple[int, SegmentRole]] = []
+            first_end = boundaries[0]
+            if include_first_segment and already_covered == 0 and first_end < end:
+                points.append((first_end, self.segments[0].role))
+            points.append((end, self.segments[-1].role))
+            return points
+        interior: tuple[int, SegmentRole] | None = None
+        for boundary, seg in zip(boundaries, self.segments, strict=True):
+            if already_covered < boundary < total:
+                interior = (boundary, seg.role)
+        return [interior] if interior is not None else []
+
     @property
     def total_tokens(self) -> int:
         return sum(len(s.tokens) for s in self.segments)

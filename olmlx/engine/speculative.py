@@ -97,10 +97,16 @@ class _SpecCacheEntry:
     a ``(target_snap, draft_snap)`` pair for :class:`SpeculativeDecoder`, or a
     single target snapshot for :class:`PromptLookupDecoder`. The store treats
     it as opaque; only the owning decoder interprets it.
+
+    ``preamble`` marks a cold start's system-prompt snapshot. Every other
+    entry is a conversation's tip (the end of its final message), which that
+    conversation's next snapshot supersedes; a preamble is meant to be a
+    prefix of other entries and is never superseded.
     """
 
     tokens: list[int]
     payload: Any = field(default=None)
+    preamble: bool = False
 
 
 class _SpecCacheStore:
@@ -162,11 +168,18 @@ class _SpecCacheStore:
         with self._serialized():
             self._entries = []
 
-    def find(self, tokens: list[int]) -> tuple[_SpecCacheEntry, int] | None:
+    def find(
+        self, tokens: list[int], *, full_prefix_only: bool = False
+    ) -> tuple[_SpecCacheEntry, int] | None:
         """Return ``(entry, common_prefix_len)`` for the entry whose stored
         tokens share the longest leading run with ``tokens``, promoting that
         entry to most-recently-used. ``None`` when the store is empty/disabled
         or no entry shares any prefix.
+
+        ``full_prefix_only`` (for extend-only caches, which can't trim back
+        to a shared prefix) only considers entries whose tokens are a strict
+        prefix of ``tokens``, so a longer partial overlap with another
+        conversation can't shadow a usable system-prompt snapshot.
 
         Note: promotion happens on any prefix overlap, even one the caller
         later rejects (e.g. a non-trimmable partial-prefix hit that falls back
@@ -180,6 +193,8 @@ class _SpecCacheStore:
             best_common = 0
             for entry in self._entries:
                 common = _common_prefix_len(entry.tokens, tokens)
+                if full_prefix_only and not (common == len(entry.tokens) < len(tokens)):
+                    continue
                 if common > best_common:
                     best_common = common
                     best = entry
@@ -189,10 +204,12 @@ class _SpecCacheStore:
             self._entries.append(best)
             return best, best_common
 
-    def insert(self, tokens: list[int], payload: Any) -> None:
+    def insert(
+        self, tokens: list[int], payload: Any, *, preamble: bool = False
+    ) -> None:
         """Store ``payload`` under ``tokens`` as the most-recently-used entry,
-        replacing any existing entry with identical tokens, and evict the
-        least-recently-used entries past ``capacity``. No-op when disabled.
+        replacing any existing entry with identical tokens, and evict entries
+        past ``capacity`` (see :meth:`_eviction_victim`). No-op when disabled.
         """
         with self._serialized():
             if not self.enabled():
@@ -201,9 +218,38 @@ class _SpecCacheStore:
             # Refresh: drop any prior entry for the same lineage so a re-prefill
             # of the same prompt doesn't consume two slots.
             self._entries = [e for e in self._entries if e.tokens != toks]
-            self._entries.append(_SpecCacheEntry(tokens=toks, payload=payload))
+            self._entries.append(
+                _SpecCacheEntry(tokens=toks, payload=payload, preamble=preamble)
+            )
             while len(self._entries) > self._capacity:
-                self._entries.pop(0)
+                self._entries.remove(self._eviction_victim())
+
+    def _eviction_victim(self) -> _SpecCacheEntry:
+        """The entry to drop, least-recently-used first within each tier:
+
+        1. A tip that a more recently used entry extends. It is that
+           conversation's previous snapshot; its next turn continues the
+           newer one. (An entry can't be superseded by an *older* one: a
+           rewound conversation's new, shorter tip is the only one it can
+           extend.)
+        2. A preamble. It only saves a new conversation's system prompt, while
+           a tip saves a whole conversation, so with two slots two
+           interleaved conversations keep both tips.
+        3. The least-recently-used entry.
+        """
+        for i, entry in enumerate(self._entries):
+            if entry.preamble:
+                continue
+            n = len(entry.tokens)
+            if any(
+                len(newer.tokens) > n and newer.tokens[:n] == entry.tokens
+                for newer in self._entries[i + 1 :]
+            ):
+                return entry
+        for entry in self._entries:
+            if entry.preamble:
+                return entry
+        return self._entries[0]
 
 
 # Cache-layer class names used to classify a working cache for reuse.
@@ -387,10 +433,32 @@ def _prefill_last_logit(
     return _logits(model(last, cache=cache))[0, 0, :]
 
 
+def _spec_snapshot_points(
+    segmented: Any, flat: list[int], already_covered: int, *, extend_only: bool
+) -> list[int]:
+    """Where a reuse prefill snapshots its caches (see
+    ``SegmentedPrompt.snapshot_points``). Only an extend-only (hybrid) cache
+    keeps a separate system-prompt snapshot on a cold start: a trimmable one
+    trims any deeper snapshot back to it.
+
+    The boundaries are only meaningful if the segmentation tokenizes to
+    exactly this prompt. A mismatch (re-tokenization drift) means no snapshot
+    this turn rather than a misaligned one.
+    """
+    if segmented.flatten() != flat:
+        return []
+    return [
+        point
+        for point, _role in segmented.snapshot_points(
+            already_covered, include_first_segment=extend_only
+        )
+    ]
+
+
 def _drive_spec_prefill(
     *,
     flat: list[int],
-    boundaries: list[int],
+    snapshot_points: list[int],
     already_covered: int,
     lanes: list[tuple[Any, list]],
     cancel_event: threading.Event | None,
@@ -400,11 +468,14 @@ def _drive_spec_prefill(
     """Forward each ``(model, cache)`` lane over ``flat[already_covered:]`` and
     return ``lanes[0]`` (the target)'s last-position logit (lazy).
 
-    Snapshots happen via ``on_boundary(deepest_boundary)`` — invoked once, after
-    every lane has been filled up to the deepest interior message boundary but
-    before the final span — so the caller can persist all caches at a clean
-    boundary depth for the next turn. When no interior boundary lies in
-    ``(already_covered, len(flat))`` the whole span runs in one pass and
+    Snapshots happen via ``on_boundary(point)``, once per snapshot point in
+    ``(already_covered, len(flat))`` (shallowest first, from
+    ``SegmentedPrompt.snapshot_points``), after every lane has been filled up
+    to that point, so the caller can persist all caches at a message boundary
+    for later turns. Each point is also the only place the span is split
+    beyond the ``_PREFILL_CHUNK`` sub-chunks, which keeps the GatedDeltaNet
+    chunking drift that ``inference._drive_segmented_prefill`` describes to a
+    point or two. With no point in range the whole span runs in one pass and
     ``on_boundary`` is not called.
 
     Runs on the **default stream** (no ``mx.stream`` wrapper) — the same stream
@@ -424,10 +495,7 @@ def _drive_spec_prefill(
     sub-chunk.
     """
     n = len(flat)
-    deepest: int | None = None
-    for b in boundaries:
-        if already_covered < b < n:
-            deepest = b
+    points = sorted(p for p in set(snapshot_points) if already_covered < p < n)
 
     target_model = lanes[0][0]
     _acc = {"target_ns": 0, "draft_ns": 0, "target_chunks": 0}
@@ -481,22 +549,18 @@ def _drive_spec_prefill(
                 }
             )
 
-    if deepest is None:
-        for model, cache in lanes[1:]:
-            _fill(model, cache, already_covered, n)
-        result = _target_last_logit(already_covered, n)
-        _record()
-        return result
-
-    # Chunk 1: uncovered prefix up to the deepest interior boundary (all lanes).
-    for model, cache in lanes:
-        _fill(model, cache, already_covered, deepest)
-    on_boundary(deepest)
-    # Chunk 2: boundary to the end. Non-target lanes fill KV; the target
-    # captures the seeding logit at the final position.
+    # Up to each snapshot point (all lanes), then snapshot.
+    start = already_covered
+    for point in points:
+        for model, cache in lanes:
+            _fill(model, cache, start, point)
+        on_boundary(point)
+        start = point
+    # Last point to the end. Non-target lanes fill KV; the target captures
+    # the seeding logit at the final position.
     for model, cache in lanes[1:]:
-        _fill(model, cache, deepest, n)
-    result = _target_last_logit(deepest, n)
+        _fill(model, cache, start, n)
+    result = _target_last_logit(start, n)
     _record()
     return result
 
@@ -743,7 +807,7 @@ class SpeculativeDecoder(SpecDecoderBase):
                 is non-zero, enables cross-request KV reuse (#421): a stored
                 snapshot whose tokens form a prefix of ``prompt`` is reused so
                 only the new suffix is prefilled, and a fresh snapshot is taken
-                at the deepest interior message boundary for the next turn.
+                at the end of the final message for the next turn.
             cancel_event: if set during prefill, raises :class:`PrefillCancelled`
                 at the next sub-chunk boundary so a client disconnect interrupts
                 a long prefill promptly instead of pinning the GPU.
@@ -814,7 +878,7 @@ class SpeculativeDecoder(SpecDecoderBase):
         cancel_event: threading.Event | None,
     ) -> int:
         """Reuse-aware prefill: look up a stored snapshot, continue it for the
-        new suffix, and snapshot the deepest interior boundary for next turn.
+        new suffix, and snapshot the end of the final message for next turn.
 
         Caches (``self._target_cache`` / ``self._draft_cache``) are fresh on
         entry; on a reuse hit they are replaced with deepcopies of the stored
@@ -829,7 +893,7 @@ class SpeculativeDecoder(SpecDecoderBase):
             self._draft_cache
         )
         already_covered = 0
-        hit = self._cache_store.find(flat)
+        hit = self._cache_store.find(flat, full_prefix_only=not is_trimmable)
         if hit is not None:
             entry, common = hit
             reuse, covered = _spec_reuse_decision(is_trimmable, entry.tokens, common, n)
@@ -853,7 +917,11 @@ class SpeculativeDecoder(SpecDecoderBase):
                 already_covered = covered
 
         self._last_target_logit = self._drive_segmented_prefill(
-            flat, segmented, already_covered, cancel_event=cancel_event
+            flat,
+            segmented,
+            already_covered,
+            extend_only=not is_trimmable,
+            cancel_event=cancel_event,
         )
         mx.eval(self._last_target_logit)
         self._cache_seq_len = n
@@ -866,32 +934,34 @@ class SpeculativeDecoder(SpecDecoderBase):
         segmented: Any,
         already_covered: int,
         *,
+        extend_only: bool,
         cancel_event: threading.Event | None,
     ) -> mx.array:
         """Forward target+draft over ``flat[already_covered:]`` and return the
         target's last-position logit (lazy), snapshotting both caches at the
-        deepest interior message boundary for the next turn. See
-        :func:`_drive_spec_prefill` for the stream / chunking invariants."""
-        boundaries = segmented.boundary_offsets()
-        # Guard: boundaries are only meaningful if the segmentation tokenizes
-        # to exactly this prompt. A mismatch (re-tokenization drift) means no
-        # snapshot this turn rather than a misaligned one.
-        if segmented.flatten() != flat:
-            boundaries = []
+        end of the final message (plus the system prompt on an extend-only
+        cold start) for later turns. See :func:`_drive_spec_prefill` for the
+        stream / chunking invariants."""
+        points = _spec_snapshot_points(
+            segmented, flat, already_covered, extend_only=extend_only
+        )
+        tip = points[-1] if points else None
         return _drive_spec_prefill(
             flat=flat,
-            boundaries=boundaries,
+            snapshot_points=points,
             already_covered=already_covered,
             lanes=[
                 (self._target, self._target_cache),
                 (self._draft, self._draft_cache),
             ],
             cancel_event=cancel_event,
-            on_boundary=lambda boundary: self._store_snapshot(flat[:boundary]),
+            on_boundary=lambda point: self._store_snapshot(
+                flat[:point], preamble=point != tip
+            ),
             breakdown=self._last_prefill_breakdown,
         )
 
-    def _store_snapshot(self, tokens: list[int]) -> None:
+    def _store_snapshot(self, tokens: list[int], *, preamble: bool = False) -> None:
         """Deep-copy + materialize the current caches and persist them under
         ``tokens`` (which ends at a message boundary)."""
         target_snap = snapshot_cache_for_persistence(
@@ -900,7 +970,7 @@ class SpeculativeDecoder(SpecDecoderBase):
         draft_snap = snapshot_cache_for_persistence(
             self._draft_cache, eager_eval=_cache_has_lazy_state(self._draft_cache)
         )
-        self._cache_store.insert(tokens, (target_snap, draft_snap))
+        self._cache_store.insert(tokens, (target_snap, draft_snap), preamble=preamble)
 
     def _step_impl(self) -> tuple[list[int], int]:
         """One speculative decoding step using persistent KV caches.
@@ -1562,8 +1632,8 @@ class PromptLookupDecoder(SpecDecoderBase):
             segmented: optional :class:`SegmentedPrompt`. When provided and
                 ``OLMLX_SPECULATIVE_CACHE_SLOTS`` is non-zero, enables
                 cross-request KV reuse (#421) — only the new suffix is
-                prefilled and a snapshot is taken at the deepest interior
-                message boundary for the next turn.
+                prefilled and a snapshot is taken at the end of the final
+                message for the next turn.
             cancel_event: if set during prefill, raises :class:`PrefillCancelled`
                 at the next sub-chunk boundary so a client disconnect interrupts
                 a long prefill promptly instead of pinning the GPU.
@@ -1636,7 +1706,7 @@ class PromptLookupDecoder(SpecDecoderBase):
         is_trimmable = _cache_is_trimmable(self._target_cache)
 
         already_covered = 0
-        hit = self._cache_store.find(flat)
+        hit = self._cache_store.find(flat, full_prefix_only=not is_trimmable)
         if hit is not None:
             entry, common = hit
             reuse, covered = _spec_reuse_decision(is_trimmable, entry.tokens, common, n)
@@ -1653,29 +1723,32 @@ class PromptLookupDecoder(SpecDecoderBase):
                         trim_prompt_cache(self._target_cache, trim)
                 already_covered = covered
 
-        boundaries = segmented.boundary_offsets()
-        if segmented.flatten() != flat:
-            boundaries = []
+        points = _spec_snapshot_points(
+            segmented, flat, already_covered, extend_only=not is_trimmable
+        )
+        tip = points[-1] if points else None
         logit = _drive_spec_prefill(
             flat=flat,
-            boundaries=boundaries,
+            snapshot_points=points,
             already_covered=already_covered,
             lanes=[(self._target, self._target_cache)],
             cancel_event=cancel_event,
-            on_boundary=lambda boundary: self._store_snapshot(flat[:boundary]),
+            on_boundary=lambda point: self._store_snapshot(
+                flat[:point], preamble=point != tip
+            ),
             breakdown=self._last_prefill_breakdown,
         )
         self._cache_seq_len = n
         self._last_reused_tokens = already_covered
         return logit
 
-    def _store_snapshot(self, tokens: list[int]) -> None:
+    def _store_snapshot(self, tokens: list[int], *, preamble: bool = False) -> None:
         """Deep-copy + materialize the target cache and persist it under
         ``tokens`` (which ends at a message boundary)."""
         target_snap = snapshot_cache_for_persistence(
             self._target_cache, eager_eval=_cache_has_lazy_state(self._target_cache)
         )
-        self._cache_store.insert(tokens, target_snap)
+        self._cache_store.insert(tokens, target_snap, preamble=preamble)
 
     def _step_impl(self) -> tuple[list[int], int]:
         """One PLD step using the persistent target KV cache.

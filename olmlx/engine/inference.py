@@ -1875,38 +1875,12 @@ def _drive_segmented_prefill(
     flat = segmented.flatten()
     if not flat:
         return []
-    boundaries = segmented.boundary_offsets()
-
-    # Find the deepest interior boundary strictly greater than what's
-    # already covered and strictly less than len(flat).
-    interior_boundary: int | None = None
-    interior_role: Any = None
-    for boundary, seg in zip(boundaries, segmented.segments, strict=True):
-        if already_covered_tokens < boundary < len(flat):
-            interior_boundary = boundary
-            interior_role = seg.role
-    # Snapshot points, shallowest first; each is also a chunk split.
-    # Deepest: the end of the final message, before the generation prompt.
-    # The next turn keeps this message verbatim and only replaces the
-    # generation prompt with the reply, so a snapshot here leaves just the
-    # reply and the new message to prefill. Snapshotting only at the final
-    # message's *start* re-prefilled it every turn (in an agent loop, each
-    # tool result twice). A cold start also keeps the end of the FIRST
-    # segment: the system prompt (or the tools block a template injects),
-    # the prefix every new conversation with the same system prompt and
-    # tools shares. Deeper interior boundaries are shared by nothing else.
-    snapshot_points: list[tuple[int, Any]] = []
-    final_message_end = segmented.final_message_end()
-    if (
-        final_message_end is not None
-        and already_covered_tokens < final_message_end < len(flat)
-    ):
-        first_segment_end = boundaries[0]
-        if already_covered_tokens == 0 and first_segment_end < final_message_end:
-            snapshot_points.append((first_segment_end, segmented.segments[0].role))
-        snapshot_points.append((final_message_end, segmented.segments[-1].role))
-    elif interior_boundary is not None:
-        snapshot_points.append((interior_boundary, interior_role))
+    # Snapshot points, shallowest first; each is also a chunk split. The
+    # deepest is the end of the final message (snapshotting only its *start*
+    # re-prefilled it every turn: in an agent loop, each tool result twice);
+    # a cold start also keeps the system prompt. See
+    # ``SegmentedPrompt.snapshot_points``.
+    snapshot_points = segmented.snapshot_points(already_covered_tokens)
 
     final_prefill_end = len(flat) - 1  # reserve trailing token for stream_generate
 
@@ -3646,6 +3620,44 @@ def _channel_chunks(
     return []
 
 
+def _speculative_prompt(
+    lm: LoadedModel,
+    prompt: str | list[int],
+    messages: list[dict] | None,
+    template_kwargs: dict | None,
+) -> tuple[str | list[int], "SegmentedPrompt | None"]:
+    """The prompt for a speculative decoder, plus its message segmentation
+    when the decoder owns an enabled snapshot store (classic / pld with
+    ``OLMLX_SPECULATIVE_CACHE_SLOTS`` > 0), so prefill reuses a stored prefix
+    instead of re-prefilling the whole growing conversation each turn (#421).
+
+    With a segmentation the prompt is returned as the *token list* it was
+    segmented from, so ``segmented.flatten()`` equals the tokens prefill
+    sees: the alignment the reuse path's boundary guard requires. Both the
+    streaming and the non-streaming path call this; the non-streaming one
+    used to skip it, so its turns never reused anything.
+    """
+    store = getattr(lm.speculative_decoder, "_cache_store", None)
+    if store is None or not store.enabled() or messages is None or lm.is_vlm:
+        return prompt, None
+    tokens = (
+        # ``tokenize_for_cache`` replicates mlx-lm's BOS heuristic; plain
+        # ``.encode`` (add_special_tokens=True) would double the BOS on
+        # BOS-prefixed templates (Llama 3 / Gemma / Mistral), diverging from
+        # the non-speculative path (#633).
+        tokenize_for_cache(lm.text_tokenizer, prompt)
+        if isinstance(prompt, str)
+        else list(prompt)
+    )
+    segmented = tokenize_segmented_chat(
+        lm.text_tokenizer,
+        messages,
+        full_tokens=tokens,
+        **(template_kwargs or {}),
+    )
+    return tokens, segmented
+
+
 async def _stream_completion(
     lm: LoadedModel,
     prompt: str | list[int],
@@ -3876,40 +3888,10 @@ async def _stream_completion(
                         "Speculative decoding uses greedy argmax; ignoring sampling parameters: %s",
                         ", ".join(sorted(_dropped)),
                     )
-                # Cross-request KV reuse (#421): when the decoder owns an
-                # enabled snapshot store (classic / pld with
-                # OLMLX_SPECULATIVE_CACHE_SLOTS > 0), build a SegmentedPrompt so
-                # prefill reuses a stored prefix instead of re-prefilling the
-                # whole growing conversation each turn. Pass the *token list*
-                # (not the str) as the prompt and segment from those exact
-                # tokens so segmented.flatten() == the tokens prefill sees —
-                # the alignment the reuse path's boundary guard requires.
-                spec_prompt: str | list[int] = prompt
-                spec_segmented = None
-                _spec_store = getattr(lm.speculative_decoder, "_cache_store", None)
-                if (
-                    _spec_store is not None
-                    and _spec_store.enabled()
-                    and messages is not None
-                    and not lm.is_vlm
-                ):
-                    spec_tokens = (
-                        # ``tokenize_for_cache`` replicates mlx-lm's BOS
-                        # heuristic; plain ``.encode`` (add_special_tokens=True)
-                        # would double the BOS on BOS-prefixed templates
-                        # (Llama 3 / Gemma / Mistral), diverging from the
-                        # non-speculative path (#633).
-                        tokenize_for_cache(lm.text_tokenizer, prompt)
-                        if isinstance(prompt, str)
-                        else list(prompt)
-                    )
-                    spec_segmented = tokenize_segmented_chat(
-                        lm.text_tokenizer,
-                        messages,
-                        full_tokens=spec_tokens,
-                        **(template_kwargs or {}),
-                    )
-                    spec_prompt = spec_tokens
+                # Cross-request KV reuse (#421): see _speculative_prompt.
+                spec_prompt, spec_segmented = _speculative_prompt(
+                    lm, prompt, messages, template_kwargs
+                )
                 stream = async_speculative_stream(
                     lm.speculative_decoder,
                     lm.text_tokenizer,
@@ -4450,6 +4432,8 @@ async def _full_completion(
                     deferred_prefill=deferred_prefill,
                     stop_sequences=stop_sequences,
                     thinking_expected=thinking_expected,
+                    messages=messages,
+                    template_kwargs=template_kwargs,
                 )
                 generation_complete = True
                 if collect_generated_tokens:
@@ -4553,6 +4537,8 @@ async def _full_completion_inner(
     deferred_prefill: Callable[[threading.Event | None], None] | None = None,
     stop_sequences: list[str] | None = None,
     thinking_expected: bool = False,
+    messages: list[dict] | None = None,
+    template_kwargs: dict | None = None,
 ) -> dict:
     audio_paths: list[str] = []
     _audio_temps: list[str] = []
@@ -4634,13 +4620,17 @@ async def _full_completion_inner(
                     tokenizer_eos_ids,
                 )
 
-                if isinstance(prompt, str):
+                # Cross-request KV reuse (#421): see _speculative_prompt.
+                spec_prompt, spec_segmented = _speculative_prompt(
+                    lm, prompt, messages, template_kwargs
+                )
+                if isinstance(spec_prompt, str):
                     # BOS heuristic (see the buffered speculative path / #633):
                     # plain ``.encode`` would double the BOS on BOS-prefixed
                     # templates, diverging from the non-speculative path.
-                    prompt_tokens = tokenize_for_cache(lm.text_tokenizer, prompt)
+                    prompt_tokens = tokenize_for_cache(lm.text_tokenizer, spec_prompt)
                 else:
-                    prompt_tokens = prompt
+                    prompt_tokens = spec_prompt
 
                 cancel = threading.Event()
                 eos_ids = tokenizer_eos_ids(lm.text_tokenizer)
@@ -4653,6 +4643,7 @@ async def _full_completion_inner(
                     cancel_event=cancel,
                     eos_token_ids=eos_ids,
                     tokenizer=lm.text_tokenizer,
+                    segmented=spec_segmented,
                 ):
                     text_parts.append(response.text)
                     # Collect produced token ids for the Ollama continuation
