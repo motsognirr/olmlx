@@ -48,16 +48,20 @@ class SegmentedPrompt:
         ``already_covered``, shallowest first, each with the role of the
         segment it ends. Both prefill drives (plain and speculative) use it.
 
-        The deepest is the end of the final message: the next turn keeps that
-        message verbatim and only replaces the generation prompt with the
-        reply, so a snapshot there leaves just the reply and the new message
-        to prefill. A cold start (``already_covered == 0``) also keeps the end
-        of the first segment, the system prompt or template-injected tools
-        block that every new conversation with the same setup shares, unless
+        When a generation prompt follows the final message, the deepest point
+        is the end of that message: the next turn keeps it verbatim and only
+        replaces the generation prompt with the reply, so a snapshot there
+        leaves just the reply and the new message to prefill. A cold start
+        (``already_covered == 0``) then also keeps the end of the first
+        segment, the system prompt or template-injected tools block that every
+        new conversation with the same setup shares, unless
         ``include_first_segment`` is False (a trimmable cache can serve that
-        prefix from any deeper snapshot). With no generation prompt detected
-        the deepest interior message boundary is used instead. Offsets are
-        always strictly inside ``(already_covered, total_tokens)``.
+        prefix from any deeper snapshot).
+
+        With no generation prompt detected, the only point is the deepest
+        interior message boundary (the pre-#780 rule), and
+        ``include_first_segment`` has no effect. Offsets are always strictly
+        inside ``(already_covered, total_tokens)``.
         """
         total = self.total_tokens
         boundaries = self.boundary_offsets()
