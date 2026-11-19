@@ -224,6 +224,12 @@ class _SpecCacheStore:
             if not self.enabled():
                 return
             toks = list(tokens)
+            # Equal tokens mean an equal KV state, so one entry serves both
+            # roles; keep it in the preamble slot if either insert put it
+            # there, rather than demoting the shared prefix to an evictable tip.
+            preamble = preamble or any(
+                e.preamble and e.tokens == toks for e in self._entries
+            )
             # Refresh: drop any prior entry for the same lineage so a re-prefill
             # of the same prompt doesn't consume two slots.
             self._entries = [

@@ -179,6 +179,19 @@ class TestSpecCacheStore:
         store.insert([3, 4], payload="system B", preamble=True)
         assert [e.payload for e in store._entries] == ["system B"]
 
+    def test_a_tip_with_the_preamble_tokens_keeps_it_a_preamble(self):
+        # Same tokens, same KV state: one entry, and it stays in the
+        # preamble slot instead of becoming an evictable tip.
+        store = _SpecCacheStore(capacity=1)
+        store.insert([1, 2], payload="system", preamble=True)
+        store.insert([1, 2], payload="system as a tip")
+        store.insert([1, 2, 3], payload="turn 1")
+        store.insert([1, 2, 3, 4], payload="turn 2")
+        assert [(e.payload, e.preamble) for e in store._entries] == [
+            ("system as a tip", True),
+            ("turn 2", False),
+        ]
+
     def test_a_preamble_does_not_supersede_a_tip(self):
         # A system-prompt snapshot is no conversation's continuation, even if
         # a tip happens to be a prefix of it; the LRU tip goes instead.
