@@ -3449,3 +3449,106 @@ class TestKvQuantCacheAttach:
 
         used = mock_stream_fn if stream else mock_stream_generate
         assert used.call_args.kwargs["prompt_cache"] is quant_cache
+
+
+class TestSpeculativeSnapshotStorePlumbing:
+    """A classic/PLD decoder with an enabled snapshot store reuses a stored
+    prefix across requests only if it receives the prompt's message
+    segmentation (#421). Both the streaming and the non-streaming path must
+    pass it; the non-streaming one used to drop it, so non-streaming agent
+    turns (e.g. Anthropic /v1/messages without ``stream``) re-prefilled the
+    whole conversation every turn."""
+
+    def _setup(self, mock_manager):
+        from olmlx.engine.speculative import _SpecCacheStore
+
+        lm = mock_manager._loaded["qwen3:latest"]
+        lm.speculative_decoder = MagicMock()
+        lm.speculative_decoder._cache_store = _SpecCacheStore(2)
+        lm.tokenizer.apply_chat_template = MagicMock(return_value="formatted prompt")
+        lm.tokenizer.bos_token = None
+        lm.tokenizer.encode = MagicMock(return_value=[10, 20, 30])
+        return lm
+
+    async def _run(self, mock_manager, *, stream: bool):
+        from olmlx.engine.inference import generate_chat
+
+        spec_response = _make_gen_response(
+            "hi", 50, prompt_tokens=3, generation_tokens=1
+        )
+        spec_response.finish_reason = "stop"
+        calls = []
+
+        def fake_spec_stream(*args, **kwargs):
+            calls.append((args, kwargs))
+            yield spec_response
+
+        segmented = MagicMock(name="segmented")
+        with (
+            patch("olmlx.engine.inference.mx", MagicMock()),
+            patch(
+                "olmlx.engine.speculative_stream.speculative_stream_generate",
+                fake_spec_stream,
+            ),
+            patch(
+                "olmlx.engine.inference.tokenize_segmented_chat",
+                MagicMock(return_value=segmented),
+            ) as seg_mock,
+            patch("olmlx.engine.inference.settings") as mock_settings,
+        ):
+            mock_settings.prompt_cache = True
+            mock_settings.prompt_cache_max_tokens = 32768
+            mock_settings.default_keep_alive = "5m"
+            mock_settings.inference_timeout = None
+            mock_settings.sync_mode = "full"
+            result = await generate_chat(
+                mock_manager,
+                "qwen3",
+                [{"role": "user", "content": "hi"}],
+                stream=stream,
+            )
+            if stream:
+                async for _ in result:
+                    pass
+        return calls, segmented, seg_mock
+
+    @pytest.mark.asyncio
+    async def test_non_streaming_passes_segmented_prompt(self, mock_manager):
+        self._setup(mock_manager)
+        calls, segmented, seg_mock = await self._run(mock_manager, stream=False)
+        assert len(calls) == 1
+        args, kwargs = calls[0]
+        assert kwargs.get("segmented") is segmented
+        # Segmented from the exact tokens prefill sees.
+        assert seg_mock.call_args.kwargs["full_tokens"] == [10, 20, 30]
+        assert list(args[1]) == [10, 20, 30]
+
+    @pytest.mark.asyncio
+    async def test_streaming_passes_segmented_prompt(self, mock_manager):
+        self._setup(mock_manager)
+        calls, segmented, _ = await self._run(mock_manager, stream=True)
+        assert len(calls) == 1
+        assert calls[0][1].get("segmented") is segmented
+
+    @pytest.mark.asyncio
+    async def test_disabled_store_skips_segmentation(self, mock_manager):
+        from olmlx.engine.speculative import _SpecCacheStore
+
+        lm = self._setup(mock_manager)
+        lm.speculative_decoder._cache_store = _SpecCacheStore(0)
+        calls, _, seg_mock = await self._run(mock_manager, stream=False)
+        seg_mock.assert_not_called()
+        assert calls[0][1].get("segmented") is None
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("stream", [False, True])
+    async def test_decoder_without_a_real_store_skips_segmentation(
+        self, mock_manager, stream
+    ):
+        # A duck-typed decoder (here a MagicMock, whose missing attribute is
+        # a truthy mock) must not be mistaken for one with a snapshot store.
+        lm = self._setup(mock_manager)
+        lm.speculative_decoder = MagicMock()
+        calls, _, seg_mock = await self._run(mock_manager, stream=stream)
+        seg_mock.assert_not_called()
+        assert calls[0][1].get("segmented") is None

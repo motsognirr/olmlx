@@ -433,7 +433,12 @@ class Settings(BaseSettings):
     #: ``OLMLX_MEMORY_LIMIT_FRACTION``, so raise this only with headroom to
     #: spare. ``0`` disables reuse entirely (fresh prefill every turn — the
     #: pre-#421 behavior, useful as a kill switch). Only the ``classic`` and
-    #: ``pld`` strategies honor this; ``dflash``/``eagle`` always fresh-prefill.
+    #: ``pld`` strategies honor this; the others (``dflash``, ``eagle``, the
+    #: per-model ``mtp``, ...) always fresh-prefill. Hybrid (non-trimmable)
+    #: caches also keep one system-prompt snapshot outside these slots, so new
+    #: conversations reuse a shared system prompt (#781): budget for slots + 1
+    #: resident snapshots, the extra one covering only the system prompt
+    #: (about 210 MB for a 7.5k-token one on Qwen3.6-35B-A3B).
     speculative_cache_slots: Annotated[int, Field(ge=0)] = 2
 
     # Tree-structured speculative verification (#358).  When enabled,
