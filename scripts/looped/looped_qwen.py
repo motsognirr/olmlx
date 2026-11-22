@@ -497,6 +497,7 @@ def load_student(out: Path, grad_checkpoint=False):
         init=False,
         grad_checkpoint=grad_checkpoint,
     )
+    st.cfg["freeze_coda"] = frozen_coda = cfg.get("freeze_coda", False)
     weights = mx.load(str(out / "student.safetensors"))
     # Only trainable parameters are saved. A --freeze-coda coda is absent and
     # rebuilt from the base (it never changed), so strict loading is impossible;
@@ -504,7 +505,7 @@ def load_student(out: Path, grad_checkpoint=False):
     missing = sorted(
         k
         for k, _ in tree_flatten(st.parameters())
-        if k not in weights and not k.startswith("coda.")
+        if k not in weights and not (frozen_coda and k.startswith("coda."))
     )
     if missing:
         raise ValueError(
@@ -529,7 +530,15 @@ def cmd_train(args):
             out, grad_checkpoint=args.grad_checkpoint
         )
         start = cfg.get("step", 0)
+        # a frozen coda is not saved, so the setting must follow the checkpoint
+        freeze_coda = cfg.get("freeze_coda", False)
+        if args.freeze_coda and not freeze_coda:
+            raise ValueError(
+                "this checkpoint trained the coda: --freeze-coda would leave it "
+                "out of the next save and reloads would fall back to the base's"
+            )
     else:
+        freeze_coda = args.freeze_coda
         base, tok = load(args.model)
         base.freeze()
         t0 = time.time()
@@ -553,7 +562,8 @@ def cmd_train(args):
                 x.unfreeze()
         else:
             m.unfreeze()
-    if args.freeze_coda:
+    student.cfg["freeze_coda"] = freeze_coda
+    if freeze_coda:
         for x in student.coda:
             x.freeze()
     student.train()
