@@ -394,6 +394,19 @@ class LoopedLM(nn.Module):
         return [None] * (self.n_prelude + self.n_core * self.loops + self.n_coda)
 
 
+def load_teacher(path, tok, base):
+    """A separate (e.g. larger) teacher. KL is taken token by token over the
+    vocabulary, so it must share the student's tokenizer exactly."""
+    teacher, t_tok = load(path)
+    teacher.freeze()
+    if t_tok.get_vocab() != tok.get_vocab():
+        raise ValueError(f"teacher {path} has a different tokenizer vocabulary")
+    t_vocab, s_vocab = teacher.args.vocab_size, base.args.vocab_size
+    if t_vocab != s_vocab:
+        raise ValueError(f"teacher logits have {t_vocab} classes, student {s_vocab}")
+    return teacher
+
+
 def teacher_from_prelude(base, h0, prelude):
     mask = create_attention_mask(h0, None)
     h = h0
@@ -494,6 +507,7 @@ _TRAIN_KEYS = (
     "hf_subset",
     "text_field",
     "grad_checkpoint",
+    "teacher",
 )
 
 
@@ -587,6 +601,7 @@ def cmd_train(args):
                 x.unfreeze()
         else:
             m.unfreeze()
+    teacher = load_teacher(args.teacher, tok, base) if args.teacher else None
     student.cfg["freeze_coda"] = freeze_coda
     if freeze_coda:
         for x in student.coda:
@@ -662,10 +677,13 @@ def cmd_train(args):
             x = next(batches)
             inp, tgt = x[:, :-1], x[:, 1:]
             h0 = mx.stop_gradient(student.prelude_forward(inp))
-            # the student's own prelude: on --resume, args.prelude is the CLI default
-            t_logits = mx.stop_gradient(
-                teacher_from_prelude(base, h0, student.n_prelude)
-            )
+            if teacher is None:
+                # the base continues from the student's own prelude output
+                # (on --resume, args.prelude is the CLI default, not the layout)
+                t_logits = teacher_from_prelude(base, h0, student.n_prelude)
+            else:
+                t_logits = teacher(inp)
+            t_logits = mx.stop_gradient(t_logits)
             (_, (kl, ce)), g = lvg(
                 student, h0, t_logits, tgt, args.temp, args.ce_weight
             )
@@ -695,23 +713,35 @@ def cmd_train(args):
 def cmd_eval(args):
     student, base, tok, cfg = load_student(Path(args.out))
     student.eval()
+    t_path = cfg.get("train", {}).get("teacher")
+    teacher = load_teacher(t_path, tok, base) if t_path else None
     batches = iter_batches(tok, iter_texts(args), args.batch, args.seq, shuffle_buf=0)
-    t_sum = s_sum = 0.0
+    sums = {"base": 0.0, "student": 0.0, "teacher": 0.0}
     for _ in range(args.batches):
         x = next(batches)
         inp, tgt = x[:, :-1], x[:, 1:]
         h0 = student.prelude_forward(inp)
-        tl = teacher_from_prelude(base, h0, cfg["prelude"]).astype(mx.float32)
-        sl = student.from_prelude(h0).astype(mx.float32)
-        t_ce = nn.losses.cross_entropy(tl, tgt).mean()
-        s_ce = nn.losses.cross_entropy(sl, tgt).mean()
-        mx.eval(t_ce, s_ce)
-        t_sum += t_ce.item()
-        s_sum += s_ce.item()
+        logits = {
+            "base": teacher_from_prelude(base, h0, cfg["prelude"]),
+            "student": student.from_prelude(h0),
+        }
+        if teacher is not None:
+            logits["teacher"] = teacher(inp)
+        ces = {
+            k: nn.losses.cross_entropy(v.astype(mx.float32), tgt).mean()
+            for k, v in logits.items()
+        }
+        mx.eval(ces)
+        for k, v in ces.items():
+            sums[k] += v.item()
     n = args.batches
-    print(
-        f"teacher ppl {math.exp(t_sum / n):.3f} | student ppl {math.exp(s_sum / n):.3f}"
-    )
+    # "base" is the model the student was converted from (the teacher too,
+    # unless --teacher named a separate one)
+    line = f"base ppl {math.exp(sums['base'] / n):.3f}"
+    line += f" | student ppl {math.exp(sums['student'] / n):.3f}"
+    if teacher is not None:
+        line += f" | teacher ppl {math.exp(sums['teacher'] / n):.3f} ({t_path})"
+    print(line)
 
 
 def cmd_generate(args):
@@ -745,6 +775,12 @@ def main():
 
     t = sub.add_parser("train")
     t.add_argument("--model", default="Qwen/Qwen2.5-3B")
+    t.add_argument(
+        "--teacher",
+        default=None,
+        help="separate (e.g. larger) teacher with the same tokenizer; "
+        "default: the base model itself",
+    )
     t.add_argument("--out", default="looped-out")
     t.add_argument("--resume", action="store_true")
     t.add_argument("--prelude", type=int, default=6)

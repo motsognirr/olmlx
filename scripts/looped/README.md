@@ -26,6 +26,11 @@ student costs the same FLOPs per token with fewer layer parameters.
   rank 0, and 10.5 in inkling mode. Distillation does all the recovery work.
 * `--mode inkling`: the gate starts closed (every pass sees only the prelude
   output) and opens during training.
+* `--teacher <model>`: distill from a separate, e.g. larger, model instead of
+  the base (Qwen3-4B for a looped Qwen3-0.6B). The student is still built from
+  `--model`. The teacher must share the tokenizer exactly, since the KL is taken
+  token by token over the vocabulary. It gets its own full forward pass, so
+  training is slower. `eval` then reports base, student and teacher perplexity.
 
 ## Usage
 
