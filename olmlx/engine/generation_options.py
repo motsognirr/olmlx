@@ -294,29 +294,39 @@ def _filter_top_k_first(
     logprobs, with filtered-out candidates at ``-inf``. The kept set equals
     mlx-lm's full-vocabulary chain (top_p, min_p, then top_k): each filter
     keeps a prefix of the descending order, so the chain keeps the shortest
-    prefix, and that prefix lies inside the k candidates. *logprobs* must be
-    normalized (``logits - logsumexp``), as generate_step passes them, and
-    ``0 < top_k < vocab``.
+    prefix, and that prefix lies inside the k candidates (which of several
+    tied tokens lands at the boundary is up to ``argpartition``, as it was in
+    mlx-lm's ``apply_top_k``). Requires ``0 < top_k < vocab``.
+
+    *logprobs* may also be raw logits: mlx-lm's and mlx-vlm's ``generate_step``
+    pass normalized logprobs, but mlx-vlm's speculative loop (Edge0 drafting at
+    temperature > 0) passes logits, so top_p normalizes by the full-vocabulary
+    log-sum-exp itself.
     """
     idx = mx.argpartition(-logprobs, kth=top_k - 1, axis=-1)[..., :top_k]
     vals = mx.take_along_axis(logprobs, idx, axis=-1)
     if 0 < top_p < 1.0:
-        vals = _top_p_over_candidates(vals, top_p)
+        log_total = mx.logsumexp(logprobs.astype(mx.float32), axis=-1, keepdims=True)
+        vals = _top_p_over_candidates(vals, top_p, log_total)
     if min_p != 0.0:
         # The max logprob is always a candidate, so the threshold is unchanged.
         vals = apply_min_p(vals, min_p, 1)
     return idx, vals
 
 
-def _top_p_over_candidates(vals: mx.array, top_p: float) -> mx.array:
+def _top_p_over_candidates(
+    vals: mx.array, top_p: float, log_total: mx.array
+) -> mx.array:
     """mlx-lm's ``apply_top_p`` restricted to the top-k candidates.
 
     ``apply_top_p`` keeps a token when the ascending cumulative probability
     up to it exceeds ``1 - top_p``. Every non-candidate is less probable than
     every candidate, so at a candidate that cumulative is the mass outside the
-    candidates plus the cumulative over the candidates alone.
+    candidates plus the cumulative over the candidates alone. *log_total* is
+    the full vocabulary's log-sum-exp, which turns *vals* into probabilities
+    whether they are logprobs (``log_total`` ~ 0) or raw logits.
     """
-    probs = mx.exp(vals.astype(mx.float32))
+    probs = mx.exp(vals.astype(mx.float32) - log_total)
     order = mx.argsort(vals, axis=-1)  # ascending, over k entries only
     cumulative = mx.cumsum(mx.take_along_axis(probs, order, axis=-1), axis=-1)
     cumulative = mx.take_along_axis(cumulative, mx.argsort(order, axis=-1), axis=-1)

@@ -111,6 +111,21 @@ class TestFilterTopKFirst:
         }
         assert kept == {int(pos[0]), int(pos[1]), int(pos[2])}
 
+    @pytest.mark.parametrize("shift", [20.0, -20.0, 100.0])
+    def test_raw_logits_keep_the_same_set_as_logprobs(self, shift):
+        """mlx-vlm's speculative loop (Edge0 drafting at temperature > 0) hands
+        the sampler raw logits, not logprobs. top_p is a fraction of the total
+        mass, so the filter has to normalize them itself. Unnormalized, +20 kept
+        only the argmax (sampling silently became greedy), -20 kept every
+        candidate, and +100 overflowed ``exp`` and dropped them all.
+        """
+        lp, pos = _logprobs([0.5, 0.25, 0.12, 0.06], vocab=200)
+        idx, vals = generation_options._filter_top_k_first(lp + shift, 4, 0.8, 0.0)
+        kept = {
+            int(i) for i, v in zip(np.array(idx[0]), np.array(vals[0])) if v > -np.inf
+        }
+        assert kept == {int(pos[0]), int(pos[1]), int(pos[2])}
+
     def test_kept_values_are_the_original_logprobs(self):
         lp, _ = _logprobs([0.4, 0.3, 0.2], vocab=100)
         idx, vals = generation_options._filter_top_k_first(lp, 5, 0.0, 0.0)
