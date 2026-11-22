@@ -474,6 +474,22 @@ def distill_loss(student, h0, t_logits, targets, temp, ce_weight):
 # --------------------------------------------------------------------------
 
 
+# training settings recorded in config.json (compared on --resume)
+_TRAIN_KEYS = (
+    "lr",
+    "warmup",
+    "steps",
+    "batch",
+    "seq",
+    "accum",
+    "temp",
+    "ce_weight",
+    "clip",
+    "weight_decay",
+    "seed",
+)
+
+
 def save_student(student, out: Path, base_path: str, step: int):
     out.mkdir(parents=True, exist_ok=True)
     # every student parameter (the teacher is a _Ref, not in the tree), frozen
@@ -500,7 +516,7 @@ def load_student(out: Path, grad_checkpoint=False):
         init=False,
         grad_checkpoint=grad_checkpoint,
     )
-    for key in ("freeze_coda", "schedule"):
+    for key in ("freeze_coda", "train"):
         if key in cfg:
             st.cfg[key] = cfg[key]
     # strict: a missing parameter would otherwise keep its random init=False value
@@ -562,12 +578,27 @@ def cmd_train(args):
     n_train = sum(v.size for _, v in tree_flatten(student.trainable_parameters()))
     print(f"trainable params: {n_train / 1e6:.1f}M")
 
-    schedule = {"lr": args.lr, "warmup": args.warmup, "steps": args.steps}
-    prev = student.cfg.get("schedule")
-    if prev and prev != schedule:
-        # allowed (extending a run is the usual reason to resume), but visible
-        print(f"note: LR schedule changes from {prev} to {schedule}")
-    student.cfg["schedule"] = schedule
+    train_cfg = {k: getattr(args, k) for k in _TRAIN_KEYS}
+    if args.resume:
+        # the architecture comes from the checkpoint; say so if the CLI differs
+        ignored = [
+            f"--{k} {getattr(args, k)} (checkpoint: {cfg[k]})"
+            for k in ("prelude", "core", "coda", "loops", "rank", "mode")
+            if getattr(args, k) != cfg[k]
+        ]
+        if ignored:
+            print("note: ignored on --resume: " + ", ".join(ignored))
+        # training settings may change (extending --steps is the usual reason
+        # to resume), but visibly
+        prev = student.cfg.get("train", {})
+        changed = [
+            f"{k} {prev[k]} -> {v}"
+            for k, v in train_cfg.items()
+            if k in prev and prev[k] != v
+        ]
+        if changed:
+            print("note: training settings change: " + ", ".join(changed))
+    student.cfg["train"] = train_cfg
     sched = optim.join_schedules(
         [
             optim.linear_schedule(0.0, args.lr, args.warmup),
@@ -584,6 +615,12 @@ def cmd_train(args):
     lvg = nn.value_and_grad(student, distill_loss)
     base_path = cfg["base"] if args.resume else args.model
     batches = iter_batches(tok, iter_texts(args), args.batch, args.seq, seed=args.seed)
+    if start:
+        # same seed and stream: skip what the checkpoint already trained on, so
+        # a resumed run continues with exactly the batches it would have seen
+        print(f"skipping {start * args.accum} batches already trained on")
+        for _ in range(start * args.accum):
+            next(batches)
 
     tokens_per_step = args.batch * args.seq * args.accum
     t_last, toks = time.time(), 0
@@ -718,6 +755,11 @@ def main():
     a = p.parse_args()
     if a.cmd in ("train", "eval") and not (a.data or a.hf_dataset):
         p.error("--data or --hf-dataset required")
+    # fail now, not as a ZeroDivisionError hours into a run
+    positive = ["batch", "seq", "steps", "accum", "log_every", "save_every", "batches"]
+    for k in positive:
+        if getattr(a, k, 1) < 1:
+            p.error(f"--{k.replace('_', '-')} must be >= 1")
     a.fn(a)
     if getattr(a, "hf_dataset", None):
         # A streamed HF dataset leaves pyarrow IO threads waiting on fsspec's
