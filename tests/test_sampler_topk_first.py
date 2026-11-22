@@ -103,12 +103,17 @@ class TestFilterTopKFirst:
         Full-vocab top_p keeps {.5, .25, .12} (ascending cumulative mass at the
         .12 token is 0.25 > 0.2). A naive top_p over only the 4 candidates
         would see 0.18 there and wrongly drop it.
+
+        The random-logits parity test rarely puts the top_p cut inside the k
+        candidates, so this case is also checked against mlx-lm's own chain:
+        a release that moves ``apply_top_p``'s boundary fails here.
         """
         lp, pos = _logprobs([0.5, 0.25, 0.12, 0.06], vocab=200)
         idx, vals = generation_options._filter_top_k_first(lp, 4, 0.8, 0.0)
         kept = {
             int(i) for i, v in zip(np.array(idx[0]), np.array(vals[0])) if v > -np.inf
         }
+        assert kept == _reference_support(lp, 4, 0.8, 0.0)
         assert kept == {int(pos[0]), int(pos[1]), int(pos[2])}
 
     @pytest.mark.parametrize("shift", [20.0, -20.0, 100.0])
