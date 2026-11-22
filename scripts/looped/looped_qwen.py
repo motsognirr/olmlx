@@ -116,20 +116,32 @@ class MessageGate(nn.Module):
     W starts at zero, so g is the constant sigmoid(bias_init) at step 0:
     bias -8 -> message passes through (teacher mode),
     bias +8 -> message blocked, every pass sees h0 (inkling mode).
+
+    sigmoid never reaches 0, so with exact_open (teacher mode) g is shifted by
+    its step-0 value, g' = (g - g0) / (1 - g0) with g0 = sigmoid(bias_init) a
+    constant: g' is exactly 0 at init, and its gradient differs from g's only by
+    the constant 1/(1-g0), so training behaves the same. Without the shift the
+    gate leaks ~3e-4 of h0 into every pass and the student can't match the
+    teacher exactly, even at full rank.
     """
 
-    def __init__(self, dim: int, eps: float, bias_init: float):
+    def __init__(self, dim: int, eps: float, bias_init: float, exact_open=False):
         super().__init__()
         self.norm_h = nn.RMSNorm(dim, eps=eps)
         self.norm_m = nn.RMSNorm(dim, eps=eps)
         self.proj = nn.Linear(2 * dim, dim)
         self.proj.weight = mx.zeros_like(self.proj.weight)
         self.proj.bias = mx.full((dim,), bias_init)
+        self._bias_init = bias_init
+        self._exact_open = exact_open
 
     def __call__(self, h0, m):
-        g = mx.sigmoid(
-            self.proj(mx.concatenate([self.norm_h(h0), self.norm_m(m)], axis=-1))
-        )
+        z = self.proj(mx.concatenate([self.norm_h(h0), self.norm_m(m)], axis=-1))
+        g = mx.sigmoid(z)
+        if self._exact_open:
+            # same op and dtype as g, so g - g0 is exactly 0 while z == bias_init
+            g0 = mx.sigmoid(mx.array(self._bias_init, dtype=z.dtype))
+            g = (g - g0) / (1 - g0)
         return (1 - g) * m + g * h0
 
 
@@ -253,7 +265,7 @@ class LoopedLM(nn.Module):
         for i in range(core):
             blk = _new_block(base)
             if init:
-                ps = [dict(tree_flatten(l.parameters())) for l in groups[i]]
+                ps = [dict(tree_flatten(layer.parameters())) for layer in groups[i]]
                 mean = {
                     k: sum(p[k].astype(mx.float32) for p in ps) / loops for k in ps[0]
                 }
@@ -268,7 +280,8 @@ class LoopedLM(nn.Module):
 
         bias = -8.0 if mode == "teacher" else 8.0
         self.gates = [
-            MessageGate(args.hidden_size, eps, bias) for _ in range(loops - 1)
+            MessageGate(args.hidden_size, eps, bias, exact_open=mode == "teacher")
+            for _ in range(loops - 1)
         ]
         self.coda = [_new_block(base, layers[n - coda + j]) for j in range(coda)]
 
@@ -278,7 +291,7 @@ class LoopedLM(nn.Module):
     # ----- init ----------------------------------------------------------
     def _init_adapters(self, groups, rank):
         for i, blk in enumerate(self.core.layers):
-            orig = [dict(tree_flatten(l.parameters())) for l in groups[i]]
+            orig = [dict(tree_flatten(layer.parameters())) for layer in groups[i]]
             for path, m in blk.named_modules():
                 pre = f"{path}." if path else ""
                 if isinstance(m, LoopRMSNorm):

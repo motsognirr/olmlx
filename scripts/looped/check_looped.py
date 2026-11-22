@@ -51,7 +51,8 @@ for kind in ["qwen2", "qwen3"]:
         "logit scale",
         mx.abs(ref).max().item(),
     )
-    assert err < 2e-3, err
+    # float32 noise is ~1e-5; a gate that is only approximately open leaks ~1e-3
+    assert err < 1e-4, err
     # low rank -> close, inkling -> far
     lo = mx.abs(lq.LoopedLM(base, 2, 3, 1, 3, rank=8)(x) - ref).mean().item()
     ink = (
@@ -88,8 +89,8 @@ for kind in ["qwen2", "qwen3"]:
         h0 = mx.stop_gradient(s.prelude_forward(x[:, :-1]))
         tl = mx.stop_gradient(lq.teacher_from_prelude(base, h0, 2))
         lvg = nn.value_and_grad(s, lq.distill_loss)
-        (l, _), g = lvg(s, h0, tl, x[:, 1:], 1.0, 0.1)
-        return l, dict(tree_flatten(g))
+        (loss, _), g = lvg(s, h0, tl, x[:, 1:], 1.0, 0.1)
+        return loss, dict(tree_flatten(g))
 
     l1, g1 = grads(True)
     l2, g2 = grads(False)

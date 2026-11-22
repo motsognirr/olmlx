@@ -17,7 +17,7 @@ student costs the same FLOPs per token with fewer layer parameters.
 
 * `--mode teacher` (default): core = mean of the replaced layer groups, plus a
   per-loop LoRA initialised by SVD of each original layer's difference from the
-  mean, exact per-loop biases/norms, and an open gate. The student starts
+  mean, exact per-loop biases/norms, and a gate that is exactly open at init. The student starts
   close to the teacher, and exactly equal to it at full rank.
 * `--mode inkling`: the gate starts closed (every pass sees only the prelude
   output) and opens during training.
