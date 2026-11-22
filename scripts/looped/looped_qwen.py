@@ -449,6 +449,8 @@ def iter_batches(
         # drop consumed tokens once per text: slicing per window copied the
         # remaining tail every time, quadratic for a long text (a whole .txt)
         del stream[:pos]
+    # only reached for a finite `texts` (iter_texts loops forever); a final
+    # partial batch is dropped so every batch keeps its shape
     while len(buf) >= batch:
         yield mx.array(buf[:batch])
         buf = buf[batch:]
@@ -487,6 +489,10 @@ _TRAIN_KEYS = (
     "clip",
     "weight_decay",
     "seed",
+    "data",
+    "hf_dataset",
+    "hf_subset",
+    "text_field",
 )
 
 
@@ -495,10 +501,16 @@ def save_student(student, out: Path, base_path: str, step: int):
     # every student parameter (the teacher is a _Ref, not in the tree), frozen
     # ones included, so the file fully describes the model and loads strictly
     flat = dict(tree_flatten(student.parameters()))
-    mx.save_safetensors(str(out / "student.safetensors"), flat)
-    (out / "config.json").write_text(
+    # write both to temp files, then rename: an interrupted save (OOM, Ctrl-C)
+    # must not leave a truncated checkpoint that --resume can't load
+    tmp_w = out / "student.tmp.safetensors"  # mlx appends .safetensors otherwise
+    tmp_c = out / "config.tmp.json"
+    mx.save_safetensors(str(tmp_w), flat)
+    tmp_c.write_text(
         json.dumps({"base": base_path, "step": step, **student.cfg}, indent=2)
     )
+    os.replace(tmp_w, out / "student.safetensors")
+    os.replace(tmp_c, out / "config.json")
 
 
 def load_student(out: Path, grad_checkpoint=False):
@@ -616,10 +628,24 @@ def cmd_train(args):
     base_path = cfg["base"] if args.resume else args.model
     batches = iter_batches(tok, iter_texts(args), args.batch, args.seq, seed=args.seed)
     if start:
-        # same seed and stream: skip what the checkpoint already trained on, so
-        # a resumed run continues with exactly the batches it would have seen
-        print(f"skipping {start * args.accum} batches already trained on")
-        for _ in range(start * args.accum):
+        # Skip what the checkpoint already trained on, counted with the
+        # checkpoint's own settings. With the same batch/seq/seed/data the
+        # resumed run sees exactly the batches it would have seen (a changed
+        # --accum is exact too); otherwise windows differ, so skip by tokens.
+        old = cfg.get("train", {})
+        o = {k: old.get(k, getattr(args, k)) for k in ("accum", "batch", "seq")}
+        n_skip = math.ceil(
+            start * o["accum"] * o["batch"] * o["seq"] / (args.batch * args.seq)
+        )
+        moved = [
+            k
+            for k in ("batch", "seq", "seed", "data", "hf_dataset", "hf_subset")
+            if k in old and old[k] != getattr(args, k)
+        ]
+        if moved:
+            print(f"note: {', '.join(moved)} changed: the data skip is approximate")
+        print(f"skipping {n_skip} batches already trained on")
+        for _ in range(n_skip):
             next(batches)
 
     tokens_per_step = args.batch * args.seq * args.accum

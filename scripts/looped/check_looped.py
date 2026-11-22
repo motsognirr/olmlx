@@ -106,4 +106,23 @@ for kind in ["qwen2", "qwen3"]:
         f"nonzero grads {nz}/{len(g1)}",
     )
     assert md < 1e-4
+
+    # real checkpoints are bf16 while the student trains in fp32: bf16 h0 feeds
+    # the fp32 core, fp32 coda output feeds the bf16 norm/head. Check that this
+    # mixed path runs, stays at the teacher at full rank, and gives finite grads.
+    base16 = make_base(kind)
+    base16.set_dtype(mx.bfloat16)
+    s16 = lq.LoopedLM(base16, 2, 3, 1, 3, rank=96)
+    s16.freeze()
+    for m in [s16.core, *s16.gates, *s16.coda]:
+        m.unfreeze()
+    h0 = s16.prelude_forward(x[:, :-1])
+    assert h0.dtype == mx.bfloat16
+    tl = lq.teacher_from_prelude(base16, h0, 2)
+    (loss, (kl, _)), g = nn.value_and_grad(s16, lq.distill_loss)(
+        s16, h0, tl, x[:, 1:], 1.0, 0.1
+    )
+    finite = all(mx.isfinite(v).all().item() for _, v in tree_flatten(g))
+    print(kind, "bf16 base: init kl", kl.item(), "| grads finite", finite)
+    assert kl.item() < 1e-3 and finite
 print("ALL OK")
