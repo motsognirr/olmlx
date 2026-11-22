@@ -232,6 +232,18 @@ class LoopedLM(nn.Module):
         train_dtype=mx.float32,
     ):
         super().__init__()
+        quantized = [
+            name
+            for name, m in base.named_modules()
+            if isinstance(m, (nn.QuantizedLinear, nn.QuantizedEmbedding))
+        ]
+        if quantized:
+            # the core is a weight mean and per-loop adapters wrap nn.Linear only:
+            # packed weights would be averaged as integers and left unadapted
+            raise ValueError(
+                f"quantized base model ({quantized[0]}, ...): use an unquantized "
+                "(bf16/fp16) checkpoint"
+            )
         layers = base.model.layers
         n = len(layers)
         if prelude + core * loops + coda != n:
@@ -479,9 +491,21 @@ def load_student(out: Path, grad_checkpoint=False):
         init=False,
         grad_checkpoint=grad_checkpoint,
     )
-    st.load_weights(
-        list(mx.load(str(out / "student.safetensors")).items()), strict=False
+    weights = mx.load(str(out / "student.safetensors"))
+    # Only trainable parameters are saved. A --freeze-coda coda is absent and
+    # rebuilt from the base (it never changed), so strict loading is impossible;
+    # anything else missing would silently keep its random init=False values.
+    missing = sorted(
+        k
+        for k, _ in tree_flatten(st.parameters())
+        if k not in weights and not k.startswith("coda.")
     )
+    if missing:
+        raise ValueError(
+            f"{out / 'student.safetensors'} lacks {len(missing)} student "
+            f"parameters, e.g. {missing[:3]}"
+        )
+    st.load_weights(list(weights.items()), strict=False)
     mx.eval(st.parameters())
     return st, base, tok, cfg
 

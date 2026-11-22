@@ -47,9 +47,12 @@ python scripts/looped/looped_qwen.py eval --out q3b-looped --data heldout.jsonl
 python scripts/looped/looped_qwen.py generate --out q3b-looped --prompt "Hello" --chat
 ```
 
-* `--data` takes `.jsonl` (`{"text": ...}`) or `.txt`. Evaluate on a held-out
-  file, because `eval` on the same HF stream reads the data that training
-  started on.
+* `--data` takes `.jsonl` (`{"text": ...}`) or `.txt`. A `.txt` is one
+  document: it is read and tokenized whole, every epoch, so use `.jsonl` or
+  `--hf-dataset` for a large corpus. Evaluate on a held-out file, because
+  `eval` on the same HF stream reads the data that training started on.
+* The base must be unquantized (bf16/fp16), e.g. `Qwen/Qwen3-0.6B`, not an
+  `mlx-community/...-4bit` build: the core is a mean of the layers' weights.
 * `--resume` continues the LR schedule from the saved step. The optimizer
   moments restart.
 * The trainer logs tok/s and peak memory every `--log-every` steps.
