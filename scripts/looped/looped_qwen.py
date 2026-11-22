@@ -367,7 +367,8 @@ class LoopedLM(nn.Module):
     def from_prelude(self, h0, cache=None):
         base = self.base.obj
         p, k = self.n_prelude, self.n_core
-        mask = create_attention_mask(h0, cache[0] if cache else None)
+        # core/coda caches advance together; cache[0] (prelude) is already past h0
+        mask = create_attention_mask(h0, cache[p] if cache else None)
         m = h0
         for t in range(self.loops):
             s = h0 if t == 0 else self.gates[t - 1](h0, m)
@@ -475,7 +476,9 @@ def distill_loss(student, h0, t_logits, targets, temp, ce_weight):
 
 def save_student(student, out: Path, base_path: str, step: int):
     out.mkdir(parents=True, exist_ok=True)
-    flat = dict(tree_flatten(student.trainable_parameters()))
+    # every student parameter (the teacher is a _Ref, not in the tree), frozen
+    # ones included, so the file fully describes the model and loads strictly
+    flat = dict(tree_flatten(student.parameters()))
     mx.save_safetensors(str(out / "student.safetensors"), flat)
     (out / "config.json").write_text(
         json.dumps({"base": base_path, "step": step, **student.cfg}, indent=2)
@@ -497,22 +500,11 @@ def load_student(out: Path, grad_checkpoint=False):
         init=False,
         grad_checkpoint=grad_checkpoint,
     )
-    st.cfg["freeze_coda"] = frozen_coda = cfg.get("freeze_coda", False)
-    weights = mx.load(str(out / "student.safetensors"))
-    # Only trainable parameters are saved. A --freeze-coda coda is absent and
-    # rebuilt from the base (it never changed), so strict loading is impossible;
-    # anything else missing would silently keep its random init=False values.
-    missing = sorted(
-        k
-        for k, _ in tree_flatten(st.parameters())
-        if k not in weights and not (frozen_coda and k.startswith("coda."))
-    )
-    if missing:
-        raise ValueError(
-            f"{out / 'student.safetensors'} lacks {len(missing)} student "
-            f"parameters, e.g. {missing[:3]}"
-        )
-    st.load_weights(list(weights.items()), strict=False)
+    for key in ("freeze_coda", "schedule"):
+        if key in cfg:
+            st.cfg[key] = cfg[key]
+    # strict: a missing parameter would otherwise keep its random init=False value
+    st.load_weights(list(mx.load(str(out / "student.safetensors")).items()))
     mx.eval(st.parameters())
     return st, base, tok, cfg
 
@@ -530,13 +522,12 @@ def cmd_train(args):
             out, grad_checkpoint=args.grad_checkpoint
         )
         start = cfg.get("step", 0)
-        # a frozen coda is not saved, so the setting must follow the checkpoint
-        freeze_coda = cfg.get("freeze_coda", False)
-        if args.freeze_coda and not freeze_coda:
+        if args.steps <= start:
             raise ValueError(
-                "this checkpoint trained the coda: --freeze-coda would leave it "
-                "out of the next save and reloads would fall back to the base's"
+                f"checkpoint is at step {start}: pass --steps > {start} to continue"
             )
+        # a frozen coda stays frozen; --freeze-coda can still add it
+        freeze_coda = args.freeze_coda or cfg.get("freeze_coda", False)
     else:
         freeze_coda = args.freeze_coda
         base, tok = load(args.model)
@@ -571,6 +562,12 @@ def cmd_train(args):
     n_train = sum(v.size for _, v in tree_flatten(student.trainable_parameters()))
     print(f"trainable params: {n_train / 1e6:.1f}M")
 
+    schedule = {"lr": args.lr, "warmup": args.warmup, "steps": args.steps}
+    prev = student.cfg.get("schedule")
+    if prev and prev != schedule:
+        # allowed (extending a run is the usual reason to resume), but visible
+        print(f"note: LR schedule changes from {prev} to {schedule}")
+    student.cfg["schedule"] = schedule
     sched = optim.join_schedules(
         [
             optim.linear_schedule(0.0, args.lr, args.warmup),

@@ -54,7 +54,10 @@ python scripts/looped/looped_qwen.py generate --out q3b-looped --prompt "Hello" 
 * The base must be unquantized (bf16/fp16), e.g. `Qwen/Qwen3-0.6B`, not an
   `mlx-community/...-4bit` build: the core is a mean of the layers' weights.
 * `--resume` continues the LR schedule from the saved step. The optimizer
-  moments restart.
+  moments restart. The schedule is rebuilt from the current `--lr`/`--warmup`/
+  `--steps`, so a larger `--steps` extends the run with a re-spanned cosine (a
+  warm restart); the trainer prints a note when it differs from the saved one.
+  `--steps` must exceed the checkpoint's step.
 * The trainer logs tok/s and peak memory every `--log-every` steps.
 
 Rough estimate for an M4 Pro with 64 GB on the 3B (computed, not measured):
