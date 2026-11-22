@@ -493,6 +493,7 @@ _TRAIN_KEYS = (
     "hf_dataset",
     "hf_subset",
     "text_field",
+    "grad_checkpoint",
 )
 
 
@@ -555,7 +556,12 @@ def cmd_train(args):
                 f"checkpoint is at step {start}: pass --steps > {start} to continue"
             )
         # a frozen coda stays frozen; --freeze-coda can still add it
-        freeze_coda = args.freeze_coda or cfg.get("freeze_coda", False)
+        was_frozen = cfg.get("freeze_coda", False)
+        freeze_coda = args.freeze_coda or was_frozen
+        if freeze_coda != was_frozen:
+            print("note: --freeze-coda freezes the checkpoint's trained coda")
+        elif was_frozen and not args.freeze_coda:
+            print("note: the coda stays frozen (checkpoint used --freeze-coda)")
     else:
         freeze_coda = args.freeze_coda
         base, tok = load(args.model)
