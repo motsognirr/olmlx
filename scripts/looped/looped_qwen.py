@@ -246,6 +246,12 @@ class LoopedLM(nn.Module):
             )
         layers = base.model.layers
         n = len(layers)
+        if min(prelude, coda, rank) < 0 or core < 1 or loops < 1:
+            raise ValueError(
+                "need prelude, coda, rank >= 0 and core, loops >= 1 "
+                f"(got prelude={prelude} core={core} coda={coda} loops={loops} "
+                f"rank={rank})"
+            )
         if prelude + core * loops + coda != n:
             raise ValueError(
                 f"prelude + core*loops + coda must equal {n} layers "
