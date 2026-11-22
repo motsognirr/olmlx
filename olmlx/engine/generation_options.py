@@ -32,7 +32,6 @@ except ImportError:  # pragma: no cover
 try:
     from mlx_lm.sample_utils import (
         apply_min_p,
-        apply_top_k,
         apply_top_p,
         make_logits_processors,
         make_sampler,
@@ -40,7 +39,7 @@ try:
 except ImportError:  # pragma: no cover
     make_sampler = None  # type: ignore[assignment]
     make_logits_processors = None  # type: ignore[assignment]
-    apply_min_p = apply_top_k = apply_top_p = None  # type: ignore[assignment]
+    apply_min_p = apply_top_p = None  # type: ignore[assignment]
     logging.getLogger(__name__).warning(
         "mlx-lm sample_utils unavailable (mlx-lm < 0.30.7?) — sampler/logits_processors disabled"
     )
@@ -253,7 +252,11 @@ def _make_thread_safe_sampler(
     worker threads the compiled draw neither reads nor advances that thread's
     state: every token gets identical noise and ``mx.random.seed`` is a no-op.
     The draw here is uncompiled, so it uses the calling thread's state. The
-    top-p/min-p/top-k filters are deterministic and reused from mlx-lm.
+    top-p/min-p filters are deterministic and reused from mlx-lm.
+
+    With ``top_k`` set (olmlx's default sampling always sets it), the k
+    candidates are selected first and top_p/min_p run over those k only
+    (:func:`_filter_top_k_first`), so no token pays a full-vocabulary sort.
     """
     if temp == 0:
         return lambda x: mx.argmax(x, axis=-1)
@@ -263,15 +266,72 @@ def _make_thread_safe_sampler(
         filters.append(lambda x: apply_top_p(x, top_p))
     if min_p != 0.0:
         filters.append(lambda x: apply_min_p(x, min_p, 1))
-    if top_k > 0:
-        filters.append(lambda x: apply_top_k(x, top_k))
 
-    def sampler(logprobs: mx.array) -> mx.array:
+    def full_vocab_sampler(logprobs: mx.array) -> mx.array:
         for f in filters:
             logprobs = f(logprobs)
         return mx.random.categorical(logprobs * (1 / temp))
 
-    return sampler
+    if top_k <= 0:
+        return full_vocab_sampler
+
+    def top_k_sampler(logprobs: mx.array) -> mx.array:
+        if top_k >= logprobs.shape[-1]:
+            return full_vocab_sampler(logprobs)  # top_k would keep everything
+        idx, vals = _filter_top_k_first(logprobs, top_k, top_p, min_p)
+        choice = mx.random.categorical(vals * (1 / temp))
+        return mx.take_along_axis(idx, choice[..., None], axis=-1).squeeze(-1)
+
+    return top_k_sampler
+
+
+def _filter_top_k_first(
+    logprobs: mx.array, top_k: int, top_p: float, min_p: float
+) -> tuple[mx.array, mx.array]:
+    """Select the ``top_k`` candidates, then apply top_p and min_p to them.
+
+    Returns ``(indices, values)``: the candidates' vocabulary ids and their
+    logprobs, with filtered-out candidates at ``-inf``. The kept set equals
+    mlx-lm's full-vocabulary chain (top_p, min_p, then top_k): each filter
+    keeps a prefix of the descending order, so the chain keeps the shortest
+    prefix, and that prefix lies inside the k candidates (which of several
+    tied tokens lands at the boundary is up to ``argpartition``, as it was in
+    mlx-lm's ``apply_top_k``). Requires ``0 < top_k < vocab``.
+
+    *logprobs* may also be raw logits: mlx-lm's and mlx-vlm's ``generate_step``
+    pass normalized logprobs, but mlx-vlm's speculative loop (Edge0 drafting at
+    temperature > 0) passes logits, so top_p normalizes by the full-vocabulary
+    log-sum-exp itself.
+    """
+    idx = mx.argpartition(-logprobs, kth=top_k - 1, axis=-1)[..., :top_k]
+    vals = mx.take_along_axis(logprobs, idx, axis=-1)
+    if 0 < top_p < 1.0:
+        log_total = mx.logsumexp(logprobs.astype(mx.float32), axis=-1, keepdims=True)
+        vals = _top_p_over_candidates(vals, top_p, log_total)
+    if min_p != 0.0:
+        # The max logprob is always a candidate, so the threshold is unchanged.
+        vals = apply_min_p(vals, min_p, 1)
+    return idx, vals
+
+
+def _top_p_over_candidates(
+    vals: mx.array, top_p: float, log_total: mx.array
+) -> mx.array:
+    """mlx-lm's ``apply_top_p`` restricted to the top-k candidates.
+
+    ``apply_top_p`` keeps a token when the ascending cumulative probability
+    up to it exceeds ``1 - top_p``. Every non-candidate is less probable than
+    every candidate, so at a candidate that cumulative is the mass outside the
+    candidates plus the cumulative over the candidates alone. *log_total* is
+    the full vocabulary's log-sum-exp, which turns *vals* into probabilities
+    whether they are logprobs (``log_total`` ~ 0) or raw logits.
+    """
+    probs = mx.exp(vals.astype(mx.float32) - log_total)
+    order = mx.argsort(vals, axis=-1)  # ascending, over k entries only
+    cumulative = mx.cumsum(mx.take_along_axis(probs, order, axis=-1), axis=-1)
+    cumulative = mx.take_along_axis(cumulative, mx.argsort(order, axis=-1), axis=-1)
+    outside = 1.0 - probs.sum(axis=-1, keepdims=True)
+    return mx.where(cumulative + outside > 1 - top_p, vals, -float("inf"))
 
 
 def _apply_seed(kwargs: dict, *, consume: bool = True) -> None:
