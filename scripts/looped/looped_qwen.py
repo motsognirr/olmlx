@@ -14,8 +14,9 @@ Two init modes:
            mean of the 3 original layer groups; each pass gets a per-loop LoRA
            initialised by SVD of (original - mean), plus exact per-loop biases and
            norms. With rank >= full the student reproduces the teacher exactly at
-           step 0; with a small rank it starts close to it. Recommended for
-           conversion.
+           step 0. A practical rank does not: on real models the layer
+           differences are near full-rank, and at rank 64-256 the init is about
+           as far from the teacher as rank 0 (see README).
   inkling  gate starts CLOSED (every pass sees only the prelude output, as in
            Inkling 2 Mini) and opens during training.
 
@@ -33,7 +34,9 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
 import random
+import sys
 import time
 from collections.abc import Iterator
 from pathlib import Path
@@ -415,14 +418,18 @@ def iter_batches(
     buf: list[list[int]] = []
     for text in texts:
         stream.extend(tokenizer.encode(text) + [eos])
-        while len(stream) >= seq + 1:
-            buf.append(stream[: seq + 1])
-            stream = stream[seq + 1 :]
+        pos = 0
+        while len(stream) - pos >= seq + 1:
+            buf.append(stream[pos : pos + seq + 1])
+            pos += seq + 1
             if len(buf) >= max(shuffle_buf, batch):
                 if shuffle_buf:  # 0 = keep stream order (eval)
                     rng.shuffle(buf)
                 yield mx.array(buf[:batch])
                 buf = buf[batch:]
+        # drop consumed tokens once per text: slicing per window copied the
+        # remaining tail every time, quadratic for a long text (a whole .txt)
+        del stream[:pos]
     while len(buf) >= batch:
         yield mx.array(buf[:batch])
         buf = buf[batch:]
@@ -538,6 +545,7 @@ def cmd_train(args):
         learning_rate=lambda i: sched(i + start), weight_decay=args.weight_decay
     )
     lvg = nn.value_and_grad(student, distill_loss)
+    base_path = cfg["base"] if args.resume else args.model
     batches = iter_batches(tok, iter_texts(args), args.batch, args.seq, seed=args.seed)
 
     tokens_per_step = args.batch * args.seq * args.accum
@@ -575,9 +583,7 @@ def cmd_train(args):
             )
             t_last, toks = time.time(), 0
         if (step + 1) % args.save_every == 0 or step + 1 == args.steps:
-            save_student(
-                student, out, args.model if not args.resume else cfg["base"], step + 1
-            )
+            save_student(student, out, base_path, step + 1)
 
 
 def cmd_eval(args):
@@ -585,7 +591,7 @@ def cmd_eval(args):
     student.eval()
     batches = iter_batches(tok, iter_texts(args), args.batch, args.seq, shuffle_buf=0)
     t_sum = s_sum = 0.0
-    for i in range(args.batches):
+    for _ in range(args.batches):
         x = next(batches)
         inp, tgt = x[:, :-1], x[:, 1:]
         h0 = student.prelude_forward(inp)
@@ -676,6 +682,14 @@ def main():
     if a.cmd in ("train", "eval") and not (a.data or a.hf_dataset):
         p.error("--data or --hf-dataset required")
     a.fn(a)
+    if getattr(a, "hf_dataset", None):
+        # A streamed HF dataset leaves pyarrow IO threads waiting on fsspec's
+        # daemon event-loop thread, which Python stops at shutdown, so exit()
+        # hangs forever in libarrow's static destructors. Everything is saved and
+        # printed by now: flush and skip the C++ teardown.
+        sys.stdout.flush()
+        sys.stderr.flush()
+        os._exit(0)
 
 
 if __name__ == "__main__":

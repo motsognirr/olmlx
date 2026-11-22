@@ -17,8 +17,13 @@ student costs the same FLOPs per token with fewer layer parameters.
 
 * `--mode teacher` (default): core = mean of the replaced layer groups, plus a
   per-loop LoRA initialised by SVD of each original layer's difference from the
-  mean, exact per-loop biases/norms, and a gate that is exactly open at init. The student starts
-  close to the teacher, and exactly equal to it at full rank.
+  mean, exact per-loop biases/norms, and a gate that is exactly open at init. At
+  full rank the student equals the teacher. At a practical rank it does **not**
+  start close: real layers are nearly unrelated (`|W - mean|` ≈ 0.8 `|W|`, with a
+  flat spectrum), so rank 64 recovers ~15 % of each difference and rank 256 ~35 %,
+  and the student collapses. Measured on Qwen3-0.6B (5 + 6×3 + 5): teacher CE
+  3.06; init KL 0.0006 at rank 1024, 11.7 at rank 64, 11.9 at rank 256, 11.2 at
+  rank 0, and 10.5 in inkling mode. Distillation does all the recovery work.
 * `--mode inkling`: the gate starts closed (every pass sees only the prelude
   output) and opens during training.
 
