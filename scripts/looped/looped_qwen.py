@@ -389,12 +389,12 @@ def iter_texts(args) -> Iterator[str]:
     if args.hf_dataset:
         from datasets import load_dataset
 
-        ds = load_dataset(
-            args.hf_dataset, args.hf_subset, split="train", streaming=True
-        )
-        for row in ds:
-            yield row[args.text_field]
-        return
+        while True:  # loop over epochs, like a local file (no StopIteration mid-run)
+            ds = load_dataset(
+                args.hf_dataset, args.hf_subset, split="train", streaming=True
+            )
+            for row in ds:
+                yield row[args.text_field]
     path = Path(args.data)
     while True:  # loop over epochs
         with path.open() as f:
@@ -419,7 +419,8 @@ def iter_batches(
             buf.append(stream[: seq + 1])
             stream = stream[seq + 1 :]
             if len(buf) >= max(shuffle_buf, batch):
-                rng.shuffle(buf)
+                if shuffle_buf:  # 0 = keep stream order (eval)
+                    rng.shuffle(buf)
                 yield mx.array(buf[:batch])
                 buf = buf[batch:]
     while len(buf) >= batch:
@@ -547,7 +548,10 @@ def cmd_train(args):
             x = next(batches)
             inp, tgt = x[:, :-1], x[:, 1:]
             h0 = mx.stop_gradient(student.prelude_forward(inp))
-            t_logits = mx.stop_gradient(teacher_from_prelude(base, h0, args.prelude))
+            # the student's own prelude: on --resume, args.prelude is the CLI default
+            t_logits = mx.stop_gradient(
+                teacher_from_prelude(base, h0, student.n_prelude)
+            )
             (_, (kl, ce)), g = lvg(
                 student, h0, t_logits, tgt, args.temp, args.ce_weight
             )
