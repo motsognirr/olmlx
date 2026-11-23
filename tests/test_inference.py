@@ -108,6 +108,19 @@ class TestPrefillCoverage:
         assert _prefill_coverage(10, 90, None, 5) == (10, 90, True)
 
 
+class _FixedTimer:
+    """Stand-in for olmlx.utils.timing.Timer with a fixed 32.2 s wall clock,
+    so the rate-to-duration split can be asserted exactly."""
+
+    duration_ns = 32_200_000_000
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
 class TestDeriveTimingStats:
     """Unit tests for _derive_timing_stats — the helper that converts
     mlx-lm's rates + a wall-clock fallback into Ollama-convention durations."""
@@ -249,6 +262,28 @@ class TestDeriveTimingStats:
         assert g == pytest.approx(50.0)
         # Prompt rate is the genuine suffix prefill rate (count matches rate).
         assert p == pytest.approx(5000.0)
+
+    def test_prefill_run_before_the_stream_counts_as_prefill(self):
+        """Checkpoint path: the segmented drive prefills all but the last
+        prompt token before mlx-lm starts, so mlx-lm's prompt_tps covers one
+        token. Without the drive's own time, a 30 s prefill was reported as
+        0.1 s (and ~30 s of wall time belonged to neither phase)."""
+        stats = TimingStats(prompt_eval_count=4000, eval_count=50)
+        # Drive: 3999 tokens in 30 s. mlx-lm: last token at 10 tok/s (0.1 s),
+        # then 50 tokens at 25 tok/s (2 s). Wall clock 32.2 s.
+        p, g = _derive_timing_stats(
+            stats,
+            10.0,
+            25.0,
+            eval_timer_ns=32_200_000_000,
+            prefilled_count=1,
+            pre_prefill_ns=30_000_000_000,
+            pre_prefill_tokens=3999,
+        )
+        assert stats.prompt_eval_duration == 30_100_000_000
+        assert stats.eval_duration == 2_000_000_000
+        assert p == pytest.approx(4000 / 30.1)
+        assert g == pytest.approx(25.0)
 
     def test_non_numeric_rate_treated_as_missing(self):
         """Defensive boundary: a non-Python-numeric scalar (e.g. MagicMock
@@ -2343,6 +2378,94 @@ class TestGenerateCompletion:
         )
 
     @pytest.mark.asyncio
+    async def test_streaming_checkpoint_drive_time_counts_as_prefill(
+        self, mock_manager
+    ):
+        """Streaming checkpoint path: the drive prefilled 3999 tokens in 30 s
+        before mlx-lm saw the last token, so mlx-lm's stream reports
+        prompt_tokens=1. The drive's time must still land in
+        prompt_eval_duration; it used to vanish from both phases."""
+        from olmlx.engine.inference import (
+            _CacheSetupResult,
+            _PreflightResult,
+            _PrefillTiming,
+        )
+
+        full = list(range(4000))
+        cs = _CacheSetupResult(
+            prompt=[full[-1]],
+            full_prompt_tokens=full,
+            cache_creation_tokens=len(full),
+            cache_setup_done=True,
+            deferred_prefill=lambda cancel_event: None,
+            deferred_prefill_timing=_PrefillTiming(
+                duration_ns=30_000_000_000, tokens=3999
+            ),
+        )
+        tokens = [
+            StreamToken(
+                text=f"t{i}",
+                token=i,
+                prompt_tokens=1,
+                generation_tokens=i,
+                prompt_tps=10.0,
+                generation_tps=25.0,
+            )
+            for i in range(1, 51)
+        ]
+        mock_stream = MagicMock(spec=CancellableStream)
+        mock_stream.drain_and_join = AsyncMock()
+        mock_stream._thread = None
+        token_iter = iter(tokens)
+
+        async def anext_impl():
+            try:
+                return next(token_iter)
+            except StopIteration:
+                raise StopAsyncIteration
+
+        mock_stream.__aiter__ = lambda self: self
+        mock_stream.__anext__ = lambda self: anext_impl()
+
+        async def fake_preflight(lm, prompt, *args, **kwargs):
+            return _PreflightResult(prompt=prompt)
+
+        with (
+            patch("olmlx.engine.inference.mx", MagicMock()),
+            patch("olmlx.engine.inference.Timer", _FixedTimer),
+            patch(
+                "olmlx.engine.inference._setup_prompt_cache",
+                new_callable=AsyncMock,
+                return_value=cs,
+            ),
+            patch(
+                "olmlx.engine.inference._kv_cache_preflight_check",
+                side_effect=fake_preflight,
+            ),
+            patch(
+                "olmlx.engine.inference._store_prompt_cache_after_generation",
+                new_callable=AsyncMock,
+            ),
+            patch("olmlx.engine.inference.async_mlx_stream", return_value=mock_stream),
+        ):
+            done_stats = TimingStats()
+            async for _chunk in _inf_mod._stream_completion(
+                mock_manager._loaded["qwen3:latest"],
+                "Hello",
+                100,
+                {},
+                done_stats,
+                use_prompt_cache=True,
+                prompt_tokens=full,
+            ):
+                pass
+
+        assert done_stats.prompt_eval_count == 4000
+        assert done_stats.eval_count == 50
+        assert done_stats.prompt_eval_duration == 30_100_000_000
+        assert done_stats.eval_duration == 2_000_000_000
+
+    @pytest.mark.asyncio
     async def test_streaming_ttft_span_is_measured(
         self, mock_manager, otel_memory_exporter
     ):
@@ -2937,6 +3060,42 @@ class TestFullCompletionInner:
         assert stats.prompt_eval_duration > 0
         assert stats.eval_duration >= 0
         assert stats.prompt_eval_duration + stats.eval_duration <= stats.total_duration
+
+    @pytest.mark.asyncio
+    async def test_checkpoint_drive_time_counts_as_prefill(self, mock_manager):
+        """Non-streaming checkpoint path: the drive's measured time must reach
+        prompt_eval_duration. mlx-lm's own rates cover only the last prompt
+        token (1 at 10 tok/s) and the decode (50 at 25 tok/s)."""
+        from olmlx.engine.inference import _full_completion_inner, _PrefillTiming
+
+        lm = mock_manager._loaded["qwen3:latest"]
+        mock_result = MagicMock()
+        mock_result.text = "ok"
+        mock_result.prompt_tokens = 1
+        mock_result.generation_tokens = 50
+        mock_result.prompt_tps = 10.0
+        mock_result.generation_tps = 25.0
+        stats = TimingStats()
+        with (
+            patch("olmlx.engine.inference.Timer", _FixedTimer),
+            patch(
+                "olmlx.engine.inference.asyncio.to_thread", new_callable=AsyncMock
+            ) as mock_thread,
+        ):
+            mock_thread.return_value = mock_result
+            await _full_completion_inner(
+                lm,
+                [7],
+                100,
+                {},
+                stats,
+                deferred_prefill=lambda cancel_event: None,
+                deferred_prefill_timing=_PrefillTiming(
+                    duration_ns=30_000_000_000, tokens=3999
+                ),
+            )
+        assert stats.prompt_eval_duration == 30_100_000_000
+        assert stats.eval_duration == 2_000_000_000
 
     @pytest.mark.asyncio
     async def test_stop_sequence_breaks_generation_early(self, mock_manager):

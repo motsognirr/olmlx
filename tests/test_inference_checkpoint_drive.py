@@ -373,6 +373,63 @@ def test_setup_prompt_cache_drives_segments_when_lm_uses_checkpoint_path(monkeyp
     assert cs.cache_creation_tokens == len(full_tokens)
 
 
+def test_deferred_checkpoint_prefill_records_its_time_and_tokens(monkeypatch):
+    """The drive replaces mlx-lm's prefill, so mlx-lm's prompt_tps covers only
+    the last token. The deferred closure must record the drive's own wall time
+    and token count, or the server reports a 30 s prefill as ~0.1 s."""
+    from olmlx.engine import inference as inference_mod
+    from olmlx.engine.inference import _setup_prompt_cache
+
+    clock = {"ns": 0}
+
+    class _OneSecondPerForward(_DummyModel):
+        def __call__(self, tokens, cache=None):
+            clock["ns"] += 1_000_000_000
+            return super().__call__(tokens, cache=cache)
+
+    monkeypatch.setattr(inference_mod.time, "perf_counter_ns", lambda: clock["ns"])
+    tok = _FakeTokenizer()
+    messages = [
+        {"role": "system", "content": "AB"},
+        {"role": "user", "content": "CD"},
+    ]
+    full_tokens = tok.apply_chat_template(messages)
+    model = _OneSecondPerForward()
+    lm = LoadedModel(
+        name="x",
+        hf_path="y",
+        model=model,
+        tokenizer=tok,
+        prompt_cache_store=PromptCacheStore(max_slots=4),
+        uses_checkpoint_persistence=True,
+        supports_cache_persistence=True,
+    )
+    monkeypatch.setattr(
+        inference_mod, "_make_prompt_cache_for_lm", lambda m: [KVCache()]
+    )
+
+    async def _go():
+        cs = await _setup_prompt_cache(
+            lm,
+            "ignored",
+            {},
+            prompt_tokens=full_tokens,
+            cache_id="test",
+            messages=messages,
+            tokenizer=tok,
+        )
+        assert cs.deferred_prefill_timing is not None
+        assert cs.deferred_prefill_timing.duration_ns == 0  # nothing ran yet
+        cs.deferred_prefill(None)
+        return cs
+
+    cs = asyncio.run(_go())
+    assert len(model.calls) > 0
+    assert cs.deferred_prefill_timing.duration_ns == len(model.calls) * 1_000_000_000
+    # Cold start: everything except the last token, which mlx-lm prefills.
+    assert cs.deferred_prefill_timing.tokens == len(full_tokens) - 1
+
+
 def test_drive_does_not_snapshot_last_segment_boundary():
     """The last segment's KV depth is N-1 (the trailing token is reserved
     for stream_generate); storing a checkpoint with tokens length N would
