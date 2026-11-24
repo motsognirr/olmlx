@@ -416,7 +416,11 @@ def tokenize_segmented_chat(
     Roles are aligned from the counts: extra EOMs are a template-injected
     preamble at the front (Harmony / gpt-oss, Qwen2.5's default system), and
     a shortfall is accepted only when runs of consecutive ``tool`` messages
-    explain it (Qwen3-family templates give each run one EOM). Counts can't
+    explain it (Qwen3-family templates give each run one EOM). When the
+    counts already match, roles map one per message, which misses offsetting
+    deviations: a preamble EOM that cancels one grouped tool run (Qwen3 with
+    ``tools=`` and no caller system message renders the tools block as its
+    own system turn) shifts every role after the first by one. Counts can't
     prove the alignment, but a misaligned role only changes a segment's
     eviction tier: every boundary sits right after an EOM token, so each
     snapshot point is a real prefix of the prompt.
