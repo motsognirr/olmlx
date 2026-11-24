@@ -377,3 +377,38 @@ class TestSpeculativeStreamTiming:
         )
         assert stats.prompt_eval_duration == pytest.approx(10_000_000_000, rel=1e-6)
         assert stats.eval_duration == pytest.approx(400_000_000, rel=1e-6)
+
+    def test_first_token_stop_reports_no_decode_time(self, monkeypatch):
+        """A response that ends on the prefill's own token did no decoding.
+        Its rate must still be a decode rate (mlx-lm times the first token
+        from the end of prefill too): with no rate at all, a wall clock that
+        equals the prefill sends _derive_timing_stats into its 50/50 split."""
+        from types import SimpleNamespace
+
+        from olmlx.engine import speculative_stream as ss
+        from olmlx.engine.inference import _derive_timing_stats
+        from olmlx.utils.timing import TimingStats
+
+        clock = SimpleNamespace(t=0.0)
+        monkeypatch.setattr(ss, "time", SimpleNamespace(perf_counter=lambda: clock.t))
+        dec = _ClockedDecoder(clock, prefill_s=10.0, step_s=0.1, tokens_per_step=2)
+        out = list(
+            ss.speculative_stream_generate(
+                dec,
+                list(range(1000)),
+                max_tokens=50,
+                cancel_event=threading.Event(),
+                eos_token_id=100,  # the token prefill returns
+            )
+        )
+        assert [t.token for t in out] == [100]
+        stats = TimingStats(prompt_eval_count=1000, eval_count=1)
+        _derive_timing_stats(
+            stats,
+            out[-1].prompt_tps,
+            out[-1].generation_tps,
+            eval_timer_ns=10_000_000_000,
+            prefilled_count=out[-1].prompt_tokens,
+        )
+        assert stats.prompt_eval_duration == pytest.approx(10_000_000_000, rel=1e-6)
+        assert stats.eval_duration < 1_000_000

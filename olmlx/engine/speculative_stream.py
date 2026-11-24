@@ -170,10 +170,12 @@ def speculative_stream_generate(
         prompt_tokens=prompt_len,
         generation_tokens=gen_count,
         prompt_tps=prompt_tps_val,
-        # The first token comes out of prefill, so no decode time has passed
-        # yet. Reporting gen_count / prefill_elapsed here (as before) would
-        # make _derive_timing_stats count the prefill a second time.
-        generation_tps=0.0,
+        # Timed from the end of prefill, like mlx-lm's first response: near
+        # zero decode time, so a response that ends here reports none.
+        # gen_count / prefill_elapsed (as before) counted the prefill twice,
+        # and 0 left the server no decode rate, which can split the wall
+        # time 50/50.
+        generation_tps=gen_count / max(time.perf_counter() - decode_start, 1e-9),
     )
 
     if first_token in stop_ids or cancel_event.is_set():
