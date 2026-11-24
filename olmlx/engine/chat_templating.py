@@ -414,9 +414,12 @@ def tokenize_segmented_chat(
     ``segmented.flatten()`` equals ``full``.
 
     Roles are aligned from the counts: extra EOMs are a template-injected
-    preamble at the front (Harmony / gpt-oss, Qwen2.5's default system), and
-    a shortfall is accepted only when runs of consecutive ``tool`` messages
-    explain it (Qwen3-family templates give each run one EOM). When the
+    preamble at the front (Harmony / gpt-oss, Qwen2.5's default system). A
+    shortfall is accepted when collapsing runs of consecutive ``tool``
+    messages covers it (Qwen3-family templates give each run one EOM); any
+    surplus left after the collapse is treated as a front preamble, which is
+    right for Qwen2.5's default system plus grouped tools but can't be
+    checked from counts alone. When the
     counts already match, roles map one per message, which misses offsetting
     deviations: a preamble EOM that cancels one grouped tool run (Qwen3 with
     ``tools=`` and no caller system message renders the tools block as its
