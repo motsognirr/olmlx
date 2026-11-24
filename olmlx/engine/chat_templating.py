@@ -413,9 +413,25 @@ def tokenize_segmented_chat(
     chat template's trailing assistant-prompt suffix so
     ``segmented.flatten()`` equals ``full``.
 
-    Falls back to a single-segment prompt (logged at debug) when the
-    tokenizer exposes no EOM token or the detected EOM count differs from
-    ``len(messages)``. The fallback records no ``trailing_tokens``, so it
+    Roles are aligned from the counts: extra EOMs are a template-injected
+    preamble at the front (Harmony / gpt-oss, Qwen2.5's default system). A
+    shortfall is accepted when collapsing runs of consecutive ``tool``
+    messages covers it (Qwen3-family templates give each run one EOM); any
+    surplus left after the collapse is treated as a front preamble, which is
+    right for Qwen2.5's default system plus grouped tools but can't be
+    checked from counts alone. When the
+    counts already match, roles map one per message, which misses offsetting
+    deviations: a preamble EOM that cancels one grouped tool run (Qwen3 with
+    ``tools=`` and no caller system message renders the tools block as its
+    own system turn) shifts every role after the first by one. Counts can't
+    prove the alignment, but a misaligned role changes only a label: it is
+    recorded as the checkpoint's ``cache_type`` metadata, which eviction and
+    reuse don't read. Every boundary sits right after an EOM token, so each
+    snapshot point is a real prefix of the prompt whatever its label.
+
+    Falls back to a single-segment prompt when the tokenizer exposes no EOM
+    token or there are fewer EOMs than messages even after collapsing tool
+    runs. The fallback records no ``trailing_tokens``, so it
     has no snapshot point (``final_message_end()`` is ``None``) and a cold
     start skips the checkpoint path. A correctly segmented single message
     followed by a generation prompt does have one: the end of that message.
@@ -474,10 +490,36 @@ def tokenize_segmented_chat(
     # (Harmony / gpt-oss) emit extras because the template injects a
     # baseline preamble (system message about output channels) that the
     # caller didn't supply. Accept extras by treating them as preamble
-    # segments at the start with the first caller-supplied role; reject
-    # only when boundaries < messages (the template emitted FEWER EOMs
-    # than expected, which means we can't safely align roles).
-    if len(boundaries) < len(messages):
+    # segments at the start with the first caller-supplied role.
+    #
+    # Qwen3-family templates emit FEWER: consecutive ``tool`` messages
+    # share one ``<|im_start|>user`` block and one EOM, so a turn with
+    # parallel tool calls has one EOM per run of tool results. Align
+    # against those runs. Any other shortfall is rejected, because the
+    # roles can't be aligned safely. Falling back here costs every later
+    # turn of the conversation its checkpoint.
+    roles: list[Any] = [m["role"] for m in messages]
+    if len(boundaries) < len(roles):
+        roles = [
+            role
+            for k, role in enumerate(roles)
+            if not (k > 0 and role == "tool" and roles[k - 1] == "tool")
+        ]
+        if len(roles) < len(messages):
+            logger.debug(
+                "tokenize_segmented_chat: %d EOMs for %d messages; aligning "
+                "against %d after collapsing tool runs",
+                len(boundaries),
+                len(messages),
+                len(roles),
+            )
+    if len(boundaries) < len(roles):
+        logger.debug(
+            "tokenize_segmented_chat: %d EOMs for %d messages; falling back "
+            "to one segment",
+            len(boundaries),
+            len(messages),
+        )
         return SegmentedPrompt(
             segments=[Segment(tokens=full, role=messages[-1]["role"])]
         )
@@ -491,10 +533,10 @@ def tokenize_segmented_chat(
         boundaries[-1] = len(full)
 
     # Build the role list, padding the front with extras using
-    # ``messages[0]["role"]`` so the LRU eviction tier still picks a
-    # sensible (typically "system") priority for the injected preamble.
-    extras = len(boundaries) - len(messages)
-    roles: list[Any] = [messages[0]["role"]] * extras + [m["role"] for m in messages]
+    # ``messages[0]["role"]`` so the injected preamble gets a sensible
+    # (typically "system") label.
+    extras = len(boundaries) - len(roles)
+    roles = [messages[0]["role"]] * extras + roles
 
     segments: list[Segment] = []
     start = 0
