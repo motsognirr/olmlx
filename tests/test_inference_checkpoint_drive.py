@@ -347,6 +347,69 @@ def test_tokenize_segmented_chat_groups_consecutive_tool_messages():
     assert sp.snapshot_points(0) == [(3, "system"), (len(full) - 2, "tool")]
 
 
+def test_tokenize_segmented_chat_groups_three_consecutive_tool_messages():
+    tok = _QwenToolGroupingTokenizer()
+    messages = [*_PARALLEL_TOOL_TURN, {"role": "tool", "content": "r3"}]
+    full = tok.apply_chat_template(messages)
+    sp = tokenize_segmented_chat(tok, messages, full_tokens=list(full))
+
+    assert sp.flatten() == full
+    assert [s.role for s in sp.segments] == ["system", "user", "assistant", "tool"]
+    assert sp.final_message_end() == len(full) - 2
+
+
+def test_tokenize_segmented_chat_groups_each_tool_run_separately():
+    """Two parallel-call turns: each run of tool results is its own segment,
+    with the assistant turn between them kept as its own segment."""
+    tok = _QwenToolGroupingTokenizer()
+    messages = [
+        *_PARALLEL_TOOL_TURN,
+        {"role": "assistant", "content": "B"},
+        {"role": "tool", "content": "r3"},
+        {"role": "tool", "content": "r4"},
+    ]
+    full = tok.apply_chat_template(messages)
+    sp = tokenize_segmented_chat(tok, messages, full_tokens=list(full))
+
+    assert sp.flatten() == full
+    assert [s.role for s in sp.segments] == [
+        "system",
+        "user",
+        "assistant",
+        "tool",
+        "assistant",
+        "tool",
+    ]
+    assert sp.segments[4].tokens == [3, 66, 9]
+    assert sp.final_message_end() == len(full) - 2
+
+
+def test_tokenize_segmented_chat_groups_tools_after_injected_preamble():
+    """A template that injects a default system block (Qwen2.5 does when the
+    caller sends none) and groups tool results: the preamble is the extra
+    leading segment, and the roles after it stay aligned."""
+
+    class _PreambleQwenTokenizer(_QwenToolGroupingTokenizer):
+        def apply_chat_template(self, messages, **kwargs):
+            return [7, 100, 9, *super().apply_chat_template(messages, **kwargs)]
+
+    tok = _PreambleQwenTokenizer()
+    messages = [
+        {"role": "user", "content": "U"},
+        {"role": "assistant", "content": "A"},
+        {"role": "tool", "content": "r1"},
+        {"role": "tool", "content": "r2"},
+        {"role": "tool", "content": "r3"},
+    ]
+    full = tok.apply_chat_template(messages)
+    sp = tokenize_segmented_chat(tok, messages, full_tokens=list(full))
+
+    assert sp.flatten() == full
+    assert [s.tokens for s in sp.segments[:3]] == [[7, 100, 9], [2, 85, 9], [3, 65, 9]]
+    assert [s.role for s in sp.segments] == ["user", "user", "assistant", "tool"]
+    assert sp.final_message_end() == len(full) - 2
+
+
 def test_tokenize_segmented_chat_falls_back_on_unexplained_eom_shortfall():
     """Fewer EOMs than messages that tool grouping does not explain still
     falls back to one segment: the roles can't be aligned safely."""

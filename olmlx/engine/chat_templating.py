@@ -413,9 +413,17 @@ def tokenize_segmented_chat(
     chat template's trailing assistant-prompt suffix so
     ``segmented.flatten()`` equals ``full``.
 
-    Falls back to a single-segment prompt (logged at debug) when the
-    tokenizer exposes no EOM token or the detected EOM count differs from
-    ``len(messages)``. The fallback records no ``trailing_tokens``, so it
+    Roles are aligned from the counts: extra EOMs are a template-injected
+    preamble at the front (Harmony / gpt-oss, Qwen2.5's default system), and
+    a shortfall is accepted only when runs of consecutive ``tool`` messages
+    explain it (Qwen3-family templates give each run one EOM). Counts can't
+    prove the alignment, but a misaligned role only changes a segment's
+    eviction tier: every boundary sits right after an EOM token, so each
+    snapshot point is a real prefix of the prompt.
+
+    Falls back to a single-segment prompt when the tokenizer exposes no EOM
+    token or there are fewer EOMs than messages even after collapsing tool
+    runs. The fallback records no ``trailing_tokens``, so it
     has no snapshot point (``final_message_end()`` is ``None``) and a cold
     start skips the checkpoint path. A correctly segmented single message
     followed by a generation prompt does have one: the end of that message.
@@ -489,7 +497,20 @@ def tokenize_segmented_chat(
             for k, role in enumerate(roles)
             if not (k > 0 and role == "tool" and roles[k - 1] == "tool")
         ]
+        logger.debug(
+            "tokenize_segmented_chat: %d EOMs for %d messages; aligning "
+            "against %d after collapsing tool runs",
+            len(boundaries),
+            len(messages),
+            len(roles),
+        )
     if len(boundaries) < len(roles):
+        logger.debug(
+            "tokenize_segmented_chat: %d EOMs for %d messages; falling back "
+            "to one segment",
+            len(boundaries),
+            len(messages),
+        )
         return SegmentedPrompt(
             segments=[Segment(tokens=full, role=messages[-1]["role"])]
         )
