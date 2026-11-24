@@ -1810,8 +1810,11 @@ class _CacheSetupResult:
     # Executed on the generation worker thread (same thread-local
     # generation_stream as decode, #284/#499), never on the event loop.
     deferred_prefill: Callable[[threading.Event | None], None] | None = None
-    # Filled in by ``deferred_prefill`` once the drive has run.
-    deferred_prefill_timing: _PrefillTiming | None = None
+    # Filled in by ``deferred_prefill`` once the drive has run (zeros when
+    # there is no drive or it hasn't run).
+    deferred_prefill_timing: _PrefillTiming = dataclasses.field(
+        default_factory=_PrefillTiming
+    )
 
 
 # Sub-chunk size for the segmented-prefill drive's per-chunk ``model()`` calls
@@ -2289,7 +2292,7 @@ async def _setup_via_checkpoint_path(
         cache_creation_tokens=max(0, len(prompt_tokens) - already_covered),
         cache_setup_done=True,
         deferred_prefill=_deferred_prefill if flat else None,
-        deferred_prefill_timing=timing if flat else None,
+        deferred_prefill_timing=timing,
     )
 
 
@@ -4078,7 +4081,7 @@ async def _stream_completion(
 
             # Checkpoint path: the drive prefilled everything but the last
             # token before the stream started (zeros if it never ran).
-            drive = cs.deferred_prefill_timing or _PrefillTiming()
+            drive = cs.deferred_prefill_timing
             prompt_tps, gen_tps = _derive_timing_stats(
                 stats,
                 getattr(token, "prompt_tps", 0) or 0,
@@ -4397,7 +4400,7 @@ async def _full_completion(
             generated_tokens: list[int] = []
             result_dict: dict = {}
             deferred_prefill: Callable[[threading.Event | None], None] | None = None
-            deferred_prefill_timing: _PrefillTiming | None = None
+            deferred_prefill_timing = _PrefillTiming()
             try:
                 if use_prompt_cache and lm.is_vlm:
                     # VLM: attach an mlx_vlm PromptCacheState. Leave ``prompt``
@@ -4875,23 +4878,29 @@ async def _full_completion_inner(
                 gen_result, full_text = result
                 result = gen_result
 
-            # Extract token counts from GenerationResult (stream_generate) or string
-            if hasattr(result, "prompt_tokens"):
-                stats.prompt_eval_count = result.prompt_tokens
-            if hasattr(result, "generation_tokens"):
-                stats.eval_count = result.generation_tokens
-
             # Checkpoint path: the drive ran inside _generate_sync before
             # stream_generate, which then prefilled only the last token.
             drive = deferred_prefill_timing or _PrefillTiming()
+
+            # Extract token counts from GenerationResult (stream_generate) or string
+            if hasattr(result, "prompt_tokens"):
+                # The prefilled count, drive included: the log line and metrics
+                # below read it before _full_completion reports the full prompt.
+                stats.prompt_eval_count = (
+                    result.prompt_tokens + drive.tokens
+                    if drive.tokens
+                    else result.prompt_tokens
+                )
+            if hasattr(result, "generation_tokens"):
+                stats.eval_count = result.generation_tokens
+
             prompt_tps, gen_tps = _derive_timing_stats(
                 stats,
                 getattr(result, "prompt_tps", 0) or 0,
                 getattr(result, "generation_tps", 0) or 0,
                 eval_timer.duration_ns,
-                # Non-streaming reports the mlx-lm-prefilled count as prompt_eval_count
-                # already, so this matches — passed explicitly for parity with the
-                # streaming path's cache-hit handling.
+                # The count mlx-lm's prompt_tps was measured over; the drive's
+                # tokens and time are added on top via pre_prefill_*.
                 prefilled_count=getattr(result, "prompt_tokens", None),
                 pre_prefill_ns=drive.duration_ns,
                 pre_prefill_tokens=drive.tokens,

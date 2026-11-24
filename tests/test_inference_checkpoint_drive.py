@@ -387,7 +387,20 @@ def test_deferred_checkpoint_prefill_records_its_time_and_tokens(monkeypatch):
             clock["ns"] += 1_000_000_000
             return super().__call__(tokens, cache=cache)
 
-    monkeypatch.setattr(inference_mod.time, "perf_counter_ns", lambda: clock["ns"])
+    import time as _real_time
+
+    class _FakeClockTime:
+        """inference.py's ``time`` with only perf_counter_ns faked, so the
+        patch can't reach any other module's clock."""
+
+        def __getattr__(self, name):
+            return getattr(_real_time, name)
+
+        @staticmethod
+        def perf_counter_ns():
+            return clock["ns"]
+
+    monkeypatch.setattr(inference_mod, "time", _FakeClockTime())
     tok = _FakeTokenizer()
     messages = [
         {"role": "system", "content": "AB"},

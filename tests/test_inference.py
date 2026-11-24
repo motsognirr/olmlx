@@ -3098,6 +3098,48 @@ class TestFullCompletionInner:
         assert stats.eval_duration == 2_000_000_000
 
     @pytest.mark.asyncio
+    async def test_checkpoint_drive_tokens_count_as_prompt_tokens(self, mock_manager):
+        """The non-streaming log line and metrics read stats.prompt_eval_count
+        before _full_completion reports the full prompt. On the checkpoint path
+        mlx-lm's prompt_tokens is 1, so without the drive's tokens a 30 s
+        prefill logs as "1 prompt tokens (132.9 tok/s)"."""
+        from olmlx.engine.inference import _full_completion_inner, _PrefillTiming
+
+        lm = mock_manager._loaded["qwen3:latest"]
+        mock_result = MagicMock()
+        mock_result.text = "ok"
+        mock_result.prompt_tokens = 1
+        mock_result.generation_tokens = 50
+        mock_result.prompt_tps = 10.0
+        mock_result.generation_tps = 25.0
+        stats = TimingStats()
+        observed: list[int] = []
+        with (
+            patch("olmlx.engine.inference.Timer", _FixedTimer),
+            patch(
+                "olmlx.engine.inference.asyncio.to_thread", new_callable=AsyncMock
+            ) as mock_thread,
+            patch(
+                "olmlx.engine.inference._metrics.observe_inference",
+                side_effect=lambda _n, _s, st: observed.append(st.prompt_eval_count),
+            ),
+        ):
+            mock_thread.return_value = mock_result
+            await _full_completion_inner(
+                lm,
+                [7],
+                100,
+                {},
+                stats,
+                deferred_prefill=lambda cancel_event: None,
+                deferred_prefill_timing=_PrefillTiming(
+                    duration_ns=30_000_000_000, tokens=3999
+                ),
+            )
+        assert stats.prompt_eval_count == 4000
+        assert observed == [4000]
+
+    @pytest.mark.asyncio
     async def test_stop_sequence_breaks_generation_early(self, mock_manager):
         """Non-streaming generation must stop pulling tokens as soon as a stop
         sequence matches, instead of decoding all the way to max_tokens and
