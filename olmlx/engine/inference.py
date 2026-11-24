@@ -419,12 +419,12 @@ def _derive_timing_stats(
     ``pre_prefill_ns`` / ``pre_prefill_tokens`` describe prefill work that ran
     before mlx-lm's stream and that its rates therefore don't cover: the
     checkpoint drive (``_PrefillTiming``), which leaves mlx-lm one token. Both
-    are added to the prefill side.
+    are added to the prefill side (the tokens only to an explicit
+    ``prefilled_count``).
     """
+    explicit_prefill_count = prefilled_count is not None and prefilled_count > 0
     prefill_count = (
-        prefilled_count
-        if prefilled_count is not None and prefilled_count > 0
-        else stats.prompt_eval_count
+        prefilled_count if explicit_prefill_count else stats.prompt_eval_count
     )
     # Explicit zero of the fields this helper owns — several branches below
     # write only one of the two, so initialize both up front to make the
@@ -452,8 +452,11 @@ def _derive_timing_stats(
         if prompt_tps > 0 and prefill_count > 0
         else 0
     ) + max(0, pre_prefill_ns)
-    # The log-line rate at the end divides by the whole prefill, drive included.
-    prefill_count += max(0, pre_prefill_tokens)
+    # The log-line rate at the end divides by the whole prefill, drive
+    # included. The fallback count is the reported prompt size, which already
+    # covers the drive.
+    if explicit_prefill_count:
+        prefill_count += max(0, pre_prefill_tokens)
     raw_decode_ns = (
         int(stats.eval_count / gen_tps * 1e9)
         if gen_tps > 0 and stats.eval_count > 0
@@ -2280,8 +2283,10 @@ async def _setup_via_checkpoint_path(
         )
         timing.duration_ns = time.perf_counter_ns() - start_ns
         # The drive covers [already_covered, len - 1); the last token is
-        # left to stream_generate.
-        timing.tokens = max(0, len(flat) - 1 - already_covered)
+        # left to stream_generate. A cancel returns early with only a prefix
+        # done, so it claims no tokens (its time is still real).
+        if cancel_event is None or not cancel_event.is_set():
+            timing.tokens = max(0, len(flat) - 1 - already_covered)
 
     gen_kwargs["prompt_cache"] = cache
     suffix: list[int] = [flat[-1]] if flat else []
@@ -4488,6 +4493,11 @@ async def _full_completion(
                     grammar_active=grammar_active,
                     deferred_prefill=deferred_prefill,
                     deferred_prefill_timing=deferred_prefill_timing,
+                    full_prompt_count=(
+                        len(full_prompt_tokens)
+                        if full_prompt_tokens is not None
+                        else None
+                    ),
                     stop_sequences=stop_sequences,
                     thinking_expected=thinking_expected,
                     messages=messages,
@@ -4594,6 +4604,7 @@ async def _full_completion_inner(
     grammar_active: bool = False,
     deferred_prefill: Callable[[threading.Event | None], None] | None = None,
     deferred_prefill_timing: _PrefillTiming | None = None,
+    full_prompt_count: int | None = None,
     stop_sequences: list[str] | None = None,
     thinking_expected: bool = False,
     messages: list[dict] | None = None,
@@ -4884,13 +4895,16 @@ async def _full_completion_inner(
 
             # Extract token counts from GenerationResult (stream_generate) or string
             if hasattr(result, "prompt_tokens"):
-                # The prefilled count, drive included: the log line and metrics
-                # below read it before _full_completion reports the full prompt.
-                stats.prompt_eval_count = (
-                    result.prompt_tokens + drive.tokens
-                    if drive.tokens
-                    else result.prompt_tokens
-                )
+                # The log line and metrics below read this before
+                # _full_completion sets it, so report the full prompt here
+                # too, as the streaming path does. The rate covers only what
+                # was prefilled (prefilled_count + the drive).
+                if full_prompt_count is not None:
+                    stats.prompt_eval_count = full_prompt_count
+                elif drive.tokens:
+                    stats.prompt_eval_count = result.prompt_tokens + drive.tokens
+                else:
+                    stats.prompt_eval_count = result.prompt_tokens
             if hasattr(result, "generation_tokens"):
                 stats.eval_count = result.generation_tokens
 

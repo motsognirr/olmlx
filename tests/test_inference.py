@@ -285,6 +285,22 @@ class TestDeriveTimingStats:
         assert p == pytest.approx(4000 / 30.1)
         assert g == pytest.approx(25.0)
 
+    def test_fallback_count_already_includes_the_drive(self):
+        """Without an explicit prefilled_count the helper falls back to the
+        reported prompt size, which already covers the drive's tokens. Adding
+        pre_prefill_tokens on top would log twice the real prefill rate."""
+        stats = TimingStats(prompt_eval_count=4000, eval_count=50)
+        p, _ = _derive_timing_stats(
+            stats,
+            0,
+            25.0,
+            eval_timer_ns=32_200_000_000,
+            pre_prefill_ns=30_000_000_000,
+            pre_prefill_tokens=3999,
+        )
+        assert stats.prompt_eval_duration == 30_000_000_000
+        assert p == pytest.approx(4000 / 30.0)
+
     def test_non_numeric_rate_treated_as_missing(self):
         """Defensive boundary: a non-Python-numeric scalar (e.g. MagicMock
         from a sloppy test, numpy/mlx scalar from mlx-lm) must not be trusted
@@ -3098,11 +3114,13 @@ class TestFullCompletionInner:
         assert stats.eval_duration == 2_000_000_000
 
     @pytest.mark.asyncio
-    async def test_checkpoint_drive_tokens_count_as_prompt_tokens(self, mock_manager):
+    async def test_checkpoint_path_reports_the_full_prompt_count(self, mock_manager):
         """The non-streaming log line and metrics read stats.prompt_eval_count
         before _full_completion reports the full prompt. On the checkpoint path
-        mlx-lm's prompt_tokens is 1, so without the drive's tokens a 30 s
-        prefill logs as "1 prompt tokens (132.9 tok/s)"."""
+        mlx-lm's prompt_tokens is 1, so a 30 s prefill logged as "1 prompt
+        tokens (132.9 tok/s)". Like the streaming path, report the full prompt
+        (warm start here: 200 tokens came from the cache) while the rate covers
+        what was actually prefilled."""
         from olmlx.engine.inference import _full_completion_inner, _PrefillTiming
 
         lm = mock_manager._loaded["qwen3:latest"]
@@ -3133,11 +3151,13 @@ class TestFullCompletionInner:
                 stats,
                 deferred_prefill=lambda cancel_event: None,
                 deferred_prefill_timing=_PrefillTiming(
-                    duration_ns=30_000_000_000, tokens=3999
+                    duration_ns=30_000_000_000, tokens=3799
                 ),
+                full_prompt_count=4000,
             )
         assert stats.prompt_eval_count == 4000
         assert observed == [4000]
+        assert stats.prompt_eval_duration == 30_100_000_000
 
     @pytest.mark.asyncio
     async def test_stop_sequence_breaks_generation_early(self, mock_manager):

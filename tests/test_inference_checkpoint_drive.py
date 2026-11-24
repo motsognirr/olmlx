@@ -443,6 +443,60 @@ def test_deferred_checkpoint_prefill_records_its_time_and_tokens(monkeypatch):
     assert cs.deferred_prefill_timing.tokens == len(full_tokens) - 1
 
 
+def test_cancelled_checkpoint_drive_claims_no_tokens(monkeypatch):
+    """A cancel makes the drive return early with only a prefix prefilled.
+    Its time is real, but claiming the whole span as prefilled tokens would
+    report a fictitious prefill rate for a request that never finished."""
+    from olmlx.engine import inference as inference_mod
+    from olmlx.engine.inference import _setup_prompt_cache
+
+    monkeypatch.setattr(inference_mod, "_PREFILL_CHUNK", 2)
+    cancel = threading.Event()
+
+    class _CancelAfterFirst(_DummyModel):
+        def __call__(self, tokens, cache=None):
+            out = super().__call__(tokens, cache=cache)
+            cancel.set()
+            return out
+
+    tok = _FakeTokenizer()
+    messages = [
+        {"role": "system", "content": "ABCDEF"},
+        {"role": "user", "content": "GH"},
+    ]
+    full_tokens = tok.apply_chat_template(messages)
+    model = _CancelAfterFirst()
+    lm = LoadedModel(
+        name="x",
+        hf_path="y",
+        model=model,
+        tokenizer=tok,
+        prompt_cache_store=PromptCacheStore(max_slots=4),
+        uses_checkpoint_persistence=True,
+        supports_cache_persistence=True,
+    )
+    monkeypatch.setattr(
+        inference_mod, "_make_prompt_cache_for_lm", lambda m: [KVCache()]
+    )
+
+    async def _go():
+        cs = await _setup_prompt_cache(
+            lm,
+            "ignored",
+            {},
+            prompt_tokens=full_tokens,
+            cache_id="test",
+            messages=messages,
+            tokenizer=tok,
+        )
+        cs.deferred_prefill(cancel)
+        return cs
+
+    cs = asyncio.run(_go())
+    assert len(model.calls) == 1  # the cancel cut the drive short
+    assert cs.deferred_prefill_timing.tokens == 0
+
+
 def test_drive_does_not_snapshot_last_segment_boundary():
     """The last segment's KV depth is N-1 (the trailing token is reserved
     for stream_generate); storing a checkpoint with tokens length N would
