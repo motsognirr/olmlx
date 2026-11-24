@@ -143,7 +143,8 @@ def speculative_stream_generate(
         # on the long-lived per-model decoder until the next prefill().
         decoder.reset()
         return
-    prefill_elapsed = time.perf_counter() - t0
+    decode_start = time.perf_counter()
+    prefill_elapsed = decode_start - t0
     prompt_tps_val = prompt_len / max(prefill_elapsed, 1e-9)
 
     generated: list[int] = [first_token]
@@ -169,7 +170,12 @@ def speculative_stream_generate(
         prompt_tokens=prompt_len,
         generation_tokens=gen_count,
         prompt_tps=prompt_tps_val,
-        generation_tps=gen_count / max(prefill_elapsed, 1e-9),
+        # Timed from the end of prefill, like mlx-lm's first response: near
+        # zero decode time, so a response that ends here reports none.
+        # gen_count / prefill_elapsed (as before) counted the prefill twice,
+        # and 0 left the server no decode rate, which can split the wall
+        # time 50/50.
+        generation_tps=gen_count / max(time.perf_counter() - decode_start, 1e-9),
     )
 
     if first_token in stop_ids or cancel_event.is_set():
@@ -205,7 +211,11 @@ def speculative_stream_generate(
 
             gen_count += 1
             generated.append(token)
-            gen_elapsed = time.perf_counter() - t0
+            # Decode-only, like mlx-lm's stream_generate (its timer restarts
+            # after the first token). Measuring from t0 folded the whole
+            # prefill into the rate, and the server, which rebuilds durations
+            # from both rates, then reported half the prefill as decode time.
+            gen_elapsed = time.perf_counter() - decode_start
 
             if tokenizer is not None:
                 full_text = tokenizer.decode(generated, skip_special_tokens=True)

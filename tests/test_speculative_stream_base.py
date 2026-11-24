@@ -306,3 +306,109 @@ class TestMultipleEosIds:
         tokens = [item.token async for item in stream]
         await stream.drain_and_join()
         assert tokens == [1, 98]
+
+
+class _ClockedDecoder:
+    """Speculative decoder stand-in on a fake clock: prefill costs
+    ``prefill_s`` seconds, each step costs ``step_s`` and accepts
+    ``tokens_per_step`` tokens."""
+
+    def __init__(self, clock, prefill_s, step_s, tokens_per_step):
+        self.clock = clock
+        self.prefill_s = prefill_s
+        self.step_s = step_s
+        self.tokens_per_step = tokens_per_step
+
+    def prefill(self, prompt, *, segmented=None, cancel_event=None):
+        self.clock.t += self.prefill_s
+        return 100
+
+    def step(self):
+        self.clock.t += self.step_s
+        return list(range(101, 101 + self.tokens_per_step)), self.tokens_per_step - 1
+
+    def reset(self):
+        pass
+
+
+class TestSpeculativeStreamTiming:
+    """The decode rate must cover decode only. A rate that also spans the
+    prefill makes the server count prefill twice: _derive_timing_stats then
+    splits the wall time proportionally, halving the reported prefill and
+    moving the other half into decode (a 14k-token MTP request showed
+    ~1 tok/s decode while it really ran at ~25 tok/s)."""
+
+    def _run(self, monkeypatch, max_tokens):
+        from types import SimpleNamespace
+
+        from olmlx.engine import speculative_stream as ss
+
+        clock = SimpleNamespace(t=0.0)
+        monkeypatch.setattr(ss, "time", SimpleNamespace(perf_counter=lambda: clock.t))
+        dec = _ClockedDecoder(clock, prefill_s=10.0, step_s=0.1, tokens_per_step=2)
+        return list(
+            ss.speculative_stream_generate(
+                dec,
+                list(range(1000)),
+                max_tokens=max_tokens,
+                cancel_event=threading.Event(),
+            )
+        )
+
+    def test_generation_rate_excludes_prefill(self, monkeypatch):
+        last = self._run(monkeypatch, max_tokens=9)[-1]
+        # 1 token from prefill + 4 steps x 2 tokens; decode took 4 x 0.1 s.
+        assert last.generation_tokens == 9
+        assert last.prompt_tps == pytest.approx(1000 / 10.0)
+        assert last.generation_tps == pytest.approx(9 / 0.4)
+
+    def test_server_durations_match_true_prefill_and_decode(self, monkeypatch):
+        from olmlx.engine.inference import _derive_timing_stats
+        from olmlx.utils.timing import TimingStats
+
+        last = self._run(monkeypatch, max_tokens=9)[-1]
+        stats = TimingStats(prompt_eval_count=1000, eval_count=last.generation_tokens)
+        _derive_timing_stats(
+            stats,
+            last.prompt_tps,
+            last.generation_tps,
+            eval_timer_ns=10_400_000_000,
+            prefilled_count=last.prompt_tokens,
+        )
+        assert stats.prompt_eval_duration == pytest.approx(10_000_000_000, rel=1e-6)
+        assert stats.eval_duration == pytest.approx(400_000_000, rel=1e-6)
+
+    def test_first_token_stop_reports_no_decode_time(self, monkeypatch):
+        """A response that ends on the prefill's own token did no decoding.
+        Its rate must still be a decode rate (mlx-lm times the first token
+        from the end of prefill too): with no rate at all, a wall clock that
+        equals the prefill sends _derive_timing_stats into its 50/50 split."""
+        from types import SimpleNamespace
+
+        from olmlx.engine import speculative_stream as ss
+        from olmlx.engine.inference import _derive_timing_stats
+        from olmlx.utils.timing import TimingStats
+
+        clock = SimpleNamespace(t=0.0)
+        monkeypatch.setattr(ss, "time", SimpleNamespace(perf_counter=lambda: clock.t))
+        dec = _ClockedDecoder(clock, prefill_s=10.0, step_s=0.1, tokens_per_step=2)
+        out = list(
+            ss.speculative_stream_generate(
+                dec,
+                list(range(1000)),
+                max_tokens=50,
+                cancel_event=threading.Event(),
+                eos_token_id=100,  # the token prefill returns
+            )
+        )
+        assert [t.token for t in out] == [100]
+        stats = TimingStats(prompt_eval_count=1000, eval_count=1)
+        _derive_timing_stats(
+            stats,
+            out[-1].prompt_tps,
+            out[-1].generation_tps,
+            eval_timer_ns=10_000_000_000,
+            prefilled_count=out[-1].prompt_tokens,
+        )
+        assert stats.prompt_eval_duration == pytest.approx(10_000_000_000, rel=1e-6)
+        assert stats.eval_duration < 1_000_000
