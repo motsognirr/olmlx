@@ -421,9 +421,10 @@ def tokenize_segmented_chat(
     deviations: a preamble EOM that cancels one grouped tool run (Qwen3 with
     ``tools=`` and no caller system message renders the tools block as its
     own system turn) shifts every role after the first by one. Counts can't
-    prove the alignment, but a misaligned role only changes a segment's
-    eviction tier: every boundary sits right after an EOM token, so each
-    snapshot point is a real prefix of the prompt.
+    prove the alignment, but a misaligned role changes only a label: it is
+    recorded as the checkpoint's ``cache_type`` metadata, which eviction and
+    reuse don't read. Every boundary sits right after an EOM token, so each
+    snapshot point is a real prefix of the prompt whatever its label.
 
     Falls back to a single-segment prompt when the tokenizer exposes no EOM
     token or there are fewer EOMs than messages even after collapsing tool
@@ -528,8 +529,8 @@ def tokenize_segmented_chat(
         boundaries[-1] = len(full)
 
     # Build the role list, padding the front with extras using
-    # ``messages[0]["role"]`` so the LRU eviction tier still picks a
-    # sensible (typically "system") priority for the injected preamble.
+    # ``messages[0]["role"]`` so the injected preamble gets a sensible
+    # (typically "system") label.
     extras = len(boundaries) - len(roles)
     roles = [messages[0]["role"]] * extras + roles
 
