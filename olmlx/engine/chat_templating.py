@@ -505,13 +505,14 @@ def tokenize_segmented_chat(
             for k, role in enumerate(roles)
             if not (k > 0 and role == "tool" and roles[k - 1] == "tool")
         ]
-        logger.debug(
-            "tokenize_segmented_chat: %d EOMs for %d messages; aligning "
-            "against %d after collapsing tool runs",
-            len(boundaries),
-            len(messages),
-            len(roles),
-        )
+        if len(roles) < len(messages):
+            logger.debug(
+                "tokenize_segmented_chat: %d EOMs for %d messages; aligning "
+                "against %d after collapsing tool runs",
+                len(boundaries),
+                len(messages),
+                len(roles),
+            )
     if len(boundaries) < len(roles):
         logger.debug(
             "tokenize_segmented_chat: %d EOMs for %d messages; falling back "
