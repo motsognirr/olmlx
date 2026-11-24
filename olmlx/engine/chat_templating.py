@@ -474,10 +474,22 @@ def tokenize_segmented_chat(
     # (Harmony / gpt-oss) emit extras because the template injects a
     # baseline preamble (system message about output channels) that the
     # caller didn't supply. Accept extras by treating them as preamble
-    # segments at the start with the first caller-supplied role; reject
-    # only when boundaries < messages (the template emitted FEWER EOMs
-    # than expected, which means we can't safely align roles).
-    if len(boundaries) < len(messages):
+    # segments at the start with the first caller-supplied role.
+    #
+    # Qwen3-family templates emit FEWER: consecutive ``tool`` messages
+    # share one ``<|im_start|>user`` block and one EOM, so a turn with
+    # parallel tool calls has one EOM per run of tool results. Align
+    # against those runs. Any other shortfall is rejected, because the
+    # roles can't be aligned safely. Falling back here costs every later
+    # turn of the conversation its checkpoint.
+    roles: list[Any] = [m["role"] for m in messages]
+    if len(boundaries) < len(roles):
+        roles = [
+            role
+            for k, role in enumerate(roles)
+            if not (k > 0 and role == "tool" and roles[k - 1] == "tool")
+        ]
+    if len(boundaries) < len(roles):
         return SegmentedPrompt(
             segments=[Segment(tokens=full, role=messages[-1]["role"])]
         )
@@ -493,8 +505,8 @@ def tokenize_segmented_chat(
     # Build the role list, padding the front with extras using
     # ``messages[0]["role"]`` so the LRU eviction tier still picks a
     # sensible (typically "system") priority for the injected preamble.
-    extras = len(boundaries) - len(messages)
-    roles: list[Any] = [messages[0]["role"]] * extras + [m["role"] for m in messages]
+    extras = len(boundaries) - len(roles)
+    roles = [messages[0]["role"]] * extras + roles
 
     segments: list[Segment] = []
     start = 0
