@@ -369,6 +369,7 @@ def _build_q8_view(model_dir: Path, target: Path) -> None:
             or entry.name.startswith(".")
             or entry.suffix == ".safetensors"
             or entry.name in _NOT_COPIED
+            or entry.name in _NOT_MODEL_CONTENT  # store bookkeeping
             or entry.name in {"config.json", "model.safetensors.index.json"}
         ):
             continue

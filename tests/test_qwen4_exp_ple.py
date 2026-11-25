@@ -808,3 +808,15 @@ def test_q8_manifest_outside_a_view_may_not_reach_its_parent(tmp_path, fresh_hoo
 
     with pytest.raises(ValueError, match="source_root"):
         fresh_hook.QuantizedMMapNGramEmbedding(str(other / "ple-store.json"))
+
+
+def test_q8_view_leaves_out_store_bookkeeping(tmp_path):
+    """olmlx's own manifest.json is store metadata, not model content."""
+    model_dir = tmp_path / "model"
+    _write_q8_checkpoint(model_dir)
+    (model_dir / "manifest.json").write_text("{}")
+
+    view = ensure_external_ple_view(model_dir)
+
+    assert not (view / "manifest.json").exists()
+    assert (view / "tokenizer.json").exists()
