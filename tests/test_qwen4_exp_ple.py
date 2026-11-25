@@ -857,3 +857,24 @@ def test_q8_detection_reads_the_quantization_the_loader_applies(tmp_path):
 
     manifest = json.loads((view / "ple-store.json").read_text())
     assert manifest["format"] == "olmlx_affine_q8"
+
+
+def test_q8_view_with_an_older_manifest_version_is_rebuilt(tmp_path, fresh_hook):
+    """A manifest schema change must force a rebuild, not a failed load."""
+    from olmlx.engine import qwen4_exp_ple
+
+    model_dir = tmp_path / "model"
+    _write_q8_checkpoint(model_dir)
+    view = ensure_external_ple_view(model_dir)
+    manifest_path = view / "ple-store.json"
+    manifest = json.loads(manifest_path.read_text())
+    current = manifest["version"]
+    manifest["version"] = current - 1
+    manifest_path.write_text(json.dumps(manifest))
+    qwen4_exp_ple.install_mlx_vlm_hook()
+    with pytest.raises(ValueError, match="version"):
+        fresh_hook.QuantizedMMapNGramEmbedding(str(manifest_path))
+
+    rebuilt = ensure_external_ple_view(model_dir)
+
+    assert json.loads((rebuilt / "ple-store.json").read_text())["version"] == current

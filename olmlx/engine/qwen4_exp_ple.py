@@ -129,6 +129,14 @@ def _view_is_current(model_dir: Path, view: Path) -> bool:
         for name in (manifest, "model.safetensors.index.json"):
             if not (view / name).is_file():
                 return False
+        # olmlx owns the Q8 manifest schema, so a view written by another
+        # version of it is rebuilt rather than failing the load.
+        content = json.loads((view / manifest).read_text())
+        if (
+            content.get("format") == Q8_MANIFEST_FORMAT
+            and content.get("version") != _Q8_MANIFEST_VERSION
+        ):
+            return False
         return recorded == _source_fingerprint(model_dir)
     except (OSError, ValueError, KeyError, TypeError):
         return False
@@ -250,6 +258,7 @@ def register_ple_table(fmt: str, factory: Callable[..., Any]) -> None:
 # ---------------------------------------------------------------------------
 
 Q8_MANIFEST_FORMAT = "olmlx_affine_q8"
+_Q8_MANIFEST_VERSION = 1
 _Q8_QUANTIZATION = {"bits": 8, "group_size": 32, "mode": "affine"}
 _Q8_GROUP = _Q8_QUANTIZATION["group_size"]
 _Q8_VALUES_PER_WORD = 32 // _Q8_QUANTIZATION["bits"]  # MLX packs into uint32
@@ -349,7 +358,7 @@ def _q8_manifest(model_dir: Path, target: Path, weight_map: dict[str, str]) -> d
         raise ValueError(f"{model_dir} has no PLE shards")
     return {
         "format": Q8_MANIFEST_FORMAT,
-        "version": 1,
+        "version": _Q8_MANIFEST_VERSION,
         "source_root": os.path.relpath(model_dir.resolve(), target.resolve()),
         "row_width": row_width,
         "row_count": row_start,
@@ -418,6 +427,11 @@ class AffineQ8NGramEmbedding:
         manifest = json.loads(manifest_path.read_text())
         if manifest.get("format") != Q8_MANIFEST_FORMAT:
             raise ValueError(f"not an {Q8_MANIFEST_FORMAT} manifest: {manifest_path}")
+        if manifest.get("version") != _Q8_MANIFEST_VERSION:
+            raise ValueError(
+                f"unsupported {Q8_MANIFEST_FORMAT} manifest version: "
+                f"{manifest.get('version')!r}"
+            )
         if manifest.get("quantization") != _Q8_QUANTIZATION:
             raise ValueError(
                 f"unsupported PLE quantization: {manifest.get('quantization')}"
