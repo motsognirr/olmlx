@@ -186,36 +186,80 @@ class TestGenerateChatRejectsOverWindow:
         assert result["text"] == "ok"
 
     @pytest.mark.asyncio
-    async def test_active_kv_eviction_skips_check(self, mock_manager, monkeypatch):
+    @pytest.mark.parametrize("stream", [False, True])
+    async def test_active_kv_eviction_skips_check(
+        self, mock_manager, monkeypatch, stream
+    ):
         # StreamingLLM sink+window eviction (#505) exists to serve prompts
-        # longer than the nominal window; when it actually bounds the cache
-        # (prompt-cache path, pure full-attention model) there's no reject.
+        # longer than the nominal window; since #755 both directions reach
+        # the bounded cache (chat prompt-cache path, or the attach).
         lm = mock_manager._loaded["qwen3:latest"]
         lm.context_length = 100
         lm.kv_eviction = "4:64"
         lm.kv_eviction_effective = True
         _set_prompt_tokens(lm, 150)
         monkeypatch.setattr(inf, "_CONTEXT_CHECK_BYTE_MARGIN", 10**9)
-        with patch.object(
-            inf, "_full_completion", AsyncMock(return_value={"text": "ok"})
-        ) as full:
+
+        async def _mock_stream(*args, **kwargs):
+            yield {"text": "ok", "done": True}
+
+        full = AsyncMock(return_value={"text": "ok"})
+        stream_fn = MagicMock(side_effect=_mock_stream)
+        with (
+            patch.object(inf, "_full_completion", full),
+            patch.object(inf, "_stream_completion", stream_fn),
+        ):
             result = await generate_chat(
-                mock_manager, "qwen3", [{"role": "user", "content": "hi"}], stream=False
+                mock_manager,
+                "qwen3",
+                [{"role": "user", "content": "hi"}],
+                stream=stream,
             )
-        assert result["text"] == "ok"
-        full.assert_called_once()
+        if stream:
+            async for _ in result:
+                pass
+            stream_fn.assert_called_once()
+        else:
+            assert result["text"] == "ok"
+            full.assert_called_once()
 
     @pytest.mark.asyncio
-    async def test_kv_eviction_without_prompt_cache_still_rejected(
+    async def test_kv_eviction_without_prompt_cache_now_served(
         self, mock_manager, monkeypatch
     ):
-        # With the prompt cache off, generation builds mlx-lm's default
-        # (unbounded) cache — the eviction cache is never used.
+        # #755: with the prompt cache off, `_attach_kv_cache` now installs
+        # the bounded eviction cache post-preflight (the pre-lock check and
+        # the attach share one gate, `_eviction_will_bound`), so the
+        # over-window prompt is served instead of rejected.
         lm = mock_manager._loaded["qwen3:latest"]
         lm.context_length = 100
         lm.kv_eviction = "4:64"
         lm.kv_eviction_effective = True
         lm.prompt_cache = False
+        _set_prompt_tokens(lm, 150)
+        monkeypatch.setattr(inf, "_CONTEXT_CHECK_BYTE_MARGIN", 10**9)
+        with patch.object(
+            inf, "_full_completion", AsyncMock(return_value={"text": "ok"})
+        ) as full:
+            result = await generate_chat(
+                mock_manager,
+                "qwen3",
+                [{"role": "user", "content": "hi"}],
+                stream=False,
+            )
+        assert result["text"] == "ok"
+        full.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_speculative_request_not_exempt(self, mock_manager, monkeypatch):
+        # Speculative decoders never read prompt_cache, so the window still
+        # applies (#755): the attach skips them.
+        lm = mock_manager._loaded["qwen3:latest"]
+        lm.context_length = 100
+        lm.kv_eviction = "4:64"
+        lm.kv_eviction_effective = True
+        lm.prompt_cache = False
+        lm.speculative_decoder = object()  # property is_speculative -> True
         _set_prompt_tokens(lm, 150)
         monkeypatch.setattr(inf, "_CONTEXT_CHECK_BYTE_MARGIN", 10**9)
         with patch.object(inf, "_full_completion", AsyncMock()) as full:
@@ -246,18 +290,54 @@ class TestGenerateChatRejectsOverWindow:
             )
 
     @pytest.mark.asyncio
-    async def test_completion_kv_eviction_still_rejected(
-        self, mock_manager, monkeypatch
+    @pytest.mark.parametrize("stream", [False, True])
+    async def test_completion_kv_eviction_now_served(
+        self, mock_manager, monkeypatch, stream
     ):
-        # generate_completion never uses the prompt cache, so no eviction.
+        # #755: the completion surface gets the bounded cache through the
+        # attach too, so the over-window prompt is served.
         lm = mock_manager._loaded["qwen3:latest"]
         lm.context_length = 100
         lm.kv_eviction = "4:64"
         lm.kv_eviction_effective = True
         _set_prompt_tokens(lm, 150)
         monkeypatch.setattr(inf, "_CONTEXT_CHECK_BYTE_MARGIN", 10**9)
-        with pytest.raises(ContextLengthExceededError):
-            await generate_completion(mock_manager, "qwen3", "Hello", stream=False)
+
+        async def _mock_stream(*args, **kwargs):
+            yield {"text": "ok", "done": True}
+
+        full = AsyncMock(return_value={"text": "ok"})
+        stream_fn = MagicMock(side_effect=_mock_stream)
+        with (
+            patch.object(inf, "_full_completion", full),
+            patch.object(inf, "_stream_completion", stream_fn),
+        ):
+            result = await generate_completion(
+                mock_manager, "qwen3", "Hello", stream=stream
+            )
+        if stream:
+            async for _ in result:
+                pass
+            stream_fn.assert_called_once()
+        else:
+            assert result["text"] == "ok"
+            full.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_completion_speculative_request_not_exempt(
+        self, mock_manager, monkeypatch
+    ):
+        lm = mock_manager._loaded["qwen3:latest"]
+        lm.context_length = 100
+        lm.kv_eviction = "4:64"
+        lm.kv_eviction_effective = True
+        lm.speculative_decoder = object()  # property is_speculative -> True
+        _set_prompt_tokens(lm, 150)
+        monkeypatch.setattr(inf, "_CONTEXT_CHECK_BYTE_MARGIN", 10**9)
+        with patch.object(inf, "_full_completion", AsyncMock()) as full:
+            with pytest.raises(ContextLengthExceededError):
+                await generate_completion(mock_manager, "qwen3", "Hello", stream=False)
+        full.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_short_prompt_skips_tokenization(self, mock_manager):
@@ -530,10 +610,14 @@ class TestKvEvictionBoundsCache:
         assert inf._kv_eviction_bounds_cache(lm) is True
 
 
-class TestEvictionCacheLostRecheck:
-    """An exempted kv_eviction request whose bounded cache is dropped before
-    generation (setup skipped it, or the memory preflight popped it) falls
-    back to mlx-lm's unbounded default cache — the window check must re-run.
+class TestEvictionCacheLossRemediatedByAttach:
+    """Before #755, an exempted kv_eviction request whose bounded cache was
+    dropped before generation (setup skipped it, or the memory preflight
+    popped it) fell back to mlx-lm's unbounded default cache, so the window
+    check re-ran under the lock. Since #755 ``_attach_kv_cache`` rebuilds the
+    bounded eviction cache in exactly that situation — the request is still
+    served by the bounded cache instead of rejected, and the exemption
+    decision (``_eviction_will_bound``) can't disagree with the attach.
     """
 
     def _lm(self, mock_manager):
@@ -543,38 +627,68 @@ class TestEvictionCacheLostRecheck:
         lm.kv_eviction_effective = True
         return lm
 
-    def test_cache_present_passes(self, mock_manager):
+    def test_speculation_and_distribution_block_the_bound(self, mock_manager):
+        # _eviction_will_bound duplicates the attach's skip conditions.
         lm = self._lm(mock_manager)
-        inf._recheck_window_if_eviction_cache_lost(
-            lm, {"prompt_cache": object()}, list(range(150)), None, True
-        )
+        assert inf._eviction_will_bound(lm, will_speculate=False) is True
+        assert inf._eviction_will_bound(lm, will_speculate=True) is False
+        lm.is_distributed = True
+        assert inf._eviction_will_bound(lm, will_speculate=False) is False
 
-    def test_cache_dropped_rejects(self, mock_manager):
+    def test_media_parity_between_router_and_generation_scope(self, mock_manager):
+        """#755 round 7 (deepseek): the pre-lock #715 exemption answers the
+        speculation question from the router's raw ``audio``, while the
+        attach/dispatch consume the materialized ``audio_paths`` — the two
+        agree only because ``materialize_audio`` preserves media-ness. Pin
+        that parity on both surfaces for every media shape, so a future
+        change to ``materialize_audio`` (e.g. filtering or dedup) that
+        would silently re-break #715 fails here first."""
+        import base64
+
+        from olmlx.utils.audio_input import cleanup_temp_audio, materialize_audio
+
         lm = self._lm(mock_manager)
-        with pytest.raises(ContextLengthExceededError):
-            inf._recheck_window_if_eviction_cache_lost(
-                lm, {}, "suffix", list(range(150)), True
+        lm.speculative_decoder = object()  # speculative lm: media decides
+        uri = "data:audio/wav;base64," + base64.b64encode(b"RIFF").decode()
+        for stream in (False, True):
+            for images in (None, ["img.png"]):
+                for audio_raw in (None, [], [uri]):
+                    paths, temps = materialize_audio(audio_raw)
+                    try:
+                        raw_decision = inf._request_will_speculate(
+                            lm,
+                            stream=stream,
+                            images=images,
+                            audio=audio_raw,
+                            grammar_active=False,
+                        )
+                        materialized_decision = inf._request_will_speculate(
+                            lm,
+                            stream=stream,
+                            images=images,
+                            audio=paths,
+                            grammar_active=False,
+                        )
+                        assert raw_decision == materialized_decision
+                    finally:
+                        cleanup_temp_audio(temps)
+
+        # And both agree on the decision at every shape: media → no
+        # speculation, no media → speculation (it's a speculative model).
+        assert (
+            inf._request_will_speculate(
+                lm, stream=False, images=None, audio=None, grammar_active=False
             )
-
-    def test_cache_dropped_under_window_passes(self, mock_manager):
-        lm = self._lm(mock_manager)
-        inf._recheck_window_if_eviction_cache_lost(lm, {}, list(range(50)), None, True)
-
-    def test_not_exempted_skips(self, mock_manager):
-        # Non-eviction requests were already checked before the lock.
-        lm = self._lm(mock_manager)
-        inf._recheck_window_if_eviction_cache_lost(
-            lm, {}, list(range(150)), None, False
+            is True
         )
-        lm.kv_eviction_effective = False
-        inf._recheck_window_if_eviction_cache_lost(lm, {}, list(range(150)), None, True)
 
     @pytest.mark.asyncio
-    async def test_full_completion_rejects_when_preflight_drops_cache(
+    async def test_full_completion_rebuilds_bounded_cache_after_preflight_drop(
         self, mock_manager
     ):
         lm = self._lm(mock_manager)
         tokens = list(range(150))
+        evict_cache = ["evict"]
         setup = inf._CacheSetupResult(
             prompt=tokens, full_prompt_tokens=tokens, cache_setup_done=True
         )
@@ -587,45 +701,30 @@ class TestEvictionCacheLostRecheck:
             gen_kwargs["prompt_cache"] = object()
             return setup
 
-        inner = AsyncMock()
+        async def _store(*a, **kw):
+            return None
+
+        captured: dict = {}
+
+        async def inner_capture(lm_, prompt, mt, gen_kwargs_, *a, **kw):
+            # Snapshot the gen_kwargs _full_completion_inner (the generation
+            # worker) actually receives — the outer finally pops prompt_cache.
+            captured.update(gen_kwargs_)
+            return {}
+
         with (
             patch.object(inf, "_setup_prompt_cache", _setup),
             patch.object(inf, "_kv_cache_preflight_check", _preflight),
-            patch.object(inf, "_full_completion_inner", inner),
+            patch.object(inf, "_full_completion_inner", inner_capture),
+            patch.object(inf, "_store_prompt_cache_after_generation", _store),
             patch.object(inf, "_batch_eligible", return_value=False),
+            patch.object(
+                inf,
+                "_make_prompt_cache_for_lm",
+                MagicMock(return_value=evict_cache),
+            ),
         ):
-            with pytest.raises(ContextLengthExceededError):
-                await inf._full_completion(
-                    lm,
-                    tokens,
-                    10,
-                    {},
-                    inf.TimingStats(),
-                    use_prompt_cache=True,
-                    prompt_tokens=tokens,
-                )
-        inner.assert_not_called()
-
-    @pytest.mark.asyncio
-    async def test_stream_completion_rejects_when_setup_skips_cache(self, mock_manager):
-        lm = self._lm(mock_manager)
-        tokens = list(range(150))
-
-        async def _setup(lm_, prompt, gen_kwargs, **kw):
-            # memory-pressure skip: no prompt_cache installed
-            return inf._CacheSetupResult(prompt=tokens, full_prompt_tokens=tokens)
-
-        async def _preflight(lm_, prompt, max_tokens, gen_kwargs, **kw):
-            return inf._PreflightResult(prompt=prompt)
-
-        stream = MagicMock()
-        with (
-            patch.object(inf, "_setup_prompt_cache", _setup),
-            patch.object(inf, "_kv_cache_preflight_check", _preflight),
-            patch.object(inf, "async_mlx_stream", stream),
-            patch.object(inf, "_batch_eligible", return_value=False),
-        ):
-            gen = inf._stream_completion(
+            await inf._full_completion(
                 lm,
                 tokens,
                 10,
@@ -634,7 +733,72 @@ class TestEvictionCacheLostRecheck:
                 use_prompt_cache=True,
                 prompt_tokens=tokens,
             )
+        # The dropped cache was rebuilt as the bounded eviction cache and the
+        # request was served — not rejected with a 400.
+        assert captured["prompt_cache"] is evict_cache
+
+    @pytest.mark.asyncio
+    async def test_stream_completion_rebuilds_bounded_cache_when_setup_skips(
+        self, mock_manager
+    ):
+        """Same remediation on the streaming path: the freed setup cache is
+        rebuilt so the exempted request is served, ending with an error-free
+        terminal chunk."""
+        lm = self._lm(mock_manager)
+        tokens = list(range(150))
+        evict_cache = ["evict"]
+
+        async def _setup(lm_, prompt, gen_kwargs, **kw):
+            # memory-pressure skip: no prompt_cache installed
+            return inf._CacheSetupResult(prompt=tokens, full_prompt_tokens=tokens)
+
+        async def _preflight(lm_, prompt, max_tokens, gen_kwargs, **kw):
+            return inf._PreflightResult(prompt=prompt)
+
+        from tests.test_prompt_cache import _make_mock_stream, _make_stream_tokens
+
+        mock_stream_fn = MagicMock(
+            return_value=_make_mock_stream(_make_stream_tokens("Hi", prompt_tokens=150))
+        )
+        with (
+            patch.object(inf, "_setup_prompt_cache", _setup),
+            patch.object(inf, "_kv_cache_preflight_check", _preflight),
+            patch.object(inf, "async_mlx_stream", mock_stream_fn),
+            patch.object(inf, "_batch_eligible", return_value=False),
+            patch.object(
+                inf,
+                "_make_prompt_cache_for_lm",
+                MagicMock(return_value=evict_cache),
+            ),
+        ):
+            chunks = []
+            async for chunk in inf._stream_completion(
+                lm,
+                tokens,
+                10,
+                {},
+                inf.TimingStats(),
+                use_prompt_cache=True,
+                prompt_tokens=tokens,
+            ):
+                chunks.append(chunk)
+        # The attached bounded cache reached mlx-lm's stream_generate.
+        assert mock_stream_fn.call_args.kwargs["prompt_cache"] is evict_cache
+        assert any(c.get("done") for c in chunks)
+
+    @pytest.mark.asyncio
+    async def test_full_completion_under_window_unaffected(self, mock_manager):
+        # Sanity: without eviction configured the over-window reject still
+        # applies pre-lock; the attach path changes nothing for plain models.
+        lm = mock_manager._loaded["qwen3:latest"]
+        lm.context_length = 100
+        _set_prompt_tokens(lm, 150)
+        with patch.object(inf, "_full_completion", AsyncMock()) as full:
             with pytest.raises(ContextLengthExceededError):
-                async for _ in gen:
-                    pass
-        stream.assert_not_called()
+                await generate_chat(
+                    mock_manager,
+                    "qwen3",
+                    [{"role": "user", "content": "hi"}],
+                    stream=False,
+                )
+        full.assert_not_called()

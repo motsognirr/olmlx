@@ -234,6 +234,9 @@ class TestContextCollectionGaps:
                 max_tokens=8,
                 gen_kwargs={},
                 stats=TimingStats(),
+                # The speculative fixture must dispatch through the
+                # speculative branch for generated_tokens_out to fill.
+                will_speculate=True,
                 generated_tokens_out=collector,
             )
         assert collector == [101, 102]
