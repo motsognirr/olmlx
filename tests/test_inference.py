@@ -3106,6 +3106,7 @@ class TestFullCompletionInner:
                 100,
                 {},
                 stats,
+                will_speculate=False,
                 deferred_prefill=lambda cancel_event: None,
                 deferred_prefill_timing=_PrefillTiming(
                     duration_ns=30_000_000_000, tokens=3999
@@ -3150,6 +3151,7 @@ class TestFullCompletionInner:
                 100,
                 {},
                 stats,
+                will_speculate=False,
                 deferred_prefill=lambda cancel_event: None,
                 deferred_prefill_timing=_PrefillTiming(
                     duration_ns=30_000_000_000, tokens=3799
