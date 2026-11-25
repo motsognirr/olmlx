@@ -213,8 +213,14 @@ class TestLoadVlmWiring:
 
         def fake_load(path, **kwargs):
             calls["path"], calls["kwargs"] = path, kwargs
+            from olmlx.engine import qwen4_exp_ple
+            from olmlx.engine.edge0 import ple as edge0_ple
+
             calls["hooked"] = getattr(
-                ple_storage.QuantizedMMapNGramEmbedding, "_olmlx_edge0_dispatch", False
+                ple_storage.QuantizedMMapNGramEmbedding, "_olmlx_ple_dispatch", False
+            ) and (
+                qwen4_exp_ple._PLE_TABLES.get(edge0_ple.MANIFEST_FORMAT)
+                is edge0_ple.Fp8NGramEmbedding
             )
             return mx.zeros(1), object()
 

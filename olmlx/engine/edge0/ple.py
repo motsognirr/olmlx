@@ -13,7 +13,6 @@ from __future__ import annotations
 
 import json
 import math
-import threading
 from pathlib import Path
 
 import mlx.core as mx
@@ -21,8 +20,6 @@ import numpy as np
 
 MANIFEST_FORMAT = "edge0_fp8"
 MANIFEST_NAME = "edge0_ple.json"
-
-_install_lock = threading.Lock()
 
 
 def _e4m3_table() -> np.ndarray:
@@ -131,33 +128,10 @@ class Fp8NGramEmbedding:
 def install_mlx_vlm_hook() -> None:
     """Make mlx-vlm build :class:`Fp8NGramEmbedding` for ``edge0_fp8`` manifests.
 
-    ``Qwen4ExpNGramEmbedding`` imports ``QuantizedMMapNGramEmbedding`` from
-    ``ple_storage`` when it is constructed, so replacing that name with a
-    dispatching subclass is enough. Any other manifest still gets mlx-vlm's own class.
-    Idempotent.
+    Registers the format with the shared PLE-table dispatch
+    (:func:`olmlx.engine.qwen4_exp_ple.register_ple_table`); any other
+    manifest still gets its own class. Idempotent.
     """
-    from mlx_vlm.models.qwen4_exp import ple_storage
+    from olmlx.engine.qwen4_exp_ple import register_ple_table
 
-    with _install_lock:
-        original = ple_storage.QuantizedMMapNGramEmbedding
-        if getattr(original, "_olmlx_edge0_dispatch", False):
-            return
-
-        # A subclass, not a factory function: mlx-vlm also reads class
-        # attributes (``MANIFEST_VERSION``) off this name.
-        class _DispatchingNGramEmbedding(original):  # type: ignore[misc, valid-type]
-            _olmlx_edge0_dispatch = True
-
-            def __new__(cls, manifest_path, *, cache_rows=None):
-                try:
-                    fmt = json.loads(Path(manifest_path).read_text()).get("format")
-                except (OSError, ValueError, AttributeError, TypeError):
-                    fmt = None
-                if fmt == MANIFEST_FORMAT:
-                    # Not an instance of ``cls``, so ``__init__`` is skipped.
-                    return Fp8NGramEmbedding(manifest_path, cache_rows=cache_rows)
-                return super().__new__(cls)
-
-        _DispatchingNGramEmbedding.__name__ = original.__name__
-        _DispatchingNGramEmbedding.__qualname__ = original.__qualname__
-        ple_storage.QuantizedMMapNGramEmbedding = _DispatchingNGramEmbedding  # type: ignore[misc]
+    register_ple_table(MANIFEST_FORMAT, Fp8NGramEmbedding)
