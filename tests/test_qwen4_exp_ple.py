@@ -841,3 +841,19 @@ def test_q8_view_rejects_index_paths_outside_the_checkpoint(tmp_path):
     # Nothing was linked next to the view either.
     assert not (model_dir / "evil.safetensors").exists()
     assert not (model_dir / VIEW_DIRNAME).exists()
+
+
+def test_q8_detection_reads_the_quantization_the_loader_applies(tmp_path):
+    """mlx-vlm quantizes from ``quantization``; an HF-style ``quantization_config``
+    stub without the per-module overrides must not hide the 8-bit PLE table."""
+    model_dir = tmp_path / "model"
+    _write_q8_checkpoint(model_dir)
+    config_path = model_dir / "config.json"
+    config = json.loads(config_path.read_text())
+    config["quantization_config"] = {"group_size": 64, "bits": 8, "mode": "affine"}
+    config_path.write_text(json.dumps(config))
+
+    view = ensure_external_ple_view(model_dir)
+
+    manifest = json.loads((view / "ple-store.json").read_text())
+    assert manifest["format"] == "olmlx_affine_q8"

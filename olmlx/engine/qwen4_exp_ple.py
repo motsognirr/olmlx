@@ -271,7 +271,10 @@ def _require_bare_filename(name: str) -> None:
 
 
 def _quantization(config: dict) -> dict:
-    quant = config.get("quantization_config") or config.get("quantization")
+    # mlx-vlm quantizes modules from ``quantization`` when present; an
+    # HF-style ``quantization_config`` may be a stub without the per-module
+    # overrides that mark the PLE table, so it is only the fallback.
+    quant = config.get("quantization") or config.get("quantization_config")
     return quant if isinstance(quant, dict) else {}
 
 
@@ -294,7 +297,12 @@ def _ple_is_q8(model_dir: Path) -> bool:
         found.add(
             (params.get("bits"), params.get("group_size"), params.get("mode", "affine"))
         )
-    return found == {tuple(_Q8_QUANTIZATION.values())}
+    expected = (
+        _Q8_QUANTIZATION["bits"],
+        _Q8_QUANTIZATION["group_size"],
+        _Q8_QUANTIZATION["mode"],
+    )
+    return found == {expected}
 
 
 def _q8_manifest(model_dir: Path, target: Path, weight_map: dict[str, str]) -> dict:
