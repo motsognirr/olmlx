@@ -820,3 +820,24 @@ def test_q8_view_leaves_out_store_bookkeeping(tmp_path):
 
     assert not (view / "manifest.json").exists()
     assert (view / "tokenizer.json").exists()
+
+
+def test_q8_view_rejects_index_paths_outside_the_checkpoint(tmp_path):
+    """Index file names are read and hard-linked, so they must be bare names."""
+    model_dir = tmp_path / "model"
+    _write_q8_checkpoint(model_dir)
+    (tmp_path / "evil.safetensors").write_bytes(
+        (model_dir / "model-00002-of-00002.safetensors").read_bytes()
+    )
+    index_path = model_dir / "model.safetensors.index.json"
+    index = json.loads(index_path.read_text())
+    index["weight_map"]["language_model.model.embed_tokens.weight"] = (
+        "../evil.safetensors"
+    )
+    index_path.write_text(json.dumps(index))
+
+    with pytest.raises(ValueError, match="bare filename"):
+        ensure_external_ple_view(model_dir)
+    # Nothing was linked next to the view either.
+    assert not (model_dir / "evil.safetensors").exists()
+    assert not (model_dir / VIEW_DIRNAME).exists()

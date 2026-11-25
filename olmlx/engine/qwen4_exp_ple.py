@@ -263,6 +263,13 @@ _NP_DTYPES = {"U32": np.dtype("<u4"), "BF16": np.dtype("<u2")}
 _NOT_COPIED = frozenset({"MANIFEST.sha256"})
 
 
+def _require_bare_filename(name: str) -> None:
+    """Reject a file name that could reach outside its directory."""
+    path = Path(name)
+    if path.is_absolute() or path.name != name or name in {".", ".."}:
+        raise ValueError(f"PLE view file must be a bare filename: {name!r}")
+
+
 def _quantization(config: dict) -> dict:
     quant = config.get("quantization_config") or config.get("quantization")
     return quant if isinstance(quant, dict) else {}
@@ -352,6 +359,9 @@ def _build_q8_view(model_dir: Path, target: Path) -> None:
     """
     index = json.loads((model_dir / "model.safetensors.index.json").read_text())
     weight_map = index["weight_map"]
+    # Every name here is read from and hard-linked into the view.
+    for file_name in set(weight_map.values()):
+        _require_bare_filename(file_name)
     manifest = _q8_manifest(model_dir, target, weight_map)
     (target / _MANIFEST_NAME).write_text(json.dumps(manifest, indent=2) + "\n")
 
@@ -438,11 +448,8 @@ class AffineQ8NGramEmbedding:
                 tensor = entry[name]
                 if tensor["dtype"] != dtype:
                     raise ValueError(f"unexpected {name} dtype: {tensor['dtype']}")
+                _require_bare_filename(tensor["file"])
                 file_name = Path(tensor["file"])
-                if file_name.is_absolute() or file_name.name != str(file_name):
-                    raise ValueError(
-                        f"PLE tensor file must be a bare filename: {tensor['file']!r}"
-                    )
                 shape = (count, widths[name])
                 if tuple(int(dim) for dim in tensor["shape"]) != shape:
                     raise ValueError(f"{name} shape does not match the row layout")
