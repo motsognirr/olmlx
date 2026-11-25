@@ -22,13 +22,21 @@ def load_vlm(path: str, **kwargs: Any) -> tuple[Any, Any]:
     # top-level import back would form a cycle. Matches flash.prepare's pattern.
     from olmlx.engine.model_manager import _materialize_module_buffers
 
-    from olmlx.engine.qwen4_exp_ple import ensure_external_ple_view
+    from olmlx.engine.qwen4_exp_ple import (
+        ensure_external_ple_view,
+        install_mlx_vlm_hook,
+        uses_external_ple,
+    )
 
     # Qwen4-Exp: serve the ~30 GiB n-gram (PLE) tables by mmap row lookup
     # instead of wiring them as parameters (see engine/qwen4_exp_ple.py).
     view = ensure_external_ple_view(path)
     if view is not None:
         path = str(view)
+    # 8-bit views are served by olmlx's own table, not mlx-vlm's. Checked on
+    # the final path so a view directory loaded directly is covered too.
+    if uses_external_ple(path):
+        install_mlx_vlm_hook()
     # Converted Edge0 packs: FP8 n-gram table hook + a non-strict load (their
     # routed experts live in the pack's experts.bin, not the safetensors).
     from olmlx.engine.edge0.loader import prepare_mlx_vlm_load

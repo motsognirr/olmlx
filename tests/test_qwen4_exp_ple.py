@@ -404,3 +404,490 @@ def test_currency_uses_manifest_name_from_view_config(tmp_path):
     assert qwen4_exp_ple._view_is_current(model_dir, view) is True
     (view / "renamed-store.json").unlink()
     assert qwen4_exp_ple._view_is_current(model_dir, view) is False
+
+
+# ---------------------------------------------------------------------------
+# 8-bit PLE tables (mlx-community/Qwen3.8-Flash-Next-oQ8e-mtp).
+#
+# mlx-vlm's mmap reader only knows Q4/group-32 affine and NVFP4. An 8-bit
+# checkpoint's PLE tables (~57 GiB) would otherwise be wired as parameters,
+# which cannot fit, so olmlx builds the view and serves the rows itself.
+# ---------------------------------------------------------------------------
+
+Q8 = {"group_size": GROUP, "bits": 8, "mode": "affine"}
+
+
+def _write_q8_checkpoint(model_dir: Path, *, with_mode: bool = True) -> mx.array:
+    """An 8-bit PLE checkpoint shaped like oQ8e; returns the dense reference rows.
+
+    ``with_mode=False`` omits ``"mode"`` from the quantization config, as
+    configs written before MLX had quantization modes do (it means affine).
+    """
+    model_dir.mkdir(parents=True, exist_ok=True)
+    mx.random.seed(0)
+    ple, dense = {}, []
+    for shard in range(2):
+        rows = mx.random.normal((ROWS, ROW_WIDTH)).astype(mx.bfloat16)
+        wq, scales, biases = mx.quantize(rows, group_size=GROUP, bits=8)
+        prefix = f"{PLE_PREFIX}.{shard}"
+        ple[f"{prefix}.weight"] = wq
+        ple[f"{prefix}.scales"] = scales
+        ple[f"{prefix}.biases"] = biases
+        dense.append(mx.dequantize(wq, scales, biases, group_size=GROUP, bits=8))
+    # oQ8e also carries a leftover FP8 table scale (exactly 1.0). mlx-vlm's FP8
+    # converter treats it as an FP8 PLE and fails without FP8 shards to scale.
+    scale_key = PLE_PREFIX.replace(".shards", ".weight_scale")
+    ple[scale_key] = mx.ones((1,), dtype=mx.bfloat16)
+    other = {"language_model.model.embed_tokens.weight": mx.zeros((4, 8))}
+    mx.save_safetensors(str(model_dir / "model-00001-of-00002.safetensors"), ple)
+    mx.save_safetensors(str(model_dir / "model-00002-of-00002.safetensors"), other)
+    weight_map = {k: "model-00001-of-00002.safetensors" for k in ple}
+    weight_map.update({k: "model-00002-of-00002.safetensors" for k in other})
+    (model_dir / "model.safetensors.index.json").write_text(
+        json.dumps({"metadata": {}, "weight_map": weight_map})
+    )
+    # Like the real checkpoint: group-64 globally, group-32 overrides for PLE.
+    quant: dict = {"group_size": 64, "bits": 8, "mode": "affine"}
+    for shard in range(2):
+        quant[f"{PLE_PREFIX}.{shard}"] = dict(Q8)
+    if not with_mode:
+        quant = {
+            k: (
+                {kk: vv for kk, vv in v.items() if kk != "mode"}
+                if isinstance(v, dict)
+                else v
+            )
+            for k, v in quant.items()
+            if k != "mode"
+        }
+    (model_dir / "config.json").write_text(
+        json.dumps(
+            {
+                "model_type": "qwen4_exp",
+                "quantization": quant,
+                "quantization_config": quant,
+                "text_config": {"model_type": "qwen4_exp_text"},
+            }
+        )
+    )
+    (model_dir / "tokenizer.json").write_text("{}")
+    return mx.concatenate(dense)
+
+
+def _upstream_table_class():
+    """mlx-vlm's own class, beneath any olmlx dispatch layer."""
+    from mlx_vlm.models.qwen4_exp import ple_storage
+
+    for cls in ple_storage.QuantizedMMapNGramEmbedding.__mro__:
+        if "_olmlx_ple_dispatch" not in cls.__dict__:
+            return cls
+    raise AssertionError("no upstream class in the MRO")
+
+
+@pytest.fixture
+def fresh_hook(monkeypatch):
+    """Start from mlx-vlm's unhooked class and an empty format registry."""
+    from mlx_vlm.models.qwen4_exp import ple_storage
+
+    from olmlx.engine import qwen4_exp_ple
+
+    monkeypatch.setattr(
+        ple_storage, "QuantizedMMapNGramEmbedding", _upstream_table_class()
+    )
+    monkeypatch.setattr(qwen4_exp_ple, "_PLE_TABLES", {})
+    return ple_storage
+
+
+def test_builds_view_for_q8_ple_checkpoint(tmp_path):
+    model_dir = tmp_path / "model"
+    _write_q8_checkpoint(model_dir)
+
+    view = ensure_external_ple_view(model_dir)
+
+    assert view == model_dir / VIEW_DIRNAME
+    config = json.loads((view / "config.json").read_text())
+    assert config["text_config"]["ple_storage"]["manifest"] == "ple-store.json"
+    for key in ("quantization", "quantization_config"):
+        assert not any(".ngram_embedding.shards." in k for k in config[key])
+        assert config[key]["bits"] == 8  # the global setting survives
+    index = json.loads((view / "model.safetensors.index.json").read_text())
+    # The whole table lives outside the index, the leftover scale included.
+    assert not any(".ngram_embedding." in k for k in index["weight_map"])
+    linked = view / "model-00002-of-00002.safetensors"
+    assert linked.stat().st_ino == (model_dir / linked.name).stat().st_ino
+    # Sidecars are hard links too, so the view costs no disk at all.
+    sidecar = view / "tokenizer.json"
+    assert sidecar.stat().st_ino == (model_dir / "tokenizer.json").stat().st_ino
+    manifest = json.loads((view / "ple-store.json").read_text())
+    assert manifest["quantization"] == Q8
+    assert manifest["row_count"] == 2 * ROWS
+    assert manifest["row_width"] == ROW_WIDTH
+    # A second call reuses the view (the currency check reads this manifest).
+    assert ensure_external_ple_view(model_dir) == view
+
+
+def test_q8_lookup_matches_dequantized_rows(tmp_path, fresh_hook):
+    from olmlx.engine import qwen4_exp_ple
+
+    model_dir = tmp_path / "model"
+    reference = _write_q8_checkpoint(model_dir)
+    view = ensure_external_ple_view(model_dir)
+    qwen4_exp_ple.install_mlx_vlm_hook()
+
+    table = fresh_hook.QuantizedMMapNGramEmbedding(
+        str(view / "ple-store.json"), cache_rows=0
+    )
+
+    assert table.row_count == 2 * ROWS
+    assert table.row_width == ROW_WIDTH
+    # Crosses the shard boundary, repeats a row, and is out of order.
+    ids = mx.array([[ROWS + 1, 0], [3, 0]])
+    out = table(ids)
+    assert out.shape == (2, 2, ROW_WIDTH)
+    assert out.dtype == mx.bfloat16
+    expected = reference[mx.array([ROWS + 1, 0, 3, 0])].reshape(2, 2, ROW_WIDTH)
+    assert mx.array_equal(out, expected).item()
+
+
+def test_q8_lookup_empty_and_out_of_range(tmp_path, fresh_hook):
+    from olmlx.engine import qwen4_exp_ple
+
+    model_dir = tmp_path / "model"
+    _write_q8_checkpoint(model_dir)
+    view = ensure_external_ple_view(model_dir)
+    qwen4_exp_ple.install_mlx_vlm_hook()
+    table = fresh_hook.QuantizedMMapNGramEmbedding(str(view / "ple-store.json"))
+
+    assert table(mx.zeros((1, 0), dtype=mx.int64)).shape == (1, 0, ROW_WIDTH)
+    with pytest.raises(IndexError):
+        table(mx.array([2 * ROWS]))
+    with pytest.raises(IndexError):
+        table(mx.array([-1]))
+
+
+def test_q8_manifest_cannot_point_outside_source_root(tmp_path, fresh_hook):
+    from olmlx.engine import qwen4_exp_ple
+
+    model_dir = tmp_path / "model"
+    _write_q8_checkpoint(model_dir)
+    view = ensure_external_ple_view(model_dir)
+    manifest_path = view / "ple-store.json"
+    manifest = json.loads(manifest_path.read_text())
+    manifest["shards"][0]["weight"]["file"] = "../elsewhere.safetensors"
+    manifest_path.write_text(json.dumps(manifest))
+    qwen4_exp_ple.install_mlx_vlm_hook()
+
+    with pytest.raises(ValueError, match="filename"):
+        fresh_hook.QuantizedMMapNGramEmbedding(str(manifest_path))
+
+
+def test_q4_manifests_still_reach_mlx_vlm(tmp_path, fresh_hook):
+    from olmlx.engine import qwen4_exp_ple
+
+    model_dir = tmp_path / "model"
+    _write_checkpoint(model_dir)
+    view = ensure_external_ple_view(model_dir)
+    qwen4_exp_ple.install_mlx_vlm_hook()
+
+    table = fresh_hook.QuantizedMMapNGramEmbedding(str(view / "ple-store.json"))
+    assert isinstance(table, _upstream_table_class())
+    assert not isinstance(table, qwen4_exp_ple.AffineQ8NGramEmbedding)
+
+
+def test_load_vlm_installs_q8_table_hook(tmp_path, monkeypatch, fresh_hook):
+    import mlx_vlm
+
+    from olmlx.engine import qwen4_exp_ple
+    from olmlx.engine.vlm_load import load_vlm
+
+    model_dir = tmp_path / "model"
+    _write_q8_checkpoint(model_dir)
+    monkeypatch.setattr(mlx_vlm, "load", lambda path, **kw: (nn.Module(), object()))
+
+    load_vlm(str(model_dir), lazy=True)
+
+    table = fresh_hook.QuantizedMMapNGramEmbedding(
+        str(model_dir / VIEW_DIRNAME / "ple-store.json")
+    )
+    assert isinstance(table, qwen4_exp_ple.AffineQ8NGramEmbedding)
+
+
+def test_edge0_and_q8_share_one_dispatch_layer(fresh_hook):
+    from olmlx.engine import qwen4_exp_ple
+    from olmlx.engine.edge0 import ple as edge0_ple
+
+    qwen4_exp_ple.install_mlx_vlm_hook()
+    edge0_ple.install_mlx_vlm_hook()
+    qwen4_exp_ple.install_mlx_vlm_hook()  # idempotent, in either order
+
+    hooked = fresh_hook.QuantizedMMapNGramEmbedding
+    dispatch_layers = [
+        cls for cls in hooked.__mro__ if "_olmlx_ple_dispatch" in cls.__dict__
+    ]
+    assert len(dispatch_layers) == 1
+    assert hooked.MANIFEST_VERSION == 2  # mlx-vlm reads class attributes
+    assert qwen4_exp_ple._PLE_TABLES == {
+        edge0_ple.MANIFEST_FORMAT: edge0_ple.Fp8NGramEmbedding,
+        qwen4_exp_ple.Q8_MANIFEST_FORMAT: qwen4_exp_ple.AffineQ8NGramEmbedding,
+    }
+
+
+# mlx-vlm loads every tensor of each indexed file, not just the indexed keys,
+# so the view cannot hide oQ8e's leftover FP8 table scale (it shares a file
+# with ordinary weights). The FP8 converter that ``sanitize`` runs must skip it.
+SCALE_KEY = PLE_PREFIX.replace(".shards", ".weight_scale")
+
+
+@pytest.fixture
+def fresh_converter(monkeypatch):
+    from mlx_vlm.models.qwen4_exp import fp8
+    from mlx_vlm.models.qwen4_exp import qwen4_exp as model_module
+
+    from olmlx.engine import qwen4_exp_ple
+
+    monkeypatch.setattr(
+        model_module, "convert_qwen4_exp_fp8_weights", fp8.convert_qwen4_exp_fp8_weights
+    )
+    monkeypatch.setattr(qwen4_exp_ple, "_converter_guard", None)
+    return model_module
+
+
+def _quantized_table_weights(scale: float) -> dict:
+    wq, scales, biases = mx.quantize(
+        mx.ones((ROWS, ROW_WIDTH), dtype=mx.bfloat16), group_size=GROUP, bits=8
+    )
+    return {
+        f"{PLE_PREFIX}.0.weight": wq,
+        f"{PLE_PREFIX}.0.scales": scales,
+        f"{PLE_PREFIX}.0.biases": biases,
+        SCALE_KEY: mx.array([scale], dtype=mx.bfloat16),
+        "language_model.model.embed_tokens.weight": mx.zeros((4, 8)),
+    }
+
+
+def test_unit_ple_scale_without_fp8_shards_is_dropped(fresh_converter):
+    from olmlx.engine import qwen4_exp_ple
+
+    weights = _quantized_table_weights(1.0)
+    with pytest.raises(ValueError, match="Missing FP8 PLE shards"):
+        fresh_converter.convert_qwen4_exp_fp8_weights(dict(weights))
+
+    qwen4_exp_ple.install_mlx_vlm_hook()
+    qwen4_exp_ple.install_mlx_vlm_hook()  # idempotent: wrapped once
+    converted = fresh_converter.convert_qwen4_exp_fp8_weights(dict(weights))
+
+    assert SCALE_KEY not in converted
+    assert set(converted) == set(weights) - {SCALE_KEY}
+
+
+def test_non_unit_ple_scale_is_still_rejected(fresh_converter):
+    from olmlx.engine import qwen4_exp_ple
+
+    qwen4_exp_ple.install_mlx_vlm_hook()
+    with pytest.raises(ValueError, match="Missing FP8 PLE shards"):
+        fresh_converter.convert_qwen4_exp_fp8_weights(_quantized_table_weights(2.0))
+
+
+def test_fp8_ple_tables_are_still_scaled(fresh_converter):
+    from olmlx.engine import qwen4_exp_ple
+
+    qwen4_exp_ple.install_mlx_vlm_hook()
+    prefix = SCALE_KEY[: -len("weight_scale")]
+    fp8 = mx.to_fp8(mx.full((2, ROW_WIDTH), 0.5))
+    converted = fresh_converter.convert_qwen4_exp_fp8_weights(
+        {f"{prefix}shard_0.weight": fp8, SCALE_KEY: mx.array([2.0], dtype=mx.bfloat16)}
+    )
+
+    # mlx-vlm decoded the FP8 bytes and applied the scale.
+    assert SCALE_KEY not in converted
+    decoded = converted[f"{prefix}shard_0.weight"]
+    assert decoded.dtype == mx.bfloat16
+    assert mx.all(decoded == 1.0).item()
+
+
+def test_q8_view_when_quantization_omits_mode(tmp_path):
+    model_dir = tmp_path / "model"
+    _write_q8_checkpoint(model_dir, with_mode=False)
+
+    view = ensure_external_ple_view(model_dir)
+
+    manifest = json.loads((view / "ple-store.json").read_text())
+    assert manifest["format"] == "olmlx_affine_q8"
+    assert manifest["quantization"] == Q8
+
+
+@pytest.mark.parametrize("source_root", ["/", "../.."])
+def test_q8_manifest_source_root_is_confined(tmp_path, fresh_hook, source_root):
+    """The table may only read the checkpoint the view was built from."""
+    from olmlx.engine import qwen4_exp_ple
+
+    model_dir = tmp_path / "model"
+    _write_q8_checkpoint(model_dir)
+    view = ensure_external_ple_view(model_dir)
+    manifest_path = view / "ple-store.json"
+    manifest = json.loads(manifest_path.read_text())
+    manifest["source_root"] = source_root
+    manifest_path.write_text(json.dumps(manifest))
+    qwen4_exp_ple.install_mlx_vlm_hook()
+
+    with pytest.raises(ValueError, match="source_root"):
+        fresh_hook.QuantizedMMapNGramEmbedding(str(manifest_path))
+
+
+def test_load_vlm_installs_hook_for_a_prebuilt_view(tmp_path, monkeypatch, fresh_hook):
+    """Loading the view directory itself (it already has ple_storage) still serves Q8."""
+    import mlx_vlm
+
+    from olmlx.engine import qwen4_exp_ple
+    from olmlx.engine.vlm_load import load_vlm
+
+    model_dir = tmp_path / "model"
+    _write_q8_checkpoint(model_dir)
+    view = ensure_external_ple_view(model_dir)
+    seen = []
+    monkeypatch.setattr(
+        mlx_vlm,
+        "load",
+        lambda path, **kw: (seen.append(path), (nn.Module(), object()))[1],
+    )
+
+    load_vlm(str(view))
+
+    assert seen == [str(view)]
+    table = fresh_hook.QuantizedMMapNGramEmbedding(str(view / "ple-store.json"))
+    assert isinstance(table, qwen4_exp_ple.AffineQ8NGramEmbedding)
+
+
+def test_hook_tolerates_mlx_vlm_without_the_fp8_converter(monkeypatch, fresh_hook):
+    """The guard is only for oQ8e; a missing converter must not break Q4 loads."""
+    from mlx_vlm.models.qwen4_exp import qwen4_exp as model_module
+
+    from olmlx.engine import qwen4_exp_ple
+
+    monkeypatch.delattr(model_module, "convert_qwen4_exp_fp8_weights")
+    monkeypatch.setattr(qwen4_exp_ple, "_converter_guard", None)
+
+    qwen4_exp_ple.install_mlx_vlm_hook()
+
+    assert not hasattr(model_module, "convert_qwen4_exp_fp8_weights")
+
+
+def test_q8_manifest_rejects_symlink_out_of_source_root(tmp_path, fresh_hook):
+    import shutil
+
+    from olmlx.engine import qwen4_exp_ple
+
+    model_dir = tmp_path / "model"
+    _write_q8_checkpoint(model_dir)
+    view = ensure_external_ple_view(model_dir)
+    # Same bytes, but the bare filename now points outside the checkpoint.
+    outside = tmp_path / "outside.safetensors"
+    shard = model_dir / "model-00001-of-00002.safetensors"
+    shutil.copy2(shard, outside)
+    shard.unlink()
+    shard.symlink_to(outside)
+    qwen4_exp_ple.install_mlx_vlm_hook()
+
+    with pytest.raises(ValueError, match="outside"):
+        fresh_hook.QuantizedMMapNGramEmbedding(str(view / "ple-store.json"))
+
+
+def test_q8_manifest_outside_a_view_may_not_reach_its_parent(tmp_path, fresh_hook):
+    """Only a manifest in an ``external_ple`` view reads from its parent."""
+    from olmlx.engine import qwen4_exp_ple
+
+    model_dir = tmp_path / "model"
+    _write_q8_checkpoint(model_dir)
+    view = ensure_external_ple_view(model_dir)
+    other = tmp_path / "elsewhere"
+    other.mkdir()
+    (other / "ple-store.json").write_text((view / "ple-store.json").read_text())
+    for name in ("model-00001-of-00002.safetensors",):
+        (tmp_path / name).hardlink_to(model_dir / name)
+    qwen4_exp_ple.install_mlx_vlm_hook()
+
+    with pytest.raises(ValueError, match="source_root"):
+        fresh_hook.QuantizedMMapNGramEmbedding(str(other / "ple-store.json"))
+
+
+def test_q8_view_leaves_out_store_bookkeeping(tmp_path):
+    """olmlx's own manifest.json is store metadata, not model content."""
+    model_dir = tmp_path / "model"
+    _write_q8_checkpoint(model_dir)
+    (model_dir / "manifest.json").write_text("{}")
+
+    view = ensure_external_ple_view(model_dir)
+
+    assert not (view / "manifest.json").exists()
+    assert (view / "tokenizer.json").exists()
+
+
+def test_q8_view_rejects_index_paths_outside_the_checkpoint(tmp_path):
+    """Index file names are read and hard-linked, so they must be bare names."""
+    model_dir = tmp_path / "model"
+    _write_q8_checkpoint(model_dir)
+    (tmp_path / "evil.safetensors").write_bytes(
+        (model_dir / "model-00002-of-00002.safetensors").read_bytes()
+    )
+    index_path = model_dir / "model.safetensors.index.json"
+    index = json.loads(index_path.read_text())
+    index["weight_map"]["language_model.model.embed_tokens.weight"] = (
+        "../evil.safetensors"
+    )
+    index_path.write_text(json.dumps(index))
+
+    with pytest.raises(ValueError, match="bare filename"):
+        ensure_external_ple_view(model_dir)
+    # Nothing was linked next to the view either.
+    assert not (model_dir / "evil.safetensors").exists()
+    assert not (model_dir / VIEW_DIRNAME).exists()
+
+
+def test_q8_detection_reads_the_quantization_the_loader_applies(tmp_path):
+    """mlx-vlm quantizes from ``quantization``; an HF-style ``quantization_config``
+    stub without the per-module overrides must not hide the 8-bit PLE table."""
+    model_dir = tmp_path / "model"
+    _write_q8_checkpoint(model_dir)
+    config_path = model_dir / "config.json"
+    config = json.loads(config_path.read_text())
+    config["quantization_config"] = {"group_size": 64, "bits": 8, "mode": "affine"}
+    config_path.write_text(json.dumps(config))
+
+    view = ensure_external_ple_view(model_dir)
+
+    manifest = json.loads((view / "ple-store.json").read_text())
+    assert manifest["format"] == "olmlx_affine_q8"
+
+
+def test_q8_view_with_an_older_manifest_version_is_rebuilt(tmp_path, fresh_hook):
+    """A manifest schema change must force a rebuild, not a failed load."""
+    from olmlx.engine import qwen4_exp_ple
+
+    model_dir = tmp_path / "model"
+    _write_q8_checkpoint(model_dir)
+    view = ensure_external_ple_view(model_dir)
+    manifest_path = view / "ple-store.json"
+    manifest = json.loads(manifest_path.read_text())
+    current = manifest["version"]
+    manifest["version"] = current - 1
+    manifest_path.write_text(json.dumps(manifest))
+    qwen4_exp_ple.install_mlx_vlm_hook()
+    with pytest.raises(ValueError, match="version"):
+        fresh_hook.QuantizedMMapNGramEmbedding(str(manifest_path))
+
+    rebuilt = ensure_external_ple_view(model_dir)
+
+    assert json.loads((rebuilt / "ple-store.json").read_text())["version"] == current
+
+
+@pytest.mark.parametrize("damaged", ["null", "[]"])
+def test_q8_view_with_a_damaged_manifest_is_rebuilt(tmp_path, damaged):
+    model_dir = tmp_path / "model"
+    _write_q8_checkpoint(model_dir)
+    view = ensure_external_ple_view(model_dir)
+    (view / "ple-store.json").write_text(damaged)
+
+    rebuilt = ensure_external_ple_view(model_dir)
+
+    manifest = json.loads((rebuilt / "ple-store.json").read_text())
+    assert manifest["format"] == "olmlx_affine_q8"
