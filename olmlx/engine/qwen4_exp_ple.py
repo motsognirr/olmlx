@@ -346,8 +346,9 @@ def _q8_manifest(model_dir: Path, target: Path, weight_map: dict[str, str]) -> d
 def _build_q8_view(model_dir: Path, target: Path) -> None:
     """mlx-vlm's ``prepare_external_ple_model`` for an 8-bit table.
 
-    Same view layout: hard-linked weight files, an index and config without
-    the PLE tensors, and ``text_config.ple_storage`` naming the manifest.
+    Same view layout: hard-linked weight files (and, unlike mlx-vlm's
+    builder, hard-linked sidecars), an index and config without the PLE
+    tensors, and ``text_config.ple_storage`` naming the manifest.
     """
     index = json.loads((model_dir / "model.safetensors.index.json").read_text())
     weight_map = index["weight_map"]
@@ -371,7 +372,8 @@ def _build_q8_view(model_dir: Path, target: Path) -> None:
             or entry.name in {"config.json", "model.safetensors.index.json"}
         ):
             continue
-        shutil.copy2(entry, target / entry.name)
+        # Linked, not copied: the view costs no disk even for a large sidecar.
+        os.link(entry, target / entry.name)
 
     config = json.loads((model_dir / "config.json").read_text())
     config["text_config"]["ple_storage"] = {"manifest": _MANIFEST_NAME, "cache_rows": 0}
@@ -401,13 +403,14 @@ class AffineQ8NGramEmbedding:
             raise ValueError(
                 f"unsupported PLE quantization: {manifest.get('quantization')}"
             )
-        # The view sits inside the checkpoint it indexes, so the source is the
-        # manifest's directory or its parent, never anywhere else: a manifest
-        # must not be able to mmap arbitrary local files.
+        # A manifest must not be able to mmap arbitrary local files. The
+        # source is the manifest's own directory, or, for a view (which sits
+        # inside the checkpoint it indexes), that view's parent.
         source_root = Path(manifest["source_root"])
         base = manifest_path.parent.resolve()
         root = (base / source_root).resolve()
-        if source_root.is_absolute() or root not in (base, base.parent):
+        allowed = {base, base.parent} if base.name == VIEW_DIRNAME else {base}
+        if source_root.is_absolute() or root not in allowed:
             raise ValueError(
                 "source_root must be the manifest's directory or its parent: "
                 f"{manifest['source_root']!r}"
@@ -442,7 +445,10 @@ class AffineQ8NGramEmbedding:
                 shape = (count, widths[name])
                 if tuple(int(dim) for dim in tensor["shape"]) != shape:
                     raise ValueError(f"{name} shape does not match the row layout")
-                path = root / file_name
+                # A bare name can still be a symlink out of the checkpoint.
+                path = (root / file_name).resolve()
+                if not path.is_relative_to(root):
+                    raise ValueError(f"PLE tensor file resolves outside {root}: {path}")
                 offset = int(tensor["offset"])
                 nbytes = count * widths[name] * _NP_DTYPES[dtype].itemsize
                 if offset < 0 or path.stat().st_size < offset + nbytes:

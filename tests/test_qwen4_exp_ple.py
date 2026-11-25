@@ -515,7 +515,9 @@ def test_builds_view_for_q8_ple_checkpoint(tmp_path):
     assert not any(".ngram_embedding." in k for k in index["weight_map"])
     linked = view / "model-00002-of-00002.safetensors"
     assert linked.stat().st_ino == (model_dir / linked.name).stat().st_ino
-    assert (view / "tokenizer.json").exists()
+    # Sidecars are hard links too, so the view costs no disk at all.
+    sidecar = view / "tokenizer.json"
+    assert sidecar.stat().st_ino == (model_dir / "tokenizer.json").stat().st_ino
     manifest = json.loads((view / "ple-store.json").read_text())
     assert manifest["quantization"] == Q8
     assert manifest["row_count"] == 2 * ROWS
@@ -768,3 +770,41 @@ def test_hook_tolerates_mlx_vlm_without_the_fp8_converter(monkeypatch, fresh_hoo
     qwen4_exp_ple.install_mlx_vlm_hook()
 
     assert not hasattr(model_module, "convert_qwen4_exp_fp8_weights")
+
+
+def test_q8_manifest_rejects_symlink_out_of_source_root(tmp_path, fresh_hook):
+    import shutil
+
+    from olmlx.engine import qwen4_exp_ple
+
+    model_dir = tmp_path / "model"
+    _write_q8_checkpoint(model_dir)
+    view = ensure_external_ple_view(model_dir)
+    # Same bytes, but the bare filename now points outside the checkpoint.
+    outside = tmp_path / "outside.safetensors"
+    shard = model_dir / "model-00001-of-00002.safetensors"
+    shutil.copy2(shard, outside)
+    shard.unlink()
+    shard.symlink_to(outside)
+    qwen4_exp_ple.install_mlx_vlm_hook()
+
+    with pytest.raises(ValueError, match="outside"):
+        fresh_hook.QuantizedMMapNGramEmbedding(str(view / "ple-store.json"))
+
+
+def test_q8_manifest_outside_a_view_may_not_reach_its_parent(tmp_path, fresh_hook):
+    """Only a manifest in an ``external_ple`` view reads from its parent."""
+    from olmlx.engine import qwen4_exp_ple
+
+    model_dir = tmp_path / "model"
+    _write_q8_checkpoint(model_dir)
+    view = ensure_external_ple_view(model_dir)
+    other = tmp_path / "elsewhere"
+    other.mkdir()
+    (other / "ple-store.json").write_text((view / "ple-store.json").read_text())
+    for name in ("model-00001-of-00002.safetensors",):
+        (tmp_path / name).hardlink_to(model_dir / name)
+    qwen4_exp_ple.install_mlx_vlm_hook()
+
+    with pytest.raises(ValueError, match="source_root"):
+        fresh_hook.QuantizedMMapNGramEmbedding(str(other / "ple-store.json"))
