@@ -25,6 +25,7 @@ def load_vlm(path: str, **kwargs: Any) -> tuple[Any, Any]:
     from olmlx.engine.qwen4_exp_ple import (
         ensure_external_ple_view,
         install_mlx_vlm_hook,
+        uses_external_ple,
     )
 
     # Qwen4-Exp: serve the ~30 GiB n-gram (PLE) tables by mmap row lookup
@@ -32,7 +33,9 @@ def load_vlm(path: str, **kwargs: Any) -> tuple[Any, Any]:
     view = ensure_external_ple_view(path)
     if view is not None:
         path = str(view)
-        # 8-bit views are served by olmlx's own table, not mlx-vlm's.
+    # 8-bit views are served by olmlx's own table, not mlx-vlm's. Checked on
+    # the final path so a view directory loaded directly is covered too.
+    if uses_external_ple(path):
         install_mlx_vlm_hook()
     # Converted Edge0 packs: FP8 n-gram table hook + a non-strict load (their
     # routed experts live in the pack's experts.bin, not the safetensors).

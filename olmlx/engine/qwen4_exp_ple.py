@@ -279,10 +279,14 @@ def _ple_is_q8(model_dir: Path) -> bool:
     index = json.loads((model_dir / "model.safetensors.index.json").read_text())
     quant = _quantization(config)
     prefixes = _ple_prefixes(index["weight_map"])
-    found = {
-        tuple(quant.get(prefix, quant).get(key) for key in _Q8_QUANTIZATION)
-        for prefix in prefixes
-    }
+    found = set()
+    for prefix in prefixes:
+        params = quant.get(prefix, quant)
+        # Configs written before MLX had quantization modes omit "mode"; it
+        # means affine.
+        found.add(
+            (params.get("bits"), params.get("group_size"), params.get("mode", "affine"))
+        )
     return found == {tuple(_Q8_QUANTIZATION.values())}
 
 
@@ -397,9 +401,17 @@ class AffineQ8NGramEmbedding:
             raise ValueError(
                 f"unsupported PLE quantization: {manifest.get('quantization')}"
             )
-        root = Path(manifest["source_root"])
-        if not root.is_absolute():
-            root = (manifest_path.parent / root).resolve()
+        # The view sits inside the checkpoint it indexes, so the source is the
+        # manifest's directory or its parent, never anywhere else: a manifest
+        # must not be able to mmap arbitrary local files.
+        source_root = Path(manifest["source_root"])
+        base = manifest_path.parent.resolve()
+        root = (base / source_root).resolve()
+        if source_root.is_absolute() or root not in (base, base.parent):
+            raise ValueError(
+                "source_root must be the manifest's directory or its parent: "
+                f"{manifest['source_root']!r}"
+            )
         self.row_width = int(manifest["row_width"])
         if self.row_width <= 0 or self.row_width % _Q8_GROUP:
             raise ValueError("row_width must be a positive multiple of the group size")
@@ -513,7 +525,11 @@ def _install_fp8_converter_guard() -> None:
     from mlx_vlm.models.qwen4_exp import qwen4_exp as model_module
 
     with _hook_lock:
-        original = model_module.convert_qwen4_exp_fp8_weights  # pyright: ignore[reportPrivateImportUsage]
+        original = getattr(model_module, "convert_qwen4_exp_fp8_weights", None)
+        if original is None:
+            # A release without the converter has nothing to guard.
+            logger.debug("mlx-vlm qwen4_exp has no FP8 converter; guard not installed")
+            return
         if original is _converter_guard:
             return
 
@@ -522,6 +538,22 @@ def _install_fp8_converter_guard() -> None:
 
         _converter_guard = guarded
         model_module.convert_qwen4_exp_fp8_weights = guarded  # pyright: ignore[reportPrivateImportUsage]
+
+
+def uses_external_ple(model_path: str | Path) -> bool:
+    """True for a qwen4_exp checkpoint whose config names an external PLE manifest.
+
+    That is every view :func:`ensure_external_ple_view` builds, and also a view
+    directory loaded directly.
+    """
+    try:
+        config = json.loads((Path(model_path) / "config.json").read_text())
+    except (OSError, ValueError):
+        return False
+    if not isinstance(config, dict) or config.get("model_type") != "qwen4_exp":
+        return False
+    text_config = config.get("text_config")
+    return isinstance(text_config, dict) and bool(text_config.get("ple_storage"))
 
 
 def install_mlx_vlm_hook() -> None:
