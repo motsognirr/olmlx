@@ -878,3 +878,16 @@ def test_q8_view_with_an_older_manifest_version_is_rebuilt(tmp_path, fresh_hook)
     rebuilt = ensure_external_ple_view(model_dir)
 
     assert json.loads((rebuilt / "ple-store.json").read_text())["version"] == current
+
+
+@pytest.mark.parametrize("damaged", ["null", "[]"])
+def test_q8_view_with_a_damaged_manifest_is_rebuilt(tmp_path, damaged):
+    model_dir = tmp_path / "model"
+    _write_q8_checkpoint(model_dir)
+    view = ensure_external_ple_view(model_dir)
+    (view / "ple-store.json").write_text(damaged)
+
+    rebuilt = ensure_external_ple_view(model_dir)
+
+    manifest = json.loads((rebuilt / "ple-store.json").read_text())
+    assert manifest["format"] == "olmlx_affine_q8"

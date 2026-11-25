@@ -138,7 +138,9 @@ def _view_is_current(model_dir: Path, view: Path) -> bool:
         ):
             return False
         return recorded == _source_fingerprint(model_dir)
-    except (OSError, ValueError, KeyError, TypeError):
+    except (OSError, ValueError, KeyError, TypeError, AttributeError):
+        # Any damaged view file (including JSON that is not an object) means
+        # rebuild, never a failed load.
         return False
 
 
