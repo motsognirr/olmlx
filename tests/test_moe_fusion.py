@@ -112,6 +112,23 @@ class TestFusedOutputIsBitIdentical:
         assert isinstance(fused, FusedSwitchGLU)
         assert mx.array_equal(fused(x, inds), ref).item()
 
+    @pytest.mark.parametrize("tokens", [1, 64], ids=["decode", "prefill-sorted"])
+    def test_real_model_shape(self, tokens):
+        # Qwen3.6-35B-A3B expert shape (hidden 2048, expert width 512, top-8,
+        # 4-bit/64). The fused projection is twice as wide; this pins that
+        # MLX still computes each row identically at a production width.
+        # Checked on Metal for more shapes (Qwen3-30B, GLM-4.5-Air,
+        # DeepSeek-V3, gpt-oss, Mixtral, widths 32..14336): all bit-exact.
+        mx.random.seed(0)
+        glu = SwitchGLU(2048, 512, 8)
+        nn.quantize(glu, group_size=64, bits=4)
+        mx.eval(glu.parameters())
+        x = mx.random.normal((1, tokens, 2048)).astype(mx.bfloat16)
+        inds = mx.random.randint(0, 8, (1, tokens, 8)).astype(mx.uint32)
+        ref = glu(x, inds)
+        _, fused = _fuse_one(glu)
+        assert mx.array_equal(fused(x, inds), ref).item()
+
     def test_mxfp4_with_bias(self):
         # gpt-oss: mxfp4 experts (no affine biases, uint8 scales) plus
         # per-expert bias vectors.
@@ -219,6 +236,21 @@ class TestUnfuse:
         assert type(restored.gate_proj) is SwitchLinear
         assert mx.array_equal(restored.gate_proj.weight, gate_w).item()
         assert mx.array_equal(restored.up_proj.weight, up_w).item()
+
+    @pytest.mark.parametrize("quantized", [False, True], ids=["fp32", "q4"])
+    def test_restored_projections_share_the_fused_buffers(self, quantized):
+        # An adapter on an MoE base would otherwise duplicate the whole
+        # expert gate/up weight set (multi-GB). If MLX ever starts copying
+        # basic slices, this must fail rather than silently use the memory.
+        import numpy as np
+
+        model = _Model([_Block(_glu(quantized=quantized))])
+        assert fuse_switch_glu_layers(model) == 1
+        fused_w = model.layers[0].switch_mlp.gate_up_proj.weight
+        assert unfuse_switch_glu_layers(model) == 1
+        restored = model.layers[0].switch_mlp
+        for proj in (restored.gate_proj, restored.up_proj):
+            assert np.shares_memory(np.asarray(fused_w), np.asarray(proj.weight))
 
     def test_restored_projections_are_usable_from_another_thread(self):
         glu = _glu()
