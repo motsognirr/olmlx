@@ -902,6 +902,7 @@ class ModelManager(SpeculativeLoaderMixin):
                 kv_cache_quant = model_config.resolved_kv_cache_quant()
                 kv_eviction = model_config.resolved_kv_eviction()
                 weight_quant_str = model_config.resolved_weight_quant()
+                moe_gate_up_fusion = model_config.resolved_moe_gate_up_fusion()
                 # Whisper models (issue #366) have no LLM KV cache — never
                 # apply KV-cache quantization / spectral calibration to them.
                 # ``_detect_model_kind`` can fall through to a blocking
@@ -1114,6 +1115,7 @@ class ModelManager(SpeculativeLoaderMixin):
                         # Registry dicts are loop-affine (#463): resolve the
                         # manifest name here, not on the load worker (#760).
                         self._manifest_name_for(hf_path),
+                        moe_gate_up_fusion=moe_gate_up_fusion,
                     )
                     timeout = settings.model_load_timeout
                     is_distributed = False
@@ -2914,6 +2916,7 @@ class ModelManager(SpeculativeLoaderMixin):
         weight_quant_str: str | None = None,
         image_config: Any = None,
         manifest_name: str | None = None,
+        moe_gate_up_fusion: bool | None = None,
     ) -> tuple[Any, Any, bool, TemplateCaps, Any]:
         """Load a model, using config.json inspection to choose the right library.
 
@@ -2940,6 +2943,10 @@ class ModelManager(SpeculativeLoaderMixin):
 
         *weight_quant_str* is the resolved weight quantization string
         (e.g. ``"hqq:4"``). ``None`` means no weight quantization.
+
+        *moe_gate_up_fusion* is the resolved per-model fusion toggle
+        (``ModelConfig.resolved_moe_gate_up_fusion()``). ``None`` falls back
+        to the global ``settings.moe_gate_up_fusion``.
 
         Returns (model, tokenizer, is_vlm, caps, speculative_decoder).
         """
@@ -3200,20 +3207,34 @@ class ModelManager(SpeculativeLoaderMixin):
         # Stack MoE expert gate/up into one matmul (bit-identical). After HQQ,
         # so it sees the final layers; never for distributed models, whose
         # model.shard() addresses switch_mlp.gate_proj / up_proj by name, nor
-        # for an mlx-vlm fallback. Identity check: a MagicMock ``settings`` in
+        # for an mlx-vlm fallback. Identity checks: a MagicMock ``settings`` in
         # tests must not switch it on.
+        if moe_gate_up_fusion is None:
+            moe_gate_up_fusion = settings.moe_gate_up_fusion is True
         if (
-            settings.moe_gate_up_fusion is True
+            moe_gate_up_fusion is True
             and self._distributed_group is None
             and not is_vlm
         ):
-            fused = fuse_switch_glu_layers(model)
-            if fused:
-                logger.info(
-                    "Fused expert gate/up projections in %d MoE blocks of %s",
-                    fused,
+            try:
+                fused = fuse_switch_glu_layers(model)
+            except Exception as exc:
+                # An optional speed-up must not cost a model that loads
+                # unfused. Blocks are independent, so a partly fused model
+                # is still correct.
+                logger.warning(
+                    "MoE gate/up fusion failed for %s; serving the remaining "
+                    "blocks unfused: %s",
                     hf_path,
+                    exc,
                 )
+            else:
+                if fused:
+                    logger.info(
+                        "Fused expert gate/up projections in %d MoE blocks of %s",
+                        fused,
+                        hf_path,
+                    )
 
         if spec_enabled and flash_config.flash_speculative:
             raise ValueError(
@@ -3368,6 +3389,7 @@ class ModelManager(SpeculativeLoaderMixin):
         weight_quant_str: str | None = None,
         image_config: Any = None,
         manifest_name: str | None = None,
+        moe_gate_up_fusion: bool | None = None,
     ) -> tuple[Any, Any, bool, TemplateCaps, bool, Any]:
         """Load a model and optionally shard it for distributed inference.
 
@@ -3393,6 +3415,7 @@ class ModelManager(SpeculativeLoaderMixin):
             weight_quant_str=weight_quant_str,
             image_config=image_config,
             manifest_name=manifest_name,
+            moe_gate_up_fusion=moe_gate_up_fusion,
         )
         is_distributed = False
 

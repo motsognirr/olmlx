@@ -31,21 +31,36 @@ try:
         QuantizedSwitchLinear,
         SwitchGLU,
         SwitchLinear,
-        _gather_sort,
-        _scatter_unsort,
     )
 except ImportError:  # pragma: no cover - exercised by a subprocess test
     SwitchGLU = None
     _PROJ_TYPES: tuple[type, ...] = ()
-
-    def _gather_sort(*args: Any, **kwargs: Any) -> Any:
-        # Unreachable: without mlx-lm nothing is ever fused.
-        raise RuntimeError("mlx-lm is not installed")
-
-    _scatter_unsort = _gather_sort
 else:
     _PROJ_TYPES = (SwitchLinear, QuantizedSwitchLinear)
-# Per-instance bookkeeping that must not be shared between module copies.
+
+# Private mlx-lm helpers, imported separately: if a release renames them,
+# fall back to copies of the mlx-lm 0.31.3 versions rather than letting the
+# ImportError above switch fusion off for every model. Sorting only groups
+# routes by expert; it never changes the output.
+try:
+    from mlx_lm.models.switch_layers import _gather_sort, _scatter_unsort
+except ImportError:
+
+    def _gather_sort(x, indices):
+        *_, M = indices.shape
+        indices = indices.flatten()
+        order = mx.argsort(indices)
+        inv_order = mx.argsort(order)
+        return x.flatten(0, -3)[order // M], indices[order], inv_order
+
+    def _scatter_unsort(x, inv_order, shape=None):
+        x = x[inv_order]
+        if shape is not None:
+            x = mx.unflatten(x, 0, shape)
+        return x
+
+
+# Per-instance bookkeeping, excluded when comparing gate/up projections.
 _PRIVATE_ATTRS = ("_no_grad", "_training")
 
 
@@ -131,13 +146,15 @@ def _fusable(glu: Any) -> bool:
 
 
 def _new_proj_like(src: nn.Module, arrays: dict[str, mx.array]) -> nn.Module:
-    """A fresh *src*-typed projection with *src*'s scalars and the given arrays."""
-    proj = type(src).__new__(type(src))
-    nn.Module.__init__(proj)
-    for k, v in _scalar_attrs(src).items():
-        proj.__dict__[k] = v
-    proj.__dict__["_training"] = src.__dict__.get("_training", False)
-    proj.__dict__["_no_grad"] = set(src.__dict__.get("_no_grad", ()))
+    """A copy of projection *src* holding *arrays* instead of its own arrays.
+
+    Uses ``structural_copy`` so there is one definition of which per-module
+    state is shared and which is copied (#362).
+    """
+    # Lazy: loaded_model sits above this module in model_manager's imports.
+    from olmlx.engine.loaded_model import structural_copy
+
+    proj = structural_copy(src)
     for k, v in arrays.items():
         proj[k] = v
     return proj
@@ -183,21 +200,31 @@ def _unfuse(fused: FusedSwitchGLU) -> nn.Module:
 def _replace_children(model: Any, match, convert) -> int:
     if not isinstance(model, nn.Module):
         return 0
-    count = 0
-    for _, module in model.named_modules():
-        for key, child in list(module.items()):
-            if match(child):
-                setattr(module, key, convert(child))
-                count += 1
-    return count
+    # Record (parent, key) slots and keep no reference to the children:
+    # named_modules() lists every module, so iterating it while replacing
+    # would keep each original block alive until the end of the loop.
+    slots = [
+        (module, key)
+        for _, module in model.named_modules()
+        for key, child in module.items()
+        if match(child)
+    ]
+    for module, key in slots:
+        setattr(module, key, convert(module[key]))
+        # The replaced block's buffers go back to MLX's cache. Release them
+        # now, so neither the peak nor get_metal_memory() (active + cache)
+        # counts them; the next block's larger fused buffers can't reuse them.
+        mx.clear_cache()
+    return len(slots)
 
 
 def fuse_switch_glu_layers(model: Any) -> int:
     """Fuse every eligible ``SwitchGLU`` in *model* in place; return how many.
 
     Run on the thread that loaded the model, after all weight transforms.
-    Each block is fused and evaluated in turn, so the originals are released
-    as it goes and peak memory grows by at most one block's gate+up weights.
+    Blocks are fused one at a time and each original is freed (and its
+    buffers released from MLX's cache) before the next, so peak memory grows
+    by about one block's gate+up weights, not the whole model's.
     """
     return _replace_children(model, _fusable, _fuse)
 

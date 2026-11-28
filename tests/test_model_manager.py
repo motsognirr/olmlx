@@ -2240,6 +2240,75 @@ class TestLoadModel:
                         manager._load_model("test/path", weight_quant_str="hqq:4")
         assert order == ["quant", "fuse"]
 
+    def test_fusion_failure_does_not_fail_the_load(self, registry, mock_store, caplog):
+        """Fusion is an optional speed-up: an error serves the model unfused."""
+        manager = self._make_manager(registry, mock_store)
+        self._pre_download(mock_store, "test/path")
+        mock_model = MagicMock()
+        mock_tokenizer = MagicMock()
+        mock_tokenizer.chat_template = None
+        with patch.object(manager, "_detect_model_kind", return_value="text"):
+            mock_mlx_lm = MagicMock()
+            mock_mlx_lm.load.return_value = (mock_model, mock_tokenizer)
+            with patch.dict("sys.modules", {"mlx_lm": mock_mlx_lm}):
+                with patch(
+                    "olmlx.engine.model_manager.fuse_switch_glu_layers",
+                    side_effect=RuntimeError("concat failed"),
+                ):
+                    with caplog.at_level("WARNING"):
+                        model, *_ = manager._load_model("test/path")
+        assert model is mock_model
+        assert "concat failed" in caplog.text
+
+    @pytest.mark.parametrize("per_model", [True, False])
+    def test_per_model_fusion_overrides_global(
+        self, registry, mock_store, monkeypatch, per_model
+    ):
+        monkeypatch.setattr(
+            "olmlx.engine.model_manager.settings.moe_gate_up_fusion", not per_model
+        )
+        manager = self._make_manager(registry, mock_store)
+        _, mock_fuse = self._load_text_capturing_fusion(
+            manager, mock_store, moe_gate_up_fusion=per_model
+        )
+        assert mock_fuse.called is per_model
+
+    def test_load_model_and_shard_forwards_fusion_setting(self, registry, mock_store):
+        manager = self._make_manager(registry, mock_store)
+        with patch.object(
+            manager,
+            "_load_model",
+            return_value=(MagicMock(), MagicMock(), False, TemplateCaps(), None),
+        ) as mock_load:
+            manager._load_model_and_shard("test/path", moe_gate_up_fusion=False)
+        assert mock_load.call_args.kwargs["moe_gate_up_fusion"] is False
+
+    @pytest.mark.asyncio
+    async def test_ensure_loaded_passes_per_model_fusion_setting(
+        self, registry, mock_store, monkeypatch
+    ):
+        monkeypatch.setattr(
+            "olmlx.engine.model_manager.settings.model_load_timeout", None
+        )
+        manager = self._make_manager(registry, mock_store)
+        manager.registry.resolve = MagicMock(  # type: ignore[method-assign]
+            return_value=ModelConfig(hf_path="new/repo", moe_gate_up_fusion=False)
+        )
+        manager.registry.normalize_name = MagicMock(  # type: ignore[method-assign]
+            side_effect=lambda n: f"{n}:latest"
+        )
+        monkeypatch.setattr(manager, "_detect_model_kind", lambda _p: "text")
+        seen = {}
+
+        def _shard(*args, **kwargs):
+            seen.update(kwargs)
+            raise RuntimeError("stop before load")
+
+        monkeypatch.setattr(manager, "_load_model_and_shard", _shard)
+        with pytest.raises(RuntimeError, match="stop before load"):
+            await manager.ensure_loaded("new")
+        assert seen["moe_gate_up_fusion"] is False
+
     def test_load_text_model_skips_fusion_when_disabled(
         self, registry, mock_store, monkeypatch
     ):

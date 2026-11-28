@@ -1410,7 +1410,7 @@ All settings are configured via `OLMLX_`-prefixed environment variables. You can
 | `OLMLX_BATCH_KV_ADMISSION` | bool | `true` | Hold a queued batched sequence in the inbox until the batch's combined KV fits under `OLMLX_MEMORY_LIMIT_FRACTION` (cross-sequence OOM guard). Disable to admit on per-request check only |
 | `OLMLX_BATCH_FAIRNESS_QUANTUM` | float | `0.0` | Minimum seconds of admission-open service the batch keeps before yielding the lock to a waiting exclusive request. `0.0` yields immediately; raise to protect batched throughput under interleaved traffic |
 | `OLMLX_MAX_TOKENS_LIMIT` | int | `131072` | Maximum tokens allowed per request |
-| `OLMLX_MOE_GATE_UP_FUSION` | bool | `true` | At load, stack each MoE layer's routed-expert `gate_proj` and `up_proj` into one expert matmul (mlx-lm `SwitchGLU`, plain text load path). Output is bit-identical; decode measured 1–3% faster on Qwen3.6-35B-A3B. Flash/flash-MoE, VLM and distributed loads are never fused. LoRA adapters get the original layout back automatically |
+| `OLMLX_MOE_GATE_UP_FUSION` | bool | `true` | At load, stack each MoE layer's routed-expert `gate_proj` and `up_proj` into one expert matmul (mlx-lm `SwitchGLU`, plain text load path). Output is bit-identical; decode measured 1–3% faster on Qwen3.6-35B-A3B. Flash/flash-MoE, VLM and distributed loads are never fused. LoRA adapters get the original layout back automatically. Override per model with `"moe_gate_up_fusion": false` (or `true`) at the top level of its `models.json` entry |
 | `OLMLX_CORS_ORIGINS` | list | `["http://localhost:*", "http://127.0.0.1:*"]` | Allowed CORS origins |
 | `OLMLX_ANTHROPIC_MODELS` | dict | `{}` | Claude model name->local model mapping for the Anthropic endpoint |
 

@@ -26,6 +26,10 @@ from olmlx.engine.moe_fusion import (
 
 D, H, E, K = 128, 64, 8, 2
 
+# sha256 prefix of mlx-lm's SwitchGLU.__call__ source with whitespace removed
+# (mlx-lm 0.31.3), the version FusedSwitchGLU.__call__ mirrors.
+_SWITCH_GLU_CALL_DIGEST = "9f80721838be4436"
+
 
 def _glu(*, quantized=True, bias=False, activation=None, bits=4, mode="affine"):
     mx.random.seed(0)
@@ -207,6 +211,110 @@ class TestFuseSwitchGluLayers:
         res = _forward_in_thread(fused, x, inds)
         assert res.get("error") is None, res.get("error")
         assert mx.array_equal(res["value"], ref).item()
+
+
+class TestFusionMemory:
+    """Fusing must not hold a second copy of the expert gate/up weights.
+
+    On a dense-loaded MoE the gate/up weights are about two thirds of the
+    model (~22 GB for Qwen3.6-35B-A3B at 8 bits), so keeping the originals
+    alive, or leaving their freed buffers in MLX's cache (which
+    ``memory_utils.get_metal_memory`` counts as used), can OOM a load or trip
+    the post-load memory check.
+    """
+
+    def test_each_original_block_is_released_before_the_next_is_fused(
+        self, monkeypatch
+    ):
+        import weakref
+
+        from olmlx.engine import moe_fusion
+
+        blocks = [_Block(_glu()) for _ in range(4)]
+        originals = [weakref.ref(b.switch_mlp) for b in blocks]
+        alive_at_each_fuse = []
+        real_fuse = moe_fusion._fuse
+
+        def spy(glu):
+            # Originals already replaced by earlier calls must be gone.
+            alive_at_each_fuse.append(
+                sum(r() is not None for r in originals) - 1  # minus this one
+            )
+            return real_fuse(glu)
+
+        monkeypatch.setattr(moe_fusion, "_fuse", spy)
+        model = _Model(blocks)
+        del blocks
+        assert fuse_switch_glu_layers(model) == 4
+        # Before fusing block i, only the not-yet-fused blocks i+1.. survive.
+        assert alive_at_each_fuse == [3, 2, 1, 0]
+
+    @pytest.mark.skipif(not mx.metal.is_available(), reason="Metal allocator")
+    def test_peak_and_cache_stay_within_one_block(self):
+        n = 6
+        model = _Model([_Block(SwitchGLU(512, 512, 32)) for _ in range(n)])
+        mx.eval(model.parameters())
+        block = (
+            sum(
+                b.switch_mlp.gate_proj.weight.nbytes
+                + b.switch_mlp.up_proj.weight.nbytes
+                for b in model.layers
+            )
+            / n
+        )
+        mx.clear_cache()
+        mx.reset_peak_memory()
+        base = mx.get_active_memory()
+        assert fuse_switch_glu_layers(model) == n
+        assert mx.get_peak_memory() - base <= 2.5 * block
+        assert mx.get_cache_memory() <= 0.5 * block
+
+
+class TestUpstreamDrift:
+    def test_switch_glu_call_is_the_version_fused_switch_glu_mirrors(self):
+        # FusedSwitchGLU.__call__ mirrors mlx-lm's SwitchGLU.__call__ step
+        # for step (sort threshold, training stop_gradient, activation
+        # argument order). The bit-identity tests only notice output changes
+        # on the shapes they exercise, so pin the upstream source: when an
+        # mlx-lm bump changes it, re-check FusedSwitchGLU and update the hash.
+        import hashlib
+        import inspect
+
+        src = "".join(inspect.getsource(SwitchGLU.__call__).split())
+        digest = hashlib.sha256(src.encode()).hexdigest()[:16]
+        assert digest == _SWITCH_GLU_CALL_DIGEST, (
+            f"mlx-lm SwitchGLU.__call__ changed (digest {digest}); verify "
+            "olmlx.engine.moe_fusion.FusedSwitchGLU.__call__ still mirrors it"
+        )
+
+    def test_fusion_survives_missing_private_mlx_lm_helpers(self):
+        # _gather_sort / _scatter_unsort are private mlx-lm helpers. If an
+        # mlx-lm release renames them, fusion must keep working (with local
+        # copies), not silently turn itself off for every model.
+        import subprocess
+        import sys
+
+        code = (
+            "import mlx.core as mx, mlx.nn as nn\n"
+            "import mlx_lm.models.switch_layers as sl\n"
+            "class B(nn.Module):\n"
+            "    def __init__(self, g):\n"
+            "        super().__init__(); self.switch_mlp = g\n"
+            "mx.random.seed(0)\n"
+            "g = sl.SwitchGLU(128, 64, 8); mx.eval(g.parameters())\n"
+            "x = mx.random.normal((1, 40, 128))\n"
+            "i = mx.random.randint(0, 8, (1, 40, 2)).astype(mx.uint32)\n"
+            "ref = g(x, i); mx.eval(ref)  # upstream needs the helpers\n"
+            "del sl._gather_sort, sl._scatter_unsort\n"
+            "from olmlx.engine.moe_fusion import fuse_switch_glu_layers\n"
+            "b = B(g)\n"
+            "assert fuse_switch_glu_layers(b) == 1, 'fusion disabled'\n"
+            "assert mx.array_equal(b.switch_mlp(x, i), ref).item()\n"
+        )
+        result = subprocess.run(
+            [sys.executable, "-c", code], capture_output=True, text=True, timeout=120
+        )
+        assert result.returncode == 0, result.stderr[-2000:]
 
 
 class TestUnfuse:
