@@ -249,6 +249,14 @@ class TestFusionMemory:
         # Before fusing block i, only the not-yet-fused blocks i+1.. survive.
         assert alive_at_each_fuse == [3, 2, 1, 0]
 
+    def test_clear_cache_hook_runs_once_per_fused_block(self):
+        # The caller supplies the clear, so the model manager can serialize
+        # it with its other Metal cache clears (mx.clear_cache is global).
+        calls = []
+        model = _Model([_Block(_glu()) for _ in range(3)])
+        assert fuse_switch_glu_layers(model, clear_cache=lambda: calls.append(1)) == 3
+        assert len(calls) == 3
+
     @pytest.mark.skipif(not mx.metal.is_available(), reason="Metal allocator")
     def test_peak_and_cache_stay_within_one_block(self):
         n = 6
@@ -344,6 +352,19 @@ class TestUnfuse:
         assert type(restored.gate_proj) is SwitchLinear
         assert mx.array_equal(restored.gate_proj.weight, gate_w).item()
         assert mx.array_equal(restored.up_proj.weight, up_w).item()
+
+    def test_unfuse_never_clears_the_metal_cache(self, monkeypatch):
+        # Unfusing frees nothing (views), and it runs on an adapter-load
+        # worker while the base may be generating: a global mx.clear_cache()
+        # there would be pointless and race live inference.
+        from olmlx.engine import moe_fusion
+
+        model = _Model([_Block(_glu()) for _ in range(2)])
+        assert fuse_switch_glu_layers(model, clear_cache=lambda: None) == 2
+        calls = []
+        monkeypatch.setattr(moe_fusion.mx, "clear_cache", lambda: calls.append(1))
+        assert unfuse_switch_glu_layers(model) == 2
+        assert calls == []
 
     @pytest.mark.parametrize("quantized", [False, True], ids=["fp32", "q4"])
     def test_restored_projections_share_the_fused_buffers(self, quantized):

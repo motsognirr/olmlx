@@ -430,6 +430,16 @@ class ModelManager(SpeculativeLoaderMixin):
         with self._flush_thread_lock:
             self._flush_metal_impl()
 
+    def _clear_metal_cache_serialized(self) -> None:
+        """``mx.clear_cache()`` under ``_flush_thread_lock``.
+
+        For load-thread callers that only need the cache released (MoE
+        gate/up fusion, once per block), without the full
+        ``gc.collect`` + ``mx.synchronize`` of :meth:`_flush_metal_sync`.
+        """
+        with self._flush_thread_lock:
+            mx.clear_cache()
+
     async def _flush_metal(self) -> None:
         """Async wrapper for :meth:`_flush_metal_sync`.
 
@@ -3217,7 +3227,9 @@ class ModelManager(SpeculativeLoaderMixin):
             and not is_vlm
         ):
             try:
-                fused = fuse_switch_glu_layers(model)
+                fused = fuse_switch_glu_layers(
+                    model, clear_cache=self._clear_metal_cache_serialized
+                )
             except Exception as exc:
                 # An optional speed-up must not cost a model that loads
                 # unfused. Blocks are independent, so a partly fused model

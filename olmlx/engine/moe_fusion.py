@@ -197,7 +197,7 @@ def _unfuse(fused: FusedSwitchGLU) -> nn.Module:
     return glu
 
 
-def _replace_children(model: Any, match, convert) -> int:
+def _replace_children(model: Any, match, convert, after_each=None) -> int:
     if not isinstance(model, nn.Module):
         return 0
     # Record (parent, key) slots and keep no reference to the children:
@@ -211,22 +211,25 @@ def _replace_children(model: Any, match, convert) -> int:
     ]
     for module, key in slots:
         setattr(module, key, convert(module[key]))
-        # The replaced block's buffers go back to MLX's cache. Release them
-        # now, so neither the peak nor get_metal_memory() (active + cache)
-        # counts them; the next block's larger fused buffers can't reuse them.
-        mx.clear_cache()
+        if after_each is not None:
+            after_each()
     return len(slots)
 
 
-def fuse_switch_glu_layers(model: Any) -> int:
+def fuse_switch_glu_layers(model: Any, *, clear_cache=mx.clear_cache) -> int:
     """Fuse every eligible ``SwitchGLU`` in *model* in place; return how many.
 
     Run on the thread that loaded the model, after all weight transforms.
-    Blocks are fused one at a time and each original is freed (and its
-    buffers released from MLX's cache) before the next, so peak memory grows
-    by about one block's gate+up weights, not the whole model's.
+    Blocks are fused one at a time and each original is freed before the
+    next, so peak memory grows by about one block's gate+up weights.
+
+    *clear_cache* runs after each block. The freed originals go back to MLX's
+    buffer cache, can't serve the next block's twice-as-wide buffers, and
+    would otherwise stay there, counted by ``get_metal_memory()`` (active +
+    cache). ``mx.clear_cache`` is global, so the model manager passes a
+    version serialized with its other Metal cache clears.
     """
-    return _replace_children(model, _fusable, _fuse)
+    return _replace_children(model, _fusable, _fuse, after_each=clear_cache)
 
 
 def unfuse_switch_glu_layers(model: Any) -> int:
