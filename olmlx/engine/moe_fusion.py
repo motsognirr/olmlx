@@ -37,6 +37,12 @@ try:
 except ImportError:  # pragma: no cover - exercised by a subprocess test
     SwitchGLU = None
     _PROJ_TYPES: tuple[type, ...] = ()
+
+    def _gather_sort(*args: Any, **kwargs: Any) -> Any:
+        # Unreachable: without mlx-lm nothing is ever fused.
+        raise RuntimeError("mlx-lm is not installed")
+
+    _scatter_unsort = _gather_sort
 else:
     _PROJ_TYPES = (SwitchLinear, QuantizedSwitchLinear)
 # Per-instance bookkeeping that must not be shared between module copies.
@@ -100,6 +106,8 @@ def _fusable(glu: Any) -> bool:
     if SwitchGLU is None or type(glu) is not SwitchGLU:
         return False
     gate, up = glu.get("gate_proj"), glu.get("up_proj")
+    if gate is None or up is None:
+        return False
     if type(gate) is not type(up) or type(gate) not in _PROJ_TYPES:
         return False
     out = _out_dims(gate)
@@ -163,9 +171,10 @@ def _unfuse(fused: FusedSwitchGLU) -> nn.Module:
     mx.eval(gate_arrays, up_arrays)
     glu = SwitchGLU.__new__(SwitchGLU)
     nn.Module.__init__(glu)
-    glu.gate_proj = _new_proj_like(gu, gate_arrays)
-    glu.up_proj = _new_proj_like(gu, up_arrays)
-    glu.down_proj = fused.down_proj
+    # Item assignment is what Module.__setattr__ does for module values.
+    glu["gate_proj"] = _new_proj_like(gu, gate_arrays)
+    glu["up_proj"] = _new_proj_like(gu, up_arrays)
+    glu["down_proj"] = fused.down_proj
     glu.activation = fused.activation
     glu.train(fused.training)
     return glu
