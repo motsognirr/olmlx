@@ -326,6 +326,12 @@ class Settings(BaseSettings):
     # ``olmlx.engine.registry``.
     weight_quant: str | None = None
 
+    # Stack each MoE layer's routed-expert gate_proj and up_proj into one
+    # expert matmul at load (mlx-lm SwitchGLU blocks, plain text load path).
+    # Bit-identical output. Decode was 1–3% faster on Qwen3.6-35B-A3B.
+    # Flash/flash-MoE, VLM and distributed loads are never fused.
+    moe_gate_up_fusion: bool = True
+
     # Distributed inference — split models across Apple Silicon machines.
     # Configured via hostfile (``distributed_hostfile``), launched by
     # ``olmlx serve``.

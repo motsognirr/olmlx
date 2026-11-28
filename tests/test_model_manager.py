@@ -2195,6 +2195,84 @@ class TestLoadModel:
 
         mock_quant.assert_called_once_with(mock_model, False, None, "test/path")
 
+    def _load_text_capturing_fusion(self, manager, mock_store, **load_kwargs):
+        self._pre_download(mock_store, "test/path")
+        mock_model = MagicMock()
+        mock_tokenizer = MagicMock()
+        mock_tokenizer.chat_template = None
+        with patch.object(manager, "_detect_model_kind", return_value="text"):
+            mock_mlx_lm = MagicMock()
+            mock_mlx_lm.load.return_value = (mock_model, mock_tokenizer)
+            with patch.dict("sys.modules", {"mlx_lm": mock_mlx_lm}):
+                with patch(
+                    "olmlx.engine.model_manager.fuse_switch_glu_layers",
+                    return_value=0,
+                ) as mock_fuse:
+                    manager._load_model("test/path", **load_kwargs)
+        return mock_model, mock_fuse
+
+    def test_load_text_model_fuses_moe_gate_up(self, registry, mock_store):
+        """The plain text path stacks MoE expert gate/up projections."""
+        manager = self._make_manager(registry, mock_store)
+        mock_model, mock_fuse = self._load_text_capturing_fusion(manager, mock_store)
+        mock_fuse.assert_called_once_with(mock_model)
+
+    def test_load_text_model_fuses_after_weight_quant(self, registry, mock_store):
+        """Fusion runs after HQQ, so it sees the final projection layers."""
+        manager = self._make_manager(registry, mock_store)
+        order = []
+        with patch.object(
+            manager,
+            "_maybe_quantize_model",
+            side_effect=lambda *a, **k: order.append("quant"),
+        ):
+            self._pre_download(mock_store, "test/path")
+            mock_tokenizer = MagicMock()
+            mock_tokenizer.chat_template = None
+            with patch.object(manager, "_detect_model_kind", return_value="text"):
+                mock_mlx_lm = MagicMock()
+                mock_mlx_lm.load.return_value = (MagicMock(), mock_tokenizer)
+                with patch.dict("sys.modules", {"mlx_lm": mock_mlx_lm}):
+                    with patch(
+                        "olmlx.engine.model_manager.fuse_switch_glu_layers",
+                        side_effect=lambda m: order.append("fuse") or 0,
+                    ):
+                        manager._load_model("test/path", weight_quant_str="hqq:4")
+        assert order == ["quant", "fuse"]
+
+    def test_load_text_model_skips_fusion_when_disabled(
+        self, registry, mock_store, monkeypatch
+    ):
+        monkeypatch.setattr(
+            "olmlx.engine.model_manager.settings.moe_gate_up_fusion", False
+        )
+        manager = self._make_manager(registry, mock_store)
+        _, mock_fuse = self._load_text_capturing_fusion(manager, mock_store)
+        mock_fuse.assert_not_called()
+
+    def test_load_text_model_skips_fusion_when_distributed(self, registry, mock_store):
+        """model.shard() addresses switch_mlp.gate_proj / up_proj by name."""
+        manager = self._make_manager(registry, mock_store)
+        manager._distributed_group = MagicMock()
+        _, mock_fuse = self._load_text_capturing_fusion(manager, mock_store)
+        mock_fuse.assert_not_called()
+
+    def test_vlm_fallback_from_text_path_is_not_fused(self, registry, mock_store):
+        manager = self._make_manager(registry, mock_store)
+        self._pre_download(mock_store, "test/path")
+        with patch.object(manager, "_detect_model_kind", return_value="text"):
+            with patch.object(
+                manager,
+                "_try_lm_then_vlm",
+                return_value=(MagicMock(), MagicMock(), True, TemplateCaps()),
+            ):
+                with patch(
+                    "olmlx.engine.model_manager.fuse_switch_glu_layers",
+                    return_value=0,
+                ) as mock_fuse:
+                    manager._load_model("test/path")
+        mock_fuse.assert_not_called()
+
 
 class TestFlashMoeVlmFallback:
     """Flash-MoE loading should fall back to mlx-vlm for unsupported model types."""

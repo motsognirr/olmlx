@@ -56,6 +56,7 @@ from olmlx.engine.model_load_utils import (  # noqa: F401
 from olmlx.engine.image_gen import (  # noqa: F401
     translate_mflux_errors as _translate_mflux_import_errors,
 )
+from olmlx.engine.moe_fusion import fuse_switch_glu_layers, unfuse_switch_glu_layers
 from olmlx.engine.cache_capabilities import (  # noqa: F401
     _is_serializable_cache,
     _kv_quant_blocks_snapshot,
@@ -579,6 +580,10 @@ class ModelManager(SpeculativeLoaderMixin):
         from mlx_lm.tuner.utils import load_adapters
 
         adapter_model = structural_copy(base_model)
+        # Adapters address switch_mlp.gate_proj / up_proj by name and load
+        # with strict=False, so on a fused base their expert weights would be
+        # dropped silently. Unfuse the copy only, using views (no copy).
+        unfuse_switch_glu_layers(adapter_model)
         load_adapters(adapter_model, adapter_dir)
         mx.eval(adapter_model.parameters())
         return adapter_model
@@ -3191,6 +3196,24 @@ class ModelManager(SpeculativeLoaderMixin):
         # loads a plain text model — pass is_vlm=False so we quantize
         # the model directly without looking for .language_model.
         self._maybe_quantize_model(model, False, weight_quant_str, hf_path)
+
+        # Stack MoE expert gate/up into one matmul (bit-identical). After HQQ,
+        # so it sees the final layers; never for distributed models, whose
+        # model.shard() addresses switch_mlp.gate_proj / up_proj by name, nor
+        # for an mlx-vlm fallback. Identity check: a MagicMock ``settings`` in
+        # tests must not switch it on.
+        if (
+            settings.moe_gate_up_fusion is True
+            and self._distributed_group is None
+            and not is_vlm
+        ):
+            fused = fuse_switch_glu_layers(model)
+            if fused:
+                logger.info(
+                    "Fused expert gate/up projections in %d MoE blocks of %s",
+                    fused,
+                    hf_path,
+                )
 
         if spec_enabled and flash_config.flash_speculative:
             raise ValueError(
