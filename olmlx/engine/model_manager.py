@@ -56,6 +56,7 @@ from olmlx.engine.model_load_utils import (  # noqa: F401
 from olmlx.engine.image_gen import (  # noqa: F401
     translate_mflux_errors as _translate_mflux_import_errors,
 )
+from olmlx.engine.moe_fusion import fuse_switch_glu_layers, unfuse_switch_glu_layers
 from olmlx.engine.cache_capabilities import (  # noqa: F401
     _is_serializable_cache,
     _kv_quant_blocks_snapshot,
@@ -429,6 +430,16 @@ class ModelManager(SpeculativeLoaderMixin):
         with self._flush_thread_lock:
             self._flush_metal_impl()
 
+    def _clear_metal_cache_serialized(self) -> None:
+        """``mx.clear_cache()`` under ``_flush_thread_lock``.
+
+        For load-thread callers that only need the cache released (MoE
+        gate/up fusion, once per block), without the full
+        ``gc.collect`` + ``mx.synchronize`` of :meth:`_flush_metal_sync`.
+        """
+        with self._flush_thread_lock:
+            mx.clear_cache()
+
     async def _flush_metal(self) -> None:
         """Async wrapper for :meth:`_flush_metal_sync`.
 
@@ -579,6 +590,10 @@ class ModelManager(SpeculativeLoaderMixin):
         from mlx_lm.tuner.utils import load_adapters
 
         adapter_model = structural_copy(base_model)
+        # Adapters address switch_mlp.gate_proj / up_proj by name and load
+        # with strict=False, so on a fused base their expert weights would be
+        # dropped silently. Unfuse the copy only, using views (no copy).
+        unfuse_switch_glu_layers(adapter_model)
         load_adapters(adapter_model, adapter_dir)
         mx.eval(adapter_model.parameters())
         return adapter_model
@@ -897,6 +912,7 @@ class ModelManager(SpeculativeLoaderMixin):
                 kv_cache_quant = model_config.resolved_kv_cache_quant()
                 kv_eviction = model_config.resolved_kv_eviction()
                 weight_quant_str = model_config.resolved_weight_quant()
+                moe_gate_up_fusion = model_config.resolved_moe_gate_up_fusion()
                 # Whisper models (issue #366) have no LLM KV cache — never
                 # apply KV-cache quantization / spectral calibration to them.
                 # ``_detect_model_kind`` can fall through to a blocking
@@ -1109,6 +1125,7 @@ class ModelManager(SpeculativeLoaderMixin):
                         # Registry dicts are loop-affine (#463): resolve the
                         # manifest name here, not on the load worker (#760).
                         self._manifest_name_for(hf_path),
+                        moe_gate_up_fusion=moe_gate_up_fusion,
                     )
                     timeout = settings.model_load_timeout
                     is_distributed = False
@@ -2909,6 +2926,7 @@ class ModelManager(SpeculativeLoaderMixin):
         weight_quant_str: str | None = None,
         image_config: Any = None,
         manifest_name: str | None = None,
+        moe_gate_up_fusion: bool | None = None,
     ) -> tuple[Any, Any, bool, TemplateCaps, Any]:
         """Load a model, using config.json inspection to choose the right library.
 
@@ -2935,6 +2953,10 @@ class ModelManager(SpeculativeLoaderMixin):
 
         *weight_quant_str* is the resolved weight quantization string
         (e.g. ``"hqq:4"``). ``None`` means no weight quantization.
+
+        *moe_gate_up_fusion* is the resolved per-model fusion toggle
+        (``ModelConfig.resolved_moe_gate_up_fusion()``). ``None`` falls back
+        to the global ``settings.moe_gate_up_fusion``.
 
         Returns (model, tokenizer, is_vlm, caps, speculative_decoder).
         """
@@ -3192,6 +3214,40 @@ class ModelManager(SpeculativeLoaderMixin):
         # the model directly without looking for .language_model.
         self._maybe_quantize_model(model, False, weight_quant_str, hf_path)
 
+        # Stack MoE expert gate/up into one matmul (bit-identical). After HQQ,
+        # so it sees the final layers; never for distributed models, whose
+        # model.shard() addresses switch_mlp.gate_proj / up_proj by name, nor
+        # for an mlx-vlm fallback. Identity checks: a MagicMock ``settings`` in
+        # tests must not switch it on.
+        if moe_gate_up_fusion is None:
+            moe_gate_up_fusion = settings.moe_gate_up_fusion is True
+        if (
+            moe_gate_up_fusion is True
+            and self._distributed_group is None
+            and not is_vlm
+        ):
+            try:
+                fused = fuse_switch_glu_layers(
+                    model, clear_cache=self._clear_metal_cache_serialized
+                )
+            except Exception as exc:
+                # An optional speed-up must not cost a model that loads
+                # unfused. Blocks are independent, so a partly fused model
+                # is still correct.
+                logger.warning(
+                    "MoE gate/up fusion failed for %s; serving the remaining "
+                    "blocks unfused: %s",
+                    hf_path,
+                    exc,
+                )
+            else:
+                if fused:
+                    logger.info(
+                        "Fused expert gate/up projections in %d MoE blocks of %s",
+                        fused,
+                        hf_path,
+                    )
+
         if spec_enabled and flash_config.flash_speculative:
             raise ValueError(
                 "Only one speculative decoder can be active at a time; "
@@ -3345,6 +3401,7 @@ class ModelManager(SpeculativeLoaderMixin):
         weight_quant_str: str | None = None,
         image_config: Any = None,
         manifest_name: str | None = None,
+        moe_gate_up_fusion: bool | None = None,
     ) -> tuple[Any, Any, bool, TemplateCaps, bool, Any]:
         """Load a model and optionally shard it for distributed inference.
 
@@ -3370,6 +3427,7 @@ class ModelManager(SpeculativeLoaderMixin):
             weight_quant_str=weight_quant_str,
             image_config=image_config,
             manifest_name=manifest_name,
+            moe_gate_up_fusion=moe_gate_up_fusion,
         )
         is_distributed = False
 

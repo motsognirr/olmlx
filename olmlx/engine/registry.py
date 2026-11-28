@@ -434,6 +434,9 @@ class ModelConfig:
     #: (e.g. "hqq:4", "hqq:8:128").
     #: ``None`` means inherit the global ``Settings.weight_quant`` value.
     weight_quant: str | None = None
+    #: Per-model override for stacking MoE expert gate/up projections at load
+    #: (``OLMLX_MOE_GATE_UP_FUSION``). ``None`` defers to the global setting.
+    moe_gate_up_fusion: bool | None = None
     #: Per-model Flash overrides for the promoted primary knobs.
     #: ``None`` means inherit from the global ``Settings.flash*`` value.
     #: Advanced/tuning knobs still go under the ``experimental`` block.
@@ -701,6 +704,13 @@ class ModelConfig:
             raise ValueError(
                 f"'batching' must be a bool or None, got {self.batching!r}"
             )
+        if self.moe_gate_up_fusion is not None and not isinstance(
+            self.moe_gate_up_fusion, bool
+        ):
+            raise ValueError(
+                "'moe_gate_up_fusion' must be a bool or None, got "
+                f"{self.moe_gate_up_fusion!r}"
+            )
         # Positive-int knobs (mirror the global ``Field(ge=1)`` constraints).
         # ``bool`` is an ``int`` subclass, so reject it explicitly.
         for _name in (
@@ -899,6 +909,13 @@ class ModelConfig:
         if self.weight_quant is not None:
             return self.weight_quant
         return settings.weight_quant
+
+    def resolved_moe_gate_up_fusion(self) -> bool:
+        """Per-model ``moe_gate_up_fusion`` if set, else the global setting."""
+        if self.moe_gate_up_fusion is not None:
+            return self.moe_gate_up_fusion
+        # Identity check: a MagicMock ``settings`` in tests must not enable it.
+        return settings.moe_gate_up_fusion is True
 
     def resolved_flash(self) -> ResolvedFlashConfig:
         """Resolve Flash primary knobs: per-model overrides global settings.
@@ -1122,6 +1139,7 @@ class ModelConfig:
             system_raw = entry.get("system")
             prompt_cache_raw = entry.get("prompt_cache")
             batching_raw = entry.get("batching")
+            moe_gate_up_fusion_raw = entry.get("moe_gate_up_fusion")
             batch_completion_size_raw = entry.get("batch_completion_size")
             batch_prefill_size_raw = entry.get("batch_prefill_size")
             batch_prefill_step_raw = entry.get("batch_prefill_step")
@@ -1196,6 +1214,7 @@ class ModelConfig:
                 kv_cache_quant=kv_cache_quant_raw,
                 kv_eviction=kv_eviction_raw,
                 weight_quant=weight_quant_raw,
+                moe_gate_up_fusion=moe_gate_up_fusion_raw,
                 flash=flash,
                 flash_sparsity_threshold=flash_sparsity_threshold,
                 flash_min_active_neurons=flash_min_active_neurons,
@@ -1245,6 +1264,7 @@ class ModelConfig:
             and self.kv_cache_quant is None
             and self.kv_eviction is None
             and self.weight_quant is None
+            and self.moe_gate_up_fusion is None
             and self.flash is None
             and self.flash_sparsity_threshold is None
             and self.flash_min_active_neurons is None
@@ -1311,6 +1331,8 @@ class ModelConfig:
             result["kv_eviction"] = self.kv_eviction
         if self.weight_quant is not None:
             result["weight_quant"] = self.weight_quant
+        if self.moe_gate_up_fusion is not None:
+            result["moe_gate_up_fusion"] = self.moe_gate_up_fusion
         if self.flash is not None:
             result["flash"] = self.flash
         if self.flash_sparsity_threshold is not None:

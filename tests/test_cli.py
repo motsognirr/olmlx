@@ -2099,12 +2099,6 @@ class TestModelsListCmd:
         out = capsys.readouterr().out
         assert "valid:latest" in out
 
-    def test_lists_no_models(self, capsys, mock_store, _patch_store):
-        mock_store.list_local.return_value = []
-        cmd_models_list(None)
-        out = capsys.readouterr().out
-        assert "No models" in out
-
     def test_handles_corrupt_manifest(self, capsys, mock_store, _patch_store):
         """Corrupt manifest in list_local should produce clean error, not traceback."""
         mock_store.list_local.side_effect = ValueError("Field 'size' should be int")

@@ -906,6 +906,51 @@ class TestModelConfig:
         mc = ModelConfig(hf_path="org/model")
         assert mc.to_entry() == "org/model"
 
+    def test_moe_gate_up_fusion_default_none(self):
+        """Unset means the global OLMLX_MOE_GATE_UP_FUSION applies."""
+        mc = ModelConfig.from_entry({"hf_path": "org/model"})
+        assert mc.moe_gate_up_fusion is None
+
+    @pytest.mark.parametrize("value", [True, False])
+    def test_moe_gate_up_fusion_parsed(self, value):
+        mc = ModelConfig.from_entry(
+            {"hf_path": "org/model", "moe_gate_up_fusion": value}
+        )
+        assert mc.moe_gate_up_fusion is value
+
+    def test_moe_gate_up_fusion_non_bool_rejected(self):
+        with pytest.raises(ValueError, match="moe_gate_up_fusion"):
+            ModelConfig.from_entry(
+                {"hf_path": "org/model", "moe_gate_up_fusion": "off"}
+            )
+
+    def test_moe_gate_up_fusion_round_trip(self):
+        mc = ModelConfig(hf_path="org/model", moe_gate_up_fusion=False)
+        entry = mc.to_entry()
+        assert isinstance(entry, dict)
+        assert entry["moe_gate_up_fusion"] is False
+        assert ModelConfig.from_entry(entry).moe_gate_up_fusion is False
+
+    @pytest.mark.parametrize("global_value", [True, False])
+    def test_resolved_moe_gate_up_fusion_falls_back_to_global(
+        self, monkeypatch, global_value
+    ):
+        from olmlx.config import settings as _settings
+
+        monkeypatch.setattr(_settings, "moe_gate_up_fusion", global_value)
+        mc = ModelConfig(hf_path="org/model")
+        assert mc.resolved_moe_gate_up_fusion() is global_value
+
+    @pytest.mark.parametrize("value", [True, False])
+    def test_resolved_moe_gate_up_fusion_per_model_overrides_global(
+        self, monkeypatch, value
+    ):
+        from olmlx.config import settings as _settings
+
+        monkeypatch.setattr(_settings, "moe_gate_up_fusion", not value)
+        mc = ModelConfig(hf_path="org/model", moe_gate_up_fusion=value)
+        assert mc.resolved_moe_gate_up_fusion() is value
+
     def test_batch_sizes_default_none(self):
         """The per-model batch-size knobs default to None (globals apply)."""
         mc = ModelConfig.from_entry({"hf_path": "org/model"})
